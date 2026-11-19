@@ -70,8 +70,7 @@ class WebDAVCommandConflictCleanupTests(unittest.TestCase):
             with patch("young_router.webdav.commands.load_settings", return_value=self._settings()), \
                 patch("young_router.webdav.commands.WebDAVClient", return_value=object()), \
                 patch("young_router.webdav.commands.local_snapshot", return_value=local), \
-                patch("young_router.webdav.commands.read_remote_manifest", return_value=None), \
-                patch("young_router.webdav.commands.remote_snapshot", return_value=remote), \
+                patch("young_router.webdav.commands.read_remote_snapshot", return_value=remote), \
                 patch("young_router.webdav.commands.baseline_snapshot", return_value=remote), \
                 patch("young_router.webdav.commands.push_bundle", return_value=(5, {})), \
                 patch("young_router.webdav.commands.default_conflict_file", return_value=conflict):
@@ -88,9 +87,8 @@ class WebDAVCommandConflictCleanupTests(unittest.TestCase):
             with patch("young_router.webdav.commands.load_settings", return_value=self._settings()), \
                 patch("young_router.webdav.commands.WebDAVClient", return_value=object()), \
                 patch("young_router.webdav.commands.local_snapshot", return_value=local), \
-                patch("young_router.webdav.commands.read_remote_manifest", side_effect=incompatible), \
+                patch("young_router.webdav.commands.read_remote_snapshot", side_effect=incompatible), \
                 patch("young_router.webdav.commands.archive_remote_bundle", return_value="kept.json") as archived, \
-                patch("young_router.webdav.commands.remote_snapshot", return_value=remote), \
                 patch("young_router.webdav.commands.baseline_snapshot", return_value=remote), \
                 patch("young_router.webdav.commands.push_bundle", return_value=(5, {})) as pushed, \
                 patch("young_router.webdav.commands.default_conflict_file", return_value=root / "conflict.json"):
@@ -125,8 +123,7 @@ class WebDAVCommandStatusTests(unittest.TestCase):
             with patch("young_router.webdav.commands.load_settings", return_value=settings), \
                 patch("young_router.webdav.commands.WebDAVClient", return_value=object()), \
                 patch("young_router.webdav.commands.local_snapshot", return_value=local), \
-                patch("young_router.webdav.commands.remote_snapshot", return_value=local), \
-                patch("young_router.webdav.commands.read_remote_manifest", return_value=local.manifest), \
+                patch("young_router.webdav.commands.read_remote_snapshot", return_value=local), \
                 patch("young_router.webdav.commands.baseline_snapshot", return_value=local), \
                 patch("young_router.webdav.commands.decide_sync", return_value=("conflict", local)), \
                 patch("young_router.webdav.commands.conflict_merge", return_value=None), \

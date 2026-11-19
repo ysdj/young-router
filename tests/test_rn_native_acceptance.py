@@ -2694,8 +2694,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("AppKitBusySpinner.frames[wheelStep % max(1, AppKitBusySpinner.frames.count)]", mac_leaf)
         # The shared pane answers the hand-over and selects the rows it wrote.
         self.assertIn("native.finishModelsToAdd({ status, close })", ui)
-        self.assertIn("const importPickedModels = async (", ui)
-        self.assertIn("await answerModelPick(translate(\"common.saved\"), true);", ui)
+        self.assertIn("const importPickedModels = (", ui)
+        self.assertIn("): Promise<void> => withModelPickSave(async () => {", ui)
+        self.assertIn('await answerModelPick(translate(id ? "common.saved" : "providers.fetchNothingNew"), true);', ui)
         self.assertIn("finishModelsToAdd?(options: { status: string; close: boolean }): Promise<string[] | undefined>;", types)
         self.assertIn("finishModelsToAdd?(status: string, close: boolean): Promise<string[] | undefined>;", bridge)
         self.assertIn("finishModelsToAdd?: (status: string, close: boolean) => Promise<string[] | undefined>;", platform)
@@ -3882,7 +3883,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, overflow: "hidden" }', native_controls)
         self.assertNotIn('tableFallback: { minHeight: 120, overflow: "scroll" }', native_controls)
-        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll}", native_controls)
+        self.assertIn('style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}', native_controls)
         # A source list draws its rows at the pane's own width instead: the
         # horizontal scroller around it was scrollable by the few points a row
         # overflowed, which is what made the sidebar slide between panes.

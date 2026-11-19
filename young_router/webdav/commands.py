@@ -28,7 +28,6 @@ from .core import (
     default_status_file,
     load_settings,
     local_snapshot,
-    manifest_url,
     save_settings,
     save_sync_status,
     save_sync_state,
@@ -43,8 +42,7 @@ from .operations import (
     publish_remote_digests,
     pull_bundle,
     push_bundle,
-    read_remote_manifest,
-    remote_snapshot,
+    read_remote_snapshot,
     remember_remote_bundle,
 )
 
@@ -152,7 +150,7 @@ def command_sync(args: argparse.Namespace) -> int:
     local = local_snapshot(config_path)
     archived_remote: str | None = None
     try:
-        remote_manifest = read_remote_manifest(client, settings)
+        remote = read_remote_snapshot(client, settings)
     except SyncError as exc:
         if exc.code != INCOMPATIBLE_BUNDLE_CODE:
             raise
@@ -160,15 +158,14 @@ def command_sync(args: argparse.Namespace) -> int:
         # compared.  Keep it under a dated sibling name before this machine's
         # state replaces it, the same way the app's sync does.
         archived_remote = archive_remote_bundle(client, settings)
-        remote_manifest = None
-    remote = remote_snapshot(client, settings, remote_manifest)
+        remote = SyncSnapshot(None)
     base = baseline_snapshot(args.state)
 
     print_manifest_summary("Local snapshot", local.manifest)
     if remote.manifest is None:
         bundle_size, pushed_manifest = push_bundle(client, settings, config_path, args.state, "sync-push")
         if archived_remote is None:
-            print(f"Remote snapshot: missing manifest; pushed local config to {_redact_url(bundle_url(settings))}")
+            print(f"Remote snapshot: missing bundle; pushed local config to {_redact_url(bundle_url(settings))}")
         else:
             print(f"Remote snapshot: kept the unreadable bundle as {archived_remote}; pushed local config to {_redact_url(bundle_url(settings))}")
         print(f"Bundle bytes: {bundle_size}")
@@ -179,16 +176,9 @@ def command_sync(args: argparse.Namespace) -> int:
     print_manifest_summary("Remote snapshot", remote.manifest)
     plan, remote = decide_sync(client, settings, local, remote, base)
     if plan == "unchanged":
-        # The bytes matched, so this side's digests describe the remote too, and
-        # the files on disk are the content both ends agreed on.
-        agreed = SyncSnapshot(
-            remote.manifest,
-            remote.digests or local.digests,
-            local.files if local.files is not None else remote.files,
-        )
+        agreed = remote
         save_sync_state(args.state, settings, agreed, "sync")
-        if remote.digests is None:
-            publish_remote_digests(client, settings, agreed)
+        publish_remote_digests(client, settings, agreed)
         clear_conflict_record(default_conflict_file())
         print("WebDAV sync: already up to date")
         return 0
@@ -274,9 +264,9 @@ def command_status(args: argparse.Namespace) -> int:
     client = WebDAVClient(settings)
     remote = SyncSnapshot(None)
     try:
-        remote = remote_snapshot(client, settings, read_remote_manifest(client, settings))
+        remote = read_remote_snapshot(client, settings)
         if remote.manifest is None:
-            print(f"Remote snapshot: missing manifest at {_redact_url(manifest_url(settings))}")
+            print(f"Remote snapshot: missing bundle at {_redact_url(bundle_url(settings))}")
         else:
             print_manifest_summary("Remote snapshot", remote.manifest)
             print(f"Remote digests: {'present' if remote.digests is not None else 'missing (bytes are compared)'}")

@@ -16,7 +16,6 @@ from .core import (
     SyncSnapshot,
     WebDAVClient,
     WebDAVHTTPError,
-    _validate_bundle_header,
     archived_bundle_name,
     build_digest_record,
     bundle_from_files,
@@ -50,29 +49,27 @@ def print_manifest_summary(prefix: str, manifest: dict[str, Any]) -> None:
 
 
 
-def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, Any] | None:
-    remote_manifest_url = manifest_url(settings)
+def read_remote_snapshot(client: WebDAVClient, settings: Settings) -> SyncSnapshot:
+    """Read one consistent remote snapshot from the published bundle."""
     try:
-        remote_manifest = json.loads(
-            client.get(remote_manifest_url, max_bytes=MANIFEST_MAX_BYTES).decode("utf-8")
-        )
+        bundle_data = client.get(bundle_url(settings), max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     except WebDAVHTTPError as exc:
-        if exc.code in BUNDLE_MISSING_STATUS | {500, 502, 503, 504}:
-            try:
-                return read_manifest_from_remote_bundle(client, settings)
-            except WebDAVHTTPError as bundle_exc:
-                if bundle_exc.code in BUNDLE_MISSING_STATUS:
-                    return None
-                raise
+        if exc.code in BUNDLE_MISSING_STATUS:
+            return SyncSnapshot(None)
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        # Bytes that do not decode are not JSON either; the decode runs first
-        # and its error is not a ``JSONDecodeError``.
-        raise SyncError(f"Remote manifest is not valid JSON: {exc}") from exc
-    if not isinstance(remote_manifest, dict):
-        raise SyncError("Remote manifest must be a JSON object")
-    _validate_bundle_header(remote_manifest)
-    return remote_manifest
+    try:
+        manifest, files = read_config_bundle(bundle_data)
+    except SyncError:
+        raise
+    except Exception as exc:
+        raise SyncError(f"Remote bundle could not be read: {exc}") from exc
+    return bundle_snapshot(manifest, files)
+
+
+def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, Any] | None:
+    """Read the published bundle's manifest."""
+
+    return read_remote_snapshot(client, settings).manifest
 
 
 def read_remote_digests(
@@ -190,20 +187,6 @@ def decide_sync(
     return smart_sync_plan(local, from_bundle, base), from_bundle
 
 
-def read_manifest_from_remote_bundle(client: WebDAVClient, settings: Settings) -> dict[str, Any]:
-    remote_bundle_url = bundle_url(settings)
-    try:
-        manifest, _files = read_config_bundle(
-            client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
-        )
-    except SyncError:
-        raise
-    except Exception as exc:
-        raise SyncError(f"Remote bundle manifest could not be read: {exc}") from exc
-    _validate_bundle_header(manifest)
-    return manifest
-
-
 def adopt_renamed_remote_bundle(
     client: WebDAVClient,
     settings: Settings,
@@ -232,7 +215,7 @@ def adopt_renamed_remote_bundle(
         source_manifest_url = remote_sibling_url(settings, manifest_name(name))
         if _remote_file_exists(client, source_manifest_url):
             client.put(
-                remote_sibling_url(settings, manifest_name(settings.remote_name)),
+                manifest_url(settings),
                 client.get(source_manifest_url, max_bytes=MANIFEST_MAX_BYTES),
                 "application/json; charset=utf-8",
             )
@@ -315,10 +298,8 @@ def push_bundle(
         if exc.code not in {403, 404, 405, 409, 500, 502, 503, 504}:
             raise
     else:
-        # The record is bound to the manifest that was just written.  A server
-        # that refuses either one therefore leaves the other stale by identity,
-        # which the next read treats as "no record" instead of as an answer
-        # about content this upload never carried.
+        # Readers obtain the authoritative manifest from the bundle, so a
+        # failed sidecar publication cannot hide a successful bundle upload.
         try:
             client.put(digests_url(settings), digest_data, "application/json; charset=utf-8")
         except WebDAVHTTPError as exc:
@@ -338,40 +319,29 @@ def pull_bundle(
     *,
     skip_when_unchanged: bool = True,
 ) -> dict[str, Any]:
-    """Install the remote bundle, or state that there is nothing to install.
+    """Read the published bundle and install only files whose content changed.
 
-    ``skip_when_unchanged`` reads the sidecar manifest (a few hundred bytes)
-    before the bundle, and stops there when its fingerprints already match the
-    files on disk.  A keep-in-sync host pulls on an interval: without this the
-    whole bundle is downloaded every tick to discover it is the one already
-    installed.  The answer is the same either way -- nothing is written -- so
-    the comparison can only save the transfer, never change the outcome, and an
-    unreadable side (a corrupt local config, a refused manifest) falls back to
-    the ordinary whole-bundle pull.
+    The bundle is also the source of its manifest. Sidecars may still describe
+    an earlier upload after a partial publication and cannot skip this read.
     """
 
     remote_bundle_url = bundle_url(settings)
+    bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     if skip_when_unchanged and config_path.exists():
         try:
             local = local_snapshot(config_path)
-            remote = remote_snapshot(client, settings, read_remote_manifest(client, settings))
+            manifest, files = read_config_bundle(bundle_data)
+            remote = bundle_snapshot(manifest, files)
         except SyncError:
             remote = SyncSnapshot(None)
         else:
             if remote.manifest is not None and local.matches(remote):
-                # The bytes matched, so this side's digests describe the remote
-                # too.  Stating them for the run keeps the next comparison off
-                # the raw bytes, and publishing them keeps the other machine's
-                # next run off them as well.
-                agreed = SyncSnapshot(
-                    remote.manifest,
-                    remote.digests or local.digests,
-                    local.files if local.files is not None else remote.files,
-                )
+                # This snapshot carries the actual remote bytes and their
+                # content digests, even when local volatile fields differ.
+                agreed = remote
                 if state_path is not None:
                     save_sync_state(state_path, settings, agreed, action)
-                if remote.digests is None:
-                    publish_remote_digests(client, settings, agreed)
+                publish_remote_digests(client, settings, agreed)
                 return {
                     "manifest": agreed.manifest,
                     "digests": agreed.digests,
@@ -380,7 +350,6 @@ def pull_bundle(
                     "removed": [],
                     "backups": [],
                 }
-    bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     result = install_bundle(bundle_data, config_path)
     snapshot = result["snapshot"]
     if state_path is not None:

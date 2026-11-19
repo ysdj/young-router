@@ -116,6 +116,38 @@ class WebDAVRemoteRenameTests(unittest.TestCase):
             settings = self._settings(Path(directory), "my-own-config.json")
         self.assertEqual("my-own-config.json", settings.remote_name)
 
+    def test_migration_to_an_explicit_url_names_the_manifest_for_that_bundle(self) -> None:
+        class Client:
+            files = {
+                "https://webdav.example.test/config/litellm-config.json?token=x": b'{}',
+                "https://webdav.example.test/config/litellm-config.manifest.json?token=x": b'{}',
+            }
+
+            def head(self, url: str) -> tuple[int, dict[str, str]]:
+                if url not in self.files:
+                    raise webdav_core.WebDAVHTTPError("HEAD", url, 404, "Not Found")
+                return 200, {}
+
+            def get(self, url: str, *, max_bytes: int) -> bytes:
+                return self.files[url]
+
+            def put(self, url: str, data: bytes, content_type: str) -> None:
+                self.files[url] = data
+
+            def delete(self, url: str) -> None:
+                del self.files[url]
+
+        settings = webdav_core.Settings(url="https://webdav.example.test/config/a%20one.json?token=x")
+        client = Client()
+        webdav_operations.adopt_renamed_remote_bundle(client, settings, ["litellm-config.json"])
+        self.assertEqual(
+            {
+                "https://webdav.example.test/config/a%20one.json?token=x": b'{}',
+                "https://webdav.example.test/config/a%20one.manifest.json?token=x": b'{}',
+            },
+            client.files,
+        )
+
 
 class WebDAVSmartSyncPlanTests(unittest.TestCase):
     """One comparison decides every sync, and it never stops to ask."""
@@ -468,11 +500,11 @@ class WebDAVConflictRecordTests(unittest.TestCase):
                 command="sync",
             )
             with patch(
-                "young_router.webdav.commands.remote_snapshot",
+                "young_router.webdav.commands.read_remote_snapshot",
                 return_value=webdav_core.SyncSnapshot(remote),
             ), patch(
                 "young_router.webdav.commands.local_snapshot", return_value=webdav_core.SyncSnapshot(local)
-            ), patch("young_router.webdav.commands.read_remote_manifest", return_value=remote), patch(
+            ), patch(
                 "young_router.webdav.commands.decide_sync",
                 return_value=("conflict", webdav_core.SyncSnapshot(remote)),
             ), patch(
@@ -513,14 +545,8 @@ class WebDAVArchiveTests(unittest.TestCase):
             webdav_core.archived_bundle_name("", "20260924-195812"),
         )
 
-    def test_a_remote_manifest_that_is_not_utf8_is_a_sync_error(self) -> None:
-        """Bytes that do not decode are "not valid JSON", not a traceback.
-
-        The decode runs before the parse, and its error is not the parse's: it
-        left ``read_remote_manifest`` as a bare ``UnicodeDecodeError``, which
-        neither the command line nor the app's sync path reports as a failed
-        sync.
-        """
+    def test_a_remote_bundle_that_is_not_utf8_is_a_sync_error(self) -> None:
+        """Invalid bundle bytes surface as a sync error."""
 
         class Client:
             def get(self, url: str, max_bytes: int = 0) -> bytes:
@@ -707,13 +733,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual([], list(target.glob("*.bak-webdav-*")))
             self.assertEqual(installed_at, config_path.stat().st_mtime_ns)
 
-    def test_a_pull_that_matches_the_remote_manifest_skips_the_bundle(self) -> None:
-        """``pull`` reads the sidecar manifest first and stops when it matches.
-
-        An unchanged remote is the ordinary case for a keep-in-sync host, and
-        downloading the whole bundle to discover that is the transfer this
-        comparison exists to avoid.  A remote that does differ still installs.
-        """
+    def test_an_unchanged_pull_reads_the_bundle_without_rewriting_local_files(self) -> None:
+        """A sidecar cannot vouch for bytes published by a separate PUT."""
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -745,13 +766,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
 
             self.assertEqual([], result["installed"])
             self.assertEqual(
-                [
-                    "https://example.com/dav/resource/config.manifest.json",
-                    # The digest record is read with the manifest; a server
-                    # that has none answers the bytes this test's fake returns,
-                    # which parses as "no record" and falls back to the bytes.
-                    "https://example.com/dav/resource/config.digests.json",
-                ],
+                ["https://example.com/dav/resource/config.json"],
                 client.urls,
             )
 
@@ -1565,9 +1580,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
 
             def sync(config_path: Path, state_path: Path) -> str:
                 local_snapshot = webdav_core.local_snapshot(config_path)
-                remote_snapshot = webdav_operations.remote_snapshot(
-                    server, settings, webdav_operations.read_remote_manifest(server, settings)
-                )
+                remote_snapshot = webdav_operations.read_remote_snapshot(server, settings)
                 if remote_snapshot.manifest is None:
                     webdav_operations.push_bundle(server, settings, config_path, state_path, "sync-push")
                     return "push"
@@ -1644,9 +1657,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
 
             def sync(config_path: Path, state_path: Path) -> str:
                 local_snapshot = webdav_core.local_snapshot(config_path)
-                remote_snapshot = webdav_operations.remote_snapshot(
-                    server, settings, webdav_operations.read_remote_manifest(server, settings)
-                )
+                remote_snapshot = webdav_operations.read_remote_snapshot(server, settings)
                 if remote_snapshot.manifest is None:
                     webdav_operations.push_bundle(server, settings, config_path, state_path, "sync-push")
                     return "push"
@@ -2814,10 +2825,10 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         remote_manifest = webdav_operations.read_remote_manifest(client, settings)
 
         self.assertEqual(remote_manifest["summary"], manifest["summary"])
-        self.assertEqual(len(client.urls), 2)
+        self.assertEqual(len(client.urls), 1)
         self.assertEqual(
             client.limits,
-            [webdav_core.MANIFEST_MAX_BYTES, webdav_core.CONFIG_BUNDLE_MAX_BYTES],
+            [webdav_core.CONFIG_BUNDLE_MAX_BYTES],
         )
 
     def test_missing_sidecar_manifest_falls_back_to_bundle_manifest(self) -> None:
@@ -2845,7 +2856,6 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         self.assertEqual(
             client.urls,
             [
-                "https://example.com/dav/resource/config.manifest.json",
                 "https://example.com/dav/resource/config.json",
             ],
         )

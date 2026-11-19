@@ -527,6 +527,44 @@ class PatchedSelectionConcurrencyTests(ConcurrencyStoreTestCase):
         # a concurrency limit rather than a cooldown.
         self.assertTrue(hooks._claim_deployment_concurrency_slot(request, deployment, 1))
 
+    async def test_a_final_router_refusal_withdraws_its_queue_ticket(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        hook = hooks.YoungRouterHook()
+        deployment = _deployment("route-a")
+        held = _request("turn-busy")
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(held, deployment, 1))
+
+        refused = _request("turn-refused")
+        ticket_time = hooks._open_concurrency_wait_ticket(refused)
+        hooks._concurrency_module.queue(
+            hooks._attempt_lease_id(refused), "id:route-a", ticket_time
+        )
+        self.assertFalse(hooks._claim_deployment_concurrency_slot(refused, deployment, 1))
+        ticket = hooks._attempt_lease_id(refused)
+        self.assertIn(ticket, runtime_store.read_document(self.leases_path).get("waiters", {}))
+
+        await hook.async_post_call_failure_hook(refused, RuntimeError("full"), None)
+
+        self.assertNotIn(ticket, runtime_store.read_document(self.leases_path).get("waiters", {}))
+        hooks._release_request_concurrency_slots(held)
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(refused, deployment, 1))
+
+    def test_a_non_streaming_refusal_does_not_join_a_queue(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        deployment = _deployment("route-a")
+        held = _request("turn-busy")
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(held, deployment, 1))
+
+        refused = _request("turn-refused")
+        refused["stream"] = False
+        self.assertFalse(hooks._claim_deployment_concurrency_slot(refused, deployment, 1))
+        self.assertNotIn(
+            hooks._attempt_lease_id(refused),
+            runtime_store.read_document(self.leases_path).get("waiters", {}),
+        )
+
 
 class ConcurrencyRefusalHopTests(ConcurrencyStoreTestCase):
     """A refusal on one route becomes the next route's turn."""
@@ -1131,6 +1169,7 @@ class ConcurrencyQueueTests(ConcurrencyStoreTestCase):
             [deployment],
             [item for item in filtered],
         )
+        self.assertEqual(hooks._concurrency_module.waiting_count("id:route-only"), 0)
 
     async def test_a_pool_that_never_frees_ends_the_round_and_keeps_the_place(self) -> None:
         """The wait is bounded by the round's deadline, and the ticket remains."""
@@ -1219,8 +1258,10 @@ class ConcurrencyQueueTests(ConcurrencyStoreTestCase):
         self.assertTrue(hooks._claim_deployment_concurrency_slot(held, deployment, 1))
 
         queued = _request("turn-queued", deployment_id="route-a")
-        # A refusal opens this turn's place in line, so the attempt that comes
-        # back (the next recovery round) is ahead of a fresh request.
+        # The recovery wait opens the place in line. Its next attempt keeps the
+        # ticket when it still cannot claim a slot.
+        ticket = hooks._open_concurrency_wait_ticket(queued)
+        hooks._concurrency_module.queue("turn-queued", "id:route-a", ticket)
         self.assertFalse(hooks._claim_deployment_concurrency_slot(queued, deployment, 1))
         self.assertEqual(hooks._concurrency_module.waiting_count("id:route-a"), 1)
 

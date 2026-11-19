@@ -5357,11 +5357,11 @@ def _claim_deployment_concurrency_slot(
         requested_at=_existing_concurrency_wait_ticket(request_kwargs),
         turn_key=lease_id,
     ):
-        # The pool is full here.  Take (or keep) this turn's place in line now,
-        # so the attempt that comes back -- the recovery poll's next round -- is
-        # ahead of a request that arrives after this one.  Releasing the turn
-        # withdraws it, so an abandoned turn never holds the head of the line.
-        ticket = _open_concurrency_wait_ticket(request_kwargs)
+        # A ticket is opened by the bounded recovery wait, where the caller can
+        # keep its stream alive and later withdraw its place. An initial
+        # refusal can end before any callback or iterator exists, so it must
+        # never create a ticket that outlives that request.
+        ticket = _existing_concurrency_wait_ticket(request_kwargs)
         if ticket is not None and lease_id:
             _concurrency_module.queue(lease_id, deployment_key, ticket)
         return False
@@ -5491,12 +5491,7 @@ def _existing_concurrency_wait_ticket(request_kwargs: Optional[dict]) -> Optiona
 
 
 def _open_concurrency_wait_ticket(request_kwargs: Optional[dict]) -> Optional[float]:
-    """This turn's place in line, stamped now if it has none yet.
-
-    Opened by a refusal as well as by a wait: the refusal is what sends the turn
-    to the recovery round, and that round's next attempt is the one that must be
-    ahead of a fresh request when a slot frees.
-    """
+    """This turn's place in line, stamped now if it has none yet."""
 
     lease_id = _attempt_lease_id(request_kwargs)
     if not lease_id:

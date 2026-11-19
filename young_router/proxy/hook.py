@@ -597,6 +597,18 @@ class YoungRouterHook(CustomLogger):
             capability_unsupported=True,
         )
 
+    async def async_post_call_failure_hook(
+        self,
+        request_data: dict,
+        original_exception: Exception,
+        user_api_key_dict: Any,
+        traceback_str: Optional[str] = None,
+    ) -> None:
+        # A route refusal can end before a deployment callback runs. In that
+        # path the turn may own only a queue ticket, so release must also
+        # withdraw the ticket or every later request can remain behind it.
+        _routing_module._release_request_concurrency_slots(request_data)
+
     async def async_post_call_response_headers_hook(
         self,
         data: dict,

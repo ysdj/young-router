@@ -89,31 +89,9 @@ def load_hook_module():
             root = importlib.import_module("litellm")
         except Exception:
             root = None
-    for name in [
-        "young_router",
-        "young_router.callbacks",
-        "litellm",
-        "litellm.main",
-        "litellm.integrations",
-        "litellm.integrations.custom_logger",
-        "litellm.integrations.websearch_interception",
-        "litellm.integrations.websearch_interception.handler",
-        "litellm.integrations.websearch_interception.transformation",
-        "litellm.llms",
-        "litellm.llms.base_llm",
-        "litellm.llms.base_llm.search",
-        "litellm.llms.base_llm.search.transformation",
-        "litellm.proxy",
-        "litellm.proxy.proxy_server",
-        "litellm.router",
-        "litellm.router_utils",
-        "litellm.router_utils.fallback_event_handlers",
-        "litellm.responses",
-        "litellm.responses.litellm_completion_transformation",
-        "litellm.responses.litellm_completion_transformation.streaming_iterator",
-        "litellm.responses.litellm_completion_transformation.transformation",
-    ]:
-        sys.modules.pop(name, None)
+    # Keep the installed dependency graph intact. Evicting only some children
+    # leaves their parents holding different module objects, and replacing the
+    # logger loses interfaces used by the real Router (including Span).
     # Reload only the hook package modules.  Clearing every ``young_router``
     # module also evicts Core/domain modules imported by neighboring tests,
     # leaving their class identities split across two module instances and
@@ -153,15 +131,9 @@ def load_hook_module():
     litellm.InternalServerError = InternalServerError
     litellm.ServiceUnavailableError = ServiceUnavailableError
 
-    integrations = types.ModuleType("litellm.integrations")
-    custom_logger = types.ModuleType("litellm.integrations.custom_logger")
-
-    class CustomLogger:
-        pass
-
-    custom_logger.CustomLogger = CustomLogger
-
-    proxy = types.ModuleType("litellm.proxy")
+    integrations = importlib.import_module("litellm.integrations")
+    custom_logger = importlib.import_module("litellm.integrations.custom_logger")
+    proxy = importlib.import_module("litellm.proxy")
     proxy_server = types.ModuleType("litellm.proxy.proxy_server")
     proxy_server.llm_router = None
 
@@ -195,6 +167,7 @@ def load_hook_module():
     sys.modules["litellm.integrations.custom_logger"] = custom_logger
     sys.modules["litellm.proxy"] = proxy
     sys.modules["litellm.proxy.proxy_server"] = proxy_server
+    proxy.proxy_server = proxy_server
 
     importlib.import_module("young_router.callbacks")
     modules = [

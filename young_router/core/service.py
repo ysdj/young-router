@@ -5901,7 +5901,7 @@ class CoreStore:
                 else:
                     local = webdav_core.local_snapshot(config_path)
                     try:
-                        remote_manifest = webdav_operations.read_remote_manifest(client, settings)
+                        remote = webdav_operations.read_remote_snapshot(client, settings)
                     except webdav_core.SyncError as exc:
                         if exc.code != webdav_core.INCOMPATIBLE_BUNDLE_CODE:
                             raise
@@ -5913,8 +5913,7 @@ class CoreStore:
                         # it: the file the guard refuses to read is never lost,
                         # and the user asked for a sync, not for a decision.
                         archived_remote = webdav_operations.archive_remote_bundle(client, settings)
-                        remote_manifest = None
-                    remote = webdav_operations.remote_snapshot(client, settings, remote_manifest)
+                        remote = webdav_core.SyncSnapshot(None)
                     base = webdav_core.baseline_snapshot(state_path)
                     # One comparison decides every sync, including the
                     # unattended one: a side that moved alone is the side to
@@ -5923,9 +5922,8 @@ class CoreStore:
                     # no branch asks for a saved direction, because there is no
                     # such setting any more.  What counts as a move is the
                     # compared digest: a relay balance another machine read is
-                    # nobody's edit, so it cannot manufacture a conflict.  A
-                    # remote with no record is asked once through its bundle,
-                    # which is the download the conflict branch would make.
+                    # nobody's edit, so it cannot manufacture a conflict. The
+                    # manifest and file digests came from one bundle read.
                     plan, remote = webdav_operations.decide_sync(client, settings, local, remote, base)
                     if plan == "unchanged":
                         # Byte equality proved the remote holds these same
@@ -5933,14 +5931,9 @@ class CoreStore:
                         # on disk are the content both ends agreed on, and
                         # keeping them is what lets a later stopped run merge
                         # instead of asking.
-                        agreed = webdav_core.SyncSnapshot(
-                            remote.manifest,
-                            remote.digests or local.digests,
-                            local.files if local.files is not None else remote.files,
-                        )
+                        agreed = remote
                         webdav_core.save_sync_state(state_path, settings, agreed, "sync")
-                        if remote.digests is None:
-                            webdav_operations.publish_remote_digests(client, settings, agreed)
+                        webdav_operations.publish_remote_digests(client, settings, agreed)
                         outcome = "unchanged"
                     elif plan == "push":
                         webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")

@@ -1396,6 +1396,12 @@ def _install_selected_deployment_marker_patch() -> None:
         "_update_kwargs_with_deployment",
         None,
     )
+    shaping_modules = ()
+    if original_update_kwargs_with_deployment is None:
+        from litellm.router_rust.invoke import endpoints, prompt_management, shaping
+
+        shaping_modules = (shaping, endpoints, prompt_management)
+        original_update_kwargs_with_deployment = shaping.update_kwargs_with_deployment
     if original_update_kwargs_with_deployment is not None and not getattr(
         original_update_kwargs_with_deployment,
         _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
@@ -1530,7 +1536,13 @@ def _install_selected_deployment_marker_patch() -> None:
             "_original_update_kwargs_with_deployment",
             original_update_kwargs_with_deployment,
         )
-        Router._update_kwargs_with_deployment = patched_update_kwargs_with_deployment
+        if shaping_modules:
+            # Both endpoint modules import this function directly. Patch their
+            # references together so every active dispatch claims its lease.
+            for module in shaping_modules:
+                module.update_kwargs_with_deployment = patched_update_kwargs_with_deployment
+        else:
+            Router._update_kwargs_with_deployment = patched_update_kwargs_with_deployment
 
     original_make_call = getattr(Router, "make_call", None)
     if original_make_call is None or getattr(
@@ -2842,7 +2854,12 @@ def _open_reasoning_summary_items(
     setattr(iterator, "_young_router_reasoning_summary_open", opened)
     setattr(iterator, "_young_router_reasoning_summary_done", finished)
     if opening:
-        pending.extend(opening)
+        # The iterator stamps every queued event with model_copy before
+        # delivery. Keep its queue typed, while delivery-only events retain
+        # the JSON mapping representation used by the proxy.
+        from litellm.types.llms.openai import BaseResponsesStreamEvent
+
+        pending.extend(BaseResponsesStreamEvent(**event) for event in opening)
 
 
 def _install_responses_completion_stream_patch() -> None:

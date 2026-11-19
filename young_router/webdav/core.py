@@ -2383,7 +2383,7 @@ def manifest_name(remote_name: str) -> str:
 def manifest_url(settings: Settings) -> str:
     url = bundle_url(settings)
     parsed = urllib.parse.urlsplit(url)
-    return _remote_with_path(url, f"{parsed.path.rsplit('/', 1)[0]}/{urllib.parse.quote(manifest_name(settings.remote_name))}")
+    return _remote_with_path(url, manifest_name(parsed.path))
 
 
 def digests_name(remote_name: str) -> str:
@@ -2402,7 +2402,7 @@ def digests_name(remote_name: str) -> str:
 def digests_url(settings: Settings) -> str:
     url = bundle_url(settings)
     parsed = urllib.parse.urlsplit(url)
-    return _remote_with_path(url, f"{parsed.path.rsplit('/', 1)[0]}/{urllib.parse.quote(digests_name(settings.remote_name))}")
+    return _remote_with_path(url, digests_name(parsed.path))
 
 
 def manifest_identity(manifest: dict[str, Any]) -> str:

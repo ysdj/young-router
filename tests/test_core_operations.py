@@ -1968,8 +1968,8 @@ class CoreOperationsTests(unittest.TestCase):
 
             pushed: list[object] = []
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest",
-                return_value=None,
+                "young_router.webdav.operations.read_remote_snapshot",
+                return_value=webdav_core.SyncSnapshot(None),
             ), mock.patch("young_router.webdav.operations.push_bundle", side_effect=lambda *args, **kwargs: pushed.append(args)):
                 core.run_automatic_webdav_sync()
 
@@ -2062,7 +2062,7 @@ class CoreOperationsTests(unittest.TestCase):
             pushed: list[str] = []
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest",
+                "young_router.webdav.operations.read_remote_snapshot",
                 side_effect=webdav_core.SyncError(
                     "WebDAV sync bundle was not created by this Young Router version",
                     webdav_core.INCOMPATIBLE_BUNDLE_CODE,
@@ -2116,9 +2116,7 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.core.local_snapshot",
                 return_value=webdav_core.SyncSnapshot(local),
-            ), mock.patch("young_router.webdav.operations.read_remote_manifest", return_value=remote), mock.patch(
-                "young_router.webdav.operations.read_remote_digests", return_value=None
-            ), mock.patch(
+            ), mock.patch("young_router.webdav.operations.read_remote_snapshot", return_value=webdav_core.SyncSnapshot(remote)), mock.patch(
                 "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=None
             ), mock.patch(
                 "young_router.webdav.operations.remember_remote_bundle"
@@ -2179,9 +2177,7 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.core.local_snapshot",
                 return_value=webdav_core.SyncSnapshot(local),
-            ), mock.patch("young_router.webdav.operations.read_remote_manifest", return_value=remote), mock.patch(
-                "young_router.webdav.operations.read_remote_digests", return_value=None
-            ), mock.patch(
+            ), mock.patch("young_router.webdav.operations.read_remote_snapshot", return_value=webdav_core.SyncSnapshot(remote)), mock.patch(
                 # No record and no bundle to read it from: the run keeps the
                 # comparison and stops, which is this test's subject.
                 "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=None
@@ -2301,11 +2297,7 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.core.local_snapshot", return_value=local
             ), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest", return_value=remote.manifest
-            ), mock.patch(
-                "young_router.webdav.operations.read_remote_digests", return_value=remote.digests
-            ), mock.patch(
-                "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=remote
+                "young_router.webdav.operations.read_remote_snapshot", return_value=remote
             ), mock.patch(
                 "young_router.webdav.operations.push_bundle",
                 side_effect=lambda *args, **kwargs: pushed.append(args[4]) or (32, remote.manifest),
@@ -2421,9 +2413,7 @@ class CoreOperationsTests(unittest.TestCase):
 
             pushed: list[object] = []
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest", return_value=host_manifest
-            ), mock.patch(
-                "young_router.webdav.operations.read_remote_digests", return_value=host_digests
+                "young_router.webdav.operations.read_remote_snapshot", return_value=webdav_core.SyncSnapshot(host_manifest, host_digests)
             ), mock.patch(
                 "young_router.webdav.operations.push_bundle",
                 side_effect=lambda *args, **kwargs: pushed.append(args) or (32, host_manifest),
@@ -2486,13 +2476,9 @@ class CoreOperationsTests(unittest.TestCase):
                 "young_router.webdav.core.local_snapshot",
                 return_value=webdav_core.SyncSnapshot(local, local_digests),
             ), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest", return_value=remote
-            ), mock.patch(
-                "young_router.webdav.operations.read_remote_digests", return_value=None
-            ), mock.patch(
-                "young_router.webdav.operations.remote_snapshot_from_bundle",
+                "young_router.webdav.operations.read_remote_snapshot",
                 return_value=webdav_core.SyncSnapshot(remote, remote_digests),
-            ) as from_bundle, mock.patch(
+            ) as read_snapshot, mock.patch(
                 "young_router.webdav.operations.publish_remote_digests", return_value=True
             ), mock.patch(
                 "young_router.webdav.operations.push_bundle",
@@ -2500,7 +2486,7 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch("young_router.webdav.operations.pull_bundle") as pulled:
                 core.run_automatic_webdav_sync()
 
-            from_bundle.assert_not_called()
+            read_snapshot.assert_called_once()
             self.assertEqual(1, len(pushed))
             pulled.assert_not_called()
             self.assertFalse((root / "webdav-conflict.json").exists())
@@ -2637,7 +2623,7 @@ class CoreOperationsTests(unittest.TestCase):
                 "GET", "https://webdav.example.test/config/menu-config.json", 404, "Not Found"
             )
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest",
+                "young_router.webdav.operations.read_remote_snapshot",
                 side_effect=missing,
             ), self.assertRaises(CoreError) as raised:
                 core.dispatch(
@@ -2673,7 +2659,7 @@ class CoreOperationsTests(unittest.TestCase):
             )
             self.assertIn("\n", str(blocked))
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest",
+                "young_router.webdav.operations.read_remote_snapshot",
                 side_effect=blocked,
             ), self.assertRaises(CoreError) as raised:
                 core.dispatch(

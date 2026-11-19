@@ -1261,9 +1261,14 @@ class WebDAVPullReloadTests(unittest.TestCase):
                 config_path.write_text(remote, encoding="utf-8")
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.read_remote_manifest", return_value=remote_manifest
-            ), mock.patch(
-                "young_router.webdav.operations.read_remote_digests", return_value=None
+                "young_router.webdav.operations.read_remote_snapshot",
+                return_value=webdav_core.SyncSnapshot(
+                    remote_manifest,
+                    {
+                        entry["path"]: entry.get("sha256") if entry.get("present") else None
+                        for entry in remote_manifest["files"]
+                    },
+                ),
             ), mock.patch("young_router.webdav.operations.pull_bundle", side_effect=install):
                 core.run_automatic_webdav_sync()
 

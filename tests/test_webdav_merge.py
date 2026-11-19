@@ -407,6 +407,51 @@ class SyncMergeTests(unittest.TestCase):
             path.write_text(CONFIG, encoding="utf-8")
         return mac_config, root / "mac" / "state.json", peer_config, root / "peer" / "state.json"
 
+    def test_a_rejected_manifest_update_cannot_hide_the_new_bundle(self) -> None:
+        class PartialPublication(_MemoryWebDAV):
+            reject_manifest = False
+
+            def put(self, url: str, data: bytes, content_type: str) -> None:
+                if self.reject_manifest and url.endswith(".manifest.json"):
+                    raise webdav_core.WebDAVHTTPError("PUT", url, 403, "Forbidden")
+                super().put(url, data, content_type)
+
+        with tempfile.TemporaryDirectory() as directory:
+            sender, sender_state, peer, peer_state = self.machines(Path(directory))
+            server = PartialPublication()
+            self.assertEqual("push", self.sync(server, sender, sender_state))
+            self.assertEqual("unchanged", self.sync(server, peer, peer_state))
+            old_manifest = server.files[webdav_core.manifest_url(self.settings)]
+            sender.write_text(CONFIG.replace("order: 1", "order: 2"), encoding="utf-8")
+            server.reject_manifest = True
+            self.assertEqual("push", self.sync(server, sender, sender_state))
+            self.assertEqual(old_manifest, server.files[webdav_core.manifest_url(self.settings)])
+
+            self.assertEqual("pull", self.sync(server, peer, peer_state))
+            self.assertEqual(sender.read_bytes(), peer.read_bytes())
+            # Explicit pull has the same authority rule as automatic sync.
+            peer.write_text(CONFIG, encoding="utf-8")
+            result = webdav_operations.pull_bundle(server, self.settings, peer)
+            self.assertEqual([str(peer)], result["installed"])
+            self.assertEqual(sender.read_bytes(), peer.read_bytes())
+
+    def test_explicit_bundle_urls_keep_their_own_sidecars(self) -> None:
+        a = webdav_core._settings_from_raw({"url": "https://dav.example.test/dav/a%20one.json?token=x"})
+        b = webdav_core._settings_from_raw({"url": "https://dav.example.test/dav/b.json?token=x"})
+        self.assertEqual("https://dav.example.test/dav/a%20one.manifest.json?token=x", webdav_core.manifest_url(a))
+        self.assertEqual("https://dav.example.test/dav/a%20one.digests.json?token=x", webdav_core.digests_url(a))
+        self.assertNotEqual(webdav_core.manifest_url(a), webdav_core.manifest_url(b))
+        self.assertNotEqual(webdav_core.digests_url(a), webdav_core.digests_url(b))
+        with tempfile.TemporaryDirectory() as directory:
+            sender, _, peer, _ = self.machines(Path(directory))
+            server = _MemoryWebDAV()
+            sender.write_text(CONFIG.replace("order: 1", "order: 2"), encoding="utf-8")
+            webdav_operations.push_bundle(server, a, sender)
+            webdav_operations.push_bundle(server, b, peer)
+            result = webdav_operations.pull_bundle(server, a, peer)
+            self.assertEqual([str(peer)], result["installed"])
+            self.assertEqual(sender.read_bytes(), peer.read_bytes())
+
     def test_both_machines_editing_one_document_settles_itself(self) -> None:
         """The whole failure, end to end, through the real sync entry points.
 
