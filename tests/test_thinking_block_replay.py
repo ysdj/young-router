@@ -185,3 +185,18 @@ class ThinkingBlockReplayTests(HookTestCase):
         with self.assertRaises(_ThinkingRequiredRefusal):
             await self.module.call_with_thinking_block_repair(call, again)
         self.assertEqual(3, len(attempts))
+
+
+class ThinkingReplayClassificationTests(HookTestCase):
+    def test_the_refusal_is_a_body_verdict_not_a_temporary_route_failure(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertTrue(
+            hooks._is_upstream_request_field_rejected_error(
+                _ThinkingRequiredRefusal()
+            )
+        )
+        # An ordinary 400 about the conversation keeps its own branch.
+        other = Exception('litellm.BadRequestError: {"error":{"message":"bad model"}}')
+        other.status_code = 400
+        self.assertFalse(hooks._is_upstream_request_field_rejected_error(other))

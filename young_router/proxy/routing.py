@@ -183,6 +183,7 @@ from .base import (
     _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
     _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS,
     _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS,
+    _UPSTREAM_THINKING_REPLAY_MARKERS,
     _UPSTREAM_FIELD_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
@@ -9846,6 +9847,8 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
     if any(marker in text for marker in _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS):
         return True
     if any(marker in text for marker in _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS):
+        return True
+    if any(marker in text for marker in _UPSTREAM_THINKING_REPLAY_MARKERS):
         return True
     if not any(marker in text for marker in _UPSTREAM_FIELD_REJECTION_MARKERS):
         return False
