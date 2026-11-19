@@ -66,6 +66,96 @@ class CoreOperationsTests(unittest.TestCase):
         self.assertTrue(core._domains["providers_models"]._exists)
         self.assertEqual([], core._domains["providers_models"].snapshot()["providers"])
 
+    def test_provider_settings_follow_the_owning_core_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            host = base / "host"
+            runtime = base / "isolated"
+            host.mkdir()
+            runtime.mkdir()
+            config = base / "config.yaml"
+            config.write_text(
+                PROVIDER_CONFIG.replace(
+                    "model_list: []",
+                    textwrap.dedent("""\
+                        model_list:
+                          - model_name: test-unlisted-model
+                            litellm_params:
+                              model: openai/test-unlisted-model
+                              api_base: https://example.test/v1
+                              api_key: replace-me-secret
+                            model_info:
+                              id: "00000001"
+                              provider: primary
+                        """).rstrip(),
+                ),
+                encoding="utf-8",
+            )
+            (host / "runtime-settings.env").write_text(
+                "YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT=7\n"
+                "YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW=18000\n"
+                "YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS=17\n"
+                "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS=18\n",
+                encoding="utf-8",
+            )
+            (runtime / "runtime-settings.env").write_text(
+                "YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT=9\n"
+                "YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW=90000\n"
+                "YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS=27\n"
+                "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS=28\n",
+                encoding="utf-8",
+            )
+            override = base / "runtime-override.env"
+            override.write_text(
+                "YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT=11\n"
+                "YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW=110000\n"
+                "YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS=37\n"
+                "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS=38\n",
+                encoding="utf-8",
+            )
+            for override_path, limit, window, recheck, timeout in (
+                ("", 9, 90_000, 27, 28),
+                (str(override), 11, 110_000, 37, 38),
+            ):
+                with self.subTest(explicit_settings=bool(override_path)), mock.patch.dict(
+                    os.environ,
+                    {
+                        "LITELLM_RUNTIME_ROOT": str(host),
+                        "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": override_path,
+                        "YOUNG_ROUTER_MODEL_PROBE_TIMEOUT_SECONDS": "",
+                    },
+                ), mock.patch("young_router.core.operations.CoreServiceController"):
+                    core = CoreStore.with_default_domains(
+                        runtime_root=runtime,
+                        config_path=config,
+                        codex_home=base / "codex",
+                        claude_settings_path=base / "claude" / "settings.json",
+                    )
+                    providers = core._domains["providers_models"]
+                    snapshot = providers.snapshot()
+                    self.assertEqual(limit, snapshot["model_concurrency_default"])
+                    self.assertEqual(recheck, snapshot["service_account_recheck_seconds"])
+                    self.assertEqual(
+                        window,
+                        snapshot["model_contexts"]["test-unlisted-model"]["context_window"],
+                    )
+                    public_registry = providers._public_model_context_registry()
+                    self.assertEqual(
+                        window,
+                        public_registry.record_for("test-unlisted-model").context_window,
+                    )
+                    with mock.patch(
+                        "young_router.core.domains.providers_models.isolated_http_opener"
+                    ) as opener:
+                        request = opener.return_value.open
+                        request.side_effect = ConnectionRefusedError
+                        providers.probe({
+                            "provider_id": "primary",
+                            "model_id": "00000001",
+                            "kind": "reachability",
+                        })
+                    self.assertEqual({timeout}, {call.kwargs["timeout"] for call in request.call_args_list})
+
     def test_a_provider_key_read_never_waits_for_the_store_lock(self) -> None:
         """A key on screen may not queue behind relay work.
 

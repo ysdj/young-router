@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import http.client
+from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
@@ -70,14 +71,19 @@ class BrowserSessionTests(unittest.TestCase):
         self.core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
         self.server = CoreIPCServer(self.core)
         self.server.start()
+        self.server.set_web_password("s3cret-word")
         self.addCleanup(self.server.stop)
 
-    def test_hello_sets_an_httponly_strict_cookie_beside_the_header(self) -> None:
+    def test_native_hello_sends_only_the_session_header(self) -> None:
         status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
         self.assertEqual(200, status)
-        # The native hosts read this header; the browser host cannot, and reads
-        # the cookie instead. Both are minted from the same lease.
         self.assertIn("x-litellm-core-session", headers)
+        self.assertNotIn("set-cookie", headers)
+
+    def test_web_login_sets_an_httponly_strict_cookie(self) -> None:
+        status, headers, _body = _login_response(self.server, "s3cret-word")
+        self.assertEqual(200, status)
+        self.assertNotIn("x-litellm-core-session", headers)
         cookie = headers.get("set-cookie", "")
         self.assertIn("yr-core-session=", cookie)
         self.assertIn("HttpOnly", cookie)
@@ -93,47 +99,23 @@ class BrowserSessionTests(unittest.TestCase):
     def test_a_published_page_gets_a_secure_cookie(self) -> None:
         # The proxy forwards the scheme the browser used, and a page reached
         # over TLS must not hand its 30-day cookie to a plaintext hop.
-        _status, headers, _body = _hello(
+        status, headers, _body = _hello(
             self.server,
             forwarded_proto="https",
-            bootstrap=self.server.bootstrap_token,
+            cookie=_login(self.server, "s3cret-word"),
         )
+        self.assertEqual(200, status)
+        self.assertNotIn("x-litellm-core-session", headers)
         self.assertIn("Secure", headers.get("set-cookie", ""))
 
     def test_a_cookie_alone_authenticates_a_request(self) -> None:
-        _status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
-        session = headers["x-litellm-core-session"]
-
-        endpoint = self.server.endpoint
-        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
-        try:
-            request = json.dumps(
-                {
-                    "protocol_version": 1,
-                    "request_id": "web-1",
-                    "method": "snapshot",
-                    "params": {},
-                }
-            ).encode("utf-8")
-            connection.request(
-                "POST",
-                "/ipc",
-                body=request,
-                headers={
-                    "Content-Type": "application/json",
-                    "Cookie": f"yr-core-session={session}",
-                },
-            )
-            response = connection.getresponse()
-            payload = json.loads(response.read())
-        finally:
-            connection.close()
-        self.assertEqual(200, response.status)
+        cookie = _login(self.server, "s3cret-word")
+        status, _headers, payload = _post_ipc(self.server, cookie, "snapshot")
+        self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
 
     def test_a_header_and_a_cookie_that_disagree_are_refused(self) -> None:
-        _status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
-        session = headers["x-litellm-core-session"]
+        cookie = _login(self.server, "s3cret-word")
         endpoint = self.server.endpoint
         connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
         try:
@@ -144,7 +126,7 @@ class BrowserSessionTests(unittest.TestCase):
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": "Bearer not-this-session",
-                    "Cookie": f"yr-core-session={session}",
+                    "Cookie": cookie,
                 },
             )
             response = connection.getresponse()
@@ -220,7 +202,50 @@ class BrowserSessionLifetimeTests(unittest.TestCase):
         self.assertNotIn('type="password"', text)
         # The pane's own calls accept it too, or the shell would draw empty.
         self.assertEqual(200, _hello(server, cookie=cookie)[0])
-        self.assertEqual(200, _post_snapshot(server, cookie)[0])
+        self.assertEqual(200, _post_ipc(server, cookie, "snapshot")[0])
+
+    def test_polling_renews_the_browser_cookie_before_its_original_expiry(self) -> None:
+        wall, monotonic = time.time(), time.monotonic()
+        with mock.patch("young_router.core.ipc.time", wraps=time) as clock:
+            clock.time.return_value = wall
+            clock.monotonic.return_value = monotonic
+            status, headers, _body = _login_response(self.server, "s3cret-word")
+            self.assertEqual(200, status)
+            issued = SimpleCookie(headers["set-cookie"])["yr-core-session"]
+            max_age = int(issued["max-age"])
+            cookie = f"{issued.key}={issued.value}"
+            status, headers, reply = _post_ipc(self.server, cookie, "subscribe")
+            self.assertEqual(200, status)
+            self.assertNotIn("set-cookie", headers)
+            poll = f'/ipc/events?timeout=0&subscription_id={reply["result"]["subscription_id"]}'
+
+            clock.time.return_value = wall + max_age - 1
+            clock.monotonic.return_value = monotonic + max_age - 1
+            status, headers, _body = _get(self.server, poll, cookie=cookie, forwarded_proto="https")
+            self.assertEqual(200, status)
+            self.assertNotIn("x-litellm-core-session", headers)
+            renewed = SimpleCookie(headers["set-cookie"])[issued.key]
+            self.assertEqual(issued.value, renewed.value)
+            self.assertEqual(str(max_age), renewed["max-age"])
+            self.assertTrue(renewed["httponly"])
+            self.assertEqual("Strict", renewed["samesite"])
+            self.assertTrue(renewed["secure"])
+            self.assertNotIn("set-cookie", _get(self.server, poll, cookie=cookie)[1])
+
+            clock.time.return_value = wall + max_age + 1
+            clock.monotonic.return_value = monotonic + max_age + 1
+            server = self._replacement()
+            self.assertEqual(200, _post_ipc(server, cookie, "snapshot")[0])
+
+    def test_hello_refuses_disagreeing_credentials_without_consuming_bootstrap(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        bootstrap = self.server.bootstrap_token
+        status, headers, body = _hello(self.server, bootstrap=bootstrap, cookie=cookie)
+        self.assertEqual(401, status)
+        self.assertNotIn("set-cookie", headers)
+        self.assertEqual("unauthorized", json.loads(body)["error"]["code"])
+        self.assertEqual(200, _hello(self.server, bootstrap=bootstrap)[0])
+        self.assertEqual(200, _hello(self.server, cookie=cookie)[0])
 
     def test_the_record_is_a_digest_and_does_not_grow_per_call(self) -> None:
         cookie = _login(self.server, "s3cret-word")
@@ -294,7 +319,7 @@ class BrowserSessionLifetimeTests(unittest.TestCase):
         native = headers["x-litellm-core-session"]
         server = self._replacement()
         self.assertEqual(200, _hello(server, cookie=cookie)[0])
-        self.assertEqual(401, _post_snapshot(server, f"yr-core-session={native}")[0])
+        self.assertEqual(401, _hello(server, bootstrap=native)[0])
 
 
 class WebSessionStorePathTests(unittest.TestCase):
@@ -2231,7 +2256,7 @@ class RelayBrowserPasswordCaptureTests(unittest.TestCase):
 
 class MirrorFrameTests(unittest.TestCase):
     """The stream and the input path, through Core's own listener."""
-    def _frame_call(self, server: CoreIPCServer, session: str, since: int) -> dict[str, object]:
+    def _frame_call(self, server: CoreIPCServer, cookie: str, since: int) -> dict[str, object]:
         """One answer from `/ipc/host/relay/browser/frames`."""
 
         endpoint = server.endpoint
@@ -2241,7 +2266,7 @@ class MirrorFrameTests(unittest.TestCase):
                 "POST",
                 "/ipc/host/relay/browser/frames",
                 body=json.dumps({"login_id": "frame-login", "since": since}),
-                headers={"Content-Type": "application/json", "Cookie": f"yr-core-session={session}"},
+                headers={"Content-Type": "application/json", "Cookie": cookie},
             )
             response = connection.getresponse()
             self.assertEqual(200, response.status)
@@ -2254,20 +2279,20 @@ class MirrorFrameTests(unittest.TestCase):
         server = CoreIPCServer(core)
         server.start()
         self.addCleanup(server.stop)
-        _status, headers, _body = _hello(server, bootstrap=server.bootstrap_token)
-        session = headers["x-litellm-core-session"]
+        server.set_web_password("s3cret-word")
+        cookie = _login(server, "s3cret-word")
         mirror = mock.Mock(width=560, height=820)
         mirror.latest = mock.Mock(side_effect=[(4, b"jpeg"), (4, b"")])
         core._browser_logins["frame-login"] = {
             "browser": mock.Mock(mirror=mirror, port=1, origin="https://example.org", expired=False),
         }
 
-        answer = self._frame_call(server, session, 0)
+        answer = self._frame_call(server, cookie, 0)
         self.assertEqual("frame", answer["status"])
         self.assertEqual(4, answer["seq"])
         self.assertEqual(b"jpeg", base64.b64decode(answer["frame"]))
 
-        idle = self._frame_call(server, session, answer["seq"])
+        idle = self._frame_call(server, cookie, answer["seq"])
         self.assertEqual("idle", idle["status"])
         self.assertEqual(4, idle["seq"])
         self.assertNotIn("frame", idle)
@@ -2556,6 +2581,7 @@ def _get(
     cookie: str | None = None,
     page_host: str | None = None,
     accept_language: str | None = None,
+    forwarded_proto: str | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     endpoint = server.endpoint
     connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
@@ -2566,6 +2592,8 @@ def _get(
         headers["Cookie"] = cookie
     if accept_language is not None:
         headers["Accept-Language"] = accept_language
+    if forwarded_proto is not None:
+        headers["X-Forwarded-Proto"] = forwarded_proto
     try:
         connection.request("GET", path, headers=headers)
         response = connection.getresponse()
@@ -2606,11 +2634,11 @@ def _launch_response(server: CoreIPCServer, token: str) -> tuple[int, dict[str, 
         connection.close()
 
 
-def _post_snapshot(server: CoreIPCServer, cookie: str) -> tuple[int, dict[str, object]]:
+def _post_ipc(server: CoreIPCServer, cookie: str, method: str) -> tuple[int, dict[str, str], dict[str, object]]:
     endpoint = server.endpoint
     connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
     request = json.dumps(
-        {"protocol_version": 1, "request_id": "web-snapshot", "method": "snapshot", "params": {}}
+        {"protocol_version": 1, "request_id": f"web-{method}", "method": method, "params": {}}
     ).encode("utf-8")
     try:
         connection.request(
@@ -2620,7 +2648,7 @@ def _post_snapshot(server: CoreIPCServer, cookie: str) -> tuple[int, dict[str, o
             headers={"Content-Type": "application/json", "Cookie": cookie, "Host": f"127.0.0.1:{endpoint.port}"},
         )
         response = connection.getresponse()
-        return response.status, json.loads(response.read())
+        return response.status, {key.lower(): value for key, value in response.getheaders()}, json.loads(response.read())
     finally:
         connection.close()
 

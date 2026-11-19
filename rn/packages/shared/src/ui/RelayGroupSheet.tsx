@@ -25,7 +25,6 @@ import type {
 } from "../types";
 import {
   askCloseRelayGroupSheet,
-  closeRelayGroupSheet,
   relayGroupSheetState,
   requestRelayGroupApply,
   setRelayGroupSheetCloseQuestion,
@@ -216,20 +215,15 @@ export function RelayGroupSheet({ translate, copyKey }: {
 
   // The sheet's Close asks before it drops a draft; Escape and the layer's own
   // close button land here too, so the question is asked exactly once.
-  const askClose = React.useCallback(() => {
-    if (!hasStagedChanges || !state) {
-      closeRelayGroupSheet();
-      return;
-    }
-    void requestHostChrome<boolean>({
+  const askClose = React.useCallback(async (): Promise<boolean> => {
+    if (!hasStagedChanges || !state) return true;
+    return requestHostChrome<boolean>({
       kind: "confirm",
       title: state.labels.discardTitle,
       message: state.labels.discardBody,
       confirmLabel: state.labels.discardConfirm,
       cancelLabel: translate("status.cancel"),
       destructive: true,
-    }).then((accepted) => {
-      if (accepted) closeRelayGroupSheet();
     });
   }, [hasStagedChanges, state, translate]);
 

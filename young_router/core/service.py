@@ -2131,6 +2131,7 @@ class CoreStore:
                 "providers_models",
                 lambda: ProvidersModelsDomain(
                     resolved_config_path,
+                    runtime_settings_path=resolved_runtime_settings_path,
                     auth_manager=provider_auth,
                     workbuddy=workbuddy_runtime,
                     qoder=qoder_runtime,

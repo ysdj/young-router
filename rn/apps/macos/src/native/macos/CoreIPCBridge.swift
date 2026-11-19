@@ -1063,6 +1063,9 @@ import Foundation
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
+        // Cookies are scoped to the loopback host, so a prior Core's cookie
+        // can conflict with the new Core's bearer even on a different port.
+        request.httpShouldHandleCookies = false
         // Core event polling waits up to 20 seconds. Keep the transport above
         // that bound so an ordinary null heartbeat is not treated as failure.
         request.timeoutInterval = timeoutInterval

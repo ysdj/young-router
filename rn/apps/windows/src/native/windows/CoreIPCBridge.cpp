@@ -1030,6 +1030,12 @@ CoreIPCBridge::HttpResult CoreIPCBridge::Request(
   // connection handle, creating separate requests tied to it.
   WinHttpHandle request{WinHttpOpenRequest(transport->connection.get(), method.c_str(), target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0)};
   if (!request) throw std::runtime_error("core unavailable");
+  // Native IPC authenticates with a bearer token. A saved WinHTTP cookie can
+  // conflict with the credential used to open or renew that session.
+  DWORD disabled_features = WINHTTP_DISABLE_COOKIES;
+  if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_DISABLE_FEATURE, &disabled_features, sizeof(disabled_features))) {
+    throw std::runtime_error("core unavailable");
+  }
   // No longer the session's timeouts: with the session cached, a receive bound
   // set for one request would bound every other request on it, so a 900 s probe
   // and a 30 s long poll would keep lowering each other's wait.  This handle

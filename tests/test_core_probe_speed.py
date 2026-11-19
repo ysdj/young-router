@@ -242,7 +242,10 @@ class SpeedMeasurementTests(unittest.TestCase):
         FakeStream.scenario = "chat"
         FakeStream.pieces = 6
         FakeStream.delay = 0.001
-        self.domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.domain = ProvidersModelsDomain(
+            root / "config.yaml", runtime_settings_path=root / "runtime-settings.env"
+        )
         # The window is the only slow part of a measurement, and a test that
         # waited six seconds per case would stop being run; the code path is the
         # same one, with the clock's bound stated instead of assumed.
@@ -362,7 +365,6 @@ class SpeedMeasurementTests(unittest.TestCase):
         a reading pinned to the request would have no token at all.
         """
 
-        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
         ticks = iter(range(0, 10_000))
         # Two seconds per clock read, and two silent reads before the first
         # piece: the wait is 8 s against a 5 s window.
@@ -410,7 +412,7 @@ class SpeedMeasurementTests(unittest.TestCase):
         ), mock.patch(
             "young_router.core.domains.providers_models.time.sleep"
         ):
-            reading = domain._speed_test_run(
+            reading = self.domain._speed_test_run(
                 protocol="openai/chat",
                 api_base="https://example.test/v1",
                 credential="replace-me-secret",

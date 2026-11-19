@@ -143,6 +143,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
         config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
         domain = ProvidersModelsDomain(
             config,
+            runtime_settings_path=root / "runtime-settings.env",
             auth_manager=ProviderAuthManager(root),
             workbuddy=runtime if runtime is not None else StubRuntime(),
         )
@@ -842,17 +843,10 @@ class WorkBuddyProviderTests(unittest.TestCase):
             # 刷新 always reaches the worker.
             domain.dispatch("workbuddy_status", {"refresh": True})
             self.assertEqual(2, len(reads()))
-            # A window of 0 means a read on every entry.  The reader resolves
-            # the file through the environment, not beside this domain's
-            # config, so the fixture has to name it outright.
+            # A window of 0 means a read on every entry.
             settings = Path(directory.name) / "runtime-settings.env"
             settings.write_text("YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS=0\n", encoding="utf-8")
-            with mock.patch.dict(
-                os.environ,
-                {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(settings)},
-                clear=False,
-            ):
-                domain.dispatch("workbuddy_status", {"refresh": False})
+            domain.dispatch("workbuddy_status", {"refresh": False})
             self.assertEqual(3, len(reads()))
 
     def test_the_projection_publishes_the_window_and_the_observation_age(self) -> None:
@@ -861,18 +855,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
         runtime = StubRuntime()
         directory, domain, _config = self._domain(runtime)
         with directory:
-            # The default is read from the installation's settings file, so
-            # name one that does not exist instead of reading the runner's.
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(
-                        Path(directory.name) / "runtime-settings.env"
-                    )
-                },
-                clear=False,
-            ):
-                self.assertEqual(60.0, domain.snapshot()["service_account_recheck_seconds"])
+            self.assertEqual(60.0, domain.snapshot()["service_account_recheck_seconds"])
             domain.dispatch("service_provider.add", {"kind": "workbuddy_login", "models": []})
             provider = domain.snapshot()["providers"][0]
             self.assertIsInstance(provider["auth_observed_seconds_ago"], float)

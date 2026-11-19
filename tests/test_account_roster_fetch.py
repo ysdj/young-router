@@ -91,6 +91,7 @@ class AccountRosterTests(unittest.TestCase):
                 api_base=pm.ProvidersModelsDomain._CHATGPT_API_BASE,
                 credential="tok",
                 model_name="gpt-5.4",
+                timeout=5.0,
                 account_id="acc",
             )
         self.assertEqual("model_unavailable", result["status"])

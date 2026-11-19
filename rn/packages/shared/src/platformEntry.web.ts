@@ -98,7 +98,7 @@ function adoptRouteAddress(): void {
   // named relatively, and `/ui` would resolve `./bundle.js` against the proxy's
   // root).
   address.hash = `#/${DEFAULT_ROUTE}`;
-  window.history.replaceState(null, "", address.toString());
+  window.history.replaceState(window.history.state, "", address.toString());
 }
 
 // Same origin: this page came from the listener that answers `/ipc`, and Core
@@ -116,8 +116,26 @@ const language = resolveLanguage("system", systemLocale);
 
 // One document per window, so a route is the address rather than a window
 // registry: opening a second tab is `window.open` and coming back is history.
+const browserNavigation = (window as Window & {
+  navigation?: { currentEntry: { index: number } | null };
+}).navigation;
+type HistoryPosition = { index: number; chain?: string };
+let historyChains = 0;
+
+function firstHistoryPosition(): HistoryPosition {
+  return { index: 0, chain: `${performance.timeOrigin}:${++historyChains}` };
+}
+
+function readAddress() {
+  const state = window.history.state;
+  const index = browserNavigation?.currentEntry?.index;
+  const position: HistoryPosition | undefined = index === undefined ? state?.youngRouterRoutePosition : { index };
+  return { url: window.location.href, state, position };
+}
+
 adoptRouteAddress();
 let currentRoute = routeFromHash();
+let shownAddress = readAddress();
 
 /**
  * Record the route the app is already drawing in the address bar.
@@ -132,7 +150,19 @@ function navigate(route: AppRoute): void {
   const next = canonicalPageRoute(route);
   if (next === currentRoute) return;
   currentRoute = next;
-  window.location.hash = next === "home" ? "" : `#/${next}`;
+  const hash = next === "home" ? "" : `#/${next}`;
+  if (!browserNavigation && window.location.hash !== hash) {
+    // Older browsers can locate the entries the page created, as long as
+    // both are part of the same sequence of app navigations.
+    const { position, state } = readAddress();
+    const previous = position ?? firstHistoryPosition();
+    if (!position) window.history.replaceState({ ...state, youngRouterRoutePosition: previous }, "");
+    window.location.hash = hash;
+    window.history.replaceState({ youngRouterRoutePosition: { ...previous, index: previous.index + 1 } }, "");
+  } else {
+    window.location.hash = hash;
+  }
+  shownAddress = readAddress();
 }
 
 // One bridge for this document: several would each exchange the one-shot
@@ -291,19 +321,55 @@ function presentRoute(route: AppRoute): void {
  * `platform/childLayers.ts`): landing on one presents its layer over the pane
  * already on screen instead of replacing that pane with a second copy.
  */
-function adoptAddress(): void {
-  const next = routeFromHash();
+let decidingAddress = false;
+let restoringFrom: HistoryPosition | undefined;
+async function adoptAddress(): Promise<void> {
   // A typed fragment that names no surface falls back to the app's own pane,
   // so the address must stop claiming to be one: otherwise the page draws that
   // pane under an address that names another, and a reload repeats it.
   adoptRouteAddress();
+  // One traversal can emit both popstate and hashchange. Further traversal
+  // while the question is open shares the same answer.
+  if (decidingAddress) return;
+  let address = readAddress();
+  // A save in progress answers immediately, before the matching hashchange.
+  // Since history.go is asynchronous, that event must not schedule a second undo.
+  if (restoringFrom && address.position?.index === restoringFrom.index && address.position.chain === restoringFrom.chain) return;
+  restoringFrom = undefined;
+  if (routeFromHash() !== currentRoute && relayGroupSheetState() !== undefined) {
+    decidingAddress = true;
+    let accepted: boolean;
+    try {
+      accepted = await askCloseRelayGroupSheet();
+    } finally {
+      decidingAddress = false;
+    }
+    address = readAddress();
+    if (!accepted) {
+      const original = shownAddress.position;
+      const destination = address.position;
+      if (original && destination && original.chain === destination.chain) {
+        // Return to the original entry, preserving Back and Forward targets.
+        const undo = original.index - destination.index;
+        if (undo !== 0) {
+          restoringFrom = destination;
+          window.history.go(undo);
+        }
+      } else if (shownAddress.url !== address.url) {
+        // An older browser cannot locate entries from before it tracked them.
+        // Reopen the shown address, with the destination still reachable by Back.
+        window.history.pushState({ ...shownAddress.state, youngRouterRoutePosition: firstHistoryPosition() }, "", shownAddress.url);
+        shownAddress = readAddress();
+      }
+      return;
+    }
+  }
+  const next = routeFromHash();
+  shownAddress = address;
   if (next === currentRoute) return;
   currentRoute = next;
   // A child layer sits over the page and the address is the page's state, so
   // the surface named by the old address must go before the new one is drawn.
-  // The grouping sheet is asked through its own "may I close?": a Back over a
-  // draft must ask before dropping it, and its layer owns that question.
-  if (relayGroupSheetState() !== undefined) askCloseRelayGroupSheet();
   if (visibleChildRoute !== undefined) dismissChildLayer(visibleChildRoute);
   if (CHILD_SURFACES.includes(next)) {
     // Through the host's own stack: `openWindow` pushes the route and calls

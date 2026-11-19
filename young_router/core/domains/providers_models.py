@@ -73,7 +73,6 @@ from ._shared import (
     _action_name,
     _copy_mapping,
     _default_provider_config_path,
-    _default_runtime_settings_path,
     _direction_destination,
     _index,
     _mapping,
@@ -81,6 +80,8 @@ from ._shared import (
     _runtime_root_for_config,
     _safe_problem,
     _selected_identifier,
+    runtime_setting_text,
+    runtime_settings_path_for,
 )
 
 
@@ -516,12 +517,18 @@ class ProvidersModelsDomain:
         self,
         config_path: Path | str | None = None,
         *,
+        runtime_settings_path: Path | str | None = None,
         auth_manager: object | None = None,
         workbuddy: object | None = None,
         qoder: object | None = None,
         our_free_model: object | None = None,
     ):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
+        self.runtime_settings_path = (
+            Path(runtime_settings_path).expanduser()
+            if runtime_settings_path is not None
+            else runtime_settings_path_for(_runtime_root_for_config(self.config_path))
+        )
         self.auth_manager = auth_manager
         self.workbuddy = workbuddy
         self.qoder = qoder
@@ -1394,9 +1401,7 @@ class ProvidersModelsDomain:
     def _model_concurrency_default(self) -> int:
         """The runtime's global concurrency limit, as a route inherits it."""
 
-        from ._shared import runtime_setting_text
-
-        value = runtime_setting_text(MODEL_CONCURRENCY_SETTING_KEY)
+        value = runtime_setting_text(MODEL_CONCURRENCY_SETTING_KEY, path=self.runtime_settings_path)
         parsed = _int_or_none(value)
         return parsed if parsed is not None and 0 <= parsed <= MODEL_CONCURRENCY_MAX else 128
 
@@ -1415,7 +1420,7 @@ class ProvidersModelsDomain:
 
         registry = ModelContextRegistry(
             runtime_config_path=self.config_path,
-            runtime_settings_path=_default_runtime_settings_path(),
+            runtime_settings_path=self.runtime_settings_path,
             # The installation's one cache, resolved from the root this
             # document belongs to rather than from the document's own
             # directory.  ``self.config_path.parent`` is the runtime
@@ -1468,7 +1473,7 @@ class ProvidersModelsDomain:
 
         registry = ModelContextRegistry(
             runtime_config_path=self.config_path,
-            runtime_settings_path=_default_runtime_settings_path(),
+            runtime_settings_path=self.runtime_settings_path,
             # One cache per installation, for the reason above.
             cache_path=default_context_cache_path(
                 _runtime_root_for_config(self.config_path)
@@ -2469,6 +2474,7 @@ class ProvidersModelsDomain:
         api_base: str,
         credential: str,
         model_name: str,
+        timeout: float,
         account_id: str = "",
     ) -> dict[str, Any]:
         """Ask one surface whether this route answers there.
@@ -2603,7 +2609,7 @@ class ProvidersModelsDomain:
             try:
                 with isolated_http_opener().open(
                     request,
-                    timeout=cls._model_probe_timeout_seconds(),
+                    timeout=timeout,
                 ) as response:
                     status = getattr(response, "status", None)
                     if status is None:
@@ -2659,26 +2665,19 @@ class ProvidersModelsDomain:
     _SPEED_PROBE_PROMPT = "Count from 1 to 60, separated by single spaces."
     _SPEED_PROBE_ATTEMPTS = 2
 
-    @classmethod
-    def _model_probe_timeout_seconds(cls) -> float:
+    def _model_probe_timeout_seconds(self) -> float:
         """The first-event budget this deployment gives a real request."""
 
-        raw = os.environ.get(cls._MODEL_PROBE_TIMEOUT_ENV, "").strip()
+        raw = os.environ.get(self._MODEL_PROBE_TIMEOUT_ENV, "").strip()
         if raw:
             try:
                 return max(1.0, float(raw))
             except ValueError:
                 pass
-        try:
-            from ..runtime_settings_io import load_specs, read_settings_file
-
-            values = read_settings_file(_default_runtime_settings_path(), load_specs())
-            configured = str(values.get(cls._MODEL_PROBE_TIMEOUT_SETTING_KEY, "")).strip()
-            if configured:
-                return max(1.0, float(configured))
-        except Exception:
-            pass
-        return cls._MODEL_PROBE_TIMEOUT_SECONDS
+        configured = runtime_setting_text(
+            self._MODEL_PROBE_TIMEOUT_SETTING_KEY, path=self.runtime_settings_path
+        )
+        return max(1.0, float(configured)) if configured else self._MODEL_PROBE_TIMEOUT_SECONDS
 
     # ------------------------------------------------------------------
     # Token throughput
@@ -4173,6 +4172,7 @@ class ProvidersModelsDomain:
             surfaces = [surface for surface in surfaces if surface != speed_protocol]
 
         def run_surfaces(targets: Sequence[str]) -> dict[str, dict[str, Any]]:
+            timeout = self._model_probe_timeout_seconds()
             with ThreadPoolExecutor(max_workers=max(1, len(targets))) as executor:
                 futures = {
                     surface: executor.submit(
@@ -4181,6 +4181,7 @@ class ProvidersModelsDomain:
                         api_base=api_base,
                         credential=credential,
                         model_name=model_name,
+                        timeout=timeout,
                         account_id=account_id,
                     )
                     for surface in targets
@@ -5228,17 +5229,8 @@ class ProvidersModelsDomain:
         place instead of failing an account read.
         """
 
-        try:
-            from ..runtime_settings_io import load_specs, read_settings_file
-
-            values = read_settings_file(_default_runtime_settings_path(), load_specs())
-            raw = str(values.get(self.SERVICE_ACCOUNT_RECHECK_KEY, "")).strip()
-            seconds = float(raw) if raw else self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
-        except Exception:
-            seconds = self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
-        if not math.isfinite(seconds) or seconds < 0:
-            return self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
-        return seconds
+        raw = runtime_setting_text(self.SERVICE_ACCOUNT_RECHECK_KEY, path=self.runtime_settings_path)
+        return float(raw) if raw else self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
 
     def _workbuddy_recent_status(self, provider_id: str) -> dict[str, Any] | None:
         """The account answer this provider's observation still covers.

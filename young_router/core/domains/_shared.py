@@ -93,7 +93,7 @@ def _default_runtime_settings_path() -> Path:
     return runtime_settings_path_for(None)
 
 
-def runtime_setting_text(key: str) -> str:
+def runtime_setting_text(key: str, *, path: Path) -> str:
     """One effective Runtime Settings value, or ``""`` when it cannot be read.
 
     Read through the same schema the proxy is handed, so a pane that states an
@@ -105,7 +105,7 @@ def runtime_setting_text(key: str) -> str:
     try:
         from ..runtime_settings_io import load_specs, read_settings_file
 
-        values = read_settings_file(_default_runtime_settings_path(), load_specs())
+        values = read_settings_file(path, load_specs())
     except Exception:
         return ""
     value = values.get(key)

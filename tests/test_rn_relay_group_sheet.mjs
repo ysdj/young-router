@@ -64,6 +64,7 @@ const second = openRelayGroupSheet({ title: "分组", accountId: "acct", labels,
 const awaiting = takeRelayGroupApply();
 requestRelayGroupApply({ autoGrouping: false, creates: [], updates: [], deletes: ["k1"] });
 assert.equal(relayGroupSheetState().saving, true);
+assert.equal(await askCloseRelayGroupSheet(), false, "navigation cannot close a sheet while it saves");
 assert.deepEqual(await awaiting, { autoGrouping: false, creates: [], updates: [], deletes: ["k1"] });
 finishRelayGroupApply({ status: "更改未生效", close: false });
 assert.equal(relayGroupSheetState().saving, false);
@@ -81,12 +82,22 @@ assert.equal(await second, undefined, "the sheet's own close answers the opening
 // whether the draft would be lost.
 openRelayGroupSheet({ title: "分组", accountId: "acct", labels, ...snapshot });
 let asked = 0;
-setRelayGroupSheetCloseQuestion(() => { asked += 1; });
-askCloseRelayGroupSheet();
-assert.equal(asked, 1, "Close asks instead of closing over a draft");
-assert.notEqual(relayGroupSheetState(), undefined);
-setRelayGroupSheetCloseQuestion(undefined);
-askCloseRelayGroupSheet();
+let answer;
+setRelayGroupSheetCloseQuestion(() => new Promise((resolve) => {
+  asked += 1;
+  answer = resolve;
+}));
+const close = askCloseRelayGroupSheet();
+const back = askCloseRelayGroupSheet();
+assert.equal(asked, 1, "Close and Back share one discard question");
+const draftSheet = relayGroupSheetState();
+answer(false);
+assert.deepEqual(await Promise.all([close, back]), [false, false]);
+assert.equal(relayGroupSheetState(), draftSheet, "cancel leaves the same sheet open");
+const retryBack = askCloseRelayGroupSheet();
+assert.equal(asked, 2, "a later Back asks again");
+answer(true);
+assert.equal(await retryBack, true);
 assert.equal(relayGroupSheetState(), undefined);
 
 // Asking for one sheet again replaces the one on screen rather than stacking a

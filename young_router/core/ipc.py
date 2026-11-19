@@ -107,8 +107,6 @@ SESSION_TOKEN_TTL_SECONDS = 30 * 60.0
 #: Thirty days is the lease the cookie states and the lease that is recorded on
 #: disk, so neither the browser closing nor Core being replaced is a sign-out.
 WEB_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60.0
-#: What the cookie's ``Max-Age`` says, in seconds: the same 30 days.
-WEB_SESSION_COOKIE_MAX_AGE_SECONDS = int(WEB_SESSION_TTL_SECONDS)
 #: The file that remembers issued browser sessions across a Core replacement.
 #: It holds digests, never tokens: a reader of the file cannot mint the cookie
 #: it names.
@@ -117,9 +115,9 @@ WEB_SESSION_STORE_VERSION = 1
 #: How many browser sessions one installation remembers.  This is one person's
 #: browser tabs, not a fleet of clients: an unbounded list would only grow.
 MAX_PERSISTED_WEB_SESSIONS = 32
-#: How far a live session's recorded expiry is moved forward at most this
-#: often.  Every authenticated call renews the lease, and a rewrite of the file
-#: on every 25-second event poll would be disk chatter nothing reads.
+#: The usual interval between renewing a live browser's cookie and disk
+#: record. Every authenticated call renews the in-memory lease, including
+#: event polls that run much more often.
 WEB_SESSION_PERSIST_INTERVAL_SECONDS = 60 * 60.0
 # The browser host's session travels in this cookie rather than a readable
 # header: page script can neither read ``X-LiteLLM-Core-Session`` nor be given
@@ -539,6 +537,10 @@ class _Session:
     #: Whether this is a browser page's lease, which is the one recorded on
     #: disk instead of living only as long as this process.
     browser: bool = False
+    cookie_sent_at: float | None = None
+
+    def web_renewal_interval(self) -> float:
+        return min(WEB_SESSION_PERSIST_INTERVAL_SECONDS, self.ttl_seconds / 2)
 
 
 def browser_session_digest(token: str) -> str:
@@ -663,6 +665,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         """
 
         self._body_consumed = False
+        self._authenticated_browser_cookie = ""
         super().handle_one_request()
 
     def log_message(self, _format: str, *_args: object) -> None:
@@ -736,13 +739,12 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             remaining -= len(chunk)
 
-    def _browser_session_cookie_header(self, token: str, *, max_age_seconds: int = WEB_SESSION_COOKIE_MAX_AGE_SECONDS) -> str:
+    def _browser_session_cookie_header(self, token: str, *, max_age_seconds: int) -> str:
         # ``Max-Age`` is what makes the page outlive the browser: a session
         # cookie is dropped when the browser closes, and a person who reopened
         # it met the password form again for a key they had already typed.
-        # The value is the same 30 days the lease itself runs for, so the
-        # cookie never outlives the session it names.  ``0`` is the sign-out
-        # answer: it deletes the cookie the browser is holding.
+        # Web sessions use their lease duration, normally 30 days. ``0`` is
+        # the sign-out answer: it deletes the cookie the browser is holding.
         parts = [
             f"{BROWSER_SESSION_COOKIE}={token}",
             "Path=/",
@@ -756,6 +758,19 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         if (self.headers.get("X-Forwarded-Proto", "") or "").strip().lower() == "https":
             parts.append("Secure")
         return "; ".join(parts)
+
+    def _send_web_session_cookie(self, token: str, *, force: bool = False) -> None:
+        max_age = self._owner._web_cookie_max_age(token, force=force)
+        if max_age is not None:
+            self.send_header("Set-Cookie", self._browser_session_cookie_header(token, max_age_seconds=max_age))
+
+    def end_headers(self) -> None:
+        # A live tab renews its Core lease by polling, but the browser clock
+        # only moves when a response sends another cookie. Do that once per
+        # renewal interval while the cookie's session is still live.
+        if self._authenticated_browser_cookie:
+            self._send_web_session_cookie(self._authenticated_browser_cookie)
+        super().end_headers()
 
     def _send(
         self,
@@ -809,12 +824,12 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         if encoding:
             self.send_header("Content-Encoding", encoding)
             self.send_header("Vary", "Accept-Encoding")
-        if session_token:
+        if session_token and browser_session:
             # A page's lease is HttpOnly on purpose; echoing it in this
             # readable header would hand the same credential back to script.
-            if not browser_session:
-                self.send_header("X-LiteLLM-Core-Session", session_token)
-            self.send_header("Set-Cookie", self._browser_session_cookie_header(session_token))
+            self._send_web_session_cookie(session_token, force=True)
+        elif session_token:
+            self.send_header("X-LiteLLM-Core-Session", session_token)
         elif clear_session:
             # Sign-out: the browser is told to forget the cookie it holds, so
             # the page it reloads meets the gate that a dead lease deserves.
@@ -857,9 +872,17 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
     def _session_authorization(self) -> str:
         header = self._authorization()
         cookie = self._browser_session_cookie()
-        if header and cookie and not hmac.compare_digest(header, cookie):
+        if header and cookie and not hmac.compare_digest(header.encode("utf-8"), cookie.encode("utf-8")):
             return ""
         return header or cookie
+
+    def _authenticated_session(self) -> str:
+        token = self._session_authorization()
+        if not self._owner._valid_session(token):
+            return ""
+        if token == self._browser_session_cookie():
+            self._authenticated_browser_cookie = token
+        return token
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
         route = urlsplit(self.path).path.rstrip("/") or "/"
@@ -880,8 +903,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self._owner._handle_web_logout(self)
             return
         if route == "/ipc/host/shutdown":
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            if not self._authenticated_session():
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
@@ -897,8 +919,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "stopped": True})
             return
         if route == "/ipc/host/file-download" and self.command == "POST":
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            token = self._authenticated_session()
+            if not token:
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
@@ -934,8 +956,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
             return
         if route == "/ipc/host/file-upload":
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            token = self._authenticated_session()
+            if not token:
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
@@ -968,8 +990,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
             return
         if route == "/ipc/host/autostart":
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            if not self._authenticated_session():
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             # The browser host's login item.  The desktop hosts register theirs
@@ -999,8 +1020,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             })
             return
         if route == "/ipc/host/file-capability":
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            if not self._authenticated_session():
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
@@ -1023,8 +1043,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
             return
         if route in {"/ipc/host/relay/browser/frames", "/ipc/host/relay/browser/input"}:
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            if not self._authenticated_session():
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             # One sign-in's screen and keyboard.  The frame is a JPEG the page
@@ -1072,8 +1091,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error(400, code="relay_login_failed", message="Relay sign-in input is unavailable")
             return
         if route in {"/ipc/host/relay/browser/start", "/ipc/host/relay/browser/poll", "/ipc/host/relay/browser/cancel", "/ipc/host/relay/browser/focus"}:
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            if not self._authenticated_session():
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             # The page host's sign-in window: Core opens a real browser at the
@@ -1124,8 +1142,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error(400, code="relay_login_failed", message="Relay login result is invalid")
             return
         if route in {"/ipc/host/secret/capability", "/ipc/host/secret/stage", "/ipc/host/relay/login", "/ipc/host/relay/remember", "/ipc/host/relay/restore", "/ipc/host/relay/resources", "/ipc/host/relay/import"}:
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            token = self._authenticated_session()
+            if not token:
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
@@ -1236,8 +1254,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error(400, code="invalid_secret", message="The requested secret field is unavailable")
             return
         if route in {"/ipc/host/secret/read-capability", "/ipc/host/secret/read"}:
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
+            token = self._authenticated_session()
+            if not token:
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
@@ -1267,8 +1285,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         if route != "/ipc":
             self._send_error(404, code="not_found", message="Core IPC route is unavailable")
             return
-        token = self._session_authorization()
-        if not self._owner._valid_session(token):
+        token = self._authenticated_session()
+        if not token:
             self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
             return
         try:
@@ -1294,8 +1312,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send_error(404, code="not_found", message="Core IPC route is unavailable")
             return
-        token = self._session_authorization()
-        if not self._owner._valid_session(token):
+        token = self._authenticated_session()
+        if not token:
             self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
             return
         query = parse_qs(route.query, keep_blank_values=False)
@@ -1563,7 +1581,7 @@ class CoreIPCServer:
         if varied:
             handler.send_header("Vary", "Accept-Encoding")
         if local_session:
-            handler.send_header("Set-Cookie", handler._browser_session_cookie_header(local_session))
+            handler._send_web_session_cookie(local_session, force=True)
         # The shell is never cached; every asset beside it is immutable for a
         # year, which is only true because the script is named after its own
         # bytes (`bundle.<hash>.js`) -- a fixed `bundle.js` under this header is
@@ -1646,9 +1664,10 @@ class CoreIPCServer:
         """
 
         cookie = handler._browser_session_cookie()
-        if not cookie:
+        if not self._valid_session(cookie):
             return False
-        return self._valid_session(cookie)
+        handler._authenticated_browser_cookie = cookie
+        return True
 
     def enable_web_host(
         self,
@@ -2177,19 +2196,11 @@ class CoreIPCServer:
             handler._read_body()
         except ProtocolError:
             handler.close_connection = True
-        token = handler._authorization()
-        cookie = handler._browser_session_cookie()
-        bootstrap = self._valid_bootstrap(token)
-        # A page that already signed in keeps its cookie across reloads, so
-        # ``/ipc/hello`` accepts it too instead of asking for the password
-        # again -- including the cookie a replaced Core only knows from its
-        # own recorded digest.
-        candidate = token or cookie
-        valid_session = bool(candidate) and self._valid_session(candidate)
-        if bootstrap:
-            self._issue_session(handler, token, consumed_bootstrap=True)
+        candidate = handler._session_authorization()
+        if candidate and handler._authorization() and self._valid_bootstrap(candidate):
+            self._issue_session(handler, candidate, consumed_bootstrap=True)
             return
-        if valid_session:
+        if candidate and self._valid_session(candidate):
             self._issue_session(handler, candidate, consumed_bootstrap=False)
             return
         handler._send_error(401, code="unauthorized", message="Core IPC authentication failed")
@@ -2417,6 +2428,18 @@ class CoreIPCServer:
         self._save_web_sessions()
         return token
 
+    def _web_cookie_max_age(self, token: str, *, force: bool) -> int | None:
+        with self._lock:
+            now = time.monotonic()
+            session = self._sessions.get(token)
+            if session is None or not session.browser or session.expires_at < now:
+                return None
+            if not force and session.cookie_sent_at is not None:
+                if now - session.cookie_sent_at < session.web_renewal_interval():
+                    return None
+            session.cookie_sent_at = now
+            return int(session.ttl_seconds)
+
     def _record_web_session(self, token: str) -> bool:
         """Move a live browser lease's recorded expiry forward.
 
@@ -2433,7 +2456,7 @@ class CoreIPCServer:
             if session is None or not session.browser:
                 return False
             expiry = time.time() + self.web_session_ttl_seconds
-            if expiry - self._web_sessions.get(digest, 0.0) < WEB_SESSION_PERSIST_INTERVAL_SECONDS:
+            if expiry - self._web_sessions.get(digest, 0.0) < session.web_renewal_interval():
                 return False
             self._web_sessions[digest] = expiry
             return True
@@ -3099,7 +3122,6 @@ __all__ = [
     "IPCError",
     "IpcEndpoint",
     "SESSION_TOKEN_TTL_SECONDS",
-    "WEB_SESSION_COOKIE_MAX_AGE_SECONDS",
     "WEB_SESSION_STORE_FILENAME",
     "WEB_SESSION_TTL_SECONDS",
 ]

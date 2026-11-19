@@ -1590,6 +1590,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 api_base="https://api.deepseek.com/v1",
                 credential="sk-synthetic-deepseek",
                 model_name="deepseek-flash",
+                timeout=5.0,
             )
 
         self.assertEqual(
@@ -1922,7 +1923,10 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         the implementation happened to look at a clock.
         """
 
-        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        domain = ProvidersModelsDomain(
+            root / "config.yaml", runtime_settings_path=root / "runtime-settings.env"
+        )
         ticks = iter(range(0, 10_000))
         # Two seconds per clock read: strictly ordered, and fast enough that the
         # window closes inside the first round, so one run measures one round
@@ -2024,7 +2028,10 @@ class ProvidersModelsDomainTests(unittest.TestCase):
     def test_a_superseded_press_stops_before_the_fingerprint_layers(self) -> None:
         """The expensive layers never run for a press that was replaced."""
 
-        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        domain = ProvidersModelsDomain(
+            root / "config.yaml", runtime_settings_path=root / "runtime-settings.env"
+        )
         ran: list[str] = []
 
         def never(*_args: object, **_kwargs: object) -> object:
@@ -2210,32 +2217,22 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_SETTING_KEY,
         )
         self.assertGreater(ProvidersModelsDomain._DEGRADATION_PROBE_TIMEOUT_SECONDS, 200.0)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV: ""}
+        ):
             settings = Path(directory) / "runtime-settings.env"
             settings.write_text("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS=42\n", encoding="utf-8")
-            with mock.patch.dict(
-                os.environ,
-                {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(settings)},
-                clear=False,
-            ):
-                os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
-                self.assertEqual(42.0, ProvidersModelsDomain._model_probe_timeout_seconds())
+            domain = ProvidersModelsDomain(
+                Path(directory) / "config.yaml", runtime_settings_path=settings
+            )
+            self.assertEqual(42.0, domain._model_probe_timeout_seconds())
             # An explicit override still wins for a focused local run.
             with mock.patch.dict(
                 os.environ,
-                {
-                    "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(settings),
-                    ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV: "7",
-                },
-                clear=False,
+                {ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV: "7"},
             ):
-                self.assertEqual(7.0, ProvidersModelsDomain._model_probe_timeout_seconds())
-        with mock.patch.dict(
-            os.environ,
-            {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": "/nonexistent/runtime-settings.env"},
-            clear=False,
-        ):
-            os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
+                self.assertEqual(7.0, domain._model_probe_timeout_seconds())
+            settings.unlink()
             # With nothing configured the probe waits as long as the proxy does
             # by default -- the number the pane shows for First-event timeout.
             # The literal is not restated here: the point of this assertion is
@@ -2249,7 +2246,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             )
             self.assertEqual(
                 ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_SECONDS,
-                ProvidersModelsDomain._model_probe_timeout_seconds(),
+                domain._model_probe_timeout_seconds(),
             )
 
     def test_model_probe_does_not_recommend_a_protocol_change_after_a_dropped_connection(self) -> None:
@@ -2525,6 +2522,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                     api_base=f"http://127.0.0.1:{port}/v1",
                     credential="local-token",
                     model_name="deepseek-v4.1-flash-free",
+                    timeout=5.0,
                 )
                 statuses[answer] = result["status"]
         finally:

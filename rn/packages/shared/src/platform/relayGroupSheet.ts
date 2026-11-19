@@ -45,7 +45,8 @@ type Sheet = {
   /** One waiter per 保存并关闭: a refused save asks again on the same sheet. */
   applyWaiters: Array<(result: RelayGroupManagerResult | undefined) => void>;
   /** The layer's own "may I close?" — it is where the discard question lives. */
-  askClose?: () => void;
+  askClose?: () => Promise<boolean>;
+  closeRequest?: Promise<boolean>;
 };
 
 let sheet: Sheet | undefined;
@@ -161,20 +162,29 @@ export function closeRelayGroupSheet(): void {
  * Escape have to refuse exactly as the footer's Close button (disabled while
  * `saving`) does.  The save's own answer closes the sheet when it lands.
  */
-export function askCloseRelayGroupSheet(): void {
-  if (!sheet || sheet.state.saving) return;
-  const ask = sheet.askClose;
-  if (ask) {
-    ask();
-    return;
+export async function askCloseRelayGroupSheet(): Promise<boolean> {
+  const current = sheet;
+  if (!current) return true;
+  if (current.state.saving) return false;
+  if (!current.askClose) {
+    closeRelayGroupSheet();
+    return true;
   }
-  closeRelayGroupSheet();
+  // Back can arrive while the Close button or Escape is already asking. They
+  // must share one answer, and that answer only applies to the sheet that asked.
+  current.closeRequest ??= current.askClose().then((accepted) => {
+    if (sheet !== current) return sheet === undefined;
+    if (!accepted || current.state.saving) return false;
+    closeRelayGroupSheet();
+    return true;
+  }).finally(() => { current.closeRequest = undefined; });
+  return current.closeRequest;
 }
 
 /**
  * The sheet registers the question its Close has to ask, because only the
  * panel knows whether the draft in its fields would be lost.
  */
-export function setRelayGroupSheetCloseQuestion(ask?: () => void): void {
+export function setRelayGroupSheetCloseQuestion(ask?: () => Promise<boolean>): void {
   if (sheet) sheet.askClose = ask;
 }
