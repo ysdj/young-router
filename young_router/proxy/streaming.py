@@ -49,6 +49,7 @@ from .base import (
     _STREAM_START_TIMEOUT_METADATA_KEY,
     _START_TIMEOUT_OBSERVED_KEY,
     _TERMINAL_FAILURE_REQUEST_KEY,
+    _UPSTREAM_INPUT_ITEM_LIMIT_ATTR,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _normalize_response_completed_event_usage,
@@ -3085,6 +3086,22 @@ def _native_stream_error_message(
         request_data,
     )
 
+# Terminal reasons that mean "the replay carried too many items", not "the
+# model cannot hold this conversation".  Live 2026-11-19 the tken relay ended a
+# 311 s turn with ``response.incomplete`` and ``reason: max_messages``; the same
+# payload had been served minutes earlier, so the router treats this as a
+# refusal to resend smaller first, and only then as a stop.
+_UPSTREAM_INPUT_ITEM_LIMIT_REASONS = frozenset(
+    {
+        "max_messages",
+        "max_input_items",
+        "max_items",
+        "too_many_messages",
+        "too_many_items",
+    }
+)
+
+
 def _responses_incomplete_stream_exception(
     reason: str,
     *,
@@ -3104,6 +3121,15 @@ def _responses_incomplete_stream_exception(
         message = f"{message}; upstream terminal error: {terminal_error_text}"
     candidate = RuntimeError(message)
     exception = candidate
+    try:
+        if str(terminal_summary.get("reason") or "") in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
+            # The upstream said the replay carries too many items.  The router
+            # answers that by resending a shorter history, which is a different
+            # verdict from "this conversation no longer fits" -- Codex must not
+            # be told to compact over a cap that a shorter replay clears.
+            setattr(exception, _UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
+    except Exception:
+        pass
     try:
         exception.responses_stream_incomplete = True  # type: ignore[attr-defined]
         # Routing and cooldown must treat an incomplete stream the same way

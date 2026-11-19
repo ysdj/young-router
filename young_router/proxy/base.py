@@ -146,6 +146,24 @@ _STREAM_HEDGE_DELAY_DEFAULT_SECONDS = 30.0
 # one gets the ordinary budget instead of another five.  Without this, a group
 # whose dead routes sit on three orders spends fifteen minutes of silence
 # before the reader is told anything.
+# Whether an upstream that refuses the replay as too large -- a context 400 or
+# a ``response.incomplete`` that says ``max_messages`` -- gets one more attempt
+# with the oldest reasoning items elided.  Nothing is trimmed before a route
+# says so: on this gateway the same 2,399-item thread served turns minutes
+# before and after one ``max_messages`` at 311 s, so size is only ever inferred
+# from the refusal itself, never guessed from the payload's age or byte count.
+_REPLAY_REASONING_ELISION_ENABLED_ENV = "YOUNG_ROUTER_REPLAY_REASONING_ELISION_ENABLED"
+_REPLAY_REASONING_ELISION_KEEP_ENV = "YOUNG_ROUTER_REPLAY_REASONING_ELISION_KEEP"
+_REPLAY_REASONING_ELISION_KEEP_DEFAULT = 8
+# Set on the retry so a second refusal ends the turn instead of eliding again:
+# each elision makes the replay a history the model never actually had.
+_REPLAY_REASONING_ELIDED_REQUEST_KEY = "_young_router_reasoning_elided"
+# Marked on the exception ``_responses_incomplete_stream_exception`` builds when
+# the upstream's own terminal said the input carried too many items.  It is not
+# ``_is_context_size_error``: that verdict changes the client-facing code to a
+# terminal ``context_length_exceeded`` and tells Codex to compact, while this one
+# only means "resend a shorter history before giving up".
+_UPSTREAM_INPUT_ITEM_LIMIT_ATTR = "upstream_input_item_limit"
 _START_TIMEOUT_OBSERVED_KEY = "_young_router_start_timeout_observed"
 _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"

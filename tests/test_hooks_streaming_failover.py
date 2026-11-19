@@ -4576,3 +4576,276 @@ class HookNativeFallbackDispatchTests(HookTestCase):
         self.assertEqual([900, 901], [frame["index"] for frame in starts])
         self.assertEqual({"command": "ls -la"}, json.loads(inputs[900]))
         self.assertEqual({"path": "/tmp/a.png", "offset": 12}, json.loads(inputs[901]))
+
+
+class ResponsesReasoningElisionTests(HookTestCase):
+    """A size refusal is answered by resending a shorter history, once."""
+
+    def _request(self, *, reasoning: int = 12, keep_env: str = "8") -> dict:
+        self.set_env("YOUNG_ROUTER_REPLAY_REASONING_ELISION_KEEP", keep_env)
+        items = []
+        for index in range(reasoning):
+            items.append({"type": "message", "role": "user", "content": f"turn {index}"})
+            items.append({"type": "reasoning", "id": f"rs_{index}", "summary": []})
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": f"call_{index}",
+                    "name": "shell",
+                    "arguments": "{}",
+                }
+            )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": f"call_{index}",
+                    "output": "ok",
+                }
+            )
+        return {
+            "model": "gpt-6.2-astra",
+            "input": items,
+            "stream": True,
+            "litellm_params": {"litellm_call_id": "call-elide-1"},
+        }
+
+    def test_an_item_cap_refusal_is_retried_with_older_reasoning_elided(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        request = self._request()
+        refusal = RuntimeError(
+            "Responses stream incomplete: terminal response event before "
+            "response.completed"
+        )
+        setattr(refusal, hooks._UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
+
+        retry = module._responses_context_truncation_fallback_kwargs(
+            refusal, request
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertTrue(retry[hooks._REPLAY_REASONING_ELIDED_REQUEST_KEY])
+        reasoning = [item for item in retry["input"] if item.get("type") == "reasoning"]
+        self.assertEqual(8, len(reasoning))
+        self.assertEqual("rs_4", reasoning[0]["id"])
+        # Everything that carries the turn's meaning is still there, in order.
+        self.assertEqual(
+            [item for item in request["input"] if item.get("type") != "reasoning"],
+            [item for item in retry["input"] if item.get("type") != "reasoning"],
+        )
+        self.assertLess(len(retry["input"]), len(request["input"]))
+
+    def test_a_context_overflow_is_answered_the_same_way(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        request = self._request()
+        refusal = RuntimeError(
+            "litellm.ContextWindowExceededError: This model's maximum context "
+            "length is 400000 tokens, but the input is too long."
+        )
+        refusal.status_code = 400
+
+        retry = module._responses_context_truncation_fallback_kwargs(
+            refusal, request
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(
+            8,
+            len([item for item in retry["input"] if item.get("type") == "reasoning"]),
+        )
+
+    def test_only_one_elision_per_turn(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        refusal = RuntimeError("maximum context length exceeded")
+        refusal.status_code = 400
+        request = self._request()
+
+        first = module._responses_context_truncation_fallback_kwargs(
+            refusal, request
+        )
+        second = module._responses_context_truncation_fallback_kwargs(
+            refusal, first
+        )
+
+        self.assertTrue(first[hooks._REPLAY_REASONING_ELIDED_REQUEST_KEY])
+        # The second answer is the API's own truncation retry; the history is
+        # not shortened a second time.
+        self.assertEqual("auto", second["truncation"])
+        self.assertEqual(first["input"], second["input"])
+        # Another copy of the same turn -- a fallback round rebuilds the body
+        # from the original -- must not elide either.
+        rebuilt = {
+            "model": "gpt-6.2-astra",
+            "input": request["input"],
+            "stream": True,
+            "litellm_params": {"litellm_call_id": "call-elide-1"},
+        }
+        self.assertIsNone(
+            module._responses_reasoning_elision_fallback_kwargs(refusal, rebuilt)
+        )
+
+    def test_the_switch_turns_elision_off(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        self.set_env(hooks._REPLAY_REASONING_ELISION_ENABLED_ENV, "0")
+        request = self._request()
+        refusal = RuntimeError("maximum context length exceeded")
+        refusal.status_code = 400
+
+        retry = module._responses_context_truncation_fallback_kwargs(
+            refusal, request
+        )
+        self.assertNotIn(hooks._REPLAY_REASONING_ELIDED_REQUEST_KEY, retry)
+        self.assertEqual(request["input"], retry["input"])
+        # With the switch off, an item-cap refusal is not retried at all.
+        item_cap = RuntimeError("Responses stream incomplete")
+        setattr(item_cap, hooks._UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
+        self.assertIsNone(
+            module._responses_context_truncation_fallback_kwargs(
+                item_cap, request
+            )
+        )
+
+    def test_nothing_is_elided_without_a_refusal(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        request = self._request()
+        self.assertIsNone(
+            module._responses_context_truncation_fallback_kwargs(
+                RuntimeError("upstream ended the turn"), request
+            )
+        )
+        self.assertEqual(len(request["input"]), 48)
+
+    def test_a_replay_with_nothing_to_drop_is_left_alone(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        refusal = RuntimeError("maximum context length exceeded")
+        refusal.status_code = 400
+        request = self._request(reasoning=3)
+
+        retry = module._responses_context_truncation_fallback_kwargs(
+            refusal, request
+        )
+        self.assertNotIn(hooks._REPLAY_REASONING_ELIDED_REQUEST_KEY, retry)
+        self.assertEqual(request["input"], retry["input"])
+
+
+class ResponsesReasoningElisionStreamTests(HookTestCase):
+    """The size refusal is answered inside the turn, before the reader sees it."""
+
+    def _request(self) -> dict:
+        items = []
+        for index in range(12):
+            items.append({"type": "message", "role": "user", "content": f"turn {index}"})
+            items.append({"type": "reasoning", "id": f"rs_{index}", "summary": []})
+        return {"model": "default-chat", "input": items, "stream": True}
+
+    class _Stream:
+        def __init__(self, events):
+            self.events = list(events)
+            self.closed = False
+            self.completed_response = None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.events:
+                raise StopAsyncIteration
+            return self.events.pop(0)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    def _item_cap_stream(self):
+        return self._Stream(
+            [
+                {"type": "response.created", "response": {"id": "resp-cap"}},
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_11"}],
+                    },
+                },
+            ]
+        )
+
+    def _answer_stream(self):
+        return self._Stream(
+            [
+                {"type": "response.created", "response": {"id": "resp-ok"}},
+                {"type": "response.output_text.delta", "delta": "the answer"},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                },
+            ]
+        )
+
+    async def test_an_item_cap_before_any_output_is_retried_shorter(self) -> None:
+        hooks, _ = load_hook_module()
+        calls: list = []
+
+        def original(**kwargs):
+            calls.append(kwargs)
+            return self._answer_stream()
+
+        request = self._request()
+        wrapped = hooks._with_responses_context_truncation_fallback_stream(
+            self._item_cap_stream(), request, original
+        )
+
+        async def collect() -> list:
+            return [chunk async for chunk in wrapped]
+
+        chunks = await asyncio.wait_for(collect(), 5)
+
+        self.assertEqual(1, len(calls))
+        self.assertTrue(calls[0][hooks._REPLAY_REASONING_ELIDED_REQUEST_KEY])
+        self.assertEqual(
+            8,
+            len([item for item in calls[0]["input"] if item.get("type") == "reasoning"]),
+        )
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+
+    async def test_an_item_cap_after_visible_output_is_not_replayed(self) -> None:
+        hooks, _ = load_hook_module()
+        calls: list = []
+
+        def original(**kwargs):
+            calls.append(kwargs)
+            return self._answer_stream()
+
+        source = self._Stream(
+            [
+                {"type": "response.created", "response": {"id": "resp-cap"}},
+                {"type": "response.output_text.delta", "delta": "partial"},
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [],
+                    },
+                },
+            ]
+        )
+        wrapped = hooks._with_responses_context_truncation_fallback_stream(
+            source, self._request(), original
+        )
+
+        async def collect() -> list:
+            return [chunk async for chunk in wrapped]
+
+        chunks = await asyncio.wait_for(collect(), 5)
+
+        # Replaying here would duplicate the part the reader already has.
+        self.assertEqual([], calls)
+        self.assertIn("partial", [chunk.get("delta") for chunk in chunks])

@@ -1213,8 +1213,17 @@ def _with_responses_context_truncation_fallback_stream(
                             request_data=request_kwargs,
                         )
                     )
+                    # A terminal that names an item cap is answered by
+                    # resending a shorter history -- but only while this
+                    # attempt has delivered nothing: replaying after the reader
+                    # has seen part of the answer duplicates it.
                     if _routing_module._is_context_size_error(
                         terminal_exception
+                    ) or (
+                        not delivery_started
+                        and _routing_module._is_upstream_input_item_limit_error(
+                            terminal_exception
+                        )
                     ):
                         async for retry_chunk in yield_retry(terminal_exception):
                             yield retry_chunk

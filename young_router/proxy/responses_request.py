@@ -20,6 +20,7 @@ from .base import (
     _FALLBACK_BROWSER_USER_AGENT,
     _MAX_COMPAT_REASONING_EFFORT,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
+    _REPLAY_REASONING_ELIDED_REQUEST_KEY,
     _HOSTED_TOOL_UNSUPPORTED_MESSAGE_KEY,
     _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
@@ -1192,10 +1193,6 @@ def _responses_context_truncation_fallback_kwargs(
     """
     if not isinstance(request_kwargs, dict):
         return None
-    if not _request_has_responses_shape(request_kwargs):
-        return None
-    if request_kwargs.get("use_chat_completions_api") is True:
-        return None
     if _request_is_codex_compaction(request_kwargs):
         # A compaction request never takes the truncation fallback, however
         # large its prefix: the upstream compacts exactly what it receives, so
@@ -1208,6 +1205,17 @@ def _responses_context_truncation_fallback_kwargs(
         return None
     attempts = _responses_context_truncation_attempts(request_kwargs)
     if attempts >= len(_context_window_module._RETRY_FRACTIONS):
+        return None
+    # Eliding old reasoning first: it is what actually changes the verdict on a
+    # relay that counts items rather than tokens, and it works on a bridged
+    # request too -- ``truncation=auto`` only exists on the native Responses
+    # API, so a chat-bridged turn had no way to answer a size refusal at all.
+    elided = _responses_reasoning_elision_fallback_kwargs(exception, request_kwargs)
+    if elided is not None:
+        return elided
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+    if request_kwargs.get("use_chat_completions_api") is True:
         return None
     if not _routing_module._is_context_size_error(exception):
         return None
@@ -1250,6 +1258,109 @@ def _responses_context_truncation_fallback_kwargs(
     return retry_kwargs
 
 
+def _responses_reasoning_item(item: Any) -> bool:
+    """Whether one input item is a reasoning item this router may elide."""
+
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        # Only plain reasoning items.  A signed/encrypted compaction prefix is
+        # an immutable replay prefix (see the compaction guard below), and any
+        # item whose type this helper cannot read is left alone.
+        return item_type == "reasoning"
+    item_type = getattr(item, "type", None)
+    return item_type == "reasoning"
+
+
+def _responses_input_with_elided_reasoning_items(
+    items: Any,
+    *,
+    keep: int,
+) -> Optional[List[Any]]:
+    """Drop the oldest reasoning items, keeping the newest ``keep`` of them.
+
+    Everything else -- user and assistant messages, function calls and their
+    outputs, images, hosted tool items -- is preserved in order and untouched.
+    Reasoning items are the only part of a replay that the API lets a client
+    drop without changing what the turn asked for, which is why a size refusal
+    is answered by shortening exactly this tail of history.
+    """
+
+    if not isinstance(items, list):
+        return None
+    reasoning_indexes = [
+        index for index, item in enumerate(items) if _responses_reasoning_item(item)
+    ]
+    if keep < 0:
+        keep = 0
+    dropped = len(reasoning_indexes) - keep
+    if dropped <= 0:
+        return None
+    elided = set(reasoning_indexes[:dropped])
+    return [item for index, item in enumerate(items) if index not in elided]
+
+
+def _responses_reasoning_elision_fallback_kwargs(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> Optional[dict]:
+    """One retry with older reasoning elided, after the upstream refused size.
+
+    The refusal is the trigger and the only trigger: nothing is elided before a
+    route says the input is too large.  A ``response.incomplete`` that names an
+    item cap is not the same verdict as an unusable conversation, so the retry
+    happens before the client is told to compact.  Only one elision per turn --
+    the history the model is handed here never existed, and repeating it would
+    walk the thread's context down route by route.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    if not _routing_module._replay_reasoning_elision_enabled():
+        return None
+    if request_kwargs.get(_REPLAY_REASONING_ELIDED_REQUEST_KEY):
+        return None
+    if _routing_module._request_replay_reasoning_elided(request_kwargs):
+        return None
+    if not (
+        _routing_module._is_context_size_error(exception)
+        or _routing_module._is_upstream_input_item_limit_error(exception)
+    ):
+        return None
+    items = request_kwargs.get("input")
+    elided_items = _responses_input_with_elided_reasoning_items(
+        items,
+        keep=_routing_module._replay_reasoning_elision_keep(),
+    )
+    if elided_items is None:
+        return None
+
+    retry_kwargs = request_kwargs.copy()
+    retry_kwargs["input"] = elided_items
+    retry_kwargs[_REPLAY_REASONING_ELIDED_REQUEST_KEY] = True
+    # Remembered by request id: a later hop of this same turn rebuilds its body
+    # from the original request and would otherwise elide a second time.
+    _routing_module._mark_request_replay_reasoning_elided(request_kwargs)
+    try:
+        _trace_module._route_trace(
+            "responses_reasoning_elision_fallback_start",
+            request_id=_routing_module._trace_request_id(request_kwargs),
+            session=_routing_module._trace_session_context(request_kwargs),
+            model_group=_request_context_module._request_model_group(
+                request_kwargs
+            ),
+            deployment_id=_routing_module._deployment_id_from_request(
+                request_kwargs
+            ),
+            before_items=len(items) if isinstance(items, list) else None,
+            after_items=len(elided_items),
+            kept_reasoning=_routing_module._replay_reasoning_elision_keep(),
+            exception=_routing_module._trace_exception(exception),
+        )
+    except Exception:
+        pass
+    return retry_kwargs
+
+
 def _request_can_attempt_responses_context_truncation_fallback(
     request_kwargs: Optional[dict],
 ) -> bool:
@@ -1257,8 +1368,9 @@ def _request_can_attempt_responses_context_truncation_fallback(
         return False
     if not _request_has_responses_shape(request_kwargs):
         return False
-    if request_kwargs.get("use_chat_completions_api") is True:
-        return False
+    # A request whose deployment call is bridged to chat completions cannot use
+    # the API's `truncation=auto`, but it can still elide old reasoning items,
+    # so the gate admits any replay with an item list to shorten.
     if _request_is_codex_compaction(request_kwargs):
         return False
     if _request_disables_responses_truncation_fallback(request_kwargs):

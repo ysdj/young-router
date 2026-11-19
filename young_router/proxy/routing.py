@@ -45,6 +45,10 @@ from .base import (
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _DEPLOYMENT_COOLDOWNS,
+    _REPLAY_REASONING_ELISION_ENABLED_ENV,
+    _REPLAY_REASONING_ELISION_KEEP_ENV,
+    _REPLAY_REASONING_ELISION_KEEP_DEFAULT,
+    _UPSTREAM_INPUT_ITEM_LIMIT_ATTR,
     _REQUEST_TURN_IDENTIFIER_KEYS,
     _DEPLOYMENT_COOLDOWN_COMPACTION_DEFAULT_ENABLED,
     _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV,
@@ -1894,6 +1898,45 @@ def _deployment_cooldown_seconds() -> float:
 
 def _deployment_cooldown_enabled() -> bool:
     return _deployment_cooldown_failure_threshold() > 0 and _deployment_cooldown_seconds() > 0
+
+
+def _replay_reasoning_elision_enabled() -> bool:
+    """Whether a size refusal may be retried with older reasoning elided."""
+
+    raw = os.environ.get(_REPLAY_REASONING_ELISION_ENABLED_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+        "disabled",
+    }
+
+
+def _replay_reasoning_elision_keep() -> int:
+    """How many of the newest reasoning items a shortened replay keeps."""
+
+    raw = os.environ.get(_REPLAY_REASONING_ELISION_KEEP_ENV)
+    if raw is None or not str(raw).strip():
+        return _REPLAY_REASONING_ELISION_KEEP_DEFAULT
+    try:
+        keep = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _REPLAY_REASONING_ELISION_KEEP_DEFAULT
+    return keep if keep >= 0 else _REPLAY_REASONING_ELISION_KEEP_DEFAULT
+
+
+def _is_upstream_input_item_limit_error(exception: Any) -> bool:
+    """Whether the upstream refused this replay for carrying too many items.
+
+    Deliberately not part of ``_is_context_size_error``: that classification is
+    what tells Codex to compact and is not retryable, while this one is the
+    router's cue to resend a shorter history first.
+    """
+
+    return bool(getattr(exception, _UPSTREAM_INPUT_ITEM_LIMIT_ATTR, False))
 
 
 def _stream_hedge_delay_seconds() -> float:
@@ -5405,6 +5448,36 @@ def _prune_terminal_failure_requests(now: float) -> None:
         )
         for name, _entry in oldest[: len(_TERMINAL_FAILURE_REQUESTS) - _TERMINAL_FAILURE_REQUEST_LIMIT]:
             _TERMINAL_FAILURE_REQUESTS.pop(name, None)
+
+
+# One turn may elide its replay's old reasoning only once, and the turn is
+# represented by several dict copies (the fallback round rebuilds the payload
+# from the original body), so the flag has to live where the id does -- the same
+# reason the terminal verdict above is kept here.
+_REASONING_ELIDED_REQUESTS: dict[str, float] = {}
+_REASONING_ELIDED_REQUESTS_LOCK = threading.Lock()
+
+
+def _request_replay_reasoning_elided(request_kwargs: Optional[dict]) -> bool:
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return False
+    now = time.time()
+    with _REASONING_ELIDED_REQUESTS_LOCK:
+        for name, marked_at in list(_REASONING_ELIDED_REQUESTS.items()):
+            if now - marked_at > _TERMINAL_FAILURE_REQUEST_TTL_SECONDS:
+                _REASONING_ELIDED_REQUESTS.pop(name, None)
+        return any(name in _REASONING_ELIDED_REQUESTS for name in names)
+
+
+def _mark_request_replay_reasoning_elided(request_kwargs: Optional[dict]) -> None:
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return
+    now = time.time()
+    with _REASONING_ELIDED_REQUESTS_LOCK:
+        for name in names:
+            _REASONING_ELIDED_REQUESTS[name] = now
 
 
 def _mark_terminal_failure_for_request(
