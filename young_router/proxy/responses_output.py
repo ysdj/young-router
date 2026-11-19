@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from . import responses_tools as _responses_tools_module
 from . import web_search_native as _web_search_native_module
 from . import routing as _routing_module
@@ -1146,25 +1148,59 @@ def _reasoning_wrapper_opener_incomplete(text: str) -> bool:
     )
 
 
+#: A marker that occupies a line of its own.  Measured 2026-11-20 in a Codex
+#: transcript: the relay writes ``<thinking>`` as its own paragraph between two
+#: tool-call blocks, which is neither the start of the message nor prose, so the
+#: leading-opener rule above never saw it and the tag itself was rendered to the
+#: reader.  A token that shares its line with other words is the model talking
+#: about a tag (``see the <thinking> tag``) and stays.
+_REASONING_WRAPPER_STANDALONE_RE = re.compile(
+    r"(?m)^[ \t]*</?(?:thinking|think|budget:thinking)>[ \t]*(?=\n|$)"
+)
+
+
+def _reasoning_wrapper_pending_len(text: str) -> int:
+    """Length of a trailing fragment that may still grow into a marker."""
+
+    if not isinstance(text, str) or not text:
+        return 0
+    best = 0
+    for tag in _REASONING_WRAPPER_TAGS:
+        for token in (f"<{tag}>", f"</{tag}>"):
+            for length in range(1, len(token)):
+                if text.endswith(token[:length]) and length > best:
+                    # Only a fragment that starts at a plausible boundary
+                    # counts: a plain "<" mid-sentence is text.
+                    if text[: -length].endswith(("\n", "\r", ">", " ", "\t")):
+                        best = length
+    return best
+
+
 def _strip_reasoning_wrapper(text: str) -> str:
     """Remove a leaked reasoning wrapper from an assistant message's text."""
 
-    opener = _reasoning_wrapper_opener(text)
-    if opener is None:
-        return text
-    tag, start, end = opener
-    closer = f"</{tag}>"
-    index = text.find(closer, end)
-    if index >= 0:
-        return text[:start] + text[end:index] + text[index + len(closer) :]
-    # The wrapper was never closed: everything after the opener is the thought
-    # summary.  A trailing fragment of the closer is a truncated marker rather
-    # than content, so it goes with the opener.
-    trailing = _web_search_native_module._raw_tool_call_pending_prefix_len(
-        text,
-        closer,
-    )
-    return text[:start] + (text[end : len(text) - trailing] if trailing else text[end:])
+    cleaned = text
+    opener = _reasoning_wrapper_opener(cleaned)
+    if opener is not None:
+        tag, start, end = opener
+        closer = f"</{tag}>"
+        index = cleaned.find(closer, end)
+        if index >= 0:
+            cleaned = (
+                cleaned[:start] + cleaned[end:index] + cleaned[index + len(closer) :]
+            )
+        else:
+            # The wrapper was never closed: everything after the opener is the
+            # thought summary.  A trailing fragment of the closer is a truncated
+            # marker rather than content, so it goes with the opener.
+            trailing = _web_search_native_module._raw_tool_call_pending_prefix_len(
+                cleaned,
+                closer,
+            )
+            cleaned = cleaned[:start] + (
+                cleaned[end : len(cleaned) - trailing] if trailing else cleaned[end:]
+            )
+    return _REASONING_WRAPPER_STANDALONE_RE.sub("", cleaned)
 
 
 class _LeakedReasoningWrapperFilter:
@@ -1186,6 +1222,11 @@ class _LeakedReasoningWrapperFilter:
         if _reasoning_wrapper_opener_incomplete(self.seen):
             return ""
         visible = _strip_reasoning_wrapper(self.seen)
+        pending = _reasoning_wrapper_pending_len(self.seen)
+        if pending:
+            # A marker split across two deltas: hold the fragment back until the
+            # next chunk says whether it is one.
+            visible = visible[: len(visible) - pending]
         if not visible.startswith(self.emitted):
             # Safety net: hand over the whole visible text rather than a diff
             # that would drop text the client is still holding.

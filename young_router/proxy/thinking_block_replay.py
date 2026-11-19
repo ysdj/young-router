@@ -50,6 +50,7 @@ every request read a shared document to find out that nothing is wrong.
 from __future__ import annotations
 
 import functools
+import json
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -246,6 +247,40 @@ def _body_shape_summary(messages: Any, *, sample_limit: int = 4) -> Dict[str, An
     }
 
 
+#: Where a refused body may be written for offline analysis, when the operator
+#: asks for it with ``YOUNG_ROUTER_CAPTURE_ANTHROPIC_BODY=/path.json``.  Off by
+#: default: a body is the client's content.  One file per process, written at
+#: the moment a repaired body is about to be resent, because that is the body an
+#: endpoint keeps refusing and the only way to see what it is actually objecting
+#: to when every shape the counters know is already correct.
+CAPTURE_PATH_ENV = "YOUNG_ROUTER_CAPTURE_ANTHROPIC_BODY"
+_CAPTURE_STATE: Dict[str, Any] = {"written": False}
+
+
+def _capture_body(request_kwargs: Any, exception: Exception) -> None:
+    import os
+
+    path = os.getenv(CAPTURE_PATH_ENV, "").strip()
+    if not path or _CAPTURE_STATE.get("written"):
+        return
+    try:
+        payload = {
+            "captured_at": time.time(),
+            "refusal": str(exception)[:2000],
+            "body": {
+                key: value
+                for key, value in (request_kwargs or {}).items()
+                if key in ("model", "messages", "system", "max_tokens", "thinking",
+                           "tools", "tool_choice", "temperature", "top_p", "stream")
+            },
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        _CAPTURE_STATE["written"] = True
+    except Exception:
+        pass
+
+
 def _requirement_cache_key(request_kwargs: Any) -> Optional[str]:
     """The session and route a learned repair belongs to."""
 
@@ -407,6 +442,7 @@ async def call_with_thinking_block_repair(call: Any, kwargs: dict) -> Any:
         )
         kwargs.clear()
         kwargs.update(retry_kwargs)
+        _capture_body(kwargs, exc)
         try:
             response = await call()
         except Exception as retry_exc:
