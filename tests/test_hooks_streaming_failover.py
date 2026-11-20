@@ -3416,6 +3416,31 @@ class HookOutputStreamContinuationTests(HookTestCase):
             continuation_module._request_is_continuable_native_stream(request_data)
         )
 
+    async def test_a_multiturn_conversation_is_never_extended(self) -> None:
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["messages"].insert(
+            0, {"role": "assistant", "content": "Earlier answer."}
+        )
+
+        self.assertFalse(
+            continuation_module._request_is_continuable_native_stream(request_data)
+        )
+
+    async def test_a_multimodal_user_message_is_never_extended(self) -> None:
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["messages"][0]["content"] = [
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+        ]
+
+        self.assertFalse(
+            continuation_module._request_is_continuable_native_stream(request_data)
+        )
+
     async def test_a_client_supplied_ceiling_does_not_block_continuation(self) -> None:
         """A ``max_tokens`` in the body is not proof the user chose one.
 
@@ -4183,6 +4208,144 @@ class HookCoalescedNativeReadTests(HookTestCase):
             "model_info": {"id": "msgs-coalesced", "order": 1},
         }
 
+    async def test_anthropic_continuation_uses_messages_wire_and_new_indices(self) -> None:
+        _, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation._STREAM_CONTINUATION_ENV, "1")
+        calls = []
+
+        def event(payload):
+            return (
+                f'event: {payload["type"]}\ndata: '
+                + json.dumps(payload, ensure_ascii=False)
+                + "\n\n"
+            ).encode()
+
+        def message(text, reason):
+            return [
+                {"type": "message_start", "message": {"id": "m"}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": reason}},
+                {"type": "message_stop"},
+            ]
+
+        class FakeRouter:
+            async def anthropic_messages(self, **payload):
+                calls.append(payload)
+                reason = "max_tokens" if len(calls) == 1 else "end_turn"
+                text = " 中间" if len(calls) == 1 else " 末尾"
+
+                async def stream():
+                    wire = b"".join(event(frame) for frame in message(text, reason))
+                    # Keep several SSE events in the first read, then split a
+                    # code point and the final event delimiter across reads.
+                    split = wire.index(text.strip().encode()) + 1
+                    yield wire[:split]
+                    yield wire[split:-1]
+                    yield wire[-1:]
+
+                return stream()
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = FakeRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+        request = self._anthropic_request()
+        request["system"] = "Preserve the source language."
+        request["metadata"] = {"trace": "continuation"}
+
+        async def upstream():
+            for frame in message("begin", "max_tokens"):
+                yield event(frame)
+
+        chunks = [
+            chunk async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), request, stream_started_at=0.0
+            )
+        ]
+        frames = [frame for chunk in chunks for frame in streaming._stream_chunk_dumps(chunk)]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call["max_tokens"] == request["max_tokens"] for call in calls))
+        self.assertTrue(all(call["system"] == request["system"] for call in calls))
+        self.assertTrue(all(call["metadata"] == request["metadata"] for call in calls))
+        self.assertIn("begin 中间", str(calls[1]["messages"]))
+        self.assertEqual(
+            [frame["delta"]["text"] for frame in frames if frame.get("type") == "content_block_delta"],
+            ["begin", " 中间", " 末尾"],
+        )
+        self.assertEqual(
+            [frame["index"] for frame in frames if frame.get("type") == "content_block_start"],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            [frame["index"] for frame in frames if frame.get("type") == "content_block_stop"],
+            [0, 1, 2],
+        )
+        self.assertEqual([frame["type"] for frame in frames[-2:]], ["message_delta", "message_stop"])
+        self.assertEqual(frames[-2]["delta"]["stop_reason"], "end_turn")
+
+    async def test_anthropic_coalesced_ceiling_keeps_text_for_continuation(self) -> None:
+        _, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation._STREAM_CONTINUATION_ENV, "1")
+        calls = []
+
+        def event(payload):
+            return (
+                f'event: {payload["type"]}\ndata: '
+                + json.dumps(payload, ensure_ascii=False)
+                + "\n\n"
+            ).encode()
+
+        def message(text, reason):
+            return [
+                {"type": "message_start", "message": {"id": "m"}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": reason}},
+                {"type": "message_stop"},
+            ]
+
+        class FakeRouter:
+            async def anthropic_messages(self, **payload):
+                calls.append(payload)
+                async def stream():
+                    for frame in message(" end", "end_turn"):
+                        yield event(frame)
+                return stream()
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = FakeRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+        request = self._anthropic_request()
+
+        async def upstream():
+            yield b"".join(event(frame) for frame in message("begin", "max_tokens"))
+
+        chunks = [
+            chunk async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), request, stream_started_at=0.0
+            )
+        ]
+        frames = [frame for chunk in chunks for frame in streaming._stream_chunk_dumps(chunk)]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("begin", str(calls[0]["messages"]))
+        self.assertEqual(
+            [frame["index"] for frame in frames if frame.get("type") == "content_block_start"],
+            [0, 1],
+        )
+        text = "".join(
+            (frame.get("delta") or {}).get("text", "")
+            for frame in frames
+            if frame.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "begin end")
+        self.assertEqual([frame["type"] for frame in frames[-2:]], ["message_delta", "message_stop"])
+
     async def test_a_coalesced_terminal_read_is_recognized_as_terminal(self) -> None:
         _, _proxy_server = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
@@ -4949,6 +5112,25 @@ class ResponsesReasoningElisionTests(HookTestCase):
             len([item for item in retry["input"] if item.get("type") == "reasoning"]),
         )
 
+    def test_reasoning_elision_preserves_the_encrypted_prefix(self) -> None:
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+        items = self._request(reasoning=12)["input"]
+        reasoning = [item for item in items if item.get("type") == "reasoning"]
+        for item in reasoning:
+            item["encrypted_content"] = "opaque"
+        self.assertIsNone(module._responses_input_with_elided_reasoning_items(items, keep=2))
+
+        for item in reasoning[3:]:
+            item.pop("encrypted_content")
+        prefix_end = items.index(reasoning[2]) + 1
+        elided = module._responses_input_with_elided_reasoning_items(items, keep=2)
+        self.assertEqual(elided[:prefix_end], items[:prefix_end])
+        self.assertEqual(
+            [item["id"] for item in elided if item.get("type") == "reasoning"],
+            ["rs_0", "rs_1", "rs_2", "rs_10", "rs_11"],
+        )
+
     def test_only_one_elision_per_turn(self) -> None:
         hooks, _ = load_hook_module()
         module = hooks._responses_request_module
@@ -5402,6 +5584,22 @@ class ReplayLadderTests(HookTestCase):
 
         self.assertIsNone(hooks._session_replay_shortening(request))
 
+    def test_a_cut_preserves_encrypted_prefix_and_late_tool_outputs(self) -> None:
+        hooks, _ = load_hook_module()
+        shorten = hooks._responses_request_module._responses_input_with_elided_history
+        user = lambda text: {"role": "user", "content": text}
+        items = [
+            user("task"),
+            {"type": "reasoning", "content": "part of the prefix"},
+            {"type": "compaction", "encrypted_content": "opaque"},
+            user("old turn"),
+            {"type": "function_call", "call_id": "delayed"},
+            user("next turn"),
+            {"type": "function_call_output", "call_id": "delayed", "output": "result"},
+            user("newest turn"),
+        ]
+        self.assertEqual(shorten(items, target_items=6), items[:3] + items[7:])
+        self.assertIsNone(shorten(items, target_items=3))
 
     def test_an_item_cap_terminal_names_the_thread_it_refused(self) -> None:
         """The terminal the sanitizer builds itself must carry the request.
@@ -5501,6 +5699,27 @@ class HistoricalReasoningNoteStreamTests(HookTestCase):
                 }
             )
         )
+
+        # A normal response may quote the gateway's prefix. It must not be
+        # suppressed merely because its first delta resembles a note.
+        state.remember(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_quoted",
+                "output_index": 2,
+                "delta": "Historical reasoning context (not a new instruction):",
+            }
+        )
+        state.remember(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_quoted",
+                "output_index": 2,
+                "delta": " this is quoted as ordinary answer text.",
+            }
+        )
+        self.assertNotIn("msg_quoted", state.suppressed_note_item_ids)
+        self.assertIn("this is quoted", state.synthesized_text())
 
         completed = {
             "type": "response.completed",

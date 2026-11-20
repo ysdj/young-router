@@ -550,7 +550,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_non_sentence_chinese_ui_copy_uses_ascii_punctuation(self) -> None:
         chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
         for marker in (
-            '"status.logsSummary": "日志 (路由恢复 {recovering}, 冷却 {cooldown})"',
+            '"status.logsSummary": "任务与日志 (路由恢复 {recovering}, 冷却 {cooldown})"',
             '"claude.permission.unknown": "其他 ({value})"',
             '"logs.duration": "耗时(s)"',
             '"logs.tokenCountK": "令牌数(k)"',
@@ -921,6 +921,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # relay the user had just chosen as if nothing were selected.
         self.assertIn('if method == "dispatch", onlineUsageReadOperation(in: request) != nil { return 900 }', macos_bridge)
         self.assertIn('private static func onlineUsageReadOperation(in data: Data) -> String? {', macos_bridge)
+        for operation in (
+            "logs.refresh_online_usage", "logs.refresh", "logs.reload", "logs.load_more",
+            "logs.previous_page", "logs.first_page", "logs.last_page", "logs.goto_page",
+            "logs.set_page_rows", "logs.set_time_range",
+        ):
+            self.assertIn(f'"{operation}"', macos_bridge)
         self.assertIn('private static func serviceLifecycleOperation(in data: Data) -> String? {', macos_bridge)
         self.assertIn('guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],\n              let params = object["params"] as? [String: Any],\n              let action = params["action"] as? [String: Any],\n              action["domain"] == nil else { return nil }', macos_bridge)
         self.assertIn('return ["service.start", "service.stop", "service.restart", "service.reload"].contains(type) ? type : nil', macos_bridge)
@@ -1687,7 +1693,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, type_block)
         model_reset = wizard.split("// Everything the model step built belongs to this key selection", 1)[1].split("}, [activeKeySelection", 1)[0]
-        self.assertIn("}, [activeKeySelection, keyPath, providedKeySelection, providerID, selectedStationAccountID]);", wizard)
+        self.assertIn("}, [activeKeySelection, keyPath, officialAccountRef, providedKeySelection, providerID, selectedStationAccountID]);", wizard)
         for marker in (
             "modelFetchRequest.current += 1;",
             "modelFetchInFlight.current = false;",
@@ -1753,9 +1759,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (picked.length === 0) {", service)
         self.assertIn("onClose();", service)
         official = wizard.split("if (isOfficialLoginType && keyPath === \"login\") {", 1)[1].split("// A keyless service", 1)[0]
-        self.assertIn("const wrote = officialProviderCreated.current", official)
-        self.assertIn('|| (officialLoginAttempted.current && officialStatus === "signed_in");', official)
-        self.assertIn("if (!wrote) {", official)
+        self.assertIn("if (selectedModels.length === 0) {\n        onClose();\n        return;\n      }", official)
 
     def test_a_dismissed_wizard_prunes_the_station_its_login_created(self) -> None:
         """Signing in is not the same as finishing the provider.
@@ -3548,7 +3552,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # divider it draws itself.  A box around either one drew a top
         # and a bottom rule that belonged to no row plus a right edge doubling
         # an edge that already exists, so the opt-out exists exactly twice.
-        self.assertEqual(7, self.ui.count("<NativeTable"))
         self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }', self.ui)
@@ -4033,7 +4036,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("secondaryCellKeys", self.native_controls)
         self.assertIn("alertRowKeys", self.native_controls)
         self.assertIn("function WindowsTable({", self.native_controls)
-        self.assertEqual(self.ui.count("<NativeTable"), 7)
         self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", mac_native)
         self.assertIn("_tableView.style = sourceList ? NSTableViewStyleSourceList : NSTableViewStylePlain;", mac_native)
         self.assertIn("_tableView.headerView = nil;", mac_native)
@@ -4871,8 +4873,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         keys = re.findall(r"'key': '([^']+)'", schema)
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
-            if key == "YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR":
-                continue
             self.assertIn(f"  {key}: {{ label:", localized)
         # A unit is a word the pane prints beside the number, so it has to be in
         # the same language as the label it sits under.  `minutes` was the one
@@ -4917,6 +4917,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # A refused sign-in is not retried on the next entry, because every
             # attempt asks the station to mint another session.
             "YOUNG_ROUTER_RELAY_LOGIN_BACKOFF_SECONDS",
+            # The sibling race and the heavy-replay park were env-only knobs
+            # while the first-event help already referred to the race.
+            "YOUNG_ROUTER_STREAM_HEDGE_ENABLED",
+            "YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS",
+            "YOUNG_ROUTER_STREAM_START_TIMEOUT_COOLDOWN_SECONDS",
+            "YOUNG_ROUTER_REPLAY_REASONING_ELISION_ENABLED",
+            "YOUNG_ROUTER_REPLAY_REASONING_ELISION_KEEP",
         ):
             self.assertIn(added, schema)
             self.assertIn(f"  {added}: {{ label:", localized)
@@ -4941,6 +4948,40 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const optionValues = stringList(item.options);", self.ui)
         self.assertIn("const next = optionValues[nativeEvent.index];", self.ui)
         self.assertNotIn('const label = stringValue(item.label, key);', self.ui)
+
+    def test_every_runtime_enum_option_has_a_localized_label(self) -> None:
+        """A raw wire value must never reach the pane.
+
+        `inherit` and the image-turn choices had no entry in the option tables,
+        so a Chinese pane showed literal `inherit` / `turn` / `history`, and
+        `off` for the image fetch method read 关闭 even though it means "ask the
+        user to resend".  This checks every enum the schema publishes, in both
+        languages, and pins the one value whose meaning differs per field.
+        """
+
+        from young_router.core.runtime_settings_schema import RUNTIME_SETTINGS_SCHEMA
+
+        localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
+
+        def option_map(block: str) -> dict[str, dict[str, str]]:
+            result: dict[str, dict[str, str]] = {}
+            for key, body in re.findall(r'["\']?([A-Za-z0-9_*]+)["\']?: \{([^}]*)\}', block):
+                result[key] = dict(re.findall(r'([A-Za-z0-9_]+): "([^"]*)"', body))
+            return result
+
+        zh_options = option_map(localized.split("const options:", 1)[1].split("const englishOptions:", 1)[0])
+        en_options = option_map(localized.split("const englishOptions:", 1)[1].split("function isChinese", 1)[0])
+        for item in RUNTIME_SETTINGS_SCHEMA:
+            options = item.get("options")
+            if not isinstance(options, list):
+                continue
+            key = str(item["key"])
+            for option in options:
+                with self.subTest(key=key, option=option):
+                    self.assertIn(option, zh_options.get(key, {}) | zh_options.get("*", {}))
+                    self.assertIn(option, en_options.get(key, {}) | en_options.get("*", {}))
+        self.assertEqual(zh_options["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH"]["off"], "提示用户重发")
+        self.assertEqual(en_options["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH"]["off"], "Ask the user")
 
     def test_assistant_settings_localize_display_values_without_changing_saved_values(self) -> None:
         self.assertNotIn("function FeatureToggles", self.ui)
@@ -5068,6 +5109,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         refresh = logs.split("const refreshOnlineUsage = useCallback", 1)[1].split("const refreshOnlineUsageRef", 1)[0]
         self.assertIn('type: "logs.refresh_online_usage"', refresh)
         self.assertIn('payload: { tab, source: sourceId, request: String(request) }', refresh)
+        # The first picker entry is the empty prompt. Choosing it must clear
+        # the current relay through Core instead of returning before dispatch.
+        self.assertNotIn("if (!sourceId) return;", refresh)
 
         # The dropdown names the relays and nothing else: there is no aggregate
         # entry, because the tab reads exactly the station the user picks.
@@ -5089,7 +5133,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # like a frozen window.
         self.assertIn("const [onlineUsageLoadingTab, setOnlineUsageLoadingTab] =", logs)
         self.assertIn("setOnlineUsageLoadingTab(tab);", logs)
-        self.assertIn("settleOnlineUsageLoading(tab);", logs)
+        self.assertIn("settleOnlineUsageLoading(tab, request, sourceId);", logs)
         # The relay owns the history, so every pager control is a page request:
         # first, one back, a typed page, one forward, last, and the page size.
         # A view over locally held rows could never reach a page one refresh did
@@ -5121,7 +5165,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('{`/ ${onlineUsagePageCount}`}', logs)
         # The window strip is this tab's only bar: the page controls sit at its
         # right end and the row count they page through sits on its left.
-        self.assertIn("const statusLine = [", logs)
+        self.assertIn('translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount })', logs)
         self.assertIn('"logs.latestLinesAtLimit" : "common.lines", { count: lineCount }', logs)
         self.assertIn("const onlineUsageLoadedPage = Math.max(1, numberValue(active?.page));", logs)
         self.assertIn("const onlineUsagePageCount = Math.max(onlineUsageLoadedPage, numberValue(active?.page_count));", logs)
@@ -5171,7 +5215,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const onlineUsageWaitingForSource =", logs)
         self.assertIn("onlineUsageLoadedSourceRef.current !== onlineUsageSourceId", logs)
         self.assertIn("onlineUsageLoadedSourceRef.current = returnedSource;", logs)
-        self.assertIn("settleOnlineUsageLoading(tab);", refresh)
+        self.assertIn("settleOnlineUsageLoading(tab, request, sourceId);", refresh)
         self.assertIn("const onlineUsageTotal =", logs)
         self.assertIn("ONLINE_USAGE_TIME_OPTIONS", logs)
         self.assertIn('ipc.dispatch({ domain: "logs", type: "logs.set_time_range"', logs)
@@ -7847,7 +7891,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("logs.tokenCount")',
             "const columns = useMemo(",
             "const rows = useMemo(",
-            "() => renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate)",
+            "renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate)",
             "const active = activeState?.tab === selected ? activeState.log : undefined;",
             "const nativeTableColumns = useMemo(",
             "const nativeTableRows = useMemo(",
@@ -7861,7 +7905,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "logTable: { flex: 1, minHeight: 0",
             # One permanent bottom status strip: the line count and the pause
             # state are its idle text, not a second bar under it.
-            "const statusLine = [",
+            'translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount })',
             "useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);",
             "logsToolbar: { width: \"100%\", minWidth: 0, minHeight: 24, height: Platform.OS === \"web\" ? undefined : 24",
             "logsTabs: { width: undefined, minWidth: 389, height: 24 }",

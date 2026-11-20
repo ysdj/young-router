@@ -57,10 +57,10 @@ HOP_BY_HOP = frozenset({
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
     "server", "date",
 })
-#: A Core answer is a settings document or a page asset.  The long poll is the
-#: one slow route: Core bounds it at ``EVENT_POLL_TIMEOUT_SECONDS``, so this
-#: only has to outlive that plus the connect/teardown around it.
+#: Page assets are bounded independently from IPC operations, some of which
+#: wait for a service start or restart to finish.
 FORWARD_TIMEOUT_SECONDS = 60.0
+IPC_FORWARD_TIMEOUT_SECONDS = 900.0
 #: What a host with no page answers for ``/ui``.  It states the one fact a
 #: reader needs -- there is no page here -- and nothing about this machine.
 NO_PAGE_BODY = b"This host serves no page.\n"
@@ -229,9 +229,10 @@ async def forward(scope: dict[str, Any], receive: Any, send: Any, endpoint: tupl
     body = b"".join(chunks)
     headers = list(scope.get("headers") or [])
     loop = asyncio.get_running_loop()
+    timeout = IPC_FORWARD_TIMEOUT_SECONDS if raw_path == "/ipc" or raw_path.startswith("/ipc/") else FORWARD_TIMEOUT_SECONDS
     try:
         answer = await loop.run_in_executor(
-            None, _exchange, endpoint, method, path, headers, body, FORWARD_TIMEOUT_SECONDS
+            None, _exchange, endpoint, method, path, headers, body, timeout
         )
     except (OSError, http.client.HTTPException):
         # Core is stopped, restarting, or too slow to answer.  The page has to

@@ -320,6 +320,17 @@ unsubscribeRuntime();
 publishSnapshot({ ...base, revision: 9, domains: { ...base.domains, providers_models: { ...base.domains.providers_models }, runtime: { domain: "runtime", revision: 10 } } });
 assert.deepEqual([providerNotifications, runtimeNotifications], [2, 2], "an unsubscribed listener was still called");
 
+// Revisions restart at zero with a new Core process.  The new instance must
+// replace the old projection even when its first snapshot has a lower number.
+const oldInstance = { ...snapshotAt(20, [provider]), core_instance_id: "core-old" };
+const newInstance = {
+  ...snapshotAt(1, [{ ...provider, id: "provider-new-instance", editor_id: "provider-new-instance" }]),
+  core_instance_id: "core-new",
+};
+publishSnapshot(oldInstance);
+publishSnapshot(newInstance);
+assert.equal(getDomain("providers_models").providers[0].id, "provider-new-instance", "a restarted Core snapshot was rejected as stale");
+
 // ---------------------------------------------------------------------------
 // One action, one read: a connected channel with a moved revision needs no
 // post-action snapshot.  Everything else keeps it.

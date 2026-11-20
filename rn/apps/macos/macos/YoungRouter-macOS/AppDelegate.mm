@@ -222,7 +222,7 @@
     }
     NSString *logTab = nil;
     if ([route isEqualToString:@"logs"]) {
-      NSSet<NSString *> *tabs = [NSSet setWithArray:@[@"requests", @"service", @"actions", @"route-trace", @"recovery", @"online-usage"]];
+      NSSet<NSString *> *tabs = [NSSet setWithArray:@[@"requests", @"service", @"actions", @"route-trace", @"recovery", @"online-usage", @"scheduled-tasks"]];
       NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
       NSArray<NSURLQueryItem *> *items = components.queryItems;
       NSURLQueryItem *item = items.count == 1 ? items.firstObject : nil;

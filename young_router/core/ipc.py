@@ -580,6 +580,13 @@ class _Subscription:
     # for nothing.
     topics: frozenset[str] | None = None
     queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=MAX_EVENTS))
+    # Job progress/results do not participate in the state revision chain.
+    # Keep them independent so a burst of patches cannot evict a probe's
+    # completion before the window has a chance to consume it.
+    job_queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue())
+    # A poll may be asleep on an empty state queue while a job is published.
+    # Wake it for either queue; the queues remain the source of truth.
+    wakeup: threading.Event = field(default_factory=threading.Event)
     #: Set when an event arrived that this queue could not hold.  The chain of
     #: patches is broken, so the next read of this subscription answers with a
     #: ``resync`` marker instead of the stale patches still queued.
@@ -2631,12 +2638,19 @@ class CoreIPCServer:
                 # The client named the topics it wants: it is not sent the
                 # events it did not ask for.
                 continue
+            if topic == "job":
+                # Job events are independent of the patch chain.  An
+                # overflowing state queue must never discard one.
+                subscription.job_queue.put_nowait(event)
+                subscription.wakeup.set()
+                continue
             if subscription.needs_resync:
                 # This subscription is owed a full read; a patch queued now
                 # would describe a state it is about to replace anyway.
                 continue
             try:
                 subscription.queue.put_nowait(event)
+                subscription.wakeup.set()
             except queue.Full:
                 # A patch cannot be dropped silently: the window would apply
                 # the next one on a revision it never reached, or keep a row
@@ -2695,13 +2709,12 @@ class CoreIPCServer:
     def remember_snapshot_result(self, result: Mapping[str, Any]) -> None:
         """Keep this state's encoded result, so its next poll is a copy."""
 
-        projected = result.get("snapshot")
-        projected_revision = projected.get("projected_revision") if isinstance(projected, Mapping) else None
-        self._snapshot_body = (
-            self.core.revision,
-            projected_revision if type(projected_revision) is int else self.core.projected_revision,
-            _encode_json(result),
-        )
+        snapshot = result.get("snapshot")
+        if isinstance(snapshot, Mapping) and type(snapshot.get("revision")) is int:
+            # A write can advance Core while this response is being encoded.
+            # Both cache keys must describe the body being stored.
+            head = snapshot["revision"]
+            self._snapshot_body = (head, snapshot.get("projected_revision", head), _encode_json(result))
 
     def next_event(self, subscription_id: str, *, session_token: str, timeout: float) -> dict[str, Any] | None:
         """One event for this subscription, ``None`` for a quiet one.
@@ -2716,22 +2729,37 @@ class CoreIPCServer:
             subscription = self._subscriptions.get(subscription_id)
             if subscription is None or subscription.session_token != session_token:
                 return SUBSCRIPTION_GONE  # type: ignore[return-value]
-        if subscription.needs_resync:
-            subscription.needs_resync = False
-            # Whatever this queue still holds predates the gap: a full read is
-            # about to replace it, and applying a patch from before the gap on
-            # the read that follows would leave the two disagreeing.
-            while True:
-                try:
-                    subscription.queue.get_nowait()
-                except queue.Empty:
-                    break
-            if subscription.topics is None or "resync" in subscription.topics:
-                return make_resync_event(self.core.revision)
-        try:
-            return subscription.queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            # Clear before inspecting both queues.  A publisher racing with
+            # this clear leaves its item queued for the inspection below; a
+            # publisher racing after the inspection sets the event that wakes
+            # the next iteration.
+            subscription.wakeup.clear()
+            try:
+                return subscription.job_queue.get_nowait()
+            except queue.Empty:
+                pass
+            if subscription.needs_resync:
+                subscription.needs_resync = False
+                # Whatever this queue still holds predates the gap: a full read
+                # is about to replace it, and applying a patch from before the
+                # gap on the read that follows would leave the two disagreeing.
+                while True:
+                    try:
+                        subscription.queue.get_nowait()
+                    except queue.Empty:
+                        break
+                if subscription.topics is None or "resync" in subscription.topics:
+                    return make_resync_event(self.core.revision)
+            try:
+                return subscription.queue.get_nowait()
+            except queue.Empty:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            subscription.wakeup.wait(remaining)
 
     def handle_request(
         self,

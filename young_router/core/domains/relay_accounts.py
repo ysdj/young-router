@@ -8,6 +8,7 @@ snapshots never expose those values.
 from __future__ import annotations
 
 import copy
+from contextlib import AbstractContextManager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.cookies import CookieError, SimpleCookie
@@ -30,6 +31,8 @@ from ...api_base import _NoRedirect, trust_context
 from ...browser_identity import browser_request_headers
 from ...public_names import imported_public_name
 from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
+from ..runtime_settings_schema import relay_balance_observation_epoch
+from ..scheduled_tasks import RELAY_NEGATIVE_BALANCE, RELAY_SIGNED_IN_BALANCE
 from ..security import safe_exception_message
 
 
@@ -654,7 +657,10 @@ def _balance(value: object) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RelayAccountsError("Relay account balance is invalid")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError:
+        raise RelayAccountsError("Relay account balance is invalid") from None
     if not math.isfinite(result):
         raise RelayAccountsError("Relay account balance is invalid")
     return result
@@ -714,6 +720,7 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "password": _text(raw.get("password", ""), "Relay password", limit=4096, required=False) if remember_password else "",
         "session": session,
         "balance": _balance(raw.get("balance")),
+        "balance_observed_at": _updated_at(raw.get("balance_observed_at")),
         "last_updated_at": _updated_at(raw.get("last_updated_at")),
         # When the login itself was last observed, which is what the pane's
         # re-check window measures.  It is deliberately not ``last_updated_at``:
@@ -807,6 +814,9 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
         "auto_grouping": account.get("auto_grouping") is True,
         "password_saved": bool(account.get("password")),
         "balance": _balance(account.get("balance")),
+        # A background or manual read can leave a displayed balance whose
+        # freshness has expired or been invalidated by a failed read.
+        "balance_observed_at": _updated_at(account.get("balance_observed_at")),
         "last_updated_at": str(account.get("last_updated_at", "")),
         # A login observation ages in the pane's own clock, so the re-check
         # window is applied before a station round trip is even considered.
@@ -959,6 +969,8 @@ def _pending_operation(raw: Mapping[str, Any]) -> dict[str, Any]:
     remote_resource_id = raw.get("remote_resource_id")
     if remote_resource_id:
         result["remote_resource_id"] = _resource_id(remote_resource_id)
+    if raw.get("automatic_grouping") is True:
+        result["automatic_grouping"] = True
     error = raw.get("error")
     if isinstance(error, str) and error.strip():
         result["error"] = _text(error, "Relay operation error", limit=240)
@@ -1516,7 +1528,7 @@ class RelayAccountsDomain:
         self._captured_passwords: dict[str, str] = {}
         # The last balance a station stated, per account, and the moment it stops
         # answering; see ``BALANCE_REUSE_SECONDS``.
-        self._balance_observations: dict[str, tuple[float, float]] = {}
+        self._balance_observations: dict[str, tuple[float, float, str]] = {}
         # The display unit the station reports, per origin; see
         # ``quota_unit``.
         self._quota_units: dict[str, tuple[float, float]] = {}
@@ -1851,6 +1863,7 @@ class RelayAccountsDomain:
         # header that host never issued.
         next_account["user_id"] = ""
         next_account["balance"] = None
+        next_account["balance_observed_at"] = ""
         next_account["last_updated_at"] = ""
         next_account["resource_status"] = "idle"
         next_account["resource_error"] = "none"
@@ -2223,6 +2236,7 @@ class RelayAccountsDomain:
         # credential. Reusing an account id from another file must never reuse
         # the previous file's browser session or API-key cache.
         self._session_secrets = {}
+        self._balance_observations.clear()
         self._resource_secret_cache = {}
         return migrated
 
@@ -2685,6 +2699,7 @@ class RelayAccountsDomain:
         station_id = str(account.get("station_id", ""))
         self._accounts.pop(index)
         self._session_secrets.pop(account["id"], None)
+        self._balance_observations.pop(account["id"], None)
         self._clear_resource_cache(account["id"])
         # The station that loses its last account goes with it, and both ids are
         # remembered: an older bundle from another machine still lists them.
@@ -4238,7 +4253,7 @@ class RelayAccountsDomain:
         # read does: a fork that requires its account id would otherwise reject
         # this probe and report a healthy session as signed out.
         headers = self._session_headers(secrets, user_id=account.get("user_id"), station_type=account.get("type"))
-        path = "/api/user/self" if account["type"] == "newapi" else "/api/v1/auth/me"
+        path = self._session_profile_path(account["type"])
         try:
             payload = self._http.json(account["origin"], path, headers=headers)
         except RelayTransportError:
@@ -4277,10 +4292,9 @@ class RelayAccountsDomain:
         try:
             balance = self._balance_from_profile(account, profile)
         except RelayAccountsError:
-            pass
+            self._invalidate_balance_observation(account)
         else:
-            account["balance"] = balance
-            self._remember_balance(account_id, balance)
+            self._record_balance(account, (balance, account["login_observed_at"]))
         self._accounts[index] = _private_account(account)
         self._persist()
         self.revision += 1
@@ -4794,6 +4808,90 @@ class RelayAccountsDomain:
         if self._session_headers(self._session_secrets.get(account_id, {})):
             return True
         return bool(self._session_headers(account.get("session")))
+
+    def maintenance_account_ids(self, *, grouping: bool) -> list[str]:
+        return [
+            account["id"] for account in self._accounts
+            if self._has_session_credentials(account)
+            and (not grouping or (account["auto_grouping"] and account["login_status"] == "signed_in"))
+        ]
+
+    def mark_group_poll_operations(self) -> None:
+        """Mark the batch just staged by a timer on an otherwise clean draft."""
+
+        for operation in self._pending_operations:
+            operation["automatic_grouping"] = True
+
+    def group_poll_retry_account(self) -> str | None:
+        if not self._pending_operations:
+            return None
+        account_id = self._pending_operations[0]["account_id"]
+        if all(
+            row.get("automatic_grouping") is True and row["account_id"] == account_id
+            for row in self._pending_operations
+        ) and account_id in self.maintenance_account_ids(grouping=True):
+            return account_id
+        return None
+
+    @staticmethod
+    def _session_profile_path(kind: str) -> str:
+        return "/api/user/self" if kind == "newapi" else "/api/v1/auth/me"
+
+    def poll_session(
+        self, account_id: str, *, io_gate: Callable[[], AbstractContextManager[None]],
+        cancelled: Callable[[], bool],
+    ) -> tuple[str, bool]:
+        """Check the session Core already holds without attempting a sign-in."""
+
+        account = next((row for row in self._accounts if row["id"] == account_id), None)
+        if account is None or not self._has_session_credentials(account):
+            return "skipped", False
+        if self.recent_login_check_answer(account_id) is not None:
+            return "skipped", False
+        origin, kind = account["origin"], account["type"]
+        observed_at = account["login_observed_at"]
+        baseline = self._baseline_bytes
+        headers = self._headers(account)
+        try:
+            with io_gate():
+                payload = self._http.json(origin, self._session_profile_path(kind), headers=headers)
+        except RelayAccountsError as error:
+            if "expired" not in str(error).lower():
+                return "failed", False
+            status = "expired"
+        else:
+            profile = _json_data(payload)
+            if not isinstance(profile, Mapping) or not profile or (
+                isinstance(payload, Mapping) and payload.get("success") is False
+            ):
+                return "failed", False
+            status = "signed_in"
+
+        current = next((row for row in self._accounts if row["id"] == account_id), None)
+        if cancelled() or current is not account or (
+            current["origin"] != origin or current["type"] != kind
+            or current["login_observed_at"] != observed_at
+            or not self._has_session_credentials(current) or self._headers(current) != headers
+            or self._baseline_bytes != baseline or self._read_storage_bytes() != baseline
+        ):
+            return "skipped", False
+        observed_at = _utc_now_iso()
+        # Persist only the observation on the saved identity. A background
+        # check can finish while this account has other edits in a draft.
+        document = json.loads(baseline) if baseline else {}
+        saved = next((row for row in document.get("accounts", ()) if row["id"] == account_id), None)
+        if saved is None or any(saved.get(key) != current[key] for key in ("origin", "type", "username")):
+            return "skipped", False
+        saved.update(login_status=status, login_observed_at=observed_at)
+        if status == "expired":
+            saved["balance_observed_at"] = ""
+        self._store.write(document)
+        self._baseline_bytes = self._read_storage_bytes()
+        current.update(login_status=status, login_observed_at=observed_at)
+        if status == "expired":
+            self._invalidate_balance_observation(current)
+        self.revision += 1
+        return "succeeded", True
 
     def _headers(self, account: Mapping[str, Any]) -> dict[str, str]:
         """Resolve dashboard headers for one station read or write.
@@ -5356,31 +5454,21 @@ class RelayAccountsDomain:
                     group["multiplier"] = user_multiplier
         return groups
 
-    def _account_balance(self, account: Mapping[str, Any], *, force: bool = False) -> float:
-        """Read the station's own account summary.
+    def _read_account_balance(
+        self, account: Mapping[str, Any], headers: Mapping[str, str]
+    ) -> tuple[float, str]:
+        """Read the optional profile and return its balance with one timestamp."""
 
-        Both paths are documentary (``OPTIONAL_READ_PATHS``): the balance is an
-        independent summary, so neither read retries and neither can hold the
-        refresh it rides along with.
-
-        A balance the station stated a moment ago is not a question: the entry's
-        session probe and the refresh behind it read the same profile, so the
-        observation answers here and the second read is not sent
-        (``BALANCE_REUSE_SECONDS``).  ``force`` is the person's own 刷新, which
-        is a question: the entry answers with the number the station holds now.
-        """
-
-        account_id = str(account.get("id", ""))
-        if not force:
-            observed = self._recent_balance(account_id)
-            if observed is not None:
-                return observed
-        headers = self._headers(account)
         path = "/api/v1/user/profile" if account["type"] == "sub2api" else "/api/user/self"
-        profile = _json_data(self._http.json(account["origin"], path, headers=headers))
-        balance = self._balance_from_profile(account, profile)
-        self._remember_balance(account_id, balance)
-        return balance
+        payload = self._http.json(account["origin"], path, headers=headers)
+        if isinstance(payload, Mapping) and (
+            payload.get("success") is False
+            or (account["type"] == "sub2api" and payload.get("code", 0) not in (0, "0"))
+        ):
+            raise RelayAccountsError("Relay account balance is unavailable")
+        profile = _json_data(payload)
+        observed_at = _utc_now_iso()
+        return self._balance_from_profile(account, profile), observed_at
 
     def _balance_from_profile(self, account: Mapping[str, Any], profile: object) -> float:
         """The money one profile answer states, or this app's own refusal.
@@ -5408,7 +5496,10 @@ class RelayAccountsDomain:
         unit = self.quota_unit(str(account["origin"]))
         if unit is None:
             raise RelayAccountsError("Relay account balance is unavailable")
-        return amount / unit
+        money = amount / unit
+        if not math.isfinite(money):
+            raise RelayAccountsError("Relay account balance is unavailable")
+        return money
 
     def quota_unit(self, origin: str) -> float | None:
         """The station's display unit, read once per origin per process.
@@ -5440,21 +5531,29 @@ class RelayAccountsDomain:
         self._quota_units[origin] = (now + QUOTA_UNIT_REUSE_SECONDS, unit)
         return unit
 
-    def _recent_balance(self, account_id: str) -> float | None:
-        """The balance this account's own last answer still covers, if any."""
+    def _recent_balance(self, account: Mapping[str, Any]) -> tuple[float, str] | None:
+        """The balance and original observation this account still covers."""
 
+        account_id = str(account["id"])
         observed = self._balance_observations.get(account_id)
         if observed is None:
             return None
-        if observed[0] <= time.monotonic():
+        if observed[0] <= time.monotonic() or observed[1:] != (
+            account["balance"], account["balance_observed_at"],
+        ):
             self._balance_observations.pop(account_id, None)
             return None
-        return observed[1]
+        return observed[1], observed[2]
 
-    def _remember_balance(self, account_id: str, balance: float) -> None:
-        """Record one balance a station just stated for later in the same entry."""
+    def _record_balance(self, account: dict[str, Any], reading: tuple[float, str]) -> None:
+        account["balance"], account["balance_observed_at"] = reading
+        self._balance_observations[account["id"]] = (time.monotonic() + BALANCE_REUSE_SECONDS, *reading)
 
-        self._balance_observations[account_id] = (time.monotonic() + BALANCE_REUSE_SECONDS, balance)
+    def _invalidate_balance_observation(self, account: dict[str, Any]) -> None:
+        # Keep the displayed value and the negative-account retry cadence.
+        # Without the stamp the proxy will permit a route again.
+        account["balance_observed_at"] = ""
+        self._balance_observations.pop(account["id"], None)
 
     # After one refused sign-in, this app waits before asking the station
     # again.  A refusal is the station's answer about *this* moment, and asking
@@ -5637,6 +5736,7 @@ class RelayAccountsDomain:
         keys_only: bool = False,
         force: bool = False,
         only_resources: Iterable[str] | None = None,
+        for_grouping: bool = False,
     ) -> dict[str, Any]:
         """Load selectable metadata after native login without staging providers.
 
@@ -5678,8 +5778,9 @@ class RelayAccountsDomain:
             keys_only=keys_only,
             force=force,
             only_resources=only_resources,
+            for_grouping=for_grouping,
         )
-        if result.get("resource_error") != "login_expired":
+        if for_grouping or result.get("resource_error") != "login_expired":
             return result
         try:
             renewed = self._renew_remembered_session(account_id)
@@ -5715,6 +5816,7 @@ class RelayAccountsDomain:
         keys_only: bool = False,
         force: bool = False,
         only_resources: Iterable[str] | None = None,
+        for_grouping: bool = False,
     ) -> dict[str, Any]:
         """Read the station's key list and group catalog in one round.
 
@@ -5735,7 +5837,6 @@ class RelayAccountsDomain:
         catalog_scope = frozenset(only_resources) if only_resources is not None else None
         previous_resources = copy.deepcopy(account.get("resources", []))
         previous_groups = copy.deepcopy(account.get("groups", []))
-        previous_balance = account.get("balance")
         carried_models = {
             str(resource.get("id", "")): list(resource.get("models") or [])
             for resource in previous_resources
@@ -5769,7 +5870,11 @@ class RelayAccountsDomain:
                     raise RelayAccountsError("Relay has no API keys")
             else:
                 with ThreadPoolExecutor(max_workers=3) as executor:
-                    balance_future = executor.submit(self._account_balance, account, force=force)
+                    cached = None if force or for_grouping else self._recent_balance(account)
+                    balance_future = (
+                        executor.submit(lambda: self._read_account_balance(account, self._headers(account)))
+                        if cached is None and not for_grouping else None
+                    )
                     groups_future = executor.submit(
                         self._newapi_groups if account["type"] == "newapi" else self._sub2api_groups,
                         account,
@@ -5782,14 +5887,15 @@ class RelayAccountsDomain:
                         )
                     )
                     try:
-                        account["balance"] = balance_future.result()
+                        if balance_future is not None:
+                            self._record_balance(account, balance_future.result())
                     except Exception:
                         # Balance is an independent account summary. A station
                         # that omits its profile endpoint must not hide usable
                         # API keys, and a documentary read the station drops
                         # leaves the last known balance in place instead of
                         # blanking it for every other round trip.
-                        account["balance"] = previous_balance
+                        self._invalidate_balance_observation(account)
                     else:
                         # An authenticated dashboard read that *answered* is this
                         # account's login observation: the station accepted the
@@ -5798,16 +5904,23 @@ class RelayAccountsDomain:
                         # to classify.  Stamping it here is what lets one read
                         # settle both questions, so the entry stops paying a
                         # probe first and a balance afterwards.
-                        account["login_status"] = "signed_in"
-                        account["login_observed_at"] = _utc_now_iso()
+                        if not for_grouping:
+                            account["login_status"] = "signed_in"
+                            account["login_observed_at"] = account["balance_observed_at"]
                     try:
                         groups = groups_future.result()
                     except RelayAccountsError:
+                        if for_grouping:
+                            # Alignment consumes this round's group catalog.
+                            # Reusing an old list could retire newly moved keys.
+                            raise
                         # Group selection is an enhancement to a usable key list.
                         # Keep the last verified choices when an older relay omits
                         # this optional dashboard endpoint.
                         groups = previous_groups
                     private_resources = resources_future.result()
+                if for_grouping and self.external_disk_state()["changed"]:
+                    return {"resource_status": "skipped"}
                 resources = _safe_resources(private_resources)
                 if not resources:
                     raise RelayAccountsError("Relay has no API keys")
@@ -5815,6 +5928,8 @@ class RelayAccountsDomain:
                 if enabled_resources and not any(resource["models"] for resource in enabled_resources):
                     raise RelayAccountsError("Relay API keys have no available models")
         except RelayAccountsError as exc:
+            if for_grouping and self.external_disk_state()["changed"]:
+                return {"resource_status": "skipped"}
             message = str(exc).lower()
             if "expired" in message:
                 # The station answered and refused this session -- but the
@@ -5832,6 +5947,7 @@ class RelayAccountsDomain:
                 # like every other determined one.  A read that failed for
                 # another reason never reaches here and stamps nothing.
                 account["login_observed_at"] = _utc_now_iso()
+                self._invalidate_balance_observation(account)
                 resource_error = "login_expired"
             elif "no api keys" in message:
                 resource_error = "no_api_keys"
@@ -5918,6 +6034,114 @@ class RelayAccountsDomain:
             self._persist()
             self.revision += 1
         return _public_account(self._accounts[index])
+
+    def balance_refresh_schedule(
+        self, negative_seconds: float, signed_in_seconds: float
+    ) -> dict[str, tuple[float, dict[str, float | None]]]:
+        negative: dict[str, float | None] = {}
+        signed_in: dict[str, float | None] = {}
+        for account in self._accounts:
+            account_id = account["id"]
+            stamp = relay_balance_observation_epoch(account["balance_observed_at"])
+            balance = account["balance"]
+            if balance is not None and balance < 0 and negative_seconds > 0:
+                negative[account_id] = stamp
+            elif account["login_status"] == "signed_in" and signed_in_seconds > 0:
+                signed_in[account_id] = stamp
+        return {
+            RELAY_NEGATIVE_BALANCE: (negative_seconds, negative),
+            RELAY_SIGNED_IN_BALANCE: (signed_in_seconds, signed_in),
+        }
+
+    def refresh_balances(
+        self,
+        account_ids: Iterable[str],
+        *,
+        io_gate: Callable[[], AbstractContextManager[None]] = nullcontext,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> tuple[dict[str, str], bool]:
+        """Read profiles outside the write lane, then publish valid answers."""
+
+        selected = set(account_ids)
+        targets: list[tuple[dict[str, Any], str, str, dict[str, str], tuple[float | None, str, str]]] = []
+        for account in self._accounts:
+            if account["id"] not in selected:
+                continue
+            try:
+                headers = self._headers(account)
+            except RelayAccountsError:
+                headers = {}
+            previous = account["balance"], account["balance_observed_at"], account["login_status"]
+            targets.append((account, account["origin"], account["type"], headers, previous))
+        if not targets or cancelled():
+            return {}, False
+
+        def read(target: tuple[dict[str, Any], str, str, dict[str, str], tuple[float | None, str, str]]) -> tuple[float, str] | None:
+            _, origin, account_type, headers, _ = target
+            if not headers or cancelled():
+                return None
+            try:
+                return self._read_account_balance({"origin": origin, "type": account_type}, headers)
+            except RelayAccountsError:
+                return None
+
+        with io_gate(), ThreadPoolExecutor(max_workers=min(len(targets), RESOURCE_REFRESH_MAX_WORKERS)) as executor:
+            readings = list(executor.map(read, targets))
+        if cancelled():
+            return {}, False
+
+        current = {account["id"]: account for account in self._accounts}
+        # A deleted or replaced row cannot consume a reading made with its
+        # predecessor's session, even when the result was a failed read.
+        updates = [
+            (account, reading)
+            for (account, _, _, _, previous), reading in zip(targets, readings, strict=True)
+            if current.get(account["id"]) is account
+            and previous == (account["balance"], account["balance_observed_at"], account["login_status"])
+        ]
+        if not updates or self._read_storage_bytes() != self._baseline_bytes:
+            return {}, False
+        self._write_balance_observations(updates)
+        changed = False
+        outcomes = {}
+        for account, reading in updates:
+            before = account["balance"], account["balance_observed_at"]
+            if reading is None:
+                outcomes[account["id"]] = "failed"
+                self._invalidate_balance_observation(account)
+            else:
+                outcomes[account["id"]] = "succeeded"
+                self._record_balance(account, reading)
+            changed |= before != (account["balance"], account["balance_observed_at"])
+        if changed:
+            self.revision += 1
+        return outcomes, changed
+
+    def _write_balance_observations(
+        self, updates: Sequence[tuple[dict[str, Any], tuple[float, str] | None]]
+    ) -> None:
+        """Write only balance fields on existing durable account identities."""
+
+        if self._baseline_bytes is None:
+            return
+        payload = json.loads(self._baseline_bytes)
+        rows = {row["id"]: row for row in payload["accounts"]}
+        changed = False
+        for account, reading in updates:
+            row = rows.get(account["id"])
+            if row is None or any(row.get(key) != account[key] for key in ("origin", "type", "username")):
+                continue
+            if reading is None:
+                reading = row.get("balance"), ""
+            if reading != (row.get("balance"), row.get("balance_observed_at", "")):
+                row["balance"], row["balance_observed_at"] = reading
+                changed = True
+        if changed:
+            try:
+                self._store.write(payload)
+                self._baseline_bytes = self._read_storage_bytes()
+            except PersistenceError as exc:
+                raise RelayAccountsError(safe_exception_message(exc)) from None
 
     @staticmethod
     def _api_key_name(value: object, *, fallback: str = "") -> str:

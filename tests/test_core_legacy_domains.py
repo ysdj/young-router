@@ -3115,19 +3115,21 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 self.assertNotIn("young_router_image_context", untouched)
                 self.assertIn("[mcp_servers.other]", untouched)
 
-                # An operator who asks for the server explicitly gets it.
-                with mock.patch.dict(
-                    "os.environ",
-                    {"YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH": "stdio"},
-                ):
-                    self.assertTrue(codex.sync_image_context_mcp())
-                    self.assertTrue(codex.snapshot()["image_context_mcp"])
-                    written = (home / "config.toml").read_text(encoding="utf-8")
-                    self.assertIn("[mcp_servers.young_router_image_context]", written)
-                    self.assertIn("[mcp_servers.other]", written)
+                # The saved choice is authoritative even while the Core's
+                # process still carries the environment from before Apply.
+                settings.write_text(
+                    "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED=1\n"
+                    "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH=stdio\n", encoding="utf-8"
+                )
+                self.assertTrue(codex.sync_image_context_mcp())
+                self.assertTrue(codex.snapshot()["image_context_mcp"])
+                written = (home / "config.toml").read_text(encoding="utf-8")
+                self.assertIn("[mcp_servers.young_router_image_context]", written)
+                self.assertIn("[mcp_servers.other]", written)
 
                 # Going back to the file-based fetch removes it again, and
                 # leaves the user's own server where it was.
+                settings.write_text("YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED=1\n", encoding="utf-8")
                 self.assertTrue(codex.sync_image_context_mcp())
                 self.assertFalse(codex.snapshot()["image_context_mcp"])
                 after = (home / "config.toml").read_text(encoding="utf-8")

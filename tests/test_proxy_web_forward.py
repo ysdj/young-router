@@ -19,6 +19,7 @@ import http.server
 import json
 import threading
 import unittest
+from unittest import mock
 
 from young_router.proxy import web_forward
 
@@ -315,6 +316,14 @@ class ForwardingTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual(payload.decode(), json.loads(body)["body"])
+
+    def test_ipc_forwarding_allows_long_service_operations(self) -> None:
+        response = web_forward._Forwarded(200, [], b"ok")
+        with mock.patch.object(web_forward, "_exchange", return_value=response) as exchange:
+            _call(self.middleware, "POST", "/ipc", b"{}")
+            self.assertEqual(web_forward.IPC_FORWARD_TIMEOUT_SECONDS, exchange.call_args.args[-1])
+            _call(self.middleware, "GET", "/ui/bundle.js")
+            self.assertEqual(web_forward.FORWARD_TIMEOUT_SECONDS, exchange.call_args.args[-1])
 
     def test_a_stopped_core_is_stated_rather_than_shown_as_an_empty_page(self) -> None:
         # Port 1 on loopback: nothing listens, which is what a Core that is

@@ -8,10 +8,52 @@ from young_router import runtime_store
 
 
 class HookStreamingTimeoutTests(HookTestCase):
+    async def test_inner_watchdog_timeout_is_not_recorded_as_an_outer_expiry(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "5")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "5")
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0")
+        request = {"model": "default-chat", "litellm_call_id": "nested-watchdog"}
+        inner_exception = None
+
+        async def upstream():
+            nonlocal inner_exception
+            inner_exception = hooks._stream_idle_timeout_exception(
+                request, idle_seconds=0.01, saw_chunk=True
+            )
+            raise inner_exception
+            yield  # Keep the source an async iterator whose next read fails.
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            for chunk_count in (0, 1):
+                with self.subTest(chunk_count=chunk_count):
+                    with self.assertRaises(TimeoutError) as raised:
+                        async for _chunk in hooks._stream_with_idle_timeout(
+                            upstream(), request, initial_chunk_count=chunk_count
+                        ):
+                            pass
+                    self.assertIs(raised.exception, inner_exception)
+
+            records = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=10_000)
+                if line.strip()
+            ]
+            stuck = [record for record in records if record.get("status") == "stuck"]
+            self.assertEqual(len(stuck), 2)
+            self.assertTrue(all(
+                record["stuck"]["stream_idle_timeout_seconds"] == 0.01
+                for record in stuck
+            ))
+
     async def test_dispatch_expiry_retains_route_after_inner_context_is_reset(self) -> None:
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.01")
-        self.addCleanup(self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None)
+        # The dispatch budget is the request's first-event budget, so a short
+        # first-event timeout is what makes this attempt expire.
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
+        self.addCleanup(self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None)
         request = {"model": "default-chat", "messages": [], "stream": True}
 
         async def dispatch():
@@ -2119,18 +2161,19 @@ class HookStreamingTimeoutTests(HookTestCase):
         self.assertIsNone(hooks._request_replay_payload_bytes({"model": "default-chat"}))
 
     async def test_the_dispatch_budget_ends_an_attempt_no_stream_budget_covers(self) -> None:
-        """The phase before the response object now has a budget of its own.
+        """The phase before the response object is timed by the same silence clock.
 
         Measured on the live gateway 2026-11-15: a route whose host stopped
         answering held a turn for 271 s, because the first-event and stream-idle
         clocks both start on the first frame of a response that host never sent.
-        What ran out was the kernel's SYN ladder and LiteLLM's own retry.
+        The dispatch budget covers that phase with the request's first-event
+        budget -- the same 120 s of silence a route gets after its head.
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.2")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.2")
         self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+            self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None
         )
         request = {"model": "default-chat", "input": "hi", "stream": True}
 
@@ -2175,10 +2218,8 @@ class HookStreamingTimeoutTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "5")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
-        )
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "5")
+        self.addCleanup(self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None)
         request = {"model": "default-chat", "input": "hi", "stream": True}
 
         async def upstream_refused():
@@ -2203,10 +2244,6 @@ class HookStreamingTimeoutTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "5")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
-        )
         request = {"model": "default-chat", "input": "hi", "stream": True}
         box: dict = {}
 
@@ -2222,59 +2259,108 @@ class HookStreamingTimeoutTests(HookTestCase):
             hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.get(),
         )
 
-    def test_the_dispatch_budget_widens_for_the_bytes_a_request_carries(self) -> None:
-        """A heavy replay has to be read before a header can come back.
+    def test_the_dispatch_budget_is_the_first_event_budget(self) -> None:
+        """Both clocks end at the response head, so they are one clock.
 
-        The clock this budget covers ends at the response head, and no upstream
-        writes one before it has prefilled the prompt.  The allowance is
-        therefore measured in prefill throughput, which is far slower than the
-        link: a one-megabyte-per-second floor cut a 2.7 MB replay at 12.6 s
-        when the live relay needed 26 s, and every attempt on every deployment
-        failed for the same reason.
+        The old budget was the connect allowance plus 1/16 KB of upload.  A
+        relay that buffers its answer behind a queue writes no head for
+        however long the queue takes, so that allowance cut a healthy
+        gemini-3.8-flash route at 11.52 s on 2026-11-20 while its first byte
+        was 13.69 s away.  A streaming dispatch now waits the request's own
+        first-event budget: 120 s ordinary, 300 s for a heavy Responses
+        replay.
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+
+        small = {"input": "hi"}
+        heavy = {"input": [{"role": "user", "content": "x" * 3_000_000}]}
+        chat = {"messages": [{"role": "user", "content": "hi"}]}
+
+        self.assertAlmostEqual(
+            120.0, hooks._upstream_dispatch_budget_seconds(small), places=2
+        )
+        self.assertAlmostEqual(
+            hooks._stream_start_timeout_seconds_for_request(small),
+            hooks._upstream_dispatch_budget_seconds(small),
+            places=2,
+        )
+        # A 3 MB Responses replay earns the 300 s heavy first-event budget, so
+        # its head wait is that budget and not the 192 s upload allowance.
+        self.assertGreater(hooks._upstream_dispatch_budget_seconds(heavy), 150.0)
+        self.assertLessEqual(
+            hooks._upstream_dispatch_budget_seconds(heavy),
+            hooks._stream_start_timeout_seconds_for_request(heavy),
+        )
+        # A Chat body is a streaming dispatch like any other; it used to be
+        # computed from ``input`` alone and paid the bare connect budget.
+        self.assertAlmostEqual(
+            hooks._stream_start_timeout_seconds_for_request(chat),
+            hooks._upstream_dispatch_budget_seconds(chat),
+            places=2,
         )
 
-        small = hooks._upstream_dispatch_budget_seconds({"input": "hi"})
-        heavy = hooks._upstream_dispatch_budget_seconds(
-            {"input": [{"role": "user", "content": "x" * 3_000_000}]}
-        )
+    def test_the_dispatch_budget_is_unbounded_when_every_start_budget_is_off(
+        self,
+    ) -> None:
+        """With no start budget there is no dispatch deadline either.
 
-        self.assertAlmostEqual(10.0, small, places=2)
-        # 3 MB at the 16 KB/s floor is 192 s, and the first-event budget for a
-        # heavy Responses replay is the wider one, so the floor is what binds.
-        self.assertGreater(heavy, 150.0)
-        self.assertLessEqual(heavy, hooks._stream_start_timeout_seconds_for_request(
-            {"input": [{"role": "user", "content": "x" * 3_000_000}]}
-        ))
+        Both zeros are an explicit request to leave the bound to the transport;
+        the removed connect setting must not come back as a hidden 10 s cap.
+        """
 
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0")
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0")
+        self.addCleanup(self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None)
+        self.addCleanup(self.set_env, hooks._REQUEST_TIMEOUT_SECONDS_ENV, None)
+
         self.assertEqual(
             0.0, hooks._upstream_dispatch_budget_seconds({"input": "hi"})
         )
 
-    def test_the_dispatch_budget_never_outlasts_the_first_event_budget(self) -> None:
-        """Both clocks end at the same event, so the shorter one is the answer.
+    def test_the_head_hedge_waits_the_connect_and_upload_allowance(self) -> None:
+        """The old connect budget becomes a race trigger, not a deadline.
 
-        Widening the dispatch budget for prefill must not turn into a licence to
-        wait longer for a response head than this proxy already waits for the
-        first frame of a response it did receive.
+        A 25 KB chat body gets 10 s plus its upload allowance (about 11.5 s),
+        which is where the healthy gemini-3.8-flash route's 13.69 s head used
+        to be cut.  The trigger is a race: the primary keeps running.  A heavy
+        replay is capped by the frame hedge's 30 s, so it is not chased at 10 s.
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
+
+        small = {"input": "hi"}
+        chat = {"messages": [{"role": "user", "content": "x" * 25_000}]}
+        heavy = {"input": [{"role": "user", "content": "x" * 1_000_000}]}
+
+        self.assertAlmostEqual(
+            10.0, hooks._head_hedge_delay_seconds(small), places=2
+        )
+        self.assertGreater(hooks._head_hedge_delay_seconds(chat), 11.0)
+        self.assertLess(hooks._head_hedge_delay_seconds(chat), 12.0)
+        self.assertAlmostEqual(
+            20.0, hooks._head_hedge_delay_seconds(heavy), places=2
+        )
+
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0")
+        self.addCleanup(self.set_env, hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, None)
+        self.assertEqual(0.0, hooks._head_hedge_delay_seconds(small))
+
+    def test_the_dispatch_budget_never_outlasts_the_first_event_budget(self) -> None:
+        """The dispatch budget is exactly the first-event budget, not more.
+
+        A shorter deadline cuts a prefill the first-event budget exists to
+        allow, and a longer one waits for a head this proxy would already have
+        given up on after the head arrived.
+        """
+
+        hooks, _ = load_hook_module()
         self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "30")
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0")
         # Without this the heavy-replay widening would raise the first-event
         # budget to its own 300 s, and the cap being tested would not bind.
         self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "0")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
-        )
         self.addCleanup(self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None)
         self.addCleanup(self.set_env, hooks._REQUEST_TIMEOUT_SECONDS_ENV, None)
         self.addCleanup(
@@ -2293,61 +2379,13 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         The budget used to give that body 12.6 s and the thread failed on every
         deployment with ``stream_start_timeout`` while the upstream was in fact
-        reading the prompt.
+        reading the prompt.  It is now the request's own first-event budget.
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
-        )
 
         body = {"messages": [{"role": "user", "content": "x" * 2_760_000}]}
         self.assertGreater(hooks._upstream_dispatch_budget_seconds(body), 26.0)
-
-    def test_a_chat_body_earns_the_same_upload_allowance(self) -> None:
-        """A Claude-sized ``messages`` history is an upload like any other.
-
-        The dispatch budget is the connect budget plus an allowance for the
-        body, and it used to be computed from ``input`` alone -- so every
-        Chat-shaped request paid the bare budget no matter how much history it
-        carried.  The bridge sends Chat shapes, and so does a plain
-        ``/v1/chat/completions`` client of this gateway.
-        """
-
-        hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
-        )
-
-        small = hooks._upstream_dispatch_budget_seconds(
-            {"messages": [{"role": "user", "content": "hi"}]}
-        )
-        heavy = hooks._upstream_dispatch_budget_seconds(
-            {"messages": [{"role": "user", "content": "x" * 1_000_000}]}
-        )
-        responses_heavy = hooks._upstream_dispatch_budget_seconds(
-            {"input": "x" * 1_000_000}
-        )
-
-        self.assertAlmostEqual(10.0, small, places=2)
-        self.assertGreater(heavy, 60.0)
-        self.assertAlmostEqual(heavy, responses_heavy, places=1)
-
-        # A Chat body has no heavy-replay widening of its own: past the ordinary
-        # first-event budget the cap binds, and the two shapes part ways.  That
-        # is a statement about the first-event budget, not about the allowance.
-        chat_three_mb = hooks._upstream_dispatch_budget_seconds(
-            {"messages": [{"role": "user", "content": "x" * 3_000_000}]}
-        )
-        self.assertAlmostEqual(
-            hooks._stream_start_timeout_seconds_for_request(
-                {"messages": [{"role": "user", "content": "x" * 3_000_000}]}
-            ),
-            chat_three_mb,
-            places=2,
-        )
 
 
 class _HedgeStream:
@@ -2395,6 +2433,7 @@ class HookStreamingHedgeTests(HookTestCase):
         hedge_stream = _HedgeStream(
             [
                 {"type": "response.output_text.delta", "delta": "hedge answer"},
+                {"type": "response.output_text.delta", "delta": " and more"},
                 {"type": "response.completed", "response": {"id": "resp-hedge"}},
             ]
         )
@@ -2429,6 +2468,8 @@ class HookStreamingHedgeTests(HookTestCase):
 
         deltas = [chunk.get("delta") for chunk in chunks if chunk.get("delta")]
         self.assertIn("hedge answer", deltas)
+        self.assertIn(" and more", deltas)
+        self.assertEqual(chunks[-1].get("type"), "response.completed")
         self.assertNotIn("slow primary", deltas)
         self.assertEqual(len(calls), 1)
         self.assertIn("order1-a", calls[0]["_excluded_deployment_ids"])
@@ -2436,6 +2477,86 @@ class HookStreamingHedgeTests(HookTestCase):
         self.assertEqual(
             hooks._request_model_info(request_data).get("id"), "order1-b"
         )
+
+    async def test_codex_keepalive_keeps_the_hedge_active(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        hedge = _HedgeStream([
+            {"type": "response.output_text.delta", "delta": "fast"},
+            {"type": "response.output_text.delta", "delta": " continuation"},
+            {"type": "response.completed", "response": {"id": "resp-hedge"}},
+        ])
+        hedge._young_router_selected_deployment_marker = {
+            "model_info": {"id": "order1-b", "order": 1}
+        }
+
+        class FakeRouter:
+            async def aresponses(self, **_payload):
+                return hedge
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def primary():
+            await asyncio.sleep(1)
+            yield {"type": "response.output_text.delta", "delta": "slow"}
+
+        request = self._request()
+        request["client_metadata"] = {"x-codex-turn-metadata": '{"request_kind":"turn"}'}
+        chunks = [
+            chunk async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None, response=primary(), request_data=request
+            )
+        ]
+        deltas = [chunk.get("delta") for chunk in chunks if isinstance(chunk, dict)]
+        self.assertIn("fast", deltas)
+        self.assertIn(" continuation", deltas)
+        self.assertEqual(chunks[-1].get("type"), "response.completed")
+
+    async def test_simultaneous_primary_and_hedge_dispatch_closes_loser(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        ready = asyncio.Event()
+        hedge = _HedgeStream([])
+        hedge._young_router_selected_deployment_marker = {
+            "model_info": {"id": "order1-b"}
+        }
+
+        async def primary():
+            await ready.wait()
+            yield {"type": "response.output_text.delta", "delta": "primary"}
+
+        async def dispatch(_request):
+            ready.set()
+            await asyncio.sleep(0)
+            return hedge, self._request()
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            iterator = primary().__aiter__()
+            winner, first, _ = await streaming._hedged_first_chunk(
+                iterator, self._request(), start_timeout_seconds=1
+            )
+            await winner.aclose()
+        self.assertEqual(first["delta"], "primary")
+        self.assertTrue(hedge.closed)
+
+    async def test_releasing_one_hedge_route_preserves_the_other_lease(self) -> None:
+        hooks, _ = load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        routing._HELD_CONCURRENCY_LEASES.clear()
+        self.addCleanup(routing._HELD_CONCURRENCY_LEASES.clear)
+        routing._HELD_CONCURRENCY_LEASES["turn"] = {"id:route-a|turn", "id:route-b|turn"}
+        request = {
+            "litellm_params": {"litellm_call_id": "turn"},
+            "model_info": {"id": "route-a"},
+        }
+
+        with mock.patch.object(routing._concurrency_module, "release") as release:
+            routing._release_request_concurrency_slots(request, deployment_only=True)
+            self.assertEqual(routing._HELD_CONCURRENCY_LEASES["turn"], {"id:route-b|turn"})
+            self.assertEqual(release.call_args.args[0], ["id:route-a|turn"])
+            routing._release_request_concurrency_slots(request)
+            self.assertEqual(release.call_args.args[0], ["id:route-b|turn"])
 
     async def test_a_primary_that_answers_first_never_dispatches_a_hedge(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -2540,6 +2661,15 @@ class HookStreamingHedgeTests(HookTestCase):
 class HookHeadHedgeTests(HookTestCase):
     """The dispatch itself is raced, because the head is where the silence is."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        cooldown_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cooldown_dir.cleanup)
+        self.set_env(
+            "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE",
+            str(Path(cooldown_dir.name) / "deployment-cooldowns.json"),
+        )
+
     def _request(self) -> dict:
         return {
             "model": "default-chat",
@@ -2557,6 +2687,240 @@ class HookHeadHedgeTests(HookTestCase):
             "model_info": {"id": deployment_id, "order": 1},
         }
         return stream, {"model_info": {"id": deployment_id, "order": 1}}
+
+    def _chat_request(self) -> dict:
+        return {
+            "model": "default-chat",
+            "call_type": "acompletion",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "order1-a", "order": 1},
+            "litellm_params": {"model": "openai/gpt-x", "litellm_call_id": "call-chat-head-hedge"},
+        }
+
+    async def test_a_chat_head_is_raced_like_a_responses_head(self) -> None:
+        """A chat relay buffers its head too, and there is no frame to watch.
+
+        Measured 2026-11-20: a healthy wawapii gemini-3.8-flash chat route's
+        first byte was 13.69 s away, and a hung sibling answered 524 after
+        126 s.  The head race is the only thing that keeps one hung relay from
+        holding a chat turn for the whole first-event budget.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
+        request = self._chat_request()
+        calls: list = []
+        hedge_response, hedge_payload = self._hedge_response("order1-b")
+
+        async def slow_dispatch():
+            await asyncio.sleep(5)
+            return "primary-response"
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return hedge_response, hedge_payload
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(
+                    slow_dispatch(), request
+                ),
+                2,
+            )
+
+        self.assertIs(hedge_response, response)
+        self.assertEqual(["head"], calls)
+        self.assertEqual("order1-b", hooks._request_model_info(request).get("id"))
+
+    async def test_an_image_generation_tool_is_not_raced_for_a_head(self) -> None:
+        """A lost race would generate a second image, not a second prefill.
+
+        The image is the expensive part and it cannot be un-billed by
+        cancelling the loser, so a turn carrying the image tool keeps its one
+        route even when that route is slow to write a head.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        request = self._chat_request()
+        request["tools"] = [{"type": "image_generation"}]
+        calls: list = []
+
+        async def slow_dispatch():
+            await asyncio.sleep(0.2)
+            return "primary-response"
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return self._hedge_response("order1-b")
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(
+                    slow_dispatch(), request
+                ),
+                2,
+            )
+
+        self.assertEqual("primary-response", response)
+        self.assertEqual([], calls)
+
+    async def test_a_native_image_model_is_not_raced_for_a_head(self) -> None:
+        """A chat turn sent straight at an image model has no tool to detect."""
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        request = self._chat_request()
+        request["model"] = "gemini-2.5-flash-image"
+        calls: list = []
+
+        async def slow_dispatch():
+            await asyncio.sleep(0.2)
+            return "primary-response"
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return self._hedge_response("order1-b")
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(
+                    slow_dispatch(), request
+                ),
+                2,
+            )
+
+        self.assertEqual("primary-response", response)
+        self.assertEqual([], calls)
+
+    async def test_an_image_generation_turn_keeps_its_first_frame_unraced(self) -> None:
+        """The silence while an image is generated is the image working.
+
+        This hedge waits for the *first frame*, which for an image turn is
+        already after the image request started; firing here would ask a
+        sibling to generate the same image again.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        request = self._request()
+        request["tools"] = [{"type": "image_generation"}]
+        calls: list = []
+
+        async def primary():
+            await asyncio.sleep(0.2)
+            yield {"type": "response.output_text.delta", "delta": "image"}
+
+        async def dispatch(_request):
+            calls.append("frame")
+            return _HedgeStream([]), request
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            winner, first, _ = await streaming._hedged_first_chunk(
+                primary().__aiter__(), request, start_timeout_seconds=2
+            )
+            await winner.aclose()
+
+        self.assertEqual("image", first["delta"])
+        self.assertEqual([], calls)
+
+    async def test_a_route_that_loses_the_head_race_is_charged_and_parked(self) -> None:
+        """A hung primary must not keep being selected first forever.
+
+        The hedge winner serves the turn, so the losing route is cancelled
+        rather than failed -- but it produced no head for the whole delay.  The
+        loss is one ordinary failure: the configured threshold (2) parks it for
+        the ordinary cooldown, and the loss never inherits the heavy-replay
+        300 s park.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        self.set_env(hooks._STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV, "1800")
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
+        hedge_response, hedge_payload = self._hedge_response("order1-b")
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            return hedge_response, hedge_payload
+
+        async def hung_primary():
+            # The live router records the selected deployment in the shared
+            # box before it starts waiting; the charge reads that identity.
+            box = hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+            if isinstance(box, dict):
+                box["marker"] = {
+                    "model_info": {"id": "order1-a", "order": 1},
+                    "litellm_params": {"model": "openai/gpt-x"},
+                }
+            await asyncio.sleep(5)
+            return "primary-response"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            for attempt in range(2):
+                hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.set({})
+                request = self._request()
+                response = await asyncio.wait_for(
+                    streaming._await_upstream_dispatch_with_head_hedge(
+                        hung_primary(), request
+                    ),
+                    2,
+                )
+                self.assertIs(hedge_response, response)
+                state = hooks._DEPLOYMENT_COOLDOWNS.get("id:order1-a")
+                self.assertIsNotNone(state, attempt)
+                self.assertEqual(attempt + 1, state["failures"])
+
+        self.assertGreater(float(state["cooldown_until"]), time.time())
+        self.assertLessEqual(
+            float(state["cooldown_until"]) - time.time(),
+            301.0,
+            "a head-race loss must not inherit the heavy-replay 1800 s park",
+        )
+
+    async def test_the_head_race_runs_because_the_dispatch_budget_outlives_the_delay(
+        self,
+    ) -> None:
+        """The race must be able to start before the attempt's own deadline.
+
+        The head trigger is the old connect allowance plus the upload allowance
+        (about 11.5 s for a 25 KB body), capped by the frame hedge delay; the
+        dispatch deadline is the first-event budget (120 s).  A trigger that
+        fired after the deadline would never race anything.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.2")
+        request = self._request()
+        calls: list = []
+        hedge_response, hedge_payload = self._hedge_response("order1-b")
+
+        async def slow_primary():
+            await asyncio.sleep(5)
+            return "primary-response"
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return hedge_response, hedge_payload
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(
+                    slow_primary(), request
+                ),
+                3,
+            )
+
+        self.assertIs(hedge_response, response)
+        self.assertEqual(["head"], calls)
 
     async def test_a_slow_head_is_raced_by_a_sibling_dispatch(self) -> None:
         hooks, _ = load_hook_module()
@@ -2593,7 +2957,7 @@ class HookHeadHedgeTests(HookTestCase):
     async def test_a_head_that_answers_first_never_asks_a_sibling(self) -> None:
         hooks, _ = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
-        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "5")
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
         request = self._request()
         calls: list = []
 
@@ -2611,9 +2975,41 @@ class HookHeadHedgeTests(HookTestCase):
                 ),
                 2,
             )
+            await asyncio.sleep(0.05)
 
         self.assertEqual("primary-response", response)
         self.assertEqual([], calls)
+
+    async def test_a_primary_head_closes_a_sibling_that_also_returned(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        routing = sys.modules["young_router.proxy.routing"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        ready = asyncio.Event()
+        request = self._request()
+        primary, _ = self._hedge_response("order1-a")
+        sibling, payload = self._hedge_response("order1-b")
+
+        async def primary_dispatch():
+            await ready.wait()
+            return primary
+
+        async def sibling_dispatch(_request, *, stage):
+            ready.set()
+            return sibling, payload
+
+        with (
+            mock.patch.object(streaming, "_dispatch_stream_hedge", sibling_dispatch),
+            mock.patch.object(routing, "_release_request_concurrency_slots") as release,
+        ):
+            result = await streaming._await_upstream_dispatch_with_head_hedge(primary_dispatch(), request)
+
+        self.assertIs(primary, result)
+        self.assertFalse(primary.closed)
+        self.assertTrue(sibling.closed)
+        release.assert_called_once()
+        self.assertEqual(release.call_args.kwargs, {"deployment_only": True})
+        self.assertEqual(release.call_args.args[0]["model_info"]["id"], "order1-b")
 
     async def test_a_failed_head_hedge_leaves_the_primary_running(self) -> None:
         hooks, _ = load_hook_module()
@@ -2685,7 +3081,6 @@ class HookHeadHedgeTests(HookTestCase):
     async def test_a_head_that_never_arrives_is_cut_by_the_dispatch_budget(self) -> None:
         hooks, _ = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.2")
         self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
         self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "1")
         request = self._request()

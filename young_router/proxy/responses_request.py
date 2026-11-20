@@ -668,17 +668,21 @@ async def _await_streaming_fallback_candidate_response(
             if request_kwargs.get("stream") is True
             else 0.0
         )
+        timeout = asyncio.timeout(timeout_seconds if timeout_seconds > 0 else None)
         try:
-            if timeout_seconds > 0:
-                return await asyncio.wait_for(response, timeout=timeout_seconds)
-            return await response
+            async with timeout:
+                return await response
         except Exception as exc:
-            if isinstance(exc, asyncio.TimeoutError):
+            if isinstance(exc, TimeoutError) and timeout.expired():
                 exc = _streaming_module._stream_start_timeout_exception(
                     request_kwargs,
                     start_seconds=timeout_seconds,
                     saw_chunk=False,
                     buffered_chunks=0,
+                    # This await ends at the response head of a fallback
+                    # candidate, so it is the dispatch phase: the route has not
+                    # been given a response object to stay silent on yet.
+                    phase=_streaming_module._STREAM_START_TIMEOUT_DISPATCH_PHASE,
                 )
             if _routing_module._is_request_scoped_priority_deployment_failover_error(
                 exc,
@@ -1286,50 +1290,46 @@ def _responses_input_with_elided_reasoning_items(
     drop without changing what the turn asked for, which is why a size refusal
     is answered by shortening exactly this tail of history.
 
-    ``allow_signed`` is the refused-thread path, and it exists because the
-    unsigned-only rule cannot shorten a Codex replay at all: its reasoning
-    arrives as ``encrypted_content``, so a thread refused as ``max_messages``
-    kept refilling the same 2,200 items and every request ended the same way
-    (2026-11-20).  Measured through this proxy against the same relay, one
-    history twice: with the signed reasoning item and with it removed both
-    answered ``Six`` -- the item is a link the upstream accepts being absent,
-    not a chain it verifies.  Nothing is dropped before a route has refused
-    the thread.
+    By default only the reasoning *after* the signed prefix is a candidate:
+    an ``encrypted_content`` item is a link the replayed chain keeps, so a
+    normal request never cuts one.  ``allow_signed`` is the refused-thread
+    path, and it exists because that rule cannot shorten a Codex replay at
+    all: its reasoning arrives as ``encrypted_content``, so a thread refused
+    as ``max_messages`` kept refilling the same 2,200 items and every request
+    ended the same way (2026-11-20).  Measured through this proxy against the
+    same relay, one history twice -- with the signed item and with it removed
+    -- answered ``Six`` both times: the item is a link the upstream accepts
+    being absent, not a chain it verifies.  Nothing is cut before a route has
+    refused the thread.
     """
 
     if not isinstance(items, list):
         return None
-    reasoning_indexes = [
-        index for index, item in enumerate(items) if _responses_reasoning_item(item)
-    ]
-    if keep < 0:
-        keep = 0
-    dropped = len(reasoning_indexes) - keep
-    if dropped <= 0:
-        return None
-    # The newest ``keep`` reasoning items always stay; the drop candidates are
-    # the ones before them.  By default a signed item is never cut (a body with
-    # one missing is not the history that was refused), so only the unsigned
-    # ones go; a refused thread cannot afford that rule.
-    elided = set()
-    for index in reasoning_indexes[: len(reasoning_indexes) - keep]:
-        if len(elided) >= dropped:
-            break
-        if not allow_signed and _responses_reasoning_item_is_signed(items[index]):
-            continue
-        elided.add(index)
+    if allow_signed:
+        # A refused thread: the signed prefix is exactly what has to go, so
+        # every reasoning item is a candidate.
+        candidates = [
+            index for index, item in enumerate(items) if _responses_reasoning_item(item)
+        ]
+    else:
+        prefix_end = _immutable_replay_prefix_end(items)
+        candidates = [
+            index
+            for index in range(prefix_end, len(items))
+            if _responses_reasoning_item(items[index])
+        ]
+    elided = set(candidates[: max(0, len(candidates) - max(0, keep))])
     if not elided:
         return None
     return [item for index, item in enumerate(items) if index not in elided]
 
 
-def _responses_reasoning_item_is_signed(item: Any) -> bool:
-    """Whether this reasoning item carries upstream-verified ciphertext."""
-
-    if not isinstance(item, dict):
-        return False
-    value = item.get("encrypted_content")
-    return isinstance(value, str) and bool(value.strip())
+def _immutable_replay_prefix_end(items: list) -> int:
+    return next(
+        (index + 1 for index in range(len(items) - 1, -1, -1)
+         if _value_has_encrypted_content(items[index])),
+        0,
+    )
 
 
 def _responses_input_with_elided_history(
@@ -1339,11 +1339,9 @@ def _responses_input_with_elided_history(
 ) -> Optional[list]:
     """Drop whole old turns until the replay fits ``target_items``.
 
-    A turn starts at a user message, so cutting there can never separate a
-    ``function_call`` from its output -- both live inside the same turn.  What
-    is never dropped is the context the thread is defined by: everything before
-    the first user message (the developer instructions and the tool registry)
-    and the first user message itself, which is the task being carried out.
+    Keep the initial task, the prefix covered by encrypted history, and the
+    longest suffix beginning at a user message that fits without separating a
+    tool call from its output.
     """
 
     if not isinstance(items, list) or target_items <= 0:
@@ -1357,22 +1355,32 @@ def _responses_input_with_elided_history(
     ]
     if len(user_indexes) < 2:
         return None
-    first_user = user_indexes[0]
-    prefix = items[: first_user + 1]
-    if len(prefix) >= target_items:
+    prefix_end = max(user_indexes[0] + 1, _immutable_replay_prefix_end(items))
+    if prefix_end >= target_items:
         return None
-    # Walk the turn boundaries oldest-first and take the first tail that fits:
-    # candidates only shrink as the start moves newer, so the first one under
-    # the target keeps the most history.  (Walking newest-first would keep a
-    # single turn whenever that alone fit, throwing away context for nothing.)
-    for start in user_indexes[1:]:
-        if any(_responses_reasoning_item_is_signed(item) for item in items[first_user + 1 : start]):
-            # A signed reasoning item inside the dropped range would leave a
-            # chain the upstream cannot verify; cut later, or not at all.
+    # Explicitly check pair boundaries: async tool output can arrive after
+    # another user message, and an encrypted prefix can end inside a turn.
+    pairs: dict[str, list[int]] = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
             continue
-        candidate = prefix + items[start:]
-        if len(candidate) <= target_items:
-            return candidate
+        kind = item.get("type")
+        call_id = item.get("call_id")
+        if isinstance(kind, str) and "_call" in kind and isinstance(call_id, str):
+            pairs.setdefault(call_id, []).append(index)
+
+    earliest = len(items) + prefix_end - target_items
+    for start in user_indexes[1:]:
+        if start <= prefix_end or start < earliest:
+            continue
+        if any(
+            len(indices) > 1
+            and (indices[0] < prefix_end or indices[-1] >= start)
+            and any(prefix_end <= index < start for index in indices)
+            for indices in pairs.values()
+        ):
+            continue
+        return items[:prefix_end] + items[start:]
     return None
 
 
@@ -3005,8 +3013,8 @@ def _with_stream_request_timeout(request_kwargs: dict) -> Optional[dict]:
     provider sees it (measured on 1.106.4 -- an ``httpx.Timeout`` in ``timeout``
     fails ``_SECONDS`` validation, and a ``stream_timeout`` always wins over
     ``timeout`` for ``stream: true`` and is validated as seconds), so a
-    per-phase connect budget cannot travel this way.  That budget is enforced
-    where the response object is awaited instead, in
+    per-phase budget cannot travel this way.  The request's first-event budget
+    is enforced where the response object is awaited instead, in
     ``streaming._await_upstream_dispatch``.
     """
 

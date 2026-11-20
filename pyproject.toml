@@ -8,11 +8,7 @@ description = "Local AI gateway desktop app: Core IPC, LiteLLM data plane, and b
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]
-# No runtime dependencies of its own: the data plane runs on what LiteLLM
-# already installs.  Encoding an image here would need Pillow, and the passes
-# that did that are gone -- image context is decided by the attachment manager,
-# which ships its own encoder.
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 [tool.setuptools.dynamic]
 version = { file = ["VERSION"] }
@@ -21,7 +17,7 @@ version = { file = ["VERSION"] }
 include = ["young_router*"]
 
 [tool.setuptools.package-data]
-"young_router.adapters" = ["*.mjs"]
+"young_router.adapters" = ["*.mjs", "modelprint-official/*.json"]
 # ``core/protocol.py`` reads the IPC contract beside itself at import; a wheel
 # without it starts no Core ("Core IPC schema is unavailable").
 "young_router.core" = ["*.json"]

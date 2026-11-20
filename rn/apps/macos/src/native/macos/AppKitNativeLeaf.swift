@@ -285,7 +285,7 @@ private enum NativeRelayOriginPolicy {
         "providerAuthCode": "Device code", "providerAuthCopy": "Copy", "providerAuthBlocked": "This navigation was blocked because it is outside the official provider authentication flow.",
         "routeCodexSettings": "External", "routeClaudeSettings": "Claude Settings",
         "routeRuntimeSettings": "Runtime",
-        "routeDataManagement": "Data Management", "routeLogs": "Logs",
+        "routeDataManagement": "Data Management", "routeLogs": "Tasks & Logs",
         "routeWebDavSettings": "WebDAV Sync Settings",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
         "modelChooserProvider": "Provider", "modelChooserKey": "Key", "modelChooserSearch": "Search models",
@@ -3059,7 +3059,7 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func isAllowedLogTab(_ tab: String) -> Bool {
-        ["requests", "service", "actions", "route-trace", "recovery", "online-usage"].contains(tab)
+        ["requests", "service", "actions", "route-trace", "recovery", "online-usage", "scheduled-tasks"].contains(tab)
     }
 
     private func localized(_ key: String, fallback: String) -> String {

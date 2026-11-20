@@ -25,8 +25,8 @@ Usage (a gateway launcher calls this instead of the proxy directly):
     python -m young_router.adapters.managed --config /opt/yr/config.yaml -- \\
         python -m young_router.proxy.macos_proxy --config /opt/yr/config.yaml ...
 
-The command is executed in this process with the workers' fragment in its
-environment; there is no second supervisor and no file to read back.
+The launcher keeps the worker supervisors alive while the command runs, and
+passes their environment fragment to that child.
 """
 
 from __future__ import annotations
@@ -35,6 +35,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 from typing import Any, Iterable, Mapping
 
@@ -68,6 +70,7 @@ def environment(
     *,
     autostart: bool = True,
     modules: Iterable[Any] | None = None,
+    _runtimes: list[Any] | None = None,
 ) -> dict[str, str]:
     """The environment fragment every worker this configuration names publishes.
 
@@ -93,6 +96,8 @@ def environment(
             if factory is None:
                 continue
             runtime = factory(root)
+            if autostart and _runtimes is not None:
+                _runtimes.append(runtime)
             fragment.update(runtime.environment(autostart=autostart))
         except Exception:
             continue
@@ -102,7 +107,7 @@ def environment(
 def _parse_arguments(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         prog="python -m young_router.adapters.managed",
-        description="Start the managed workers a configuration references, then exec the proxy.",
+        description="Start the managed workers a configuration references, then run the proxy.",
     )
     parser.add_argument("--config", default=str(config_paths.provider_config_path()))
     parser.add_argument(
@@ -113,7 +118,7 @@ def _parse_arguments(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="the command to exec with the fragment in its environment (after --)",
+        help="the command to run with the fragment in its environment (after --)",
     )
     arguments = parser.parse_args(argv)
     command = list(arguments.command)
@@ -124,19 +129,44 @@ def _parse_arguments(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     arguments, command = _parse_arguments(list(sys.argv[1:] if argv is None else argv))
-    fragment = environment(arguments.config, autostart=not arguments.no_start)
-    # The values are bearer secrets: report the variables, never what they hold.
-    print(f"managed workers: {', '.join(sorted(fragment)) or 'none'}", file=sys.stderr)
-    if not command:
-        print(json.dumps(sorted(fragment)), file=sys.stderr)
-        return 0
-    os.environ.update(fragment)
+    runtimes: list[Any] = []
     try:
-        os.execvpe(command[0], command, os.environ)
-    except OSError as exc:
-        print(f"could not exec {command[0]}: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        fragment = environment(arguments.config, autostart=not arguments.no_start, _runtimes=runtimes)
+        # The values are bearer secrets: report the variables, never what they hold.
+        print(f"managed workers: {', '.join(sorted(fragment)) or 'none'}", file=sys.stderr)
+        if not command:
+            print(json.dumps(sorted(fragment)), file=sys.stderr)
+            return 0
+        child_environment = os.environ.copy()
+        child_environment.update(fragment)
+        try:
+            process = subprocess.Popen(command, env=child_environment)
+        except OSError as exc:
+            print(f"could not start {command[0]}: {exc}", file=sys.stderr)
+            return 1
+
+        def forward_signal(signum: int, _frame: Any) -> None:
+            try:
+                process.send_signal(signum)
+            except (OSError, ValueError):
+                pass
+
+        signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            signals.append(signal.SIGHUP)
+        previous = {signum: signal.signal(signum, forward_signal) for signum in signals}
+        try:
+            status = process.wait()
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+        return status if status >= 0 else 128 - status
+    finally:
+        for runtime in reversed(runtimes):
+            try:
+                runtime.stop()
+            except Exception:
+                print("could not stop a managed worker", file=sys.stderr)
 
 
 if __name__ == "__main__":

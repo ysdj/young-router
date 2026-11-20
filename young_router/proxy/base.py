@@ -95,23 +95,31 @@ _STREAM_START_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"
 # is wedged, not thinking.  This default disagreed with it for long enough that
 # the pane published a number no process ever used.
 _STREAM_START_TIMEOUT_DEFAULT_SECONDS = 120.0
-# The phase no stream watchdog covers: TCP handshake, TLS, upload, and the wait
-# for the response head.  ``_stream_with_idle_timeout`` starts its clock on the
-# first frame of an already-returned response, so without this budget an
-# unreachable host is bounded only by the kernel's SYN ladder (127 s) times
-# LiteLLM's own retry (2), and the turn sat on a dead route for 271 s on
-# 2026-11-15 while every other budget in this list was still unspent.
-_UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_UPSTREAM_CONNECT_TIMEOUT_SECONDS"
-_UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS = 10.0
-#: Floor throughput for the dispatch phase, which ends when the upstream writes
-#: the response head -- after the body has been uploaded *and prefilled*.
-#: Prefill, not the link, dominates that wait: measured against the live relay
-#: on 2026-11-16, a megabyte of English prose cost 8.8 s (about 110 KB/s) and a
-#: megabyte of Chinese 32 s (about 31 KB/s).  The previous figure here was one
-#: megabyte per second, a property of the link rather than of this phase, so
-#: every replay over about 1.5 MB was cut before its head arrived: 2.7 MB of
-#: Claude Code history needed 26 s and was given 12.6 s.  This floor sits below
-#: the slowest measurement, and the first-event budget still caps the total.
+# Which phase a local "no first byte yet" timeout ended.  ``dispatch`` is the
+# wait for the response head; ``first_frame`` is the first-event budget spent on
+# a response object that already arrived.  ``head_hedge_lost`` is not a timeout
+# at all: it is the failure charged to a primary route that had produced no head
+# when a sibling's head won the race.  The cooldown reads these differently.
+_STREAM_START_TIMEOUT_PHASE_ATTR = "stream_start_timeout_phase"
+_STREAM_START_TIMEOUT_DISPATCH_PHASE = "dispatch"
+_STREAM_START_TIMEOUT_FIRST_FRAME_PHASE = "first_frame"
+_STREAM_START_TIMEOUT_HEDGE_LOSS_PHASE = "head_hedge_lost"
+# How long a dispatch waits for the response head before a sibling is raced.
+# This is a *hedge trigger*, never a deadline: the primary keeps running, and
+# the first head wins.  The base is widened by the body's upload/prefill
+# allowance below, so a heavy replay is not chased by a sibling at 10 s, and it
+# is capped by ``YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS`` (20 s by default),
+# which is the ceiling the frame hedge already uses.  Measured 2026-11-20: a
+# healthy wawapii gemini-3.8-flash route's first byte was 13.69 s away, and a
+# hung sibling answered 524 only after 126 s; 10 s plus the upload allowance
+# asks a sibling at about 11.5 s for that request, while the healthy route is
+# never cut.
+_HEAD_HEDGE_DELAY_DEFAULT_SECONDS = 10.0
+#: Floor throughput for a request's upload/prefill allowance, which widens the
+#: head-hedge trigger.  Prefill, not the link, dominates the wait for the head:
+#: measured against the live relay on 2026-11-16, a megabyte of English prose
+#: cost 8.8 s (about 110 KB/s) and a megabyte of Chinese 32 s (about 31 KB/s).
+#: This floor sits below the slowest measurement.
 _UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND = 16.0 * 1024.0
 _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"
@@ -139,7 +147,7 @@ _STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS = 300.0
 # ``0`` (or ``YOUNG_ROUTER_STREAM_HEDGE_ENABLED=0``) turns it off.
 _STREAM_HEDGE_ENABLED_ENV = "YOUNG_ROUTER_STREAM_HEDGE_ENABLED"
 _STREAM_HEDGE_DELAY_SECONDS_ENV = "YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS"
-_STREAM_HEDGE_DELAY_DEFAULT_SECONDS = 30.0
+_STREAM_HEDGE_DELAY_DEFAULT_SECONDS = 20.0
 # Marked on a request that was dispatched *as* a hedge.  The hedge is a real
 # attempt through this proxy's own router, so without the mark each one would
 # hedge again and one slow turn would fan out into a pool of prefills.

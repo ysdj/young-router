@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import socket
 import stat
 import subprocess
 import sys
@@ -2053,17 +2054,18 @@ class CoreOperationsTests(unittest.TestCase):
             # the window has something unapplied).
             core._drafts.setdefault("webdav", {})["dirty"] = True
             core._drafts.setdefault("providers_models", {})["dirty"] = True
-            webdav.dispatch("patch", {"sync_interval_minutes": 45})
+            webdav.dispatch("patch", {"sync_interval_minutes": 45, "url": "https://draft.example.test/"})
             self.assertEqual(45, webdav.draft_state()["settings"]["sync_interval_minutes"])
 
             pushed: list[object] = []
-            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()) as client, mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot",
                 return_value=webdav_core.SyncSnapshot(None),
             ), mock.patch("young_router.webdav.operations.push_bundle", side_effect=lambda *args, **kwargs: pushed.append(args)):
                 core.run_automatic_webdav_sync()
 
             self.assertEqual(1, len(pushed))
+            self.assertEqual("https://webdav.example.test/config/", client.call_args.args[0].url)
             with self.assertRaises(CoreError) as raised:
                 core.dispatch(
                     {"domain": "webdav", "type": "sync", "payload": {"sections": ["providers_models", "relay_accounts"]}},
@@ -2087,6 +2089,8 @@ class CoreOperationsTests(unittest.TestCase):
 
             with mock.patch.object(WebDAVSyncScheduler, "kick") as kick:
                 core.dispatch({"domain": "webdav", "action": "patch", "payload": {"sync_interval_minutes": 5}})
+                kick.assert_not_called()
+                core.apply("webdav")
             kick.assert_called_once()
 
             # Any other domain's action leaves the loop's sleep alone.
@@ -2995,12 +2999,6 @@ class OwnershipTokenMemoTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
 
 
-
-if __name__ == "__main__":
-
-    unittest.main()
-
-
 class InheritedGatewaySocketTests(unittest.TestCase):
     """A socket unit's descriptor is what the proxy is told to serve.
 
@@ -3037,6 +3035,7 @@ class InheritedGatewaySocketTests(unittest.TestCase):
 
         self.assertIsNone(controller._inherited_gateway_socket())
 
+    @unittest.skipIf(os.name == "nt", "Windows does not inherit a systemd descriptor")
     def test_the_first_systemd_descriptor_is_the_gateway(self) -> None:
         operations = self._controller()
         controller = operations.CoreServiceController.__new__(
@@ -3057,25 +3056,47 @@ class InheritedGatewaySocketTests(unittest.TestCase):
 
         self.assertIsNone(controller._inherited_gateway_socket())
 
-    def test_the_reported_port_is_the_one_the_descriptor_names(self) -> None:
-        """A stepped-forward port is a port nothing listens on.
+    @unittest.skipIf(os.name == "nt", "Windows does not inherit a systemd descriptor")
+    def test_start_reports_the_port_the_inherited_listener_owns(self) -> None:
+        """The bound socket is already occupied; searching would probe the wrong port."""
 
-        With socket activation the listener is already bound (it is systemd's),
-        so the free-port search found 4402, recorded it and health-checked it
-        while the inherited descriptor answered on 4401.
-        """
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            port = listener.getsockname()[1]
+            fd = listener.fileno()
+            configured_port = str(4401 if port != 4401 else 4402)
+            controller = CoreServiceController(directory)
+            process = mock.Mock(pid=4242)
+            process.poll.return_value = None
+            with (
+                mock.patch.dict(os.environ, {"YOUNG_ROUTER_HOST_PROFILE": "gateway", "LITELLM_PORT": configured_port}),
+                mock.patch.object(controller, "_inherited_gateway_socket", return_value=fd),
+                mock.patch.object(controller, "_stage_runtime_config"),
+                mock.patch.object(controller, "_runtime_env", return_value={"LITELLM_PORT": configured_port}),
+                mock.patch.object(controller, "_process_identity", return_value="test-process"),
+                mock.patch.object(controller, "_posix_process_has_token", return_value=True),
+                mock.patch.object(controller, "_health", side_effect=[False, True, True]) as health,
+                mock.patch.object(controller, "_port_available") as available,
+                mock.patch.object(controller, "_first_free_port") as stepped,
+                mock.patch.object(controller, "_stop_process_group"),
+                mock.patch.object(operations_module.subprocess, "Popen", return_value=process) as popen,
+            ):
+                result = controller.start()
 
-        import socket
+            available.assert_not_called()
+            stepped.assert_not_called()
+            self.assertEqual("running", result["state"])
+            self.assertEqual(port, result["port"])
+            self.assertEqual(port, controller._recorded_port())
+            health.assert_called_with(port)
+            command = popen.call_args.args[0]
+            self.assertEqual(str(port), command[command.index("--port") + 1])
+            self.assertEqual(str(port), popen.call_args.kwargs["env"]["LITELLM_PORT"])
+            self.assertEqual(str(fd), popen.call_args.kwargs["env"]["YOUNG_ROUTER_PROXY_LISTEN_FD"])
+            self.assertEqual((fd,), popen.call_args.kwargs["pass_fds"])
+            self.assertEqual(port, listener.getsockname()[1])
 
-        operations = self._controller()
-        controller = operations.CoreServiceController.__new__(
-            operations.CoreServiceController
-        )
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.addCleanup(listener.close)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(8)
-        port = listener.getsockname()[1]
 
-        self.assertEqual(port, controller._inherited_gateway_port(listener.fileno()))
-        self.assertIsNone(controller._inherited_gateway_port(-1))
+if __name__ == "__main__":
+    unittest.main()

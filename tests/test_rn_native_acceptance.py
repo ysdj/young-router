@@ -502,7 +502,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_event_poll_retries_without_replacing_core(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
-        poll = mac.split("    private func poll(subscription: String, generation: Int) {", 1)[1].split(
+        poll = mac.split("    private func poll(subscription: String, generation: Int, needsSnapshot: Bool) {", 1)[1].split(
             "    private func requestMetadata", 1
         )[0]
 
@@ -3680,14 +3680,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "private func poll(", 1
         )[0]
         self.assertIn("let live = self.generation == generation", subscribe)
-        self.assertIn("if live {\n            subscriptionID = subscription\n            pollCancelled = false\n        }", subscribe)
+        self.assertIn("if install {\n            subscriptionID = subscription\n            pollCancelled = false\n        }", subscribe)
         self.assertLess(
             subscribe.index("subscriptionRequest = request"),
-            subscribe.index("guard live else { return }"),
+            subscribe.index("guard install else {"),
         )
         # A non-200 event poll waits instead of spinning.
         poll = windows_bridge.split("void CoreIPCBridge::PollEvents(", 1)[1].split("\n}\n", 1)[0]
-        self.assertIn("std::this_thread::sleep_for(std::chrono::seconds(1));", poll)
+        self.assertIn("poll_condition_.wait_for(lock, std::chrono::seconds(1)", poll)
         self.assertNotIn("if (result.status != 200) continue;", poll)
 
 
@@ -4193,10 +4193,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # hosts classify it with the other slow remote operations.
         macos_bridge = (ROOT / "rn/apps/macos/src/native/macos/CoreIPCBridge.swift").read_text(encoding="utf-8")
         self.assertIn('if method == "dispatch", onlineUsageReadOperation(in: request) != nil { return 900 }', macos_bridge)
-        self.assertIn('"logs.refresh_online_usage", "logs.refresh", "logs.reload"', macos_bridge)
+        for operation in (
+            "logs.refresh_online_usage", "logs.refresh", "logs.reload", "logs.load_more",
+            "logs.previous_page", "logs.first_page", "logs.last_page", "logs.goto_page",
+            "logs.set_page_rows", "logs.set_time_range",
+        ):
+            self.assertIn(f'"{operation}"', macos_bridge)
         windows_bridge = (ROOT / "rn/apps/windows/src/native/windows/CoreIPCBridge.cpp").read_text(encoding="utf-8")
         self.assertIn("IsOnlineUsageReadOperation(parsed_request);", windows_bridge)
-        self.assertIn('type == "logs.refresh_online_usage" || type == "logs.refresh" || type == "logs.reload"', windows_bridge)
+        for operation in (
+            "logs.refresh_online_usage", "logs.refresh", "logs.reload", "logs.load_more",
+            "logs.previous_page", "logs.first_page", "logs.last_page", "logs.goto_page",
+            "logs.set_page_rows", "logs.set_time_range",
+        ):
+            self.assertIn(f'type == "{operation}"', windows_bridge)
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
         self.assertIn("logColumns(", ui)
         self.assertIn("selected !== \"online-usage\" || rows.some((row) => Boolean(row.status)),", ui)
@@ -4220,14 +4230,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # macOS: one observer per React root, fanned out by the shared bridge.
         self.assertIn("func addEventHandler(_ handler: @escaping (String) -> Void) -> Int", mac_bridge)
         self.assertIn("private var eventHandlers: [Int: (String) -> Void] = [:]", mac_bridge)
-        self.assertIn("for handler in handlers { handler(eventText) }", mac_bridge)
+        self.assertIn("for handler in eventHandlers.values { handler(text) }", mac_bridge)
         self.assertIn("eventHandlerToken = core.addEventHandler", mac_module)
         self.assertIn("override func stopObserving()", mac_module)
         self.assertIn("core.removeEventHandler(token)", mac_module)
         # Windows: the same contract through the module's listener lifecycle.
         self.assertIn("int AddEventHandler(std::function<void(std::string const&)> handler);", windows_bridge_header)
         self.assertIn("std::map<int, std::function<void(std::string const&)>> event_handlers_;", windows_bridge_header)
-        self.assertIn("for (auto const& handler : handlers) handler(text);", windows_bridge)
+        self.assertIn("for (auto const& entry : event_handlers_) entry.second(text);", windows_bridge)
         self.assertIn("event_handler_token_ = CoreIPCBridge::Shared().AddEventHandler(", windows_module)
         self.assertIn("void CoreIPCModule::AddListener(std::string const&) noexcept {\n  RegisterEventHandler();", windows_module)
         # A root that drops its last listener detaches: the guard used to return

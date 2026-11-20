@@ -5260,10 +5260,8 @@ if __name__ == "__main__":
         """
 
         hooks, _ = load_hook_module()
-        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.2")
-        self.addCleanup(
-            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
-        )
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.2")
+        self.addCleanup(self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None)
         router_module = types.ModuleType("litellm.router")
         seen: list[bool] = []
 

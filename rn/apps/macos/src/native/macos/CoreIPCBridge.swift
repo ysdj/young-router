@@ -96,7 +96,8 @@ import Foundation
     }
 
     /// Register one observer for Core events. Each native leaf passes a token
-    /// back so its module can detach when the window stops listening.
+    /// back so its module can detach when the window stops listening. The
+    /// observer enqueues delivery without calling back into the bridge.
     func addEventHandler(_ handler: @escaping (String) -> Void) -> Int {
         lock.lock()
         defer { lock.unlock() }
@@ -111,7 +112,7 @@ import Foundation
         lock.unlock()
     }
 
-    func send(_ request: String, completion: @escaping (Result<String, Error>) -> Void) {
+    func send(_ request: String, recoveringSubscription: Bool = false, completion: @escaping (Result<String, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 guard !self.isStopping() else { throw BridgeError.unavailable }
@@ -129,7 +130,7 @@ import Foundation
                     self.scheduleSubscriptionRecovery()
                     throw BridgeError.invalidResponse
                 }
-                self.startPollingIfSubscription(in: text, request: request, method: metadata.method, generation: requestGeneration)
+                self.startPollingIfSubscription(in: text, request: request, method: metadata.method, generation: requestGeneration, recovering: recoveringSubscription)
                 if restarted && metadata.method != "subscribe" { self.scheduleSubscriptionRecovery() }
                 completion(.success(text))
             } catch {
@@ -1084,7 +1085,7 @@ import Foundation
         return try result.get()
     }
 
-    private func startPollingIfSubscription(in response: String, request: String, method: String, generation: Int) {
+    private func startPollingIfSubscription(in response: String, request: String, method: String, generation: Int, recovering: Bool) {
         guard method == "subscribe" else { return }
         guard let data = response.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1100,30 +1101,81 @@ import Foundation
         // subscription *and* no request, so every later recovery was a no-op
         // and every window's snapshots stayed frozen until the app restarted.
         let live = self.generation == generation
-        subscriptionRequest = request
-        if live {
+        let stopping = isStopping()
+        if !recovering && !stopping { subscriptionRequest = request }
+        let install = live && !stopping && (!recovering || subscriptionID == nil)
+        if install {
             subscriptionID = subscription
             pollCancelled = false
         }
         lock.unlock()
-        guard live else { return }
+        guard install else {
+            if !live && !recovering { scheduleSubscriptionRecovery() }
+            return
+        }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.poll(subscription: subscription, generation: generation)
+            self?.poll(subscription: subscription, generation: generation, needsSnapshot: recovering)
         }
     }
 
-    private func poll(subscription: String, generation: Int) {
+    private func subscriptionSnapshot(endpoint: Endpoint, token: String) throws -> [String: Any] {
+        let requestID = "native-\(UUID().uuidString.lowercased())"
+        let request = try JSONSerialization.data(withJSONObject: [
+            "protocol_version": 1,
+            "request_id": requestID,
+            "method": "snapshot",
+            "params": [String: Any](),
+        ])
+        let (body, response) = try performRequest(endpoint: endpoint, route: "", method: "POST", body: request, token: token)
+        guard response.statusCode == 200,
+              isValidResponseEnvelope(body, requestID: requestID),
+              let envelope = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let result = envelope["result"] as? [String: Any],
+              let snapshot = result["snapshot"] as? [String: Any],
+              snapshot["protocol_version"] as? Int == 1,
+              let revision = snapshot["revision"] as? Int else { throw BridgeError.invalidResponse }
+        return ["protocol_version": 1, "event": "snapshot", "revision": revision, "snapshot": snapshot]
+    }
+
+    private func publishEvent(_ event: [String: Any], subscription: String, generation: Int) throws -> Bool {
+        guard event["protocol_version"] as? Int == 1,
+              let text = String(data: try JSONSerialization.data(withJSONObject: event), encoding: .utf8) else {
+            throw BridgeError.invalidResponse
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !pollCancelled, subscriptionID == subscription, self.generation == generation else { return false }
+        for handler in eventHandlers.values { handler(text) }
+        return true
+    }
+
+    private func poll(subscription: String, generation: Int, needsSnapshot: Bool) {
+        var readMissedState = needsSnapshot
         while true {
             lock.lock()
             let cancelled = pollCancelled || subscriptionID != subscription || self.generation != generation
             let endpoint = self.endpoint
             let token = sessionToken
-            let handlers = Array(eventHandlers.values)
             lock.unlock()
             guard !cancelled, let endpoint, let token else { return }
             do {
+                if readMissedState {
+                    // The replacement queue is already open. Read the state
+                    // before consuming patches queued while the read ran.
+                    let event = try subscriptionSnapshot(endpoint: endpoint, token: token)
+                    guard try publishEvent(event, subscription: subscription, generation: generation) else { return }
+                    readMissedState = false
+                }
                 let route = "events?subscription_id=\(subscription)&timeout=20"
                 let (data, response) = try performRequest(endpoint: endpoint, route: route, method: "GET", body: nil, token: token)
+                if response.statusCode == 410 {
+                    lock.lock()
+                    let lost = !pollCancelled && subscriptionID == subscription && self.generation == generation
+                    if lost { subscriptionID = nil }
+                    lock.unlock()
+                    if lost { scheduleSubscriptionRecovery(after: 1) }
+                    return
+                }
                 guard response.statusCode == 200,
                       let outer = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       outer["protocol_version"] as? Int == 1,
@@ -1132,13 +1184,10 @@ import Foundation
                 }
                 // `event: null` is a normal heartbeat for a quiet Core.
                 if outer["event"] is NSNull { continue }
-                guard let event = outer["event"] as? [String: Any],
-                      event["protocol_version"] as? Int == 1,
-                      let eventData = try? JSONSerialization.data(withJSONObject: event),
-                      let eventText = String(data: eventData, encoding: .utf8) else {
+                guard let event = outer["event"] as? [String: Any] else {
                     throw BridgeError.invalidResponse
                 }
-                for handler in handlers { handler(eventText) }
+                guard try publishEvent(event, subscription: subscription, generation: generation) else { return }
             } catch {
                 lock.lock()
                 let retry = !pollCancelled
@@ -1146,6 +1195,7 @@ import Foundation
                     && self.generation == generation
                 lock.unlock()
                 guard retry else { return }
+                readMissedState = true
                 Thread.sleep(forTimeInterval: 1)
             }
         }
@@ -1191,9 +1241,16 @@ import Foundation
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let params = object["params"] as? [String: Any],
               let action = params["action"] as? [String: Any],
-              (action["domain"] as? String)?.lowercased() == "logs" else { return nil }
+              (action["domain"] as? String)?.lowercased() == "logs",
+              let payload = action["payload"] as? [String: Any],
+              payload["tab"] as? String == "online-usage" else { return nil }
         let type = ((action["type"] as? String) ?? (action["action"] as? String) ?? "").lowercased()
-        return ["logs.refresh_online_usage", "logs.refresh", "logs.reload"].contains(type) ? type : nil
+        return [
+            "logs.refresh_online_usage", "logs.refresh", "logs.reload",
+            "logs.load_more", "logs.previous_page", "logs.first_page",
+            "logs.last_page", "logs.goto_page", "logs.set_page_rows",
+            "logs.set_time_range",
+        ].contains(type) ? type : nil
     }
 
     /// The WebDAV operation inside a dispatch request, when it has one: these
@@ -1255,12 +1312,12 @@ import Foundation
                 return
             }
             self.lock.unlock()
-            self.send(request) { result in
+            self.send(request, recoveringSubscription: true) { _ in
                 self.lock.lock()
                 self.recoveryScheduled = false
                 let retry = self.subscriptionRequest != nil && self.subscriptionID == nil
                 self.lock.unlock()
-                if case .failure = result, retry { self.scheduleSubscriptionRecovery(after: 1) }
+                if retry { self.scheduleSubscriptionRecovery(after: 1) }
             }
         }
     }

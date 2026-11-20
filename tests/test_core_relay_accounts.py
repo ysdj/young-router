@@ -573,12 +573,17 @@ class RelayAccountsDomainTests(unittest.TestCase):
             domain.accept_login_result(
                 account["id"], username="account-a@example.test", access_token="replace-token"
             )
-            self.assertEqual(8.75, domain.refresh_resources(account["id"])["balance"])
+            first = domain.refresh_resources(account["id"])
+            self.assertEqual(8.75, first["balance"])
+            self.assertTrue(first["balance_observed_at"])
 
             # The station states a new number, but an implicit read inside the
             # window answers what the entry already observed.
             fake.responses["/api/v1/user/profile"] = {"data": {"balance": 3.25}}
-            self.assertEqual(8.75, domain.refresh_resources(account["id"])["balance"])
+            with mock.patch.object(relay_accounts, "_utc_now_iso", return_value="2026-11-19T00:00:00Z"):
+                cached = domain.refresh_resources(account["id"])
+            self.assertEqual(8.75, cached["balance"])
+            self.assertEqual(first["balance_observed_at"], cached["balance_observed_at"])
             profile_reads = [
                 path for _origin, path, _headers in fake.requests if path == "/api/v1/user/profile"
             ]
@@ -591,6 +596,149 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 len([path for _origin, path, _headers in fake.requests if path == "/api/v1/user/profile"]),
                 "the forced read was answered by the entry instead of the station",
             )
+
+    def test_background_balance_is_durable_without_applying_relay_drafts(self) -> None:
+        profile = "/api/v1/user/profile"
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient({profile: {"data": {"balance": -2.5}}})
+            relay = RelayAccountsDomain(directory, http_client=fake)
+            relay.dispatch("account.add", {
+                "id": "account-one", "type": "sub2api", "label": "Original",
+                "origin": "https://relay.example.test",
+            })
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            relay.accept_login_result(account_id, username="person", access_token="replace-token")
+            relay.apply()
+            core = CoreStore(domains=[relay])
+            self.addCleanup(core.shutdown)
+
+            edit = core.dispatch({
+                "domain": "relay_accounts", "type": "account.update",
+                "payload": {"id": account_id, "label": "Draft"},
+            })
+            result = core.run_automatic_relay_balance_refresh([account_id], lambda: False)
+            self.assertEqual({account_id: "succeeded"}, result)
+            self.assertEqual([profile], [path for _, path, _ in fake.requests])
+            stored = RelayAccountsDomain(directory).snapshot()["accounts"][0]
+            self.assertEqual("Original", stored["label"])
+            self.assertEqual(-2.5, stored["balance"])
+            self.assertTrue(stored["balance_observed_at"])
+            current = core.snapshot()
+            self.assertGreater(current["revision"], edit["revision"])
+            self.assertTrue(current["drafts"]["relay_accounts"]["dirty"])
+            self.assertEqual("Draft", current["domains"]["relay_accounts"]["accounts"][0]["label"])
+            # Live readings move the view, so the original edit remains valid.
+            self.assertTrue(core.apply("relay_accounts", revision=edit["revision"])["applied"])
+
+            fake.errors[profile] = RelayTransportError()
+            result = core.run_automatic_relay_balance_refresh([account_id], lambda: False)
+            self.assertEqual({account_id: "failed"}, result)
+            reloaded = RelayAccountsDomain(directory)
+            stored = reloaded.snapshot()["accounts"][0]
+            self.assertEqual(-2.5, stored["balance"])
+            self.assertEqual("", stored["balance_observed_at"])
+            self.assertEqual("signed_in", stored["login_status"])
+            self.assertTrue(reloaded.secret_present("session", account_id))
+            self.assertEqual(2, len(fake.requests))
+
+            fake.errors.clear()
+            fake.responses[profile] = {"code": 503, "data": {"balance": -99}}
+            self.assertEqual({account_id: "failed"}, core.run_automatic_relay_balance_refresh([account_id], lambda: False))
+            self.assertEqual(-2.5, relay.snapshot()["accounts"][0]["balance"])
+            self.assertEqual("", relay.snapshot()["accounts"][0]["balance_observed_at"])
+
+    def test_group_poll_recovers_a_lost_create_response_after_core_restart(self) -> None:
+        from young_router.core.scheduled_tasks import RELAY_GROUPS
+
+        keys_path = "/api/v1/keys?page=1&page_size=100"
+
+        class Station(FakeRelayHTTPClient):
+            def post(self, origin, path, *, headers, body=None):
+                self.post_requests.append((origin, path, dict(headers)))
+                raise RelayTransportError()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = Station({
+                keys_path: {"data": {"items": []}},
+                "/api/v1/channels/available": {"data": []},
+                "/api/v1/groups/available": {"data": [{"id": 7, "name": "Group"}]},
+            })
+            config = root / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account_id = relay.dispatch("account.add", {
+                "type": "sub2api", "label": "Relay", "origin": "https://relay.example.test",
+            })["accounts"][0]["id"]
+            relay.accept_login_result(account_id, username="person", access_token="replace-token")
+            relay.set_auto_grouping(account_id, True)
+            relay.apply()
+            core = CoreStore(domains=[ProvidersModelsDomain(config), relay])
+            try:
+                self.assertEqual("failed", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False))
+                self.assertEqual(1, relay.snapshot()["pending_operation_count"])
+                edit = core.dispatch({"domain": "relay_accounts", "type": "account.update", "payload": {
+                    "id": account_id, "label": "Unsaved edit",
+                }})
+                self.assertEqual("skipped", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False))
+                self.assertEqual(edit["revision"], core.revision)
+            finally:
+                core.shutdown()
+
+            # The key exists, although the station lost its POST response.
+            fake.responses[keys_path] = {"data": {"items": [{
+                "id": 42, "name": "Group", "group_id": 7, "status": "active", "key": "replace-key",
+            }]}}
+            relay = RelayAccountsDomain(root, http_client=fake)
+            core = CoreStore(domains=[ProvidersModelsDomain(config), relay])
+            try:
+                self.assertEqual("succeeded", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False))
+                self.assertEqual(0, relay.snapshot()["pending_operation_count"])
+                self.assertEqual(1, len(fake.post_requests))
+                self.assertEqual("Relay", relay.snapshot()["accounts"][0]["label"])
+            finally:
+                core.shutdown()
+
+    def test_failed_balance_read_cannot_erase_another_account_during_a_removal(self) -> None:
+        profile = "/api/v1/user/profile"
+        began = threading.Event()
+        release = threading.Event()
+
+        class Station(FakeRelayHTTPClient):
+            def json(self, origin, path, *, headers):
+                if path == profile and origin == "https://a.example.test":
+                    began.set()
+                    if not release.wait(2):
+                        raise AssertionError("Balance read was held across a relay edit")
+                    raise RelayTransportError()
+                return super().json(origin, path, headers=headers)
+
+        with tempfile.TemporaryDirectory() as directory:
+            relay = RelayAccountsDomain(directory, http_client=Station({profile: {"data": {"balance": -1}}}))
+            ids = []
+            for host in ("a", "b"):
+                relay.dispatch("account.add", {"type": "sub2api", "label": host, "origin": f"https://{host}.example.test"})
+                account_id = relay.snapshot()["accounts"][-1]["id"]
+                ids.append(account_id)
+                relay.accept_login_result(account_id, username="person", access_token="replace-token")
+            relay.apply()
+            core = CoreStore(domains=[relay])
+            self.addCleanup(core.shutdown)
+            core.run_automatic_relay_balance_refresh(ids[1:], lambda: False)
+            before = relay.snapshot()["accounts"][1]["balance_observed_at"]
+            results = []
+            thread = threading.Thread(target=lambda: results.append(core.run_automatic_relay_balance_refresh(ids[:1], lambda: False)))
+            thread.start()
+            try:
+                self.assertTrue(began.wait(1))
+                core.dispatch({"domain": "relay_accounts", "type": "account.delete", "payload": {"id": ids[0]}})
+            finally:
+                release.set()
+                thread.join(3)
+            self.assertEqual([{}], results)
+            survivor = relay.snapshot()["accounts"][0]
+            self.assertEqual(ids[1], survivor["id"])
+            self.assertEqual(before, survivor["balance_observed_at"])
 
     def test_relay_key_read_keeps_the_rest_of_the_station_key_list(self) -> None:
         """One station answer caches every key, so the next key is a cache hit.

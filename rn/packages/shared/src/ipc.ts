@@ -17,7 +17,7 @@ import {
   type StagedPlan,
   type ValidationSummary,
 } from "./types";
-import { mergeSnapshot } from "./applyPatch";
+import { applyPatch, mergeSnapshot } from "./applyPatch";
 
 export class IpcProtocolError extends Error {
   readonly code: string;
@@ -56,7 +56,8 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
   let initialSnapshotRequest: Promise<CoreSnapshot> | undefined;
   const snapshotListeners = new Set<(event: IpcEvent) => void>();
   let unsubscribeTransport: (() => void) | undefined;
-  let subscriptionStarted = false;
+  let subscriptionStarted: Promise<void> | undefined;
+  let subscriptionRetry: ReturnType<typeof setTimeout> | undefined;
   // Jobs this client is waiting on, and the answers that arrived before their
   // waiter was registered: a probe can finish between the dispatch response
   // and the next statement, and that answer must not be lost because of it.
@@ -99,9 +100,11 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     const finished = finishedJobs.get(jobId);
     if (finished) {
       finishedJobs.delete(jobId);
-      return Promise.resolve(jobProbeResult(finished));
+      const result = jobProbeResult(finished);
+      return finished.state === "failed"
+        ? Promise.reject(new IpcProtocolError("probe_failed", result.detail ?? "The probe failed.", true))
+        : Promise.resolve(result);
     }
-    ensureEventStream();
     return new Promise<IpcResults["probe"]>((resolve, reject) => {
       const timer = setTimeout(() => {
         jobWaiters.delete(jobId);
@@ -120,24 +123,33 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     });
   }
 
-  function ensureEventStream(topics?: IpcEventTopic[]): void {
+  function ensureEventStream(topics?: IpcEventTopic[]): Promise<void> {
     if (!unsubscribeTransport) {
       unsubscribeTransport = transport.subscribe((event) => {
-        // A snapshot is still the only state event this layer reads: patches
-        // and resyncs describe the same state and are handed to the UI, which
-        // is what decides how to apply or replace them.  A job is one caller's
-        // operation, so it is joined back to that caller here.
+        // Every root starts from this cache. Keep its projection current when
+        // existing roots accept a patch so a window opened later sees the
+        // same state on its first frame.
         if (event.event === "snapshot") rememberSnapshot(event.snapshot);
+        if (event.event === "patch" && latestSnapshot) {
+          const patched = applyPatch(latestSnapshot, event);
+          if (patched) rememberSnapshot(patched);
+        }
         if (event.event === "job") rememberFinishedJob(event);
         for (const snapshotListener of snapshotListeners) snapshotListener(event);
       });
     }
     if (!subscriptionStarted) {
-      subscriptionStarted = true;
-      void call("subscribe", topics ? { topics } : {}).catch(() => {
-        subscriptionStarted = false;
+      if (subscriptionRetry !== undefined) clearTimeout(subscriptionRetry);
+      subscriptionRetry = undefined;
+      subscriptionStarted = call("subscribe", topics ? { topics } : {}).then(() => undefined, (reason: unknown) => {
+        subscriptionStarted = undefined;
+        if (snapshotListeners.size > 0) subscriptionRetry = setTimeout(() => {
+          if (snapshotListeners.size > 0) void ensureEventStream(topics).catch(() => undefined);
+        }, 1000);
+        throw reason;
       });
     }
+    return subscriptionStarted;
   }
 
   function rememberSnapshot(next: CoreSnapshot): CoreSnapshot {
@@ -208,7 +220,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     dispatch: async (action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]> => call("dispatch", revision === undefined ? { action } : { action, revision }),
     subscribe: (listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): (() => void) => {
       snapshotListeners.add(listener);
-      ensureEventStream(topics);
+      void ensureEventStream(topics).catch(() => undefined);
       return () => {
         snapshotListeners.delete(listener);
       };
@@ -222,6 +234,9 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     // holds the whole request (and the native host's 900 s budget) for as long
     // as the upstream takes; this path answers with an id at once.
     probe: async (providerId?: string, modelId?: string, domain?: "providers_models" | "webdav", values?: Record<string, unknown>): Promise<IpcResults["probe"]> => {
+      // Core can finish a probe before dispatch returns. Its subscription must
+      // already exist for the finishedJobs buffer to be able to catch it.
+      await ensureEventStream();
       const target = domain ?? "providers_models";
       const started = await call("dispatch", {
         action: {

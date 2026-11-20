@@ -17,9 +17,10 @@ pass keeps happening while Core is alive.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable
+from typing import Callable
 
 from .oplog import note as _note
+from .scheduled_tasks import PROXY_SUPERVISION, ScheduledTasks
 
 INITIAL_DELAY_SECONDS = 5.0
 """Let the app's own launch start run first, so two starts do not race."""
@@ -33,18 +34,20 @@ open still gets the recovery."""
 class ServiceSupervisor:
     """Run one supervision pass per interval until Core stops.
 
-    ``supervise`` performs the pass and returns whether it touched the proxy.
+    ``supervise`` performs the pass and reports its outcome.
     Tests drive it with a fake, so the loop itself never touches a process.
     """
 
     def __init__(
         self,
         *,
-        supervise: Callable[[], Any],
+        supervise: Callable[[], str],
         interval: float = CHECK_INTERVAL_SECONDS,
         initial_delay: float = INITIAL_DELAY_SECONDS,
+        tasks: ScheduledTasks | None = None,
     ) -> None:
         self._supervise = supervise
+        self._tasks = tasks
         self._interval = max(1.0, float(interval))
         self._initial_delay = max(0.0, float(initial_delay))
         self._stop = threading.Event()
@@ -69,19 +72,29 @@ class ServiceSupervisor:
             thread.join(timeout=timeout)
 
     def run_once(self) -> None:
+        if self._tasks is not None:
+            self._tasks.begin(PROXY_SUPERVISION)
         try:
-            self._supervise()
+            outcome = self._supervise()
         except Exception as exc:
             # A pass that failed is simply due again next interval; it must
             # never take Core down or stop the loop.  It must still be said:
             # this loop exists for the installation nobody is looking at, and
             # a pass that keeps failing is invisible everywhere else.
             _note("a recovery pass failed", trace=exc)
+            outcome = "failed"
+        if self._tasks is not None:
+            self._tasks.finish(PROXY_SUPERVISION, outcome)
+
+    def _plan(self, delay: float | None) -> None:
+        if self._tasks is not None:
+            self._tasks.plan(PROXY_SUPERVISION, interval_seconds=self._interval, delay_seconds=delay)
 
     def _loop(self) -> None:
-        if self._stop.wait(self._initial_delay):
-            return
-        while not self._stop.is_set():
+        delay = self._initial_delay
+        self._plan(delay)
+        while not self._stop.wait(delay):
             self.run_once()
-            if self._stop.wait(self._interval):
-                return
+            delay = self._interval
+            self._plan(delay)
+        self._plan(None)

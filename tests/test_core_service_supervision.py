@@ -200,7 +200,7 @@ class ServiceSupervisionTests(unittest.TestCase):
         unsubscribe = core.subscribe(events.append)
         self.addCleanup(unsubscribe)
 
-        self.assertTrue(core.supervise_service_once())
+        self.assertEqual("succeeded", core.supervise_service_once())
 
         self.assertEqual(["start"], calls)
         self.assertEqual("running", core.snapshot()["service"]["state"])
@@ -215,7 +215,7 @@ class ServiceSupervisionTests(unittest.TestCase):
         core = CoreStore(service_handlers=_service_handlers({"state": "stopped"}, calls))
         core.dispatch({"type": "service.stop"})
 
-        self.assertFalse(core.supervise_service_once())
+        self.assertEqual("skipped", core.supervise_service_once())
         self.assertNotIn("start", calls)
 
     def test_the_stop_decision_survives_a_replacement_core(self) -> None:
@@ -232,7 +232,7 @@ class ServiceSupervisionTests(unittest.TestCase):
                 metadata_path=metadata,
                 service_handlers=_service_handlers({"state": "stopped"}, calls),
             )
-            self.assertFalse(replacement.supervise_service_once())
+            self.assertEqual("skipped", replacement.supervise_service_once())
             self.assertNotIn("start", calls)
 
     def test_an_unhealthy_proxy_is_replaced_after_its_patience(self) -> None:
@@ -240,14 +240,14 @@ class ServiceSupervisionTests(unittest.TestCase):
         core = CoreStore(service_handlers=_service_handlers({"state": "unhealthy"}, calls))
 
         with mock.patch("young_router.core.service.time.monotonic", return_value=1000.0):
-            self.assertFalse(core.supervise_service_once())
+            self.assertEqual("skipped", core.supervise_service_once())
         self.assertEqual([], calls, "one missed probe is not a wedged proxy")
 
         with mock.patch(
             "young_router.core.service.time.monotonic",
             return_value=1000.0 + SERVICE_RECOVERY_PATIENCE_SECONDS + 1,
         ):
-            self.assertTrue(core.supervise_service_once())
+            self.assertEqual("succeeded", core.supervise_service_once())
         self.assertEqual(["restart"], calls)
         self.assertEqual("running", core.snapshot()["service"]["state"])
 
@@ -259,7 +259,7 @@ class ServiceSupervisionTests(unittest.TestCase):
             "young_router.core.service.time.monotonic",
             return_value=1000.0 + SERVICE_RECOVERY_PATIENCE_SECONDS + 1,
         ):
-            self.assertFalse(core.supervise_service_once())
+            self.assertEqual("skipped", core.supervise_service_once())
 
         self.assertEqual([], calls)
 
@@ -277,9 +277,9 @@ class ServiceSupervisionTests(unittest.TestCase):
 
         core = CoreStore(service_handlers={"health": probe, "restart": restart})
         with mock.patch("young_router.core.service.time.monotonic", return_value=1000.0):
-            self.assertFalse(core.supervise_service_once())
+            self.assertEqual("skipped", core.supervise_service_once())
         with mock.patch("young_router.core.service.time.monotonic", return_value=2000.0):
-            self.assertFalse(core.supervise_service_once())
+            self.assertEqual("succeeded", core.supervise_service_once())
         self.assertIsNone(core._service_supervision_unhealthy_since)
         self.assertEqual([], calls)
 
@@ -295,17 +295,17 @@ class ServiceSupervisionTests(unittest.TestCase):
         core = CoreStore(service_handlers={"health": handler, "status": handler, "start": handler})
         first = 1000.0
         with mock.patch("young_router.core.service.time.monotonic", return_value=first):
-            self.assertTrue(core.supervise_service_once())
+            self.assertEqual("failed", core.supervise_service_once())
         self.assertEqual(["start"], attempts)
         self.assertEqual("stopped", core.snapshot()["service"]["state"])
 
         delay = SERVICE_RECOVERY_RETRY_SECONDS[0]
         with mock.patch("young_router.core.service.time.monotonic", return_value=first + delay - 1):
-            self.assertFalse(core.supervise_service_once())
+            self.assertEqual("skipped", core.supervise_service_once())
         self.assertEqual(["start"], attempts, "the ladder must not spin on a failing start")
 
         with mock.patch("young_router.core.service.time.monotonic", return_value=first + delay + 1):
-            self.assertTrue(core.supervise_service_once())
+            self.assertEqual("failed", core.supervise_service_once())
         self.assertEqual(["start", "start"], attempts)
 
     def test_a_supervised_start_announces_its_transition(self) -> None:
@@ -318,7 +318,7 @@ class ServiceSupervisionTests(unittest.TestCase):
             return {"state": "running", "pid": 2, "port": 49173}
 
         core = CoreStore(service_handlers={"status": handler, "start": handler})
-        self.assertTrue(core.supervise_service_once())
+        self.assertEqual("succeeded", core.supervise_service_once())
 
         self.assertEqual(["starting"], seen)
 
@@ -328,7 +328,7 @@ class ServiceSupervisionTests(unittest.TestCase):
 
         core.shutdown(stopped_by="app_exit")
 
-        self.assertFalse(core.supervise_service_once())
+        self.assertEqual("skipped", core.supervise_service_once())
         self.assertNotIn("start", calls)
 
 
@@ -356,8 +356,9 @@ class ServiceSupervisorLoopTests(unittest.TestCase):
     def test_the_loop_keeps_passing_and_stops_on_request(self) -> None:
         passes: list[int] = []
 
-        def supervise() -> None:
+        def supervise() -> str:
             passes.append(len(passes))
+            return "succeeded"
 
         loop = ServiceSupervisor(supervise=supervise, interval=1.0, initial_delay=0.0)
         loop.start()

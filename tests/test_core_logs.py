@@ -3141,6 +3141,21 @@ model_list:
             self.assertEqual(["two"], sorted(set(reader.scopes)))
             self.assertEqual("two", domain.view("online-usage")["log"]["source_id"])
 
+    def test_switching_online_usage_source_resets_page_and_explicit_empty_clears_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _PagedUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            domain.dispatch("logs.goto_page", {"tab": "online-usage", "page": 4})
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "two"})
+            self.assertEqual(1, reader.requests[-1][0])
+            self.assertEqual("two", domain.view("online-usage")["log"]["source_id"])
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": ""})
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual("", tab["source_id"])
+            self.assertEqual([], tab["records"])
+            self.assertEqual(0, tab["total"])
+
     def test_default_core_resolves_usage_sources_from_the_provider_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime_root = Path(directory) / "home" / ".young-router"
@@ -3517,6 +3532,22 @@ model_list:
             tab = domain.view("online-usage")["log"]
             self.assertEqual("fast", tab["source_id"])
             self.assertEqual("fast model", tab["records"][0]["model"])
+
+    def test_clearing_source_supersedes_an_inflight_read_without_request_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _OverlappingUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+            slow = threading.Thread(target=lambda: domain.dispatch(
+                "logs.refresh_online_usage", {"tab": "online-usage", "source": "slow"}
+            ))
+            slow.start()
+            self.assertTrue(reader.started.wait(1))
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": ""})
+            reader.release.set()
+            slow.join(2)
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual("", tab["source_id"])
+            self.assertEqual([], tab["records"])
 
 
     def test_request_rows_keep_the_clients_stream_mode(self) -> None:

@@ -10,6 +10,7 @@ LOG_TABS = (
     "route-trace",
     "recovery",
     "online-usage",
+    "scheduled-tasks",
 )
 
 

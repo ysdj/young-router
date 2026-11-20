@@ -153,10 +153,11 @@ class WebDAVSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "WebDAV settings are invalid") from None
 
-    def sync_settings(self) -> Any:
-        """Return validated private settings only for Core's manual sync path."""
+    def sync_settings(self, *, committed: bool = False) -> Any:
+        """Return private settings; the timer uses the saved connection."""
 
-        settings = self._settings()
+        raw = self._load()[0] if committed else None
+        settings = self._settings(raw)
         if not settings.configured:
             raise DomainError("WebDAV is not configured")
         return settings

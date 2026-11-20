@@ -35,6 +35,12 @@ class FakeCore:
     def webdav_scheduler(self) -> FakeScheduler:
         return FakeScheduler(self._events, "webdav")
 
+    def relay_balance_scheduler(self) -> FakeScheduler:
+        return FakeScheduler(self._events, "relay_balance")
+
+    def relay_maintenance(self) -> FakeScheduler:
+        return FakeScheduler(self._events, "relay_maintenance")
+
     def image_context_sweeper(self) -> FakeScheduler:
         return FakeScheduler(self._events, "sweeper")
 
@@ -91,11 +97,11 @@ def run_core(argv: list[str] | None = None) -> list[str]:
 
 
 class CoreMainShutdownTests(unittest.TestCase):
-    def test_core_stops_the_client_model_sync_loop_when_it_exits(self) -> None:
+    def test_core_stops_its_background_loops_when_it_exits(self) -> None:
         events = run_core()
 
-        self.assertIn("model_sync.start", events)
-        self.assertIn("model_sync.stop", events)
+        for name in ("model_sync", "relay_balance", "relay_maintenance"):
+            self.assertLess(events.index(f"{name}.start"), events.index(f"{name}.stop"))
 
 
 if __name__ == "__main__":

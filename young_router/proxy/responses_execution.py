@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from contextlib import aclosing
+
+from litellm.responses.streaming_iterator import (
+    BaseResponsesAPIStreamingIterator,
+    partial_responses_incomplete_event_on_disconnect,
+)
+
 from . import context_window as _context_window_module
 from . import image_generation as _image_generation_module
 from . import responses_output as _responses_output_module
@@ -750,9 +757,9 @@ async def _responses_chat_bridge_direct_stream_response(
     # different question -- that clock times the first frame of a response that
     # exists, and a host that never answers never produces one.  ``wait_for``
     # also moves the call into a child task, whose context is a copy; this proxy
-    # keeps the route that answered in a ContextVar.  The old budget stays as
-    # the fallback so turning the connect budget off does not mean "wait
-    # forever".
+    # keeps the route that answered in a ContextVar.  The first-event budget is
+    # the dispatch deadline (both clocks end at the response head); the start
+    # budget stays as the fallback for the case that deadline is disabled.
     chat_response = await _streaming_module._await_upstream_dispatch(
         acompletion(**payload),
         bridge_kwargs,
@@ -1035,6 +1042,7 @@ class _ResponsesContextTruncationStream:
     def __init__(self, stream: Any, source: Any) -> None:
         self._stream = stream
         self._source = source
+        self._active_source = source
         self._closed = False
         self.completed_response = getattr(source, "completed_response", None)
 
@@ -1052,7 +1060,7 @@ class _ResponsesContextTruncationStream:
             response = dumped.get("response")
             self.completed_response = response if response is not None else chunk
             return
-        source_completed = getattr(self._source, "completed_response", None)
+        source_completed = getattr(self._active_source, "completed_response", None)
         if source_completed is None:
             return
         source_response = getattr(source_completed, "response", None)
@@ -1093,6 +1101,27 @@ class _ResponsesContextTruncationStream:
             await _streaming_module._close_async_iterator_safely(self._source)
 
 
+class _NativeResponsesContextTruncationStream(
+    _ResponsesContextTruncationStream, BaseResponsesAPIStreamingIterator
+):
+    """Keep LiteLLM's stream reporting and disconnect billing around the repair."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+    def _remember_completion(self, chunk: Any) -> None:
+        if (
+            _streaming_module._responses_stream_chunk_is_completed(chunk)
+            or _streaming_module._responses_stream_chunk_is_incomplete_terminal(chunk)
+        ):
+            self.completed_response = chunk
+        elif self.completed_response is None:
+            self.completed_response = getattr(self._active_source, "completed_response", None)
+
+    def partial_response_on_disconnect(self) -> Any:
+        return partial_responses_incomplete_event_on_disconnect(self._active_source)
+
+
 def _with_responses_context_truncation_fallback_stream(
     response: Any,
     request_kwargs: dict,
@@ -1104,6 +1133,9 @@ def _with_responses_context_truncation_fallback_stream(
     if request_kwargs.get("stream") is not True:
         return response
     if not _responses_output_module._response_is_async_iterable(response):
+        return response
+    if request_kwargs.get("background") is True:
+        # The native router can release a background run's response ID early.
         return response
     if not _responses_request_module._request_can_attempt_responses_context_truncation_fallback(
         request_kwargs
@@ -1130,6 +1162,7 @@ def _with_responses_context_truncation_fallback_stream(
             if fallback is None:
                 raise exception
             fallback_response, _fallback_kwargs = fallback
+            guard._active_source = fallback_response
             if _responses_output_module._response_is_async_iterable(
                 fallback_response
             ):
@@ -1162,9 +1195,6 @@ def _with_responses_context_truncation_fallback_stream(
                                 fallback_chunk
                             )
                         ):
-                            await _streaming_module._close_async_iterator_safely(
-                                fallback_response
-                            )
                             return
                 finally:
                     await _streaming_module._close_async_iterator_safely(
@@ -1182,8 +1212,9 @@ def _with_responses_context_truncation_fallback_stream(
                     chunk_exception is not None
                     and _routing_module._is_context_size_error(chunk_exception)
                 ):
-                    async for retry_chunk in yield_retry(chunk_exception):
-                        yield retry_chunk
+                    async with aclosing(yield_retry(chunk_exception)) as retry_stream:
+                        async for retry_chunk in retry_stream:
+                            yield retry_chunk
                     return
 
                 buffered.append(chunk)
@@ -1225,8 +1256,9 @@ def _with_responses_context_truncation_fallback_stream(
                             terminal_exception
                         )
                     ):
-                        async for retry_chunk in yield_retry(terminal_exception):
-                            yield retry_chunk
+                        async with aclosing(yield_retry(terminal_exception)) as retry_stream:
+                            async for retry_chunk in retry_stream:
+                                yield retry_chunk
                         return
 
                 if (
@@ -1274,15 +1306,22 @@ def _with_responses_context_truncation_fallback_stream(
                 and not delivery_started
                 and _routing_module._is_context_size_error(exception)
             ):
-                async for retry_chunk in yield_retry(exception):
-                    yield retry_chunk
+                async with aclosing(yield_retry(exception)) as retry_stream:
+                    async for retry_chunk in retry_stream:
+                        yield retry_chunk
                 return
             raise
 
         for buffered_chunk in buffered:
             yield buffered_chunk
 
-    return _ResponsesContextTruncationStream(guarded_stream(), response)
+    stream_type = (
+        _NativeResponsesContextTruncationStream
+        if isinstance(response, BaseResponsesAPIStreamingIterator)
+        else _ResponsesContextTruncationStream
+    )
+    guard = stream_type(guarded_stream(), response)
+    return guard
 
 
 async def _execute_bridged_upstream_attempt(

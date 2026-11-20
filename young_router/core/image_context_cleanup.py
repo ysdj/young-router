@@ -17,6 +17,8 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
+from .scheduled_tasks import IMAGE_CONTEXT_CLEANUP, ScheduledTasks
+
 INTERVAL_SECONDS = 60 * 60
 """One hour: often enough for a one-day rule, rarely enough to stay idle."""
 
@@ -24,8 +26,12 @@ INTERVAL_SECONDS = 60 * 60
 class ImageContextSweeper:
     """Apply the store's own age rule from outside the request path."""
 
-    def __init__(self, *, sweep: Callable[[], object], interval: float = INTERVAL_SECONDS) -> None:
+    def __init__(
+        self, *, sweep: Callable[[], object], interval: float = INTERVAL_SECONDS,
+        tasks: ScheduledTasks | None = None,
+    ) -> None:
         self._sweep = sweep
+        self._tasks = tasks
         self._interval = max(1.0, float(interval))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -49,15 +55,24 @@ class ImageContextSweeper:
             thread.join(timeout=timeout)
 
     def run_once(self) -> None:
+        if self._tasks is not None:
+            self._tasks.begin(IMAGE_CONTEXT_CLEANUP)
+        outcome = "succeeded"
         try:
             self._sweep()
         except Exception:
             # A sweep that failed is simply due again next interval; it must
             # never take Core down or stop the loop.
-            pass
+            outcome = "failed"
+        if self._tasks is not None:
+            self._tasks.finish(IMAGE_CONTEXT_CLEANUP, outcome)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             self.run_once()
+            if self._tasks is not None:
+                self._tasks.plan(IMAGE_CONTEXT_CLEANUP, interval_seconds=self._interval, delay_seconds=self._interval)
             if self._stop.wait(self._interval):
-                return
+                break
+        if self._tasks is not None:
+            self._tasks.plan(IMAGE_CONTEXT_CLEANUP, interval_seconds=self._interval, delay_seconds=None)

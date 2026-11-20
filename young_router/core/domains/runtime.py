@@ -144,8 +144,6 @@ DEFAULT_MASTER_KEY = "sk-young-router"
 #: scalar marker and a flow indicator do not, because writing one unquoted
 #: would restructure the document around it rather than set a key.
 _MASTER_KEY_VALUE = re.compile(r"[A-Za-z0-9._~+/=:@!*(),;-]{1,256}")
-#: The first top-level ``general_settings:`` block a document holds.
-_MASTER_KEY_BLOCK = re.compile(r"^general_settings:[^\n]*\n(?:[ \t]+[^\n]*(?:\n|$))*", re.MULTILINE)
 
 
 def master_key_is_valid(key: object) -> bool:
@@ -217,45 +215,127 @@ def generate_web_password() -> str:
     )
 
 
-def _setting_line_in_document(text: str, name: str, value: str) -> str:
-    """Rewrite one ``general_settings`` scalar, touching nothing else.
+def _yaml_node_after(events: list[yaml.Event], index: int) -> int:
+    depth = 0
+    while True:
+        event = events[index]
+        index += 1
+        if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+            depth += 1
+        elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            depth -= 1
+        if depth == 0:
+            return index
 
-    The document is edited as text because it is the source of truth for
-    everything the provider editor does not model: comments, anchors, and the
-    order of every other section survive a one-line change here, and a
-    hand-written document keeps its own shape.  A document without a
-    ``general_settings`` block gains one, and a block that states no ``name``
-    gains the line at the block's own indentation.
-    """
 
-    setter = re.compile(
-        r"^(?P<lead>[ \t]+)" + re.escape(name) + r"[ \t]*:[ \t]*(?P<rest>.*)$",
-        re.MULTILINE,
-    )
-    block_match = _MASTER_KEY_BLOCK.search(text)
-    if block_match is None:
-        section = f"general_settings:\n  {name}: {value}\n"
-        return section if not text.strip() else text.rstrip("\n") + "\n\n" + section
-    block = block_match.group(0)
-    body = block.split("\n", 1)[1] if "\n" in block else ""
-    indent_match = re.match(r"[ \t]+", body)
-    indent = indent_match.group(0) if indent_match is not None else "  "
-    line_match = setter.search(block)
-    if line_match is None:
-        head = block.split("\n", 1)[0]
-        stated = head.partition(":")[2].strip()
-        # A header holding a flow mapping -- ``general_settings: {}`` -- cannot
-        # take an indented line after it, so it becomes a block mapping.
-        if stated.startswith(("{", "[")):
-            head = f"{head.partition(':')[0]}:"
-        updated = f"{head}\n{indent}{name}: {value}\n{body}"
+def _yaml_child(events: list[yaml.Event], index: int, name: str) -> int | None:
+    """Find the direct mapping value, skipping nested keys and values."""
+
+    value = None
+    index += 1
+    while not isinstance(events[index], yaml.MappingEndEvent):
+        key = events[index]
+        child = _yaml_node_after(events, index)
+        if isinstance(key, yaml.ScalarEvent) and key.value == name:
+            value = child
+        index = _yaml_node_after(events, child)
+    return value
+
+
+def _insert_yaml_entry(text: str, events: list[yaml.Event], index: int, entry: str, newline: str) -> str:
+    mapping = events[index]
+    mark = mapping.end_mark
+    if mapping.flow_style:
+        entry += "" if isinstance(events[index + 1], yaml.MappingEndEvent) else ", "
     else:
-        updated = (
-            block[: line_match.start()]
-            + f"{line_match.group('lead')}{name}: {value}\n"
-            + block[line_match.end() :].lstrip("\n")
-        )
-    return text[: block_match.start()] + updated + text[block_match.end() :]
+        entry += newline + " " * mark.column
+    return text[:mark.index] + entry + text[mark.index:]
+
+
+def _replace_yaml_scalar(text: str, scalar: yaml.Event, value: str, newline: str) -> str:
+    start, end = scalar.start_mark.index, scalar.end_mark.index
+    if isinstance(scalar, yaml.ScalarEvent) and (scalar.anchor or scalar.style in {"|", ">"}):
+        # The token starts after any &anchor. Also retain a block scalar's
+        # header comment, which its source span otherwise includes.
+        for token in yaml.scan(text):
+            if token.start_mark.index >= end:
+                break
+            if isinstance(token, yaml.ScalarToken) and token.start_mark.index >= start:
+                start = token.start_mark.index
+                if token.style in {"|", ">"}:
+                    header = text[start:end].splitlines()[0]
+                    comment = re.search(r"[ \t]+#.*", header)
+                    if comment:
+                        value += comment.group()
+                break
+    if start == end:
+        value = (" " if text[start - 1:start] == ":" else ": ") + value
+        if text[start:start + 1] == "#":
+            value += " "
+    # Block scalar spans include the newline before the next entry; ordinary
+    # scalar spans exclude it. Keep that boundary when changing scalar style.
+    trailing_newlines = re.search(r"[\r\n\x85\u2028\u2029]+\Z", text[start:end])
+    if trailing_newlines:
+        value += trailing_newlines.group()
+    elif end == len(text):
+        value += newline
+    return text[:start] + value + text[end:]
+
+
+def _setting_line_in_document(text: str, name: str, value: str) -> str:
+    """Use YAML structure to locate the field and rewrite only its source span."""
+
+    try:
+        events = list(yaml.parse(text))
+        if sum(isinstance(event, yaml.DocumentStartEvent) for event in events) > 1:
+            raise DomainError("The provider configuration is invalid")
+        line_break = re.search(r"\r\n|\n|\r", text)
+        newline = line_break.group() if line_break else "\n"
+        root_index = 2
+        root = events[root_index] if len(events) > root_index else None
+        if isinstance(root, yaml.MappingStartEvent):
+            settings_index = _yaml_child(events, root_index, "general_settings")
+            if settings_index is not None:
+                settings = events[settings_index]
+                if isinstance(settings, yaml.MappingStartEvent):
+                    child_index = _yaml_child(events, settings_index, name)
+                    rendered = json.dumps(value) if settings.flow_style else value
+                    if child_index is None:
+                        return _insert_yaml_entry(text, events, settings_index, f"{name}: {rendered}", newline)
+                    child = events[child_index]
+                    if isinstance(child, (yaml.ScalarEvent, yaml.AliasEvent)):
+                        if isinstance(child, yaml.ScalarEvent):
+                            if child.style == "'":
+                                rendered = f"'{value}'"
+                            elif child.style == '"':
+                                rendered = json.dumps(value)
+                        return _replace_yaml_scalar(text, child, rendered, newline)
+                entry = f"{name}: {json.dumps(value)}"
+                if isinstance(settings, yaml.AliasEvent):
+                    entry = f"<<: *{settings.anchor}, {entry}"
+                elif not (
+                    isinstance(settings, yaml.ScalarEvent)
+                    and settings.style is None
+                    and settings.value in {"", "null", "Null", "NULL", "~"}
+                ):
+                    raise DomainError("The provider configuration is invalid")
+                return _replace_yaml_scalar(text, settings, "{" + entry + "}", newline)
+            if root.flow_style:
+                entry = f"general_settings: {{{name}: {json.dumps(value)}}}"
+                return _insert_yaml_entry(text, events, root_index, entry, newline)
+            indent = " " * root.end_mark.column
+        elif root is None or (isinstance(root, yaml.ScalarEvent) and root.value == "" and root.style is None):
+            indent = ""
+        else:
+            raise DomainError("The provider configuration is invalid")
+        position = events[-2].start_mark.index if root is not None else len(text)
+        prefix = text[:position]
+        separator = newline if prefix.removeprefix("\ufeff") and not prefix.endswith(("\r", "\n")) else ""
+        section = f"{indent}general_settings:{newline}{indent}  {name}: {value}{newline}"
+        return prefix + separator + section + text[position:]
+    except yaml.YAMLError:
+        # Parser diagnostics include the source line, which can hold secrets.
+        raise DomainError("The provider configuration is invalid") from None
 
 
 def master_key_in_document(text: str, key: str) -> str:
@@ -475,6 +555,18 @@ class RuntimeSettingsDomain:
         # same flat projection rather than a second shape, because the staging
         # it answers for is one document-wide draft.
         return {**copy.deepcopy(self._draft_values), MASTER_KEY_SETTING: self._master_key_draft}
+
+    def committed_relay_balance_intervals(self) -> tuple[int, int]:
+        from ..runtime_settings_schema import (
+            RELAY_NEGATIVE_BALANCE_INTERVAL_KEY,
+            RELAY_SIGNED_IN_BALANCE_INTERVAL_KEY,
+        )
+
+        values = self._raw_values
+        return (
+            int(values[RELAY_NEGATIVE_BALANCE_INTERVAL_KEY]) * 60,
+            int(values[RELAY_SIGNED_IN_BALANCE_INTERVAL_KEY]) * 60,
+        )
 
     def transaction_checkpoint(self) -> dict[str, object]:
         """Capture the staged document, not the attached lane runtime.
@@ -840,7 +932,9 @@ class RuntimeSettingsDomain:
             # configuration there is no proxy to hand any key to.
             raise DomainError("Provider configuration is unavailable")
         try:
-            source = self.master_key_path.read_text(encoding="utf-8")
+            source = self.master_key_path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            raise DomainError("The provider configuration is invalid") from None
         except OSError as exc:
             raise DomainError(safe_exception_message(exc)) from None
         if master_key_from_document(source) != self._master_key:

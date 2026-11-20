@@ -20,6 +20,7 @@ from . import streaming as _streaming_module
 from . import tools as _tools_module
 from . import concurrency as _concurrency_module
 from . import trace as _trace_module
+from . import relay_balance as _relay_balance_module
 
 
 from .base import (
@@ -44,6 +45,7 @@ from .base import (
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
+    _HEAD_HEDGE_METADATA_KEY,
     _DEPLOYMENT_COOLDOWNS,
     _REPLAY_REASONING_ELISION_ENABLED_ENV,
     _REPLAY_REASONING_ELISION_KEEP_ENV,
@@ -149,9 +151,11 @@ from .base import (
     _STREAM_NO_PROGRESS_DEFAULT_SECONDS,
     _STREAM_NO_PROGRESS_SECONDS_ENV,
     _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+    _STREAM_START_TIMEOUT_DISPATCH_PHASE,
+    _STREAM_START_TIMEOUT_HEDGE_LOSS_PHASE,
+    _STREAM_START_TIMEOUT_PHASE_ATTR,
     _STREAM_START_TIMEOUT_SECONDS_ENV,
-    _UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
-    _UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
+    _HEAD_HEDGE_DELAY_DEFAULT_SECONDS,
     _UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
@@ -937,57 +941,58 @@ def _stream_start_timeout_seconds() -> float:
     )
 
 
-def _upstream_connect_timeout_seconds() -> float:
-    """How long reaching an upstream may take before this attempt is over.
-
-    This is the budget for the one phase no stream watchdog times: the TCP
-    handshake, the TLS exchange, the upload of the body and the wait for the
-    response head.  Everything after the response object exists is the
-    first-event and stream-idle budgets' job.  ``0`` disables the cap and
-    restores the transport's own behaviour.
-
-    It cannot be handed to LiteLLM as a per-phase ``httpx.Timeout``: the router
-    collapses every timeout into one number before the provider sees it (see
-    ``responses_request._with_stream_request_timeout``), so this value is
-    enforced by this proxy around the dispatch itself --
-    ``streaming._await_upstream_dispatch``.
-    """
-
-    return _env_float_seconds(
-        _UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
-        _UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
-        minimum=0.0,
-    )
-
-
 def _upstream_dispatch_budget_seconds(request_data: Optional[dict]) -> float:
-    """The connect budget, widened for the body this request has to send.
+    """How long one streaming dispatch may wait for the response head.
 
-    A handshake budget alone would cut a legitimate heavy replay: a signed
-    history of a few megabytes has to travel before the upstream can write even
-    its first header, and the budget is spent waiting on the same socket.
+    The clock ends when the upstream writes the response head, and no upstream
+    writes one before it has prefilled the prompt.  That wait is therefore a
+    prefill wait, not a handshake: a relay that buffers its answer behind a
+    queue writes no head for however long the queue takes, whatever the body
+    weighs.  Live 2026-11-20 15:58: a healthy gemini-3.8-flash route answered
+    with its first byte at 13.69 s (measured directly against ``wawapii.com``),
+    while a 10 s connect allowance plus an upload allowance cut its dispatch at
+    11.52 s -- so the turn ended with ``stream start timeout after 11.5236s``
+    on a route that was about to answer.
 
-    That wait is not only the upload.  The clock this budget covers ends when
-    the upstream writes the response head, and no upstream writes one before it
-    has prefilled the prompt -- so the allowance is measured in prefill
-    throughput, not link throughput.  It used to be one megabyte per second,
-    which is a link figure: a 2.7 MB replay then received 12.6 s while the live
-    relay needed 26 s, and every attempt failed with ``stream_start_timeout``
-    on every deployment for the same reason.  The floor now sits below the
-    slowest measured prefill rate (see ``_UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND``).
+    So a streaming request's dispatch budget *is* its first-event budget: both
+    clocks end at the first evidence the route is producing anything.  A
+    shorter deadline here is not a connect timeout, it is a prefill timeout,
+    and one that cut routes this proxy's own first-event budget says are
+    allowed 120 s (300 s for a heavy Responses replay).  A request that disabled
+    every start budget (both ``YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS`` and
+    ``YOUNG_ROUTER_REQUEST_TIMEOUT_SECONDS`` are 0) returns 0, which leaves the
+    bound to the transport -- exactly what both zeros asked for.
 
-    Widening is safe because an unreachable host still pays only the bare
-    budget: it accepts no bytes, so it cannot make the proxy wait for a body
-    that never travels.  The widening is also capped by the first-event budget
-    for the same request, because both clocks end at the same event -- the
-    response head.  Waiting longer for that head than this proxy already waits
-    for the first frame of a response it did receive would be two answers to
-    one question.
+    A silent route is handled by the head hedge, not by this deadline: see
+    ``_head_hedge_delay_seconds``.
     """
 
-    connect_seconds = _upstream_connect_timeout_seconds()
-    if connect_seconds <= 0:
+    first_event = _stream_start_timeout_seconds_for_request(request_data)
+    if first_event <= 0:
         return 0.0
+    request_timeout = _request_timeout_seconds()
+    if request_timeout > 0:
+        return min(first_event, request_timeout)
+    return first_event
+
+
+def _head_hedge_delay_seconds(request_data: Optional[dict]) -> float:
+    """How long a dispatch waits for the head before a sibling is raced.
+
+    This is a trigger, not a deadline: the primary keeps running, and the
+    first head wins.  It is the old connect allowance plus this body's upload
+    allowance (10 s + weight/16 KBps: about 11.5 s for a 25 KB chat body, where
+    the healthy route measured 13.69 s), capped by the frame hedge's own delay
+    (20 s by default) so a heavy replay is not chased at 10 s.  A disabled
+    frame hedge (delay 0, or ``YOUNG_ROUTER_STREAM_HEDGE_ENABLED=0``) also
+    disables this one, and the first-event budget caps the trigger so it never
+    fires after the attempt is already being judged.
+    """
+
+    ceiling = _stream_hedge_delay_seconds()
+    if ceiling <= 0:
+        return 0.0
+    delay = _HEAD_HEDGE_DELAY_DEFAULT_SECONDS
     weight = 0
     try:
         weight = (
@@ -996,15 +1001,12 @@ def _upstream_dispatch_budget_seconds(request_data: Optional[dict]) -> float:
         )
     except Exception:
         weight = 0
-    upload_seconds = float(max(0, weight)) / _UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND
-    budget = connect_seconds + upload_seconds
+    delay += float(max(0, weight)) / _UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND
+    delay = min(delay, ceiling)
     first_event = _stream_start_timeout_seconds_for_request(request_data)
     if first_event > 0:
-        budget = min(budget, first_event)
-    request_timeout = _request_timeout_seconds()
-    if request_timeout > 0:
-        budget = min(budget, request_timeout)
-    return budget
+        delay = min(delay, first_event)
+    return max(0.0, delay)
 
 
 def _heavy_replay_stream_start_timeout_seconds() -> float:
@@ -5932,7 +5934,9 @@ def _claim_deployment_concurrency_slot(
     return True
 
 
-def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
+def _release_request_concurrency_slots(
+    request_kwargs: Optional[dict], *, deployment_only: bool = False
+) -> None:
     """Release every slot this turn still holds.
 
     A turn that ends on a route, or ends at all, must not leave a slot behind:
@@ -5947,11 +5951,25 @@ def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
     queued = False
     with _HELD_CONCURRENCY_LEASES_LOCK:
         for lease_id in names:
-            found = _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
+            found = _HELD_CONCURRENCY_LEASES.get(lease_id)
             if found:
                 held |= set(found)
-            if _WAIT_TICKETS.pop(lease_id, None) is not None:
+            if not deployment_only and _WAIT_TICKETS.pop(lease_id, None) is not None:
                 queued = True
+        if deployment_only:
+            deployment_key = _deployment_cooldown_key_from_request(request_kwargs)
+            if deployment_key:
+                held = {key for key in held if key.startswith(f"{deployment_key}|")}
+            elif len(held) > 1:
+                held.clear()
+        # A lease is registered under every available alias. Remove it from all
+        # aliases while holding the lock so another attempt's lease survives.
+        for lease_id, keys in list(_HELD_CONCURRENCY_LEASES.items()):
+            remaining = set(keys) - held
+            if remaining:
+                _HELD_CONCURRENCY_LEASES[lease_id] = remaining
+            else:
+                _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
     if not held and not queued:
         # Nothing to give back is the ordinary shape (a turn that never claimed,
         # a listing).  It stays silent: a trace per request would drown the ones
@@ -5962,15 +5980,6 @@ def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
     # ticket at the head of the line and keep refusing every later request for
     # that route.
     _concurrency_module.release(sorted(held), ticket_keys=names if queued else [])
-    # The same slot may be registered under more than one of this turn's names;
-    # once it is given back, no name may still claim to hold it.
-    with _HELD_CONCURRENCY_LEASES_LOCK:
-        for lease_id, keys in list(_HELD_CONCURRENCY_LEASES.items()):
-            remaining = set(keys) - held
-            if remaining:
-                _HELD_CONCURRENCY_LEASES[lease_id] = remaining
-            else:
-                _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
     _trace_module._route_trace(
         "concurrency_slot_release",
         request_id=_trace_request_id(request_kwargs),
@@ -6721,6 +6730,8 @@ def _apply_selected_deployment_marker_to_request(
 
     litellm_metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     updated_metadata = litellm_metadata.copy()
+    if marker.get(_HEAD_HEDGE_METADATA_KEY) is True:
+        updated_metadata[_HEAD_HEDGE_METADATA_KEY] = True
     updated_metadata["model_info"] = selected_model_info
     deployment_model_name = selected_model_info.get("model_group")
     if isinstance(deployment_model_name, str) and deployment_model_name.strip():
@@ -8577,7 +8588,7 @@ def _mark_exception_for_deployment_failover(
     # for the whole lease window -- observed live 2026-11-04: three turns that
     # refused on one route and were served by a sibling left three leases behind,
     # and that is exactly the traffic a refusing route produces.
-    _release_request_concurrency_slots(request_kwargs)
+    _release_request_concurrency_slots(request_kwargs, deployment_only=True)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
     remembered_route = None
@@ -9159,6 +9170,38 @@ def _record_deployment_failure_for_cooldown(
     # closed mid-stream is the same evidence: the route cut a turn the reader
     # was already consuming, and the next request must not select it again.
     start_timeout = _is_local_stream_start_timeout_error(exception)
+    # A dispatch-clock expiry on an ordinary request is not the silence the
+    # one-strike rule is about.  A relay that buffers its answer does not write
+    # the response head before it has prefilled, so the clock can expire on a
+    # route that has answered every request it was given.  Live 2026-11-20
+    # 15:28: ``stream_start_timeout after 11.1409s`` parked both glm-5.3-flash
+    # routes after one attempt each (``连续 1 次尝试失败``), and the client's
+    # retry got RouterRateLimitError.  The same shape at 15:58 cut a healthy
+    # gemini-3.8-flash route whose first byte was 13.69 s away.
+    #
+    # The one-strike rule stays where the evidence is strong: a route that held
+    # the whole first-event budget after its response head arrived, a body the
+    # upstream cut mid-stream, and a heavy replay that spent its whole 120/300 s
+    # dispatch budget without a head -- that last one is the 2026-11-19
+    # incident, where two deployments of one group answered nothing for ninety
+    # minutes while every selection paid the full heavy budget.  An ordinary
+    # dispatch expiry is charged like any other transient failure, to the
+    # configured threshold (2 by default).
+    #
+    # A head-race loss is the third shape: a sibling produced the head while
+    # this route had produced none.  That is charged to the configured
+    # threshold too, and to the ordinary cooldown -- a route that loses the
+    # race is not the 300 s zero-byte replay silence, and parking it for that
+    # would be a different verdict than the evidence supports.
+    dispatch_timeout = start_timeout and (
+        getattr(exception, _STREAM_START_TIMEOUT_PHASE_ATTR, "")
+        == _STREAM_START_TIMEOUT_DISPATCH_PHASE
+    )
+    hedge_loss = start_timeout and (
+        getattr(exception, _STREAM_START_TIMEOUT_PHASE_ATTR, "")
+        == _STREAM_START_TIMEOUT_HEDGE_LOSS_PHASE
+    )
+    heavy_start_timeout = start_timeout and _request_is_heavy_replay(request_kwargs)
     item_cap_cut = bool(getattr(exception, "item_cap_cut", False))
     threshold = (
         _deployment_cooldown_failure_threshold()
@@ -9166,17 +9209,16 @@ def _record_deployment_failure_for_cooldown(
         else 1
         if getattr(exception, "stream_incomplete", False)
         or _is_route_cut_stream_error(exception)
-        # A route that accepted the socket and sent no first byte for the
-        # whole budget is not a slow answer.  Live 2026-11-19: two deployments
-        # of one group answered no request in ninety minutes, and each
-        # selection cost the reader the full heavy-replay budget before the
-        # walk moved on.  One such silence parks it.
-        or start_timeout
+        or (
+            start_timeout
+            and not hedge_loss
+            and (not dispatch_timeout or heavy_start_timeout)
+        )
         else _deployment_cooldown_failure_threshold()
     )
     cooldown_seconds = (
         _stream_start_timeout_cooldown_seconds()
-        if start_timeout and _request_is_heavy_replay(request_kwargs)
+        if heavy_start_timeout and not hedge_loss
         else _deployment_cooldown_seconds()
     )
     request_log = _request_log_record("cooldown", request_kwargs)
@@ -9328,7 +9370,7 @@ def _record_deployment_success_for_cooldown(request_kwargs: Optional[dict]) -> N
     # slot must be given back before the next request is filtered against the
     # count.  A stream that ends through the failure path releases in the
     # fallback wrapper instead; the lease TTL covers the paths neither sees.
-    _release_request_concurrency_slots(request_kwargs)
+    _release_request_concurrency_slots(request_kwargs, deployment_only=True)
     _record_session_deployment_affinity(request_kwargs)
     _trace_deployment_success(request_kwargs)
     if _request_replay_reasoning_elided(request_kwargs):
@@ -9508,6 +9550,10 @@ def _with_active_deployment_cooldowns(
     *,
     request_kwargs: Optional[dict] = None,
 ) -> tuple[List[dict], list[dict[str, Any]], bool]:
+    # Balance observations are shared by every worker and every recovery hop.
+    # Apply this before cooldown state so a negative relay account cannot be
+    # selected again by a fallback path that bypasses the normal hook.
+    deployments = _relay_balance_module.filter_deployments(deployments)
     if not deployments or not _deployment_cooldown_enabled():
         return deployments, [], False
 
@@ -9583,13 +9629,19 @@ def _router_configured_deployments(
             _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(token)
 
     if isinstance(deployments, list):
-        return deployments
-    if deployments is None:
-        return []
-    try:
-        return list(deployments)
-    except Exception:
-        return []
+        configured = deployments
+    elif deployments is None:
+        configured = []
+    else:
+        try:
+            configured = list(deployments)
+        except Exception:
+            configured = []
+    # This helper is used by protocol fallback, recovery, and diagnostics as
+    # well as the normal LiteLLM selection hook.  Apply the balance predicate at
+    # this shared boundary so those paths cannot reintroduce a deployment that
+    # the normal candidate filter already removed.
+    return _relay_balance_module.filter_deployments(configured)
 
 
 def _preserved_failure_reason(exception: BaseException) -> str:

@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import threading
 import time
+from math import isfinite, log2
 from typing import Any, Callable, Mapping
+
+from .scheduled_tasks import WEBDAV_SYNC, ScheduledTasks
 
 INITIAL_DELAY_SECONDS = 120.0
 """Grace period before a machine that has never synced runs its first one."""
@@ -77,8 +80,9 @@ class WebDAVSyncScheduler:
         self,
         *,
         snapshot: Callable[[], Mapping[str, Any]],
-        sync: Callable[[], None],
+        sync: Callable[[], str | None],
         settle_seconds: Callable[[], float] | None = None,
+        tasks: ScheduledTasks | None = None,
         clock: Callable[[], float] = time.time,
         initial_delay: float = INITIAL_DELAY_SECONDS,
         max_sleep: float = MAX_SLEEP_SECONDS,
@@ -88,6 +92,7 @@ class WebDAVSyncScheduler:
         self._snapshot = snapshot
         self._sync = sync
         self._settle_seconds = settle_seconds
+        self._tasks = tasks
         self._clock = clock
         self._initial_delay = max(0.0, float(initial_delay))
         self._max_sleep = max(0.0, float(max_sleep))
@@ -148,15 +153,15 @@ class WebDAVSyncScheduler:
         """
 
         state = self._read_state()
-        if state is None:
-            return (None, False)
-        if self._blocked:
+        interval = self._interval_seconds(state) if state is not None else None
+        if self._blocked and interval is not None:
             # Nothing on a clock can answer this one.  The pane is holding the
             # two sides of a conflict and the next run is the reader's, not
             # the timer's.
+            self._plan(interval, None, state="blocked")
             return (None, False)
-        interval = self._interval_seconds(state)
-        if interval is None:
+        if state is None or interval is None:
+            self._plan(None, None)
             return (None, False)
         due = self._due_in(interval, state.get("last_sync_at"))
         if self._failures:
@@ -166,14 +171,22 @@ class WebDAVSyncScheduler:
             due = max(due, self._backoff_seconds(interval) - (self._clock() - (self._last_attempt or 0.0)))
         if due > 0:
             self._due_since = None
+            self._plan(interval, due)
             return (min(due, self._max_sleep), False)
         now = self._clock()
         if self._due_since is None:
             self._due_since = now
         settled = self._settled_in()
-        if settled > 0 and now - self._due_since < self._settle_grace:
+        settled = min(settled, self._settle_grace - (now - self._due_since))
+        if settled > 0:
+            self._plan(interval, settled)
             return (min(settled, self._max_sleep), False)
+        self._plan(interval, 0.0)
         return (0.0, True)
+
+    def _plan(self, interval: float | None, delay: float | None, *, state: str | None = None) -> None:
+        if self._tasks is not None:
+            self._tasks.plan(WEBDAV_SYNC, interval_seconds=interval, delay_seconds=delay, state=state)
 
     def _read_state(self) -> Mapping[str, Any] | None:
         try:
@@ -190,7 +203,7 @@ class WebDAVSyncScheduler:
         minutes = state.get("sync_interval_minutes")
         if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
             return None
-        if minutes <= 0:
+        if minutes <= 0 or not isfinite(minutes):
             return None
         return float(minutes) * 60.0
 
@@ -227,40 +240,22 @@ class WebDAVSyncScheduler:
         return max(0.0, self._settle - quiet)
 
     # -- loop --------------------------------------------------------------
-    def _wait(self, seconds: float | None) -> bool:
-        """Wait out one delay; True when a kick asked to re-read instead."""
-
-        if seconds is None:
-            self._wake.wait()
-            woken = self._wake.is_set()
-            self._wake.clear()
-            return woken
-        if seconds <= 0:
-            return False
-        woken = self._wake.wait(seconds)
-        if woken:
-            self._wake.clear()
-        return woken
-
     def _loop(self) -> None:
-        while not self._stop.is_set():
+        while True:
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             delay, fire = self.next_run()
-            if fire:
+            if fire and not self._wake.is_set():
                 self._run()
-                continue
-            if delay is None:
-                # Nothing is scheduled until the settings change: sleep until a
-                # kick (or stop) wakes the event, then let the loop head decide.
-                self._wait(None)
-                continue
-            if self._wait(delay):
-                continue
-            # The wait elapsed: recompute, which fires when the time is up.
+            else:
+                self._wake.wait(delay)
+        self._plan(None, None)
 
     def _backoff_seconds(self, interval: float) -> float:
         """How long to wait after ``self._failures`` consecutive failures."""
 
-        factor = min(2.0 ** max(0, self._failures), MAX_BACKOFF_FACTOR)
+        factor = 2.0 ** min(self._failures, log2(MAX_BACKOFF_FACTOR))
         return interval * factor
 
     def _run(self) -> None:
@@ -269,11 +264,16 @@ class WebDAVSyncScheduler:
         # outcome.
         self._last_attempt = self._clock()
         self._due_since = None
+        if self._tasks is not None:
+            self._tasks.begin(WEBDAV_SYNC)
         try:
             outcome = self._sync()
         except Exception as exc:
             outcome = str(getattr(exc, "code", "") or "webdav_sync_failed")
         self._observe(outcome)
+        if self._tasks is not None:
+            result = "skipped" if outcome == UNSAVED_CODE else "failed" if self._blocked or self._failures else "succeeded"
+            self._tasks.finish(WEBDAV_SYNC, result)
 
     def _observe(self, outcome: object) -> None:
         """Turn one run's answer into how long the loop waits next.

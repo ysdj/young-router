@@ -154,10 +154,9 @@ class WebDAVSyncSchedulerTests(unittest.TestCase):
         )
         self.assertEqual((30.0, False), scheduler.next_run())
         clock.advance(119.0)
-        # Still inside the grace: wait for quiet again.
-        self.assertEqual((30.0, False), scheduler.next_run())
-        clock.advance(2.0)
-        # Past it: the interval wins over a Core that never goes quiet.
+        # Quiet may take longer, but the grace expires in one second.
+        self.assertEqual((1.0, False), scheduler.next_run())
+        clock.advance(1.0)
         self.assertEqual((0.0, True), scheduler.next_run())
 
     def test_the_loop_runs_once_and_stops(self) -> None:

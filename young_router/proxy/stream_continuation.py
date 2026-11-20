@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
+from . import anthropic_sse as _anthropic_sse_module
 from . import routing as _routing_module
 from . import trace as _trace_module
 
@@ -203,7 +204,37 @@ def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
         return False
     if request_data.get("tools") or request_data.get("functions"):
         return False
-    return True
+    messages = request_data.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    user_message_count = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        role = message.get("role")
+        if role == "user":
+            user_message_count += 1
+        elif role != "system":
+            # The resume prompt intentionally rebuilds a single plain-text
+            # request. Earlier assistant turns, tool results, and other roles
+            # carry context it would otherwise discard.
+            return False
+
+        content = message.get("content")
+        if isinstance(content, str):
+            continue
+        if not isinstance(content, list) or any(
+            not isinstance(part, dict)
+            or part.get("type") != "text"
+            or not isinstance(part.get("text"), str)
+            for part in content
+        ):
+            # Images and other structured input cannot be represented by the
+            # text-only continuation conversation.
+            return False
+
+    return user_message_count == 1
 
 
 def _stopped_at_the_routes_own_ceiling(
@@ -287,6 +318,8 @@ def _continuation_request_payload(
     continuation that kept the ceiling would stop at the same place and never
     make progress.
     """
+    from . import streaming as _streaming_module
+
     messages = request_data.get("messages")
     if not isinstance(messages, list):
         return None
@@ -301,6 +334,24 @@ def _continuation_request_payload(
             continue
         payload[key] = request_data.get(key)
     payload["messages"] = _continuation_messages(messages, tail)
+    if _streaming_module._request_is_anthropic_messages_stream(request_data):
+        max_tokens = request_data.get("max_tokens")
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            return None
+        payload["max_tokens"] = max_tokens
+        payload["messages"] = [
+            message for message in payload["messages"] if message.get("role") != "system"
+        ]
+        for key in (
+            "system",
+            "stop_sequences",
+            "thinking",
+            "top_k",
+            "container",
+            "metadata",
+        ):
+            if key in request_data:
+                payload[key] = request_data[key]
     # The continuation is the router's own call, not the client's turn: it must
     # not inherit the fallback bookkeeping, or a ceiling would be recorded as a
     # route failure and quarantine a healthy deployment.
@@ -372,6 +423,7 @@ async def _stream_native_continuation_rounds(
     stream_idle_timeout_seconds: float,
     ceiling_chunk: Any = None,
     answered_output_tokens: Optional[int] = None,
+    anthropic_index_offset: int = 0,
 ) -> AsyncIterator[Any]:
     """Ask the same route for the rest of an answer it cut off at its ceiling.
 
@@ -395,13 +447,25 @@ async def _stream_native_continuation_rounds(
         return
     from litellm.proxy.proxy_server import llm_router
 
-    from . import streaming as _streaming_module
-
-    router_method = getattr(llm_router, "acompletion", None) if llm_router else None
+    is_anthropic = _streaming_module._request_is_anthropic_messages_stream(request_data)
+    method_name = "anthropic_messages" if is_anthropic else "acompletion"
+    router_method = getattr(llm_router, method_name, None) if llm_router else None
     if router_method is None:
         return
 
     seen_text = delivered_text
+    next_anthropic_index = anthropic_index_offset
+    # Anthropic reports ``usage.output_tokens`` for each Messages request.  A
+    # continuation is a second request that belongs to the same client answer,
+    # so the terminal usage we publish must include the initial route and every
+    # continuation round.
+    cumulative_anthropic_output_tokens = (
+        answered_output_tokens
+        if isinstance(answered_output_tokens, int)
+        and not isinstance(answered_output_tokens, bool)
+        and answered_output_tokens >= 0
+        else None
+    )
     for round_number in range(1, _max_continuation_rounds() + 1):
         payload = _continuation_request_payload(request_data, seen_text)
         if payload is None:
@@ -441,14 +505,63 @@ async def _stream_native_continuation_rounds(
         round_ceiling_hit = False
         released = False
         final_terminal: Optional[Any] = None
+        final_message_delta: Optional[dict] = None
+        round_anthropic_output_tokens: Optional[int] = None
+        anthropic_indices: dict[int, int] = {}
+        open_anthropic_indices: set[int] = set()
+        stream_failed = False
+        stream = _streaming_module._stream_with_idle_timeout(response, payload)
+        chunks = _anthropic_sse_module.iter_messages_sse_frames(stream) if is_anthropic else stream
         try:
-            async for chunk in _streaming_module._stream_with_idle_timeout(
-                response,
-                payload,
-            ):
+            async for chunk in chunks:
                 chunk_exception = _streaming_module._stream_chunk_error_exception(chunk)
                 if chunk_exception is not None:
                     raise chunk_exception
+                if is_anthropic:
+                    for event in _streaming_module._stream_chunk_dumps(chunk):
+                        event_type = event.get("type")
+                        if event_type == "message_delta":
+                            usage = event.get("usage")
+                            if isinstance(usage, dict):
+                                output_tokens = usage.get("output_tokens")
+                                if (
+                                    isinstance(output_tokens, int)
+                                    and not isinstance(output_tokens, bool)
+                                    and output_tokens >= 0
+                                ):
+                                    round_anthropic_output_tokens = output_tokens
+                            if _native_stream_output_limit_reason(event) is not None:
+                                round_ceiling_hit = True
+                            else:
+                                final_message_delta = event
+                            continue
+                        if event_type == "message_stop":
+                            if not round_ceiling_hit:
+                                final_terminal = event
+                            continue
+                        if event_type not in {
+                            "content_block_start", "content_block_delta", "content_block_stop"
+                        }:
+                            continue
+                        index = event.get("index")
+                        if not isinstance(index, int):
+                            continue
+                        if event_type == "content_block_start":
+                            anthropic_indices[index] = next_anthropic_index
+                            next_anthropic_index += 1
+                            open_anthropic_indices.add(anthropic_indices[index])
+                        if index not in anthropic_indices:
+                            continue
+                        event = dict(event)
+                        event["index"] = anthropic_indices[index]
+                        if event_type == "content_block_stop":
+                            open_anthropic_indices.discard(event["index"])
+                        delta = event.get("delta")
+                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                            round_text += str(delta.get("text") or "")
+                        released = True
+                        yield _anthropic_sse_module._sse_block(event)
+                    continue
                 reason = _native_stream_output_limit_reason(chunk)
                 if reason is not None:
                     round_ceiling_hit = True
@@ -475,9 +588,36 @@ async def _stream_native_continuation_rounds(
                 round=round_number,
                 exception=_routing_module._trace_exception(exception),
             )
-            return
+            stream_failed = True
         finally:
+            if chunks is not stream:
+                await chunks.aclose()
+            await stream.aclose()
             await _streaming_module._close_async_iterator_safely(response)
+
+        for index in sorted(open_anthropic_indices):
+            yield _anthropic_sse_module._sse_block(
+                {"type": "content_block_stop", "index": index}
+            )
+        if stream_failed:
+            return
+
+        if round_anthropic_output_tokens is not None:
+            if cumulative_anthropic_output_tokens is None:
+                cumulative_anthropic_output_tokens = round_anthropic_output_tokens
+            else:
+                cumulative_anthropic_output_tokens += round_anthropic_output_tokens
+
+        if is_anthropic and final_terminal is not None:
+            if final_message_delta is not None:
+                if cumulative_anthropic_output_tokens is not None:
+                    final_message_delta = dict(final_message_delta)
+                    usage = final_message_delta.get("usage")
+                    updated_usage = dict(usage) if isinstance(usage, dict) else {}
+                    updated_usage["output_tokens"] = cumulative_anthropic_output_tokens
+                    final_message_delta["usage"] = updated_usage
+                yield _anthropic_sse_module._sse_block(final_message_delta)
+            final_terminal = _anthropic_sse_module._sse_block(final_terminal)
 
         if not released:
             if final_terminal is not None:

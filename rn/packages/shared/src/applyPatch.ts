@@ -16,6 +16,7 @@
  * patched window holds the same fields a fresh snapshot would have given it.
  */
 
+import { LOG_TABS } from "./routes";
 import type {
   CoreSnapshot,
   IpcEventOp,
@@ -123,7 +124,6 @@ export function mergeSnapshot(held: CoreSnapshot | undefined, next: CoreSnapshot
 
 /** The queue depth Core uses when a log tab states an unusable limit. */
 const SUBSCRIPTION_QUEUE_LIMIT = 32;
-const LOG_TABS: readonly LogTab[] = ["requests", "service", "actions", "route-trace", "recovery", "online-usage"];
 
 type UnknownRecord = Record<string, unknown>;
 

@@ -189,4 +189,4 @@ jobs:
         run: pnpm run build
       - name: Build React Native Windows host
         working-directory: rn
-        run: pnpm run build:windows
+        run: pnpm run build:windows -AllowUpstreamWheel

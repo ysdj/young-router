@@ -290,7 +290,9 @@ async def _stream_streaming_error_fallback(
             # the client's stream keeps its slot until the lease ages out,
             # because the turn really did hold the route for that long.
             if not started_delivery:
-                _routing_module._release_request_concurrency_slots(request_data)
+                _routing_module._release_request_concurrency_slots(
+                    request_data, deployment_only=True
+                )
             if started_delivery:
                 _routing_module._mark_same_deployment_retry_exhausted(exc)
                 _routing_module._sync_failed_deployment_exclusions(request_data, exc)
@@ -765,8 +767,19 @@ async def _yield_native_stream_after_terminal(
     buffered_chunks: List[Any] = []
     finished_choice_indices: set[int] = set()
     saw_terminal = False
+    stream_options = request_data.get("stream_options")
+    await_usage = (
+        not _streaming_module._request_is_anthropic_messages_stream(request_data)
+        and isinstance(stream_options, dict)
+        and stream_options.get("include_usage") is True
+    )
     try:
         async for chunk in _streaming_module._stream_with_idle_timeout(response, request_data):
+            if saw_terminal:
+                if _streaming_module._stream_chunk_dump(chunk).get("usage") is not None:
+                    yield chunk
+                    return
+                continue
             chunk_exception = _streaming_module._stream_chunk_error_exception(chunk)
             if chunk_exception is not None:
                 failure_request = request_data.copy()
@@ -805,9 +818,15 @@ async def _yield_native_stream_after_terminal(
             )
             for buffered_chunk in buffered_chunks:
                 yield buffered_chunk
-            return
+            if not await_usage or _streaming_module._stream_chunk_dump(chunk).get("usage") is not None:
+                return
     except Exception:
+        if saw_terminal:
+            return
         raise
+
+    if saw_terminal:
+        return
 
     raise _native_stream_incomplete_exception(
         request_data,

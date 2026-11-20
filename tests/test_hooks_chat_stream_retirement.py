@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 import asyncio
 
 
@@ -272,6 +274,84 @@ class ChatStreamRetirementTests(HookTestCase):
 
         self.assertIn("terminal", str(raised.exception).lower())
 
+
+    async def test_a_retired_chat_turn_is_not_logged_as_a_success(self) -> None:
+        """The row says the restart cut the turn, not that the model answered.
+
+        Live 2026-11-20 15:11: a Cherry Studio turn on ``deepseek-v4.1-flash``
+        was cancelled by the retiring worker, the client was handed
+        ``router_restarting`` -- and 0.3 s later the same request id logged
+        ``success`` (65.2 s, deployment ``b1673a97``) with ``deployment_success``
+        clearing that route's failure count.  The stream *did* close normally:
+        the synthesized stop is its last frame, so nothing but the turn's own
+        verdict can tell LiteLLM's logging callback what happened.  The row is
+        closed with the restart path's own words, which is also what the boot
+        settlement would have written had the success row not replaced it.
+        """
+        hooks, _proxy_server = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            request_data = {
+                **self.chat_request(),
+                "litellm_call_id": "cut-turn-1",
+                "litellm_params": {"litellm_call_id": "cut-turn-1"},
+            }
+            hook._record_recent_request_started(request_data)
+
+            async def upstream_stream():
+                yield self.chunk("partial answer")
+                await asyncio.Event().wait()
+
+            async def collect() -> None:
+                async for _chunk in hook.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=None,
+                    response=upstream_stream(),
+                    request_data=request_data,
+                ):
+                    pass
+
+            hooks._begin_proxy_shutdown()
+            try:
+                task = asyncio.create_task(collect())
+                await asyncio.sleep(0.1)
+                task.cancel()
+                await asyncio.wait_for(task, timeout=2.0)
+                # LiteLLM's logging callback is handed its own copy of the
+                # request: the verdict has to travel under the call id.
+                await hook.async_log_success_event(
+                    {
+                        "model": "default-chat",
+                        "stream": True,
+                        "litellm_call_id": "cut-turn-1",
+                        "async_complete_streaming_response": {
+                            "id": "chatcmpl-retirement"
+                        },
+                    },
+                    {"id": "chatcmpl-retirement"},
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc),
+                )
+            finally:
+                hooks._end_proxy_shutdown()
+                for pending in list(hooks._PENDING_SETTLEMENT_TASKS):
+                    pending.cancel()
+
+            records = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=10_000)
+                if line.strip()
+            ]
+
+        statuses = [record["status"] for record in records]
+        self.assertEqual(["pending", "aborted"], statuses)
+        self.assertEqual("service_restart", records[-1]["aborted"]["reason"])
+        self.assertEqual(
+            "cut-turn-1",
+            records[-1]["request_id"],
+            "the aborted row closes this turn's own progress row",
+        )
 
 class RetireRemainingStreamsTests(HookTestCase):
     """The shutdown patch must cancel what the drain could not finish."""

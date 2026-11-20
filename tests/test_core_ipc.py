@@ -216,6 +216,16 @@ class SnapshotPollCacheTests(unittest.TestCase):
             fresh = core.snapshot()
             self.assertEqual(fresh["revision"], fresh["projected_revision"])
 
+    def test_snapshot_cache_keys_come_from_the_response_even_if_the_head_moves(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        old = core.snapshot()
+        core._advance_revision()
+        server.remember_snapshot_result({"snapshot": old})
+
+        self.assertEqual(old["revision"], server._snapshot_body[0])
+        self.assertIsNone(server._prepared_snapshot("fresh"))
+
 class CoreProtocolTests(unittest.TestCase):
     def test_ipc_server_uses_a_short_shutdown_poll_interval(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
@@ -287,6 +297,12 @@ class CoreProtocolTests(unittest.TestCase):
             def webdav_scheduler(self) -> "FakeScheduler":
                 return FakeScheduler("scheduler")
 
+            def relay_balance_scheduler(self) -> "FakeScheduler":
+                return FakeScheduler("relay_balance")
+
+            def relay_maintenance(self) -> "FakeScheduler":
+                return FakeScheduler("relay_maintenance")
+
             def image_context_sweeper(self) -> "FakeScheduler":
                 return FakeScheduler("cleanup")
 
@@ -343,9 +359,13 @@ class CoreProtocolTests(unittest.TestCase):
             [
                 "server.start",
                 "scheduler.start",
+                "relay_balance.start",
+                "relay_maintenance.start",
                 "cleanup.start",
                 "supervisor.start",
                 "scheduler.stop",
+                "relay_balance.stop",
+                "relay_maintenance.stop",
                 "cleanup.stop",
                 "core.shutdown",
                 "server.stop",
@@ -386,6 +406,12 @@ class CoreProtocolTests(unittest.TestCase):
             class FakeCore:
                 def webdav_scheduler(self) -> FakeScheduler:
                     return FakeScheduler("scheduler")
+
+                def relay_balance_scheduler(self) -> FakeScheduler:
+                    return FakeScheduler("relay_balance")
+
+                def relay_maintenance(self) -> FakeScheduler:
+                    return FakeScheduler("relay_maintenance")
 
                 def image_context_sweeper(self) -> FakeScheduler:
                     return FakeScheduler("cleanup")

@@ -36,6 +36,12 @@ from typing import Any, Protocol, runtime_checkable
 from .emitter import CoalescingEmitter
 from .entity_ops import MAX_PATCH_OPS, EntityOp, domain_diff
 from .log_tabs import LOG_TABS
+from .scheduled_tasks import (
+    HISTORY_LIMIT as SCHEDULED_TASK_HISTORY_LIMIT,
+    RELAY_GROUPS,
+    RELAY_LOGIN,
+    ScheduledTasks,
+)
 from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
 from .protocol import (
@@ -1413,6 +1419,8 @@ class CoreStore:
         workbuddy_runtime: object | None = None,
         qoder_runtime: object | None = None,
         our_free_model_runtime: object | None = None,
+        scheduled_tasks_path: Path | None = None,
+        image_context_runtime_root: Path | None = None,
     ) -> None:
         # ``_lock`` is the state lock: short critical sections only (see
         # ``_BudgetLock``).  ``_mutation`` is the cross-domain transaction
@@ -1423,6 +1431,10 @@ class CoreStore:
         # ``_domain_scope``), so a probe cannot queue an unrelated edit behind
         # it.  Neither lock is the one every window needs for its next frame.
         self._lock = _BudgetLock()
+        self._scheduled_tasks = ScheduledTasks(scheduled_tasks_path)
+        self._image_context_runtime_root = image_context_runtime_root
+        self._relay_maintenance: Any | None = None
+        self._group_retry: tuple[str, int] | None = None
         self._mutation = threading.RLock()
         self._mutation_owner: int | None = None
         self._mutation_depth = 0
@@ -1565,6 +1577,9 @@ class CoreStore:
         # The WebDAV interval loop is created on request, started by the Core
         # entry point, and stopped with the store.
         self._webdav_scheduler: Any | None = None
+        # Relay balance observations have their own small interval loop.  It
+        # never performs WebDAV or resource/catalog refreshes.
+        self._relay_balance_scheduler: Any | None = None
         # When a user action last reached this store.  An automatic WebDAV sync
         # holds the store for its whole round trip, so it waits for quiet.
         self._last_activity = time.monotonic()
@@ -2242,6 +2257,8 @@ class CoreStore:
             workbuddy_runtime=workbuddy_runtime,
             qoder_runtime=qoder_runtime,
             our_free_model_runtime=our_free_model_runtime,
+            scheduled_tasks_path=resolved_runtime_root / "scheduled-task-history.json",
+            image_context_runtime_root=controller.paths.root,
         )
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)
@@ -2271,6 +2288,9 @@ class CoreStore:
         """
 
         self._stop_webdav_scheduler()
+        self._stop_relay_balance_scheduler()
+        if self._relay_maintenance is not None:
+            self._relay_maintenance.stop()
         self._stop_image_context_sweeper()
         # A sign-in window this Core opened belongs to this Core: a replacement
         # or a quit must not leave a browser running on a throwaway profile that
@@ -2763,6 +2783,9 @@ class CoreStore:
         """
 
         self._emitter.request()
+        if self._relay_maintenance is not None:
+            self._relay_maintenance.kick()
+        self._kick_relay_balance_scheduler()
 
     # -- jobs: work too slow to answer inside a request ---------------------
     def _job_executor(self) -> ThreadPoolExecutor:
@@ -3345,6 +3368,16 @@ class CoreStore:
     def log_view(self, tab: str, known_revision: int | None = None) -> dict[str, Any]:
         """Load one requested log tab without inflating global snapshots."""
 
+        if tab == "scheduled-tasks":
+            revision, records = self._scheduled_tasks.view(known_revision)
+            return {
+                "revision": revision,
+                "changed": records is not None,
+                "log": None if records is None else {
+                    "tab": tab, "available": True, "paused": False, "filter": "",
+                    "limit": SCHEDULED_TASK_HISTORY_LIMIT, "line_count": len(records), "records": records,
+                },
+            }
         with self._domain_scope("logs"):
             adapter = self._domains.get("logs")
             view = getattr(adapter, "view", None) if adapter is not None else None
@@ -4776,8 +4809,9 @@ class CoreStore:
         self,
         account_id: object,
         *,
-        revision: int,
+        revision: int | None,
         force: bool = False,
+        for_grouping: bool = False,
     ) -> dict[str, Any]:
         """Refresh selectable relay API metadata without staging providers.
 
@@ -4792,28 +4826,40 @@ class CoreStore:
             refresher = getattr(relay, "refresh_resources", None) if relay is not None else None
             if not isinstance(account_id, str) or not account_id or not callable(refresher):
                 raise CoreError("relay_resources_failed", "Relay account is unavailable")
+            if for_grouping:
+                self._refresh_external_disk_state(("relay_accounts",))
+                if self._drafts["relay_accounts"].get("dirty") or self._disk["relay_accounts"]["changed"]:
+                    return {"resource_status": "skipped"}
+                if account_id not in relay.maintenance_account_ids(grouping=True):
+                    return {"resource_status": "skipped"}
             relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
             relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
             relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
             try:
-                result = refresher(account_id, force=force)
+                result = refresher(account_id, for_grouping=True) if for_grouping else refresher(account_id, force=force)
             except Exception as exc:
                 raise CoreError("relay_resources_failed", safe_exception_message(exc)) from None
             resources = result.get("resources", []) if isinstance(result, Mapping) else []
             resource_status = result.get("resource_status", "unavailable") if isinstance(result, Mapping) else "unavailable"
+            if for_grouping and resource_status == "skipped":
+                return {"resource_status": "skipped"}
             resource_count = len(resources) if isinstance(resources, list) else 0
-            self._advance_revision()
+            if for_grouping:
+                self._advance_projection_revision()
+            else:
+                self._advance_revision()
             self._record_relay_transient_update(
                 was_dirty=relay_was_dirty,
                 prior_baseline=relay_prior_baseline,
                 prior_base_revision=relay_prior_base_revision,
             )
-            self._last_actions["relay_accounts"] = {
-                "resources_ready": resource_status == "ready",
-                "account_id": account_id,
-                "resource_status": resource_status,
-                "resource_count": resource_count,
-            }
+            if not for_grouping:
+                self._last_actions["relay_accounts"] = {
+                    "resources_ready": resource_status == "ready",
+                    "account_id": account_id,
+                    "resource_status": resource_status,
+                    "resource_count": resource_count,
+                }
             self._persist_metadata()
             should_emit = True
             response = {
@@ -4825,6 +4871,99 @@ class CoreStore:
         if should_emit:
             self._request_emit()
         return response
+
+    def relay_maintenance(self) -> Any:
+        if self._relay_maintenance is None:
+            from .relay_maintenance import RelayMaintenance
+
+            self._relay_maintenance = RelayMaintenance(
+                tasks=self._scheduled_tasks,
+                accounts=self._relay_maintenance_accounts,
+                run=self._run_relay_maintenance,
+            )
+        return self._relay_maintenance
+
+    def _relay_maintenance_accounts(self) -> dict[str, list[str]]:
+        with self._domain_scope("relay_accounts"):
+            relay = self._domains.get("relay_accounts")
+            accounts = getattr(relay, "maintenance_account_ids", None)
+            if not callable(accounts):
+                return {}
+            self._refresh_external_disk_state(("relay_accounts",))
+            return {
+                RELAY_LOGIN: accounts(grouping=False),
+                RELAY_GROUPS: accounts(grouping=True),
+            }
+
+    def _run_relay_maintenance(
+        self, task_id: str, account_id: str, cancelled: Callable[[], bool],
+    ) -> str:
+        if cancelled():
+            return "skipped"
+        if task_id == RELAY_GROUPS:
+            names = self._apply_domain_hints("relay_accounts", None)
+            with self._domain_scope(*names):
+                self._refresh_external_disk_state(names)
+                relay = self._domains["relay_accounts"]
+                if cancelled() or any(self._disk.get(name, {}).get("changed") for name in names):
+                    return "skipped"
+                if relay.group_poll_retry_account() == account_id and (
+                    not any(self._drafts.get(name, {}).get("dirty") for name in names)
+                    or (self._group_retry is not None and self._group_retry[0] == account_id
+                        and self._revision_covers_settings(self._group_retry[1]))
+                ):
+                    # The journal identifies unattended work after a restart.
+                    # In the same process the revision also proves the draft
+                    # has not acquired edits since the timer staged it.
+                    return self._apply_automatic_groups(account_id, self._revision)
+            result = self.refresh_relay_resources(account_id, revision=None, for_grouping=True)
+            if result["resource_status"] == "skipped":
+                return "skipped"
+            if result["resource_status"] != "ready":
+                return "failed"
+            with self._domain_scope(*names):
+                self._refresh_external_disk_state(names)
+                relay = self._domains["relay_accounts"]
+                # Alignment may retire linked models. Keep the staging and
+                # Apply inside one lane and stand aside for existing edits or
+                # unresolved journal work, including work from a previous run.
+                if (
+                    cancelled()
+                    or not self._revision_covers_settings(result["revision"])
+                    or any(self._drafts.get(name, {}).get("dirty") or self._disk.get(name, {}).get("changed") for name in names)
+                    or self._relay_operation_count(relay)
+                    or account_id not in relay.maintenance_account_ids(grouping=True)
+                ):
+                    return "skipped"
+                staged = self.dispatch({
+                    "domain": "relay_accounts", "type": "api_key.auto_group_align",
+                    "payload": {"account_id": account_id},
+                })
+                if not self._drafts["relay_accounts"]["dirty"]:
+                    return "succeeded"
+                relay.mark_group_poll_operations()
+                return self._apply_automatic_groups(account_id, staged["revision"])
+
+        with self._domain_scope("relay_accounts"):
+            relay = self._domains["relay_accounts"]
+            self._refresh_external_disk_state(("relay_accounts",))
+            outcome, changed = relay.poll_session(account_id, io_gate=self._release_lane_for_io, cancelled=cancelled)
+            if changed:
+                self._advance_projection_revision()
+                self._persist_metadata()
+        if changed:
+            self._request_emit()
+        return outcome
+
+    def _apply_automatic_groups(self, account_id: str, revision: int) -> str:
+        relay = self._domains["relay_accounts"]
+        self._group_retry = (account_id, revision)
+        applied = self.apply("relay_accounts", revision=revision)
+        if applied["applied"] and not self._relay_operation_count(relay):
+            self._group_retry = None
+            return "succeeded"
+        self._group_retry = (account_id, applied["revision"])
+        return "partial" if applied.get("completed_operations") else "failed"
 
     def restore_relay_session(
         self,
@@ -5568,6 +5707,7 @@ class CoreStore:
                 snapshot=self.webdav_auto_sync_state,
                 sync=self.run_automatic_webdav_sync,
                 settle_seconds=self.quiet_seconds,
+                tasks=self._scheduled_tasks,
             )
         return self._webdav_scheduler
 
@@ -5578,6 +5718,73 @@ class CoreStore:
 
     def _stop_webdav_scheduler(self) -> None:
         scheduler = self._webdav_scheduler
+        if scheduler is not None:
+            scheduler.stop()
+
+    def _relay_balance_schedule(self) -> dict[str, tuple[float, dict[str, float | None]]]:
+        from .runtime_settings_schema import (
+            RELAY_NEGATIVE_BALANCE_DEFAULT_MINUTES,
+            RELAY_SIGNED_IN_BALANCE_DEFAULT_MINUTES,
+        )
+
+        with self._domain_scope("relay_accounts", "runtime"):
+            schedule = getattr(self._domains.get("relay_accounts"), "balance_refresh_schedule", None)
+            intervals = getattr(self._domains.get("runtime"), "committed_relay_balance_intervals", None)
+            if not callable(schedule):
+                return {}
+            negative, signed_in = intervals() if callable(intervals) else (
+                RELAY_NEGATIVE_BALANCE_DEFAULT_MINUTES * 60,
+                RELAY_SIGNED_IN_BALANCE_DEFAULT_MINUTES * 60,
+            )
+            self._refresh_external_disk_state(("relay_accounts",))
+            return schedule(negative, signed_in)
+
+    def run_automatic_relay_balance_refresh(
+        self, account_ids: Sequence[str], cancelled: Callable[[], bool],
+    ) -> dict[str, str]:
+        """Read profile balances and publish the corresponding live state."""
+
+        with self._domain_scope("relay_accounts"):
+            relay = self._domains.get("relay_accounts")
+            refresher = getattr(relay, "refresh_balances", None)
+            if not callable(refresher):
+                return {}
+            outcomes, changed = refresher(
+                account_ids, io_gate=self._release_lane_for_io, cancelled=cancelled,
+            )
+            if not changed:
+                return outcomes
+            draft = self._drafts.get("relay_accounts", {})
+            self._advance_projection_revision()
+            self._record_relay_transient_update(
+                was_dirty=bool(draft.get("dirty")),
+                prior_baseline=self._baselines.get("relay_accounts"),
+                prior_base_revision=draft.get("base_revision"),
+            )
+            self._persist_metadata()
+        self._request_emit()
+        return outcomes
+
+    def relay_balance_scheduler(self) -> Any:
+        """The interval loop for balance-only relay observations."""
+
+        if self._relay_balance_scheduler is None:
+            from .relay_balance_scheduler import RelayBalanceScheduler
+
+            self._relay_balance_scheduler = RelayBalanceScheduler(
+                schedule=self._relay_balance_schedule,
+                refresh=self.run_automatic_relay_balance_refresh,
+                tasks=self._scheduled_tasks,
+            )
+        return self._relay_balance_scheduler
+
+    def _kick_relay_balance_scheduler(self) -> None:
+        scheduler = self._relay_balance_scheduler
+        if scheduler is not None:
+            scheduler.kick()
+
+    def _stop_relay_balance_scheduler(self) -> None:
+        scheduler = self._relay_balance_scheduler
         if scheduler is not None:
             scheduler.stop()
 
@@ -5595,7 +5802,7 @@ class CoreStore:
             from . import client_model_sync as _client_model_sync
 
             self._client_model_sync = _client_model_sync.attach(
-                self, self.client_model_documents()
+                self, self.client_model_documents(), tasks=self._scheduled_tasks,
             )
         return self._client_model_sync
 
@@ -5636,7 +5843,7 @@ class CoreStore:
         *,
         include_claude: bool = True,
         refresh_contexts: bool = True,
-    ) -> None:
+    ) -> str:
         """Regenerate the client model documents this app still generates.
 
         A provider Apply calls this with the default so the Claude picker
@@ -5652,14 +5859,21 @@ class CoreStore:
         only a difference.
         """
 
+        succeeded = failed = 0
+
+        def refresh(action: object) -> None:
+            nonlocal succeeded, failed
+            if callable(action):
+                try:
+                    action()
+                except Exception:
+                    failed += 1
+                else:
+                    succeeded += 1
+
         codex_domain = self._domains.get("codex")
         if refresh_contexts:
-            refresh_contexts_now = getattr(codex_domain, "refresh_model_contexts_if_due", None)
-            if callable(refresh_contexts_now):
-                try:
-                    refresh_contexts_now()
-                except Exception:
-                    pass
+            refresh(getattr(codex_domain, "refresh_model_contexts_if_due", None))
         live_domains = ("claude", "codex") if include_claude else ("codex",)
         revisions_before = {
             name: getattr(self._domains.get(name), "revision", None)
@@ -5671,20 +5885,8 @@ class CoreStore:
         # their own locks, so this work runs outside the store's: a window
         # polling its snapshot must never wait for a client document.
         if include_claude:
-            claude = self._domains.get("claude")
-            refresh = getattr(claude, "refresh_model_lists", None)
-            if callable(refresh):
-                try:
-                    refresh()
-                except Exception:
-                    pass
-        codex = self._domains.get("codex")
-        refresh_catalog = getattr(codex, "refresh_model_catalog", None)
-        if callable(refresh_catalog):
-            try:
-                refresh_catalog()
-            except Exception:
-                pass
+            refresh(getattr(self._domains.get("claude"), "refresh_model_lists", None))
+        refresh(getattr(codex_domain, "refresh_model_catalog", None))
         # The live read belongs to this lane, not to ``snapshot``.  A window
         # polls the projection many times a second while the proxy reloads, and
         # a read taken there both blocks every other request on the store lock
@@ -5704,6 +5906,9 @@ class CoreStore:
                 except PersistenceError:
                     pass
             self._request_emit()
+        if failed:
+            return "partial" if succeeded else "failed"
+        return "succeeded" if succeeded else "skipped"
 
     def service_supervisor(self, *, initial_delay: float | None = None) -> Any:
         """The loop that restores the proxy without a person's click.
@@ -5724,7 +5929,7 @@ class CoreStore:
 
             head_start = {} if initial_delay is None else {"initial_delay": float(initial_delay)}
             self._service_supervisor = ServiceSupervisor(
-                supervise=self.supervise_service_once, **head_start
+                supervise=self.supervise_service_once, tasks=self._scheduled_tasks, **head_start,
             )
         return self._service_supervisor
 
@@ -5750,7 +5955,15 @@ class CoreStore:
             from .image_context_cleanup import ImageContextSweeper
             from ..proxy import image_context_store
 
-            self._image_context_sweeper = ImageContextSweeper(sweep=image_context_store.sweep)
+            def sweep() -> int:
+                env = os.environ.copy()
+                if self._image_context_runtime_root is not None:
+                    env[image_context_store.RUNTIME_ROOT_ENV] = str(self._image_context_runtime_root)
+                return image_context_store.sweep(env)
+
+            self._image_context_sweeper = ImageContextSweeper(
+                sweep=sweep, tasks=self._scheduled_tasks,
+            )
         return self._image_context_sweeper
 
     def _stop_image_context_sweeper(self) -> None:
@@ -5826,7 +6039,7 @@ class CoreStore:
             if not callable(settings_getter):
                 raise CoreError("webdav_sync_failed", "WebDAV sync is unavailable")
             try:
-                settings = settings_getter()
+                settings = settings_getter(committed=True) if automatic else settings_getter()
             except Exception:
                 raise CoreError("webdav_sync_failed", "WebDAV is not configured") from None
             config_value = getattr(providers, "config_path", None)
@@ -6392,10 +6605,6 @@ class CoreStore:
             # upstream, it can take minutes, and nothing else in the store has
             # to wait for it.
             return self._dispatch_probe_job(_canonical_domain(domain_value), data.get("payload"))
-        if domain_value is not None and _canonical_domain(domain_value) == "webdav":
-            # The switch, the interval, and the direction all reshape the
-            # interval loop, so let it re-read instead of waiting out its sleep.
-            self._kick_webdav_scheduler()
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "codex"
@@ -6419,11 +6628,13 @@ class CoreStore:
                 "webdav_sync": "sync",
             }.get(normalized_action)
             if webdav_operation is not None:
-                return self._dispatch_webdav_sync(
+                result = self._dispatch_webdav_sync(
                     webdav_operation,
                     data.get("payload"),
                     expected_revision if expected_revision is not None else data.get("expected_revision"),
                 )
+                self._kick_webdav_scheduler()
+                return result
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "relay_accounts"
@@ -7258,6 +7469,9 @@ class CoreStore:
             # the restart below reports the failure on the service's own row.
             staged = None
         fingerprint = staged.get("fingerprint") if isinstance(staged, Mapping) else None
+        if isinstance(staged, Mapping) and staged.get("requires_restart") is True:
+            self._schedule_service_reload_after_apply(replace_process=True)
+            return
         if isinstance(fingerprint, str) and fingerprint == runtime_document_before:
             # The proxy already holds this document; replacing it would spend
             # the whole drain budget to load the bytes it is serving now.
@@ -7573,7 +7787,7 @@ class CoreStore:
             )
         self._request_emit()
 
-    def supervise_service_once(self) -> bool:
+    def supervise_service_once(self) -> str:
         """Restore an unwatched proxy instead of leaving 不健康 to a click.
 
         One pass reads the controller's real status and acts only on a state
@@ -7595,19 +7809,19 @@ class CoreStore:
         recovery takes the same transition guard an explicit operation does,
         so a person's stop and this pass can never both win.
 
-        Returns whether this pass touched the proxy.
+        Returns the outcome of the check or recovery.
         """
 
         # One pass at a time.  The loop is single-threaded, but a caller may
         # also ask for one pass directly, and two recoveries must not overlap.
         if not self._service_supervision_guard.acquire(blocking=False):
-            return False
+            return "skipped"
         try:
             return self._supervise_service_once()
         finally:
             self._service_supervision_guard.release()
 
-    def _supervise_service_once(self) -> bool:
+    def _supervise_service_once(self) -> str:
         # A pass can replace the proxy, which takes seconds.  It holds the
         # mutation lane so a pane's edit cannot land mid-replacement, while
         # snapshots keep reading the last committed projection.
@@ -7616,47 +7830,47 @@ class CoreStore:
             with self._lock:
                 if self._service_supervision_stopping or self._service_intent != "running":
                     self._service_supervision_unhealthy_since = None
-                    return False
+                    return "skipped"
                 if self._service_proxy_operations > 0:
-                    return False
+                    return "skipped"
                 reload_thread = self._service_reload_thread
                 if reload_thread is not None and reload_thread.is_alive():
-                    return False
+                    return "skipped"
                 handlers = dict(self._service_handlers)
             # A forced read: the settled cache would hide the death this pass is
             # looking for until it expired.
             status_handler = handlers.get("health") or handlers.get("status")
             if status_handler is None:
-                return False
+                return "skipped"
             try:
                 current = status_handler("health" if handlers.get("health") is not None else "status")
             except Exception:
-                return False
+                return "failed"
             if not isinstance(current, Mapping):
-                return False
+                return "failed"
             state = str(current.get("state"))
             now = time.monotonic()
             if state in {"running", "starting"}:
                 self._service_supervision_unhealthy_since = None
                 self._service_supervision_attempts = 0
                 self._service_supervision_retry_at = 0.0
-                return False
+                return "succeeded"
             if state == "unhealthy":
                 if self._service_supervision_unhealthy_since is None:
                     self._service_supervision_unhealthy_since = now
-                    return False
+                    return "skipped"
                 if now - self._service_supervision_unhealthy_since < SERVICE_RECOVERY_PATIENCE_SECONDS:
-                    return False
+                    return "skipped"
             elif state != "stopped":
                 # "unknown" is somebody else's listener on the configured port.
                 self._service_supervision_unhealthy_since = None
-                return False
+                return "skipped"
             if now < self._service_supervision_retry_at:
-                return False
+                return "skipped"
             operation = "restart" if state == "unhealthy" else "start"
             handler = handlers.get(operation)
             if handler is None:
-                return False
+                return "failed"
             # Stated before the attempt, not after: a recovery that hangs or
             # dies while replacing the proxy leaves this line as the only
             # record that anything was being done about it.
@@ -7668,9 +7882,9 @@ class CoreStore:
                     # shutdown, or a person's own start may have landed since
                     # the probe.
                     if self._service_supervision_stopping or self._service_intent != "running":
-                        return False
+                        return "skipped"
                     if self._service_proxy_operations > 0:
-                        return False
+                        return "skipped"
                     # Hold the replacement count for this pass exactly as an
                     # explicit operation does: every window must draw 启动中
                     # while the proxy is being replaced, never the failure it
@@ -7755,7 +7969,7 @@ class CoreStore:
             should_emit = True
         if should_emit:
             self._request_emit()
-        return True
+        return "succeeded" if recovered else "failed"
 
     def _stop_service_after_reload_shutdown(self) -> None:
         stopper = self._shutdown_handler
@@ -8323,9 +8537,9 @@ class CoreStore:
                 self._mark_relay_coordinated_applied("relay_accounts")
                 applied.append("relay_accounts")
 
-            if provider_locally_applied:
+            if provider_locally_applied or "runtime" in applied:
                 self._schedule_reload_for_applied_domains(
-                    ("providers_models",),
+                    applied,
                     runtime_document_before,
                 )
 
@@ -8657,13 +8871,16 @@ class CoreStore:
                 raise ConfirmationNeeded(missing_overwrite)
 
             if "relay_accounts" in adapters and relay_coordinator_available:
-                return self._apply_relay_coordinated(
+                result = self._apply_relay_coordinated(
                     names,
                     adapters,
                     confirm_codes,
                     overwrite_codes,
                     relay_dependency_only=relay_dependency_only,
                 )
+                if "webdav" in result["domains"]:
+                    self._kick_webdav_scheduler()
+                return result
 
             if "runtime" in names and len(names) > 1:
                 # The proxy key is a line of the provider document, and that
@@ -8806,6 +9023,8 @@ class CoreStore:
                 "issues": [],
             }
         if should_emit:
+            if "webdav" in applied:
+                self._kick_webdav_scheduler()
             self._request_emit()
         return response
 

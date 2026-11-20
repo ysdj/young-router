@@ -524,6 +524,7 @@ def image_context_settings(path: Path | None = None) -> dict[str, Any]:
     return {
         "enabled": str(values.get("YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED") or "").strip()
         in {"1", "true", "TRUE", "True"},
+        "fetch": str(values.get("YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH") or "auto").strip().lower(),
     }
 
 
@@ -2016,13 +2017,8 @@ class CodexSettingsDomain:
         # it a file path instead of adding a server.  An entry is only kept when
         # an operator explicitly asks for the MCP server, and one written by an
         # earlier build is removed here rather than left behind.
-        from ...proxy import image_context as _image_context_module
-
-        enabled_now = _image_context_module.fetch_mode() == "stdio" and bool(
-            image_context_settings(
-                self.runtime_settings_path or _default_runtime_settings_path()
-            ).get("enabled")
-        )
+        settings = image_context_settings(self.runtime_settings_path or _default_runtime_settings_path())
+        enabled_now = settings["fetch"] == "stdio" and bool(settings["enabled"])
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
         if enabled_now == image_context_mcp_registered(structured):

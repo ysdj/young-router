@@ -318,7 +318,10 @@ bool IsOnlineUsageReadOperation(winrt::Windows::Data::Json::JsonObject const& re
     auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
     if (WideToUtf8(action.GetNamedString(L"domain", L"").c_str()) != std::string("logs")) return false;
     const std::string type = WideToUtf8(action.GetNamedString(L"type", L"").c_str());
-    return type == "logs.refresh_online_usage" || type == "logs.refresh" || type == "logs.reload";
+    return type == "logs.refresh_online_usage" || type == "logs.refresh" || type == "logs.reload" ||
+           type == "logs.load_more" || type == "logs.previous_page" || type == "logs.first_page" ||
+           type == "logs.last_page" || type == "logs.goto_page" || type == "logs.set_page_rows" ||
+           type == "logs.set_time_range";
   } catch (...) {
     return false;
   }
@@ -341,6 +344,49 @@ bool IsServiceLifecycleOperation(winrt::Windows::Data::Json::JsonObject const& r
   } catch (...) {
     return false;
   }
+}
+
+std::string ReadSubscriptionId(std::string const& response) {
+  auto outer = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(response));
+  if (outer.GetNamedNumber(L"protocol_version", 0) != 1 || !outer.GetNamedBoolean(L"ok", false)) {
+    throw std::runtime_error("invalid Core subscription");
+  }
+  auto subscription = outer.GetNamedObject(L"result").GetNamedString(L"subscription_id");
+  if (subscription.empty()) throw std::runtime_error("invalid Core subscription");
+  return WideToUtf8(subscription.c_str());
+}
+
+constexpr char kSubscriptionSnapshotRequest[] =
+    R"({"protocol_version":1,"request_id":"native-subscription-snapshot","method":"snapshot","params":{}})";
+
+std::string ReadSubscriptionSnapshot(std::string const& response) {
+  using namespace winrt::Windows::Data::Json;
+  auto outer = JsonObject::Parse(Utf8ToWide(response));
+  if (outer.GetNamedNumber(L"protocol_version", 0) != 1 || !outer.GetNamedBoolean(L"ok", false) ||
+      outer.GetNamedString(L"request_id", L"") != L"native-subscription-snapshot") {
+    throw std::runtime_error("invalid Core snapshot");
+  }
+  auto snapshot = outer.GetNamedObject(L"result").GetNamedObject(L"snapshot");
+  const auto revision = snapshot.GetNamedNumber(L"revision", -1);
+  if (snapshot.GetNamedNumber(L"protocol_version", 0) != 1 || revision < 0 || revision != std::floor(revision)) {
+    throw std::runtime_error("invalid Core snapshot");
+  }
+  JsonObject event;
+  event.SetNamedValue(L"protocol_version", JsonValue::CreateNumberValue(1));
+  event.SetNamedValue(L"event", JsonValue::CreateStringValue(L"snapshot"));
+  event.SetNamedValue(L"revision", JsonValue::CreateNumberValue(revision));
+  event.SetNamedValue(L"snapshot", snapshot);
+  return WideToUtf8(event.Stringify().c_str());
+}
+
+std::string ReadPolledEvent(std::string const& response) {
+  using namespace winrt::Windows::Data::Json;
+  auto outer = JsonObject::Parse(Utf8ToWide(response));
+  if (outer.GetNamedNumber(L"protocol_version", 0) != 1) throw std::runtime_error("invalid Core event");
+  auto value = outer.GetNamedValue(L"event");
+  // GetNamedObject throws for a present JSON null, which is a quiet heartbeat.
+  if (value.ValueType() == JsonValueType::Null) return {};
+  return WideToUtf8(value.GetObject().Stringify().c_str());
 }
 
 struct WinHttpHandleCloser {
@@ -420,17 +466,7 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
       if ((result.status != 200 && (result.status < 400 || result.status >= 500)) || result.body.empty()) {
         throw std::runtime_error("core unavailable");
       }
-      if (is_subscription) {
-        std::lock_guard guard(mutex_);
-        subscription_request_ = request_json;
-      }
-      StartPollingIfSubscription(result.body, generation);
-      bool recover_subscription = false;
-      {
-        std::lock_guard guard(mutex_);
-        recover_subscription = !is_subscription && !subscription_request_.empty() && subscription_id_.empty();
-      }
-      if (recover_subscription) RecoverSubscription();
+      if (is_subscription && result.status == 200) StartPolling(request_json, result.body, generation);
       return result.body;
     } catch (std::exception const& error) {
       InvalidateCoreIfGeneration(generation, true);
@@ -516,7 +552,6 @@ std::optional<CoreIPCBridge::SecretStageResult> CoreIPCBridge::StageSecret(
         !response.HasKey(L"revision") || !response.HasKey(L"present")) return std::nullopt;
     double revision = response.GetNamedNumber(L"revision", -1);
     if (revision < 0 || revision != floor(revision)) return std::nullopt;
-    RecoverSubscription();
     return SecretStageResult{revision, response.GetNamedBoolean(L"present", false)};
   } catch (...) {
     return std::nullopt;
@@ -687,7 +722,6 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     if (revision < 0 || revision != floor(revision) || accepted_username.empty() || accepted_username.size() > 320) {
       return std::nullopt;
     }
-    RecoverSubscription();
     return RelayLoginResult{revision, std::move(accepted_username)};
   } catch (...) {
     return std::nullopt;
@@ -765,7 +799,6 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
         restored_username.size() > 320) {
       return std::nullopt;
     }
-    RecoverSubscription();
     return RelaySessionRestoreResult{revision, std::move(restored_status), std::move(restored_username)};
   } catch (...) {
     return std::nullopt;
@@ -918,6 +951,7 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
     establishing_session_ = false;
     session_error_ = nullptr;
     session_condition_.notify_all();
+    poll_condition_.notify_one();
     return {endpoint, session_token_, core_generation_};
   } catch (...) {
     if (!lock.owns_lock()) lock.lock();
@@ -1108,123 +1142,109 @@ void CoreIPCBridge::DiscardTransports() {
   transport_.reset();
 }
 
-void CoreIPCBridge::StartPollingIfSubscription(
-    std::string const& response_json,
+void CoreIPCBridge::StartPolling(
+    std::string const& request,
+    std::string const& response,
     unsigned long generation) {
-  try {
-    auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(response_json));
-    if (!response.GetNamedBoolean(L"ok", false)) return;
-    auto result = response.GetNamedObject(L"result", nullptr);
-    if (!result) return;
-    std::string subscription = WideToUtf8(result.GetNamedString(L"subscription_id", L"").c_str());
-    if (subscription.empty()) return;
-    {
-      std::lock_guard guard(mutex_);
-      if (core_generation_ != generation || !endpoint_ || session_token_.empty()) return;
-      if (subscription_id_ == subscription) return;
-      subscription_id_ = subscription;
+  auto subscription = ReadSubscriptionId(response);
+  std::lock_guard guard(mutex_);
+  if (stopping_) return;
+  if (core_generation_ == generation) {
+    if (subscription_id_ != subscription) {
+      subscription_needs_snapshot_ = !subscription_request_.empty();
+      subscription_id_ = std::move(subscription);
     }
-    JoinRetiredPollThread();
-    std::lock_guard poll_guard(poll_mutex_);
-    // The slot is free here: ``JoinRetiredPollThread`` joined the previous
-    // loop, or detached it when this very thread is that loop and cannot wait
-    // on itself.  Assigning over a joinable std::thread calls std::terminate,
-    // which is what a second subscriber used to hit.
-    poll_thread_ = std::thread([this, subscription] { PollEvents(subscription); });
-  } catch (...) {
+    subscription_request_ = request;
+  } else if (subscription_request_.empty()) {
+    // The first successful subscribe may come from a Core already replaced
+    // by another request. Keep its topics and recover against the live Core.
+    subscription_request_ = request;
   }
+  if (!poll_thread_.joinable()) poll_thread_ = std::thread([this] { PollEvents(); });
+  poll_condition_.notify_one();
 }
 
-void CoreIPCBridge::RecoverSubscription() {
-  std::string request;
-  {
-    std::lock_guard guard(mutex_);
-    request = subscription_request_;
-  }
-  if (request.empty()) return;
-  // Recovery is best effort and never changes the result of the user's
-  // foreground operation. A later snapshot request will retry if Core exited.
-  try {
-    auto [endpoint, session, generation] = EnsureSession();
-    auto result = Request(endpoint, L"", L"POST", request, session);
-    if (IsSessionFailure(result.status)) {
-      InvalidateCoreIfGeneration(generation, true);
-    } else if (result.status == 200) {
-      StartPollingIfSubscription(result.body, generation);
-    }
-  } catch (...) {
-  }
-}
-
-void CoreIPCBridge::PollEvents(std::string subscription) {
-  while (!stopping_) {
-    Endpoint endpoint;
-    std::wstring session;
-    unsigned long generation = 0;
+void CoreIPCBridge::PollEvents() {
+  // One worker owns all recovery and event delivery. Foreground calls can
+  // change the active subscription while it is reading, never its thread.
+  for (;;) {
+    Session active;
+    std::string subscription;
+    std::string subscribe_request;
+    bool needs_snapshot = false;
     {
-      std::lock_guard guard(mutex_);
-      if (!endpoint_ || session_token_.empty() || subscription_id_ != subscription) return;
-      endpoint = *endpoint_;
-      session = session_token_;
-      generation = core_generation_;
+      std::unique_lock lock(mutex_);
+      poll_condition_.wait(lock, [&] {
+        return stopping_ || (endpoint_ && !session_token_.empty() && !subscription_request_.empty());
+      });
+      if (stopping_) return;
+      active = {*endpoint_, session_token_, core_generation_};
+      subscription = subscription_id_;
+      if (subscription.empty()) subscribe_request = subscription_request_;
+      needs_snapshot = subscription_needs_snapshot_;
     }
+    // Consult only with mutex_ held. The subscription also changes without a
+    // Core replacement, so matching the process generation alone is unsafe.
+    auto current = [&] {
+      return !stopping_ && core_generation_ == active.generation && subscription_id_ == subscription;
+    };
     try {
-      std::wstring route = L"events?subscription_id=" + Utf8ToWide(subscription) + L"&timeout=20";
-      auto result = Request(endpoint, route, L"GET", "", session);
-      if (IsSessionFailure(result.status)) {
-        InvalidateCoreIfGeneration(generation, true);
-        return;
+      HttpResult result;
+      if (subscription.empty()) {
+        result = Request(active.endpoint, L"", L"POST", subscribe_request, active.token);
+      } else if (needs_snapshot) {
+        // Open the queue before the snapshot so changes during the read are
+        // queued, then publish the full state before reading any patch.
+        result = Request(active.endpoint, L"", L"POST", kSubscriptionSnapshotRequest, active.token);
+      } else {
+        auto route = L"events?subscription_id=" + Utf8ToWide(subscription) + L"&timeout=20";
+        result = Request(active.endpoint, route, L"GET", "", active.token);
       }
-      if (result.status != 200) {
-        // A status that is neither an answer nor a session failure (a
-        // version-mismatched 404, a wedged 500) must not spin: retry at the
-        // same one-second pace the macOS bridge keeps.
-        if (stopping_) return;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (IsSessionFailure(result.status)) {
+        InvalidateCoreIfGeneration(active.generation, true, &subscription);
         continue;
       }
-      auto outer = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result.body));
-      // A missing/null event is the expected quiet heartbeat.  A JSON null is
-      // a present value, so ``GetNamedObject`` throws E_ILLEGAL_METHOD_CALL
-      // instead of answering the default: every heartbeat poll (Core answers
-      // one every 20 s) looked like a dead Core and tore the whole session
-      // down. Only an actual object is an event.
-      winrt::Windows::Data::Json::JsonObject event{nullptr};
-      try {
-        auto value = outer.GetNamedValue(L"event");
-        if (value.ValueType() == winrt::Windows::Data::Json::JsonValueType::Object) {
-          event = value.GetObject();
-        }
-      } catch (...) {
-        // No event key at all, or a value shaped unlike one: nothing to emit.
-      }
-      std::vector<std::function<void(std::string const&)>> handlers;
-      {
+      if (result.status == 410 && !subscription.empty() && !needs_snapshot) {
         std::lock_guard guard(mutex_);
-        if (core_generation_ != generation || subscription_id_ != subscription) return;
-        for (auto const& entry : event_handlers_) handlers.push_back(entry.second);
+        if (current()) subscription_id_.clear();
+        continue;
       }
-      if (event) {
-        std::string text = WideToUtf8(event.Stringify().c_str());
-        for (auto const& handler : handlers) handler(text);
+      if (result.status != 200) throw std::runtime_error("Core event request failed");
+      if (subscription.empty()) {
+        auto replacement = ReadSubscriptionId(result.body);
+        std::lock_guard guard(mutex_);
+        if (current()) {
+          subscription_id_ = std::move(replacement);
+          subscription_needs_snapshot_ = true;
+        }
+        continue;
       }
+      auto text = needs_snapshot ? ReadSubscriptionSnapshot(result.body) : ReadPolledEvent(result.body);
+      if (text.empty()) continue;
+      std::lock_guard guard(mutex_);
+      if (!current()) continue;
+      for (auto const& entry : event_handlers_) entry.second(text);
+      subscription_needs_snapshot_ = false;
     } catch (...) {
-      InvalidateCoreIfGeneration(generation, true);
-      return;
+      std::unique_lock lock(mutex_);
+      if (!current()) continue;
+      // A read may have dequeued an event before its reply was lost. Keep the
+      // live subscription and refresh the state before consuming more patches.
+      if (!subscription.empty()) subscription_needs_snapshot_ = true;
+      poll_condition_.wait_for(lock, std::chrono::seconds(1), [&] { return !current(); });
     }
   }
 }
 
 void CoreIPCBridge::Stop() {
-  bool expected = false;
-  if (!stopping_.compare_exchange_strong(expected, true)) return;
-
   std::optional<Endpoint> shutdown_endpoint;
   std::wstring shutdown_token;
   {
     std::lock_guard guard(mutex_);
+    if (stopping_.exchange(true)) return;
     shutdown_endpoint = endpoint_;
     shutdown_token = session_token_;
+    poll_condition_.notify_one();
   }
   // Stop the managed LiteLLM service through the authenticated host route
   // before reaping Core. Direct process termination remains the final fallback.
@@ -1235,27 +1255,11 @@ void CoreIPCBridge::Stop() {
     }
   }
   InvalidateCore(false);
-  JoinRetiredPollThread();
+  if (poll_thread_.joinable()) poll_thread_.join();
 }
 
 bool CoreIPCBridge::IsSessionFailure(unsigned long status) noexcept {
   return status == 401 || status == 403;
-}
-
-void CoreIPCBridge::JoinRetiredPollThread() {
-  std::unique_lock poll_lock(poll_mutex_);
-  if (!poll_thread_.joinable()) return;
-  if (poll_thread_.get_id() == std::this_thread::get_id()) {
-    // A subscription arriving from inside the poll loop cannot wait on that
-    // loop.  Detaching frees the slot without blocking; the loop notices the
-    // replaced subscription and returns on its own, and the caller assigns a
-    // fresh thread over a slot that is no longer joinable.
-    poll_thread_.detach();
-    return;
-  }
-  std::thread retired = std::move(poll_thread_);
-  poll_lock.unlock();
-  retired.join();
 }
 
 void CoreIPCBridge::InvalidateCore(bool preserve_subscription) {
@@ -1272,12 +1276,14 @@ void CoreIPCBridge::InvalidateCore(bool preserve_subscription) {
 
 void CoreIPCBridge::InvalidateCoreIfGeneration(
     unsigned long generation,
-    bool preserve_subscription) {
+    bool preserve_subscription,
+    std::string const* subscription) {
   std::vector<void*> processes;
   std::vector<std::wstring> directories;
   {
     std::lock_guard guard(mutex_);
-    if (core_generation_ != generation) return;
+    if (core_generation_ != generation ||
+        (subscription && (stopping_ || subscription_id_ != *subscription))) return;
     TakeCoreLocked(processes, directories, preserve_subscription);
   }
   for (size_t index = 0; index < processes.size(); ++index) {
@@ -1290,6 +1296,7 @@ void CoreIPCBridge::InvalidateCoreLocked(bool preserve_subscription) {
   session_token_.clear();
   session_expires_at_tick_ = 0;
   subscription_id_.clear();
+  subscription_needs_snapshot_ = false;
   // Every Core teardown lands here, so this is where the pooled connection to
   // the old process goes: a fresh Core answers on its own endpoint, and a stale
   // connection must not be reused against it.

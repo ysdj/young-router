@@ -204,6 +204,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             macos_proxy.PROXY_APP,
             host="127.0.0.1",
             port=4000,
+            fd=None,
             workers=16,
             loop="uvloop",
             ws_max_size=67108864,

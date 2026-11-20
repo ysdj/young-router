@@ -200,7 +200,7 @@ class YoungRouterHook(CustomLogger):
         # more; without this it stayed counted until the lease aged out (two
         # hours), and enough of them parked the whole route.  Releasing is a
         # no-op for a turn that holds nothing (a listing, a health read).
-        _routing_module._release_request_concurrency_slots(kwargs)
+        _routing_module._release_request_concurrency_slots(kwargs, deployment_only=True)
         # A model-list or health read is not a turn: it selects no route, so the
         # row it would add has no model, cost, or usage.  See
         # ``_is_local_control_plane_read``.
@@ -229,6 +229,19 @@ class YoungRouterHook(CustomLogger):
                 kwargs
             )
         if terminal_failure is not None:
+            if _routing_module._is_local_shutdown_exception(terminal_failure):
+                # This worker's own retirement cut the turn, and the stop the
+                # client was handed says so.  That is neither a delivered answer
+                # nor a route failure: the row belongs to the restart path's
+                # vocabulary (``service_restart``), so it is closed here with
+                # those words instead of the success the transport's normal
+                # close would otherwise write.  Live 2026-11-20 15:11 the
+                # reference install logged 成功 for a Cherry Studio chat turn
+                # this exact retirement had cut with ``router_restarting``, and
+                # ``deployment_success`` cleared the route's failure count 0.3 s
+                # later.
+                _close_request_row_for_local_restart(kwargs)
+                return
             previous_exception = kwargs.get("exception")
             if not isinstance(previous_exception, Exception):
                 kwargs["exception"] = terminal_failure
@@ -279,7 +292,7 @@ class YoungRouterHook(CustomLogger):
         # moment the failure is known, not when the lease expires.  A streaming
         # turn is no exception: a recovery round claims the slot its next
         # attempt needs, and the stream releases again when the body ends.
-        _routing_module._release_request_concurrency_slots(kwargs)
+        _routing_module._release_request_concurrency_slots(kwargs, deployment_only=True)
         # A listing or health read that failed never became a turn.  Left
         # logged, every ``/v1/models`` read a client or this app's own
         # client-model loop made while a worker was still loading its key became
@@ -1075,6 +1088,45 @@ def _settle_client_stopped_stream(request_data: dict) -> None:
             request_data,
             request=_trace_module._trace_request_summary(request_data),
         )
+
+
+def _close_request_row_for_local_restart(request_data: dict) -> bool:
+    """Close this turn's progress row as interrupted by this worker's restart.
+
+    The restart path already owns these rows (``settle_stale_recent_requests``
+    settles whatever the previous process left in flight), but it only sees them
+    at the *next* start, and by then the success callback has replaced the row
+    with a delivered answer -- a stream that was cancelled at the wire boundary
+    returns from its generator, so LiteLLM read the transport's close and wrote
+    成功 for a turn the client was just told was cut.  Closing it at the moment
+    the verdict is known keeps the log on the same side as the frame the client
+    received, and the boot settlement then finds a terminal row and leaves it
+    alone.
+    """
+
+    if not isinstance(request_data, dict):
+        return False
+    request_id = _routing_module._trace_request_id(request_data)
+    if not request_id:
+        return False
+    if not _state_module._settle_recent_request(request_id, "service_restart"):
+        # Nothing of this attempt is still open: either another ending already
+        # closed its row (a client stop, the stale watch) or the turn never
+        # published one.  Inventing a second row here would be a second writer
+        # for the same attempt, so the only thing worth leaving is the fact
+        # that the success callback found nothing to close.
+        _trace_module._request_route_trace(
+            "request_log_local_restart_row_missing",
+            request_data,
+            request=_trace_module._trace_request_summary(request_data),
+        )
+        return False
+    _trace_module._request_route_trace(
+        "request_log_closed_for_local_restart",
+        request_data,
+        request=_trace_module._trace_request_summary(request_data),
+    )
+    return True
 
 
 def _trace_codex_fast_tier_result(

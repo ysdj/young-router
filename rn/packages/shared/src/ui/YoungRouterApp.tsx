@@ -67,6 +67,7 @@ import type {
   ProviderSummary,
   ProviderAuthKind,
   ProviderAuthStatus,
+  ScheduledTaskRecord,
   ServiceStatus,
   StagedPlan,
   ValidationSummary,
@@ -2048,9 +2049,12 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // Held is returned only when the incoming state is older in both halves:
     // an answer that advances neither is not a state this window can move to.
     if (next === held) return;
-    acceptedSnapshotRevision.current = Math.max(acceptedSnapshotRevision.current, next.revision);
+    if (held?.core_instance_id && next.core_instance_id && held.core_instance_id !== next.core_instance_id) {
+      eventChannel.current.received = 0;
+    }
+    acceptedSnapshotRevision.current = next.revision;
     latestSnapshot.current = next;
-    eventChannel.current.revision = Math.max(eventChannel.current.revision, next.revision);
+    eventChannel.current.revision = next.revision;
     // Hand the per-domain layer the state before React renders it, so a pane
     // subscribed to one domain is notified once for this state and not again
     // when the root's commit reaches it.
@@ -2097,7 +2101,10 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       await refreshSnapshot();
       return;
     }
-    if (plan.revision < held.revision) return;
+    if (plan.revision < held.revision) {
+      await refreshSnapshot();
+      return;
+    }
     if (plan.revision === held.revision && plan.service.state === held.service.state) return;
     receiveSnapshot({ ...held, revision: plan.revision, service: plan.service });
   }, [ipc, receiveSnapshot, refreshSnapshot]);
@@ -2219,7 +2226,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeWebDavSettings: translate("webdav.detailsTitle"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeWebDavSettings: translate("webdav.detailsTitle"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("status.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
       // The page's own sign-in surface.  The native hosts never show it: their
@@ -4875,6 +4882,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const manualModelID = useRef(0);
   const [processing, setProcessing] = useState(false);
   const [validation, setValidation] = useState("");
+  const [officialLoginAccountRef, setOfficialLoginAccountRef] = useState("");
   // WorkBuddy: the account is the desktop app's own sign-in and the roster is
   // its live catalog, so the wizard reads both instead of asking for a secret.
   const [workbuddyAccount, setWorkbuddyAccount] = useState<UnknownRecord | undefined>(undefined);
@@ -4890,12 +4898,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // the screen cannot show by itself: this press did not work, and why.
   const wizardFooterStatus = validation || loginFailure.current;
   const shownChallenge = useRef<Record<string, string>>({});
-  // Whether this wizard itself created the official provider or changed its
-  // account.  A zero-model 完成 on an already-signed-in existing provider
-  // writes nothing, so it must not claim 已保存; a newly created provider or a
-  // completed sign-in did write something.
-  const officialProviderCreated = useRef(false);
-  const officialLoginAttempted = useRef(false);
   const setLoginFailure = (message: string | undefined): void => {
     loginFailure.current = message;
     forceLoginFeedbackRender((value) => value + 1);
@@ -4958,6 +4960,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (providerMode !== "existing" || selectedProvider) return;
     setProviderMode("new");
     setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);
+    setOfficialLoginAccountRef("");
     setValidation("");
     if (providerName.trim() && providerBaseURL.trim()) return;
     setStep("provider");
@@ -5185,7 +5188,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const id = editorIdentifier(entry);
       return { value: id, label: stringValue(entry.display_name, stringValue(entry.name, id)) };
     });
-  const officialStatus = isOfficialLoginType && selectedProvider ? providerAuthStatus(selectedProvider) : "signed_out";
+  const officialAccountRecords = asRecords(selectedProvider?.accounts);
+  const authorizingOfficialAccount = officialAccountRecords.find((account) => providerAuthStatus(account) === "authorizing");
+  const officialAccountRef = isOfficialLoginType && keyPath === "login"
+    ? officialLoginAccountRef
+      || stringValue(authorizingOfficialAccount?.ref)
+      || stringValue(officialAccountRecords.find((account) => providerAuthStatus(account) === "signed_in")?.ref)
+    : "";
+  const officialAccount = officialAccountRecords.find((account) => stringValue(account.ref) === officialAccountRef);
+  const officialStatus = providerAuthStatus(officialAccountRef ? officialAccount : selectedProvider);
   const servicePickerItems: Array<{ type: WizardType; label: string }> = [
     { type: "api", label: translate("providers.wizard.typeApi") },
     { type: "openai", label: translate("providers.type.openai") },
@@ -5331,9 +5342,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const verificationURL = stringValue(summary.verification_uri);
     const userCode = stringValue(summary.user_code);
     if (!verificationURL || !userCode) return;
-    const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}`;
-    if (shownChallenge.current[accountFingerprint] === fingerprint) return;
-    shownChallenge.current[accountFingerprint] = fingerprint;
+    const challengeAccountRef = stringValue(summary.account_ref) || accountFingerprint;
+    const fingerprint = `${challengeAccountRef}|${kind}|${verificationURL}|${userCode}`;
+    if (shownChallenge.current[challengeAccountRef] === fingerprint) return;
+    shownChallenge.current[challengeAccountRef] = fingerprint;
     const options = {
       title: label + " " + translate("relay.officialProviderLogin"),
       closeLabel: translate("status.close"),
@@ -5343,7 +5355,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (native.showProviderAuth) {
       void native.showProviderAuth({
         provider: "openai",
-        fingerprint: accountFingerprint,
+        fingerprint: challengeAccountRef,
         verificationURL,
         userCode,
         ...options,
@@ -5358,17 +5370,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     }
   };
   useEffect(() => {
-    if (!isOfficialLoginType || officialStatus !== "authorizing" || !providerID) return;
+    if (!officialAccountRef || officialStatus !== "authorizing" || !providerID) return;
+    // Pin a login started outside this wizard too. When it finishes, the
+    // provider may already have a different signed-in account listed first.
+    setOfficialLoginAccountRef(officialAccountRef);
     const kind: ServiceProviderKind = "openai_login";
     const timer = setInterval(() => {
-      void dispatchWithOutcome("service_provider.auth_status", { provider_id: providerID }, "providers_models", true)
-        .then((next) => presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), providerID))
+      void dispatchWithOutcome("service_provider.auth_status", { provider_id: providerID, account_ref: officialAccountRef }, "providers_models", true)
+        .then((next) => presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), officialAccountRef))
         .catch(() => undefined);
     }, 1_000);
     return () => clearInterval(timer);
     // The challenge presentation deduplicates by fingerprint, so re-running
     // the poll on label or status changes is safe.
-  }, [dispatchWithOutcome, officialStatus, providerID, providerType, selectedProviderName, translate]);
+  }, [dispatchWithOutcome, officialAccountRef, officialStatus, providerID, selectedProviderName, translate]);
 
   // The sign-in page has a window of its own, so this one keeps the size its
   // step needs instead of growing to fit a page it no longer shows.
@@ -5420,14 +5435,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setManualModels([]);
     setSelectedManualModelIDs([]);
     setModelFetchState("idle");
-  }, [activeKeySelection, keyPath, providedKeySelection, providerID, selectedStationAccountID]);
+  }, [activeKeySelection, keyPath, officialAccountRef, providedKeySelection, providerID, selectedStationAccountID]);
 
   const chooseProviderType = (value: WizardType): void => {
     setProviderType(value);
     setProviderMode("new");
     setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);
-    officialProviderCreated.current = false;
-    officialLoginAttempted.current = false;
+    setOfficialLoginAccountRef("");
     setLoginFailure(undefined);
     setKeySelection("");
     setKeyName("");
@@ -5520,6 +5534,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   /** Switch one official service between its web login and a custom key. */
   const chooseOfficialAuthPath = (path: "login" | "manual"): void => {
     setKeyPath(path);
+    setOfficialLoginAccountRef("");
     setLoginFailure(undefined);
     setKeySelection("");
     setKeyName("");
@@ -5533,8 +5548,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const chooseExistingProvider = (value: string): void => {
     setProviderMode("existing");
     setProviderSelection(value);
-    officialProviderCreated.current = false;
-    officialLoginAttempted.current = false;
+    setOfficialLoginAccountRef("");
     setLoginFailure(undefined);
     // An existing account-backed entry keeps its own key path: a login
     // provider shows the account, a custom-key entry shows its key.  A relay
@@ -5560,9 +5574,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const firstProvider = providers.find((entry) => editorIdentifier(entry) === first?.value);
     setProviderMode(value);
     setProviderSelection(value === "new" ? PROVIDER_WIZARD_NEW_PROVIDER : first?.value ?? PROVIDER_WIZARD_NEW_PROVIDER);
+    setOfficialLoginAccountRef("");
     setKeyPath(value === "new" ? (providerType === "api" ? "manual" : "login") : existingKeyPath(firstProvider));
-    officialProviderCreated.current = false;
-    officialLoginAttempted.current = false;
     setLoginFailure(undefined);
     setKeySelection("");
     setKeyName("");
@@ -5877,8 +5890,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    */
   const fetchOfficialAccountModels = async (): Promise<void> => {
     if (modelFetchInFlight.current) return;
-    const accountRef = stringValue(asRecords(selectedProvider?.accounts).find((account) => providerAuthStatus(account) === "signed_in")?.ref);
-    if (!providerID || !accountRef) {
+    if (!providerID || !officialAccountRef || officialStatus !== "signed_in") {
       setModelFetchState("unavailable");
       return;
     }
@@ -5886,7 +5898,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     modelFetchInFlight.current = true;
     setModelFetchState("loading");
     try {
-      const next = await dispatchWithOutcome("providers.fetch_models", { provider_id: providerID, account_ref: accountRef }, "providers_models", true);
+      const next = await dispatchWithOutcome("providers.fetch_models", { provider_id: providerID, account_ref: officialAccountRef }, "providers_models", true);
       if (request !== modelFetchRequest.current) return;
       const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
       if (summary.available === false) {
@@ -6380,23 +6392,25 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
       setProviderMode("existing");
       setProviderSelection(target);
-      officialProviderCreated.current = true;
       focusProviderAfterWizard(target);
       setValidation("");
     }
     const kind: ServiceProviderKind = "openai_login";
-    delete shownChallenge.current[target];
-    officialLoginAttempted.current = true;
     try {
       const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: target }, "providers_models");
-      presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), target);
+      const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+      const accountRef = stringValue(summary.account_ref);
+      if (!accountRef) return;
+      setOfficialLoginAccountRef(accountRef);
+      delete shownChallenge.current[accountRef];
+      presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), accountRef);
     } catch (reason) {
       setValidation(errorMessage(reason, translate));
     }
   };
   const cancelOfficialLogin = async (): Promise<void> => {
-    if (!providerID) return;
-    await dispatchWithOutcome("service_provider.auth_cancel", { provider_id: providerID }, "providers_models");
+    if (!providerID || !officialAccountRef) return;
+    await dispatchWithOutcome("service_provider.auth_cancel", { provider_id: providerID, account_ref: officialAccountRef }, "providers_models");
   };
   const logoutOfficial = async (): Promise<void> => {
     if (!providerID) return;
@@ -6417,7 +6431,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       destructive: true,
     });
     if (!confirmed) return;
-    await dispatchWithOutcome("service_provider.auth_logout", { provider_id: providerID }, "providers_models");
+    const next = await dispatchWithOutcome("service_provider.auth_logout", { provider_id: providerID }, "providers_models");
+    if (next) setOfficialLoginAccountRef("");
   };
   /** One place that moves the wizard onto the model step, so the
    * duplicate-press guard's ref can never disagree with the render. */
@@ -6553,11 +6568,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         return;
       }
       if (isOfficialLoginType && keyPath === "login") {
-        if (officialStatus !== "signed_in") {
+        if (!officialAccountRef || officialStatus !== "signed_in") {
           setValidation(translate("providers.wizard.loginRequired"));
           return;
         }
         advanceStepToModel();
+        setModelFetchTicket((current) => current + 1);
         return;
       }
       if (keyPath === "login") {
@@ -6627,22 +6643,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // empty for no reason the wizard ever stated.  Nothing picked is still a
       // finished wizard — the provider pane offers 获取模型 on the account.
       if (selectedModels.length === 0) {
-        const wrote = officialProviderCreated.current
-          || (officialLoginAttempted.current && officialStatus === "signed_in");
-        if (!wrote) {
-          // An existing, already-signed-in provider has nothing to write with
-          // no model picked.  Close without claiming a save that did not
-          // happen; the footer's Close is the same outcome without the lie.
-          onClose();
-          return;
-        }
         onClose();
+        return;
+      }
+      if (!providerID || !officialAccountRef || officialStatus !== "signed_in") {
+        setValidation(translate("providers.wizard.loginRequired"));
         return;
       }
       setProcessing(true);
       try {
-        if (!providerID) return;
-        const accountRef = stringValue(asRecords(selectedProvider?.accounts).find((account) => providerAuthStatus(account) === "signed_in")?.ref);
         const next = await dispatchWithOutcome("model.add_many", {
           provider_id: providerID,
           models: selectedModels.map((name) => ({
@@ -6652,7 +6661,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             imported_name_case: importNameCase,
             enabled: true,
             order: 0,
-            ...(accountRef ? { account_ref: accountRef } : {}),
+            account_ref: officialAccountRef,
           })),
         });
         if (!next) return;
@@ -9065,49 +9074,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       setFormBusy(false);
     }
   };
-  // Quietly keep station groups aligned while auto-grouping is on.
-  //
-  // The tick reads the accounts, the bridge, and the busy guard through a ref:
-  // this pane re-renders on every snapshot, and an effect that depended on
-  // those values directly would tear its timer down and restart the half-hour
-  // countdown on each render — so the alignment would effectively never run.
-  // Only the enabled flag and the set of accounts the timer covers re-arm it.
-  const autoGroupingAccountIDs = useMemo(
-    () => stationAccounts.filter((account) => account.autoGrouping).map((account) => account.id),
-    [stationAccounts],
-  );
-  const autoGroupingKey = autoGroupingAccountIDs.join("\n");
-  const autoGroupingTick = useRef({ relay, controlsBusy, accountIDs: autoGroupingAccountIDs });
-  useEffect(() => {
-    autoGroupingTick.current = { relay, controlsBusy, accountIDs: autoGroupingAccountIDs };
-  });
-  useEffect(() => {
-    if (!autoGrouping || !autoGroupingKey) return;
-    let active = true;
-    const interval = setInterval(() => {
-      const current = autoGroupingTick.current;
-      if (!active || current.controlsBusy) return;
-      const align = current.relay.apiKeyActions.alignAutoGrouping;
-      if (!align) return;
-      void (async () => {
-        for (const accountID of current.accountIDs) {
-          if (!active) return;
-          try {
-            const status = await current.relay.refreshResources(accountID);
-            if (!active || status !== "ready") continue;
-            await align(accountID);
-          } catch {
-            // The next interval can retry.
-          }
-        }
-        if (active) await current.relay.refreshAccounts();
-      })();
-    }, 30 * 60_000);
-    return () => {
-      active = false;
-      clearInterval(interval);
-    };
-  }, [autoGrouping, autoGroupingKey]);
   const previousKeyRowKeys = useRef<string[]>([]);
   useEffect(() => {
     // tableRows keys already carry the custom:/provided: prefix; compare the
@@ -15657,6 +15623,79 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
   </View>;
 }
 
+function taskIntervalText(seconds: number | null, translate: Translate): string {
+  if (seconds === null) return translate("common.notAvailable");
+  if (seconds >= 3600 && seconds % 3600 === 0) return translate("tasks.intervalHours", { count: seconds / 3600 });
+  if (seconds >= 60 && seconds % 60 === 0) return translate("tasks.intervalMinutes", { count: seconds / 60 });
+  return translate("tasks.intervalSeconds", { count: seconds });
+}
+
+function TaskFact({ label, value, outcome }: { label: string; value: string; outcome?: ScheduledTaskRecord["history"][number]["outcome"] }): React.JSX.Element {
+  return <View>
+    <Text style={styles.scheduledTaskLabel}>{label}</Text>
+    <Text style={[styles.routeTraceDetailMeta, outcome === "failed" && styles.routeTraceOutcomeFailed, outcome === "partial" && styles.routeTraceOutcomeFallback]}>{value}</Text>
+  </View>;
+}
+
+function ScheduledTasksWorkspace({ log, loadFailed, translate, selectedKey, onSelect }: {
+  log?: LogView;
+  loadFailed: boolean;
+  translate: Translate;
+  selectedKey: string;
+  onSelect: (id: string) => void;
+}): React.JSX.Element {
+  // The scheduled-tasks view is the only log tab whose records are task types
+  // with a nested run history. Keep them out of the ordinary log row reducer.
+  const tasks = (log?.records ?? []) as ScheduledTaskRecord[];
+  const selected = tasks.find((task) => task.id === selectedKey) ?? tasks[0];
+  if (!selected) {
+    const message = log ? "tasks.empty" : loadFailed ? "tasks.loadFailed" : "tasks.loading";
+    return <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{translate(message)}</Text></View>;
+  }
+  const name = translate(`tasks.name.${selected.id}`);
+  return <View style={styles.routeTraceWorkspace}>
+    <View style={styles.scheduledTaskList}>
+      <NativeTable
+        columns={[{ label: "", width: 210 }]}
+        rows={tasks.map((task) => ({ key: task.id, cells: [translate(`tasks.name.${task.id}`)] }))}
+        selectedKey={selected.id}
+        onSelectionChange={onSelect}
+        sourceList
+        style={styles.logTable}
+      />
+    </View>
+    <View style={styles.routeTraceDetailPane}>
+      <View style={styles.scheduledTaskHeader}>
+        <Text accessibilityRole="header" style={styles.routeTraceDetailTitle}>{name}</Text>
+        <View style={styles.scheduledTaskFacts}>
+          <TaskFact label={translate("tasks.status")} value={translate(`tasks.state.${selected.state}`)} />
+          <TaskFact label={translate("tasks.interval")} value={taskIntervalText(selected.interval_seconds, translate)} />
+          {selected.running_since
+            ? <TaskFact label={translate("tasks.runningSince")} value={shortLogTimestamp(selected.running_since)} />
+            : <TaskFact label={translate("tasks.nextRun")} value={shortLogTimestamp(selected.next_run_at) || translate("common.notAvailable")} />}
+        </View>
+      </View>
+      <Text accessibilityRole="header" style={styles.scheduledTaskHistoryTitle}>{translate("tasks.history")}</Text>
+      <PersistentScrollView key={selected.id} style={styles.scheduledTaskHistory} showsVerticalScrollIndicator>
+        {selected.history.length === 0 ? <Text style={styles.scheduledTaskNoHistory}>{translate("tasks.noHistory")}</Text> : selected.history.map((run) => {
+          const counts = (["succeeded", "failed", "skipped"] as const).flatMap((outcome) => {
+            const count = run[outcome];
+            return count === undefined ? [] : [translate(`tasks.total.${outcome}`, { count })];
+          });
+          return <View key={`${run.started_at}:${run.finished_at}`} style={styles.scheduledTaskRun}>
+            <View style={styles.scheduledTaskFacts}>
+              <TaskFact label={translate("tasks.startedAt")} value={shortLogTimestamp(run.started_at)} />
+              <TaskFact label={translate("tasks.finishedAt")} value={shortLogTimestamp(run.finished_at)} />
+              <TaskFact label={translate("tasks.outcome")} value={translate(`tasks.outcome.${run.outcome}`)} outcome={run.outcome} />
+            </View>
+            {counts.length > 0 ? <Text style={styles.scheduledTaskLabel}>{counts.join(" · ")}</Text> : null}
+          </View>;
+        })}
+      </PersistentScrollView>
+    </View>
+  </View>;
+}
+
 function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, requestedTab, requestedTabKey = 0, onStatus, onStatusBar }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; requestedTab?: typeof LOG_TABS[number]; requestedTabKey?: number; onStatus?: (status?: string) => void; onStatusBar?: (controls: React.ReactNode) => void }): React.JSX.Element {
   type PauseIntent = { tab: typeof LOG_TABS[number]; paused: boolean; token: number };
   type ClearIntent = { tab: typeof LOG_TABS[number]; token: number };
@@ -15765,6 +15804,8 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   useEffect(() => {
     let mounted = true;
     let polling = false;
+    // The cursor belongs to this Core instance. A restart may reuse a log
+    // revision number, so the new instance needs an unconditional first read.
     viewRevisionRef.current = undefined;
     setPauseIntent(undefined);
     setClearIntent(undefined);
@@ -15807,7 +15848,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);
     }
     return () => { mounted = false; clearInterval(interval); };
-  }, [ipc, selected]);
+  }, [ipc, selected, snapshot?.core_instance_id]);
   // "Load older" is one page of the store's history, read on demand: the tab
   // opens on 300 rows (about 17 KB gzipped) instead of the whole 10 000-line
   // window (3.2 MB / 257 KB on the gateway), and the reader asks for more by
@@ -15835,7 +15876,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   };
   const clearing = clearIntent?.tab === selected;
   const rows = useMemo(
-    () => renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate),
+    () => selected === "scheduled-tasks" ? [] : renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate),
     [active?.records, clearing, selected, translate],
   );
   const columns = useMemo(
@@ -16025,10 +16066,12 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // The window strip is the only bar this tab has: the page controls sit at its
   // right end, so the row count they page through belongs on its left, exactly
   // where every other route states its status.
-  const statusLine = [
-    translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
-    paused ? translate("logs.paused") : "",
-  ].filter(Boolean).join(" | ");
+  const statusLine = selected === "scheduled-tasks"
+    ? (active ? translate("tasks.count", { count: active.records.length }) : "")
+    : [
+      translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
+      paused ? translate("logs.paused") : "",
+    ].filter(Boolean).join(" | ");
   useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);
 
   // The online-usage tab reads through Core's own log-format reader: the
@@ -16119,8 +16162,15 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // An answered read and a failed one both end the wait, and only the read that
   // is still current may clear it: a stale answer must not hide the wait of a
   // newer station the user has since chosen.
-  const settleOnlineUsageLoading = (tab: typeof LOG_TABS[number], log?: LogView): void => {
+  const settleOnlineUsageLoading = (
+    tab: typeof LOG_TABS[number],
+    request: number,
+    sourceId: string,
+    log?: LogView,
+  ): void => {
     if (onlineUsageLoadingTabRef.current !== tab) return;
+    if (onlineUsageLoadingRequest.current !== request) return;
+    if (onlineUsagePendingSourceIdRef.current !== sourceId) return;
     if (log) setActiveState({ tab, log });
     onlineUsageLoadingTabRef.current = undefined;
     setOnlineUsageLoadingTab(undefined);
@@ -16176,13 +16226,13 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       if (onlineUsagePendingSourceIdRef.current !== sourceId) return;
       if (selectedTabRef.current !== tab) return;
       viewRevisionRef.current = result.revision;
-      settleOnlineUsageLoading(tab);
+      settleOnlineUsageLoading(tab, request, sourceId);
     }).catch(() => {
-      settleOnlineUsageLoading(tab);
+      settleOnlineUsageLoading(tab, request, sourceId);
     }).finally(() => {
       if (onlineUsageLoadingRequest.current !== onlineUsageRequest.current) return;
       if (onlineUsagePendingSourceIdRef.current !== sourceId) return;
-      settleOnlineUsageLoading(tab);
+      settleOnlineUsageLoading(tab, request, sourceId);
     });
   }, [ipc]);
   // The tab-entry effect runs before this callback exists in source order, so
@@ -16399,7 +16449,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       if (clearTabRef.current) return;
       setSelected(tab as LogTab);
     }} style={styles.logsTabs} />
-    <View style={styles.logsToolbar}>
+    {selected !== "scheduled-tasks" ? <View style={styles.logsToolbar}>
       <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { flushFilter.current(); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
       {selected === "online-usage" ? <><NativePicker overlayLayer labels={onlineUsageTimeLabels} selectedValue={onlineUsageTimeValue} compact accessibilityLabel={translate("logs.onlineUsageTimeLabel")} onChange={({ nativeEvent }) => {
         const option = onlineUsageTimeValues[nativeEvent.index];
@@ -16411,7 +16461,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           `onlineUsageLoadingSource` covered.  A wheel here as well spun two for
           one read, the second one floating above the picker. */}
       <View style={styles.logActionsRow}>{selected === "requests" && active?.has_older ? <NativeButton title={translate("logs.loadOlder")} accessibilityLabel={translate("logs.loadOlder")} compact busy={olderPending} disabled={busy || olderPending} onPress={loadOlder} style={styles.loadOlderButton} /> : null}{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} disabledIndices={onlineUsageDisabledSources} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} accessibilityLabel={translate("logs.onlineUsageSourceLabel")} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label={Platform.OS === "web" ? translate("common.clear") : ""} symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
-    </View>
+    </View> : null}
     {/* The range message is the only thing that makes this slot exist: an empty
         row of its own height sat between the toolbar and the table for every
         online-usage view, which is the blank band the pane showed instead of
@@ -16420,7 +16470,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       <Text numberOfLines={1} style={styles.logRangeError} accessibilityLiveRegion="polite">{onlineUsageRangeError}</Text>
       {onlineUsageRangeError === translate("logs.onlineUsageRangeInvalid") ? <Text numberOfLines={1} style={styles.logRangeErrorHint}>{translate("logs.onlineUsageRangeHint")}</Text> : null}
     </View> : null}
-    {rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
+    {selected === "scheduled-tasks" ? <ScheduledTasksWorkspace log={active} loadFailed={loadFailed} translate={translate} selectedKey={selectedKey} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} /> : rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
       : <View style={styles.logTablesLayout} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onEndReached={selected === "requests" && active?.has_older ? loadOlder : undefined} onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         if (onlineUsageWaitingForSource || onlineUsageTimePending) return;
@@ -17683,6 +17733,14 @@ const assistantFileSurfaceStyles = StyleSheet.create({
 
 const styles = StyleSheet.create({
   routeTraceWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
+  scheduledTaskList: { width: "33%", minWidth: 160, maxWidth: 224, minHeight: 0 },
+  scheduledTaskHeader: { gap: 6, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
+  scheduledTaskFacts: { flexDirection: "row", flexWrap: "wrap", columnGap: 16, rowGap: 4 },
+  scheduledTaskLabel: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  scheduledTaskHistoryTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600", paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  scheduledTaskHistory: { flex: 1, minHeight: 0 },
+  scheduledTaskRun: { gap: 4, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  scheduledTaskNoHistory: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, padding: SETTINGS_PANE_INSET },
   routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceRequestScroll: { flex: 1, minHeight: 0 },
   routeTraceRequestList: { flexGrow: 1 },

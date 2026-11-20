@@ -46,6 +46,7 @@ from .persistence import (
     read_json,
     read_text,
 )
+from .runtime_settings_schema import RELAY_NEGATIVE_BALANCE_INTERVAL_KEY
 from .security import REDACT_TEXT
 from .domains.logs import active_cooldown_states, active_recovery_states
 
@@ -98,6 +99,7 @@ DEFAULT_SERVICE_HEALTH_WAIT_SECONDS = 180.0
 SERVICE_STARTUP_GRACE_SECONDS = 240.0
 _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
     {
+        RELAY_NEGATIVE_BALANCE_INTERVAL_KEY,
         "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP",
         "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
         # The image-context pass is the one request rewrite whose *switch* the
@@ -1472,8 +1474,22 @@ class CoreServiceController:
         its own name; this one stages a document and never touches the child.
         """
 
+        from ..adapters import managed_base_references
+
+        managed_references = managed_base_references()
+
+        def required_workers() -> set[str]:
+            config = read_text(self.paths.runtime_config) or ""
+            return {ref for ref in managed_references if ref in config}
+
+        previous_workers = required_workers()
         self._stage_runtime_config()
-        return {"fingerprint": self.runtime_fingerprint()}
+        # The master that forks rolling replacements retains its launch
+        # environment. Capture changes before staging overwrites the old file.
+        return {
+            "fingerprint": self.runtime_fingerprint(),
+            "requires_restart": previous_workers != required_workers(),
+        }
 
     def runtime_fingerprint(self) -> str | None:
         """A digest of the exact bytes the managed proxy loads at startup."""
@@ -1907,8 +1923,10 @@ class CoreServiceController:
         # Stage before signalling.  The workers load the staged document as they
         # come up, so a roll started before the new bytes are in place would
         # bring up replacements carrying the document the proxy already had.
-        self._stage_runtime_config()
+        staged = self.stage_runtime_config()
         self.reset_transient_routing_state()
+        if staged["requires_restart"]:
+            return self.restart()
         if self._rolling_restart(pid):
             # A positive answer is memoized, so drop the pre-roll one before
             # probing; otherwise the wait can finish on an answer recorded

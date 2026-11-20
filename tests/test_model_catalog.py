@@ -179,6 +179,20 @@ class ModelCatalogTests(unittest.TestCase):
             _number_text_for_schema(base_module._STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS),
             defaults_by_key["YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS"],
         )
+        self.assertEqual(
+            _number_text_for_schema(base_module._STREAM_HEDGE_DELAY_DEFAULT_SECONDS),
+            defaults_by_key["YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS"],
+        )
+        self.assertEqual(
+            _number_text_for_schema(
+                base_module._STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS
+            ),
+            defaults_by_key["YOUNG_ROUTER_STREAM_START_TIMEOUT_COOLDOWN_SECONDS"],
+        )
+        self.assertEqual(
+            str(base_module._REPLAY_REASONING_ELISION_KEEP_DEFAULT),
+            defaults_by_key["YOUNG_ROUTER_REPLAY_REASONING_ELISION_KEEP"],
+        )
         # A value at its schema default is not written to the settings file, so
         # the number the pane shows is only true while the proxy's own fallback
         # agrees with it.  These two were raised to 300 s in the proxy while the

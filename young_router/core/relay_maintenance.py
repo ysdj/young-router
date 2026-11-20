@@ -1,0 +1,93 @@
+"""Run relay login checks and group refreshes independently of open panes."""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
+
+from .oplog import note
+from .scheduled_tasks import RELAY_GROUPS, RELAY_LOGIN, ScheduledTasks
+
+RELAY_MAINTENANCE_SECONDS = 30 * 60
+
+
+class RelayMaintenance:
+    def __init__(
+        self, *, tasks: ScheduledTasks, accounts: Callable[[], Mapping[str, Sequence[str]]],
+        run: Callable[[str, str, Callable[[], bool]], str], interval: float = RELAY_MAINTENANCE_SECONDS,
+    ) -> None:
+        self._tasks = tasks
+        self._accounts = accounts
+        self._run = run
+        self._interval = interval
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="young-router-relay-maintenance", daemon=True)
+        self._thread.start()
+
+    def kick(self) -> None:
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        next_runs: dict[str, float] = {}
+        while True:
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            try:
+                accounts = self._accounts()
+            except Exception:
+                note("relay maintenance could not read the accounts")
+                for task_id in (RELAY_LOGIN, RELAY_GROUPS):
+                    self._tasks.begin(task_id)
+                    self._tasks.finish(task_id, "failed")
+                    self._tasks.plan(task_id, interval_seconds=self._interval, delay_seconds=self._interval)
+                self._wake.wait(self._interval)
+                continue
+            now = time.monotonic()
+            due = None
+            for task_id in (RELAY_LOGIN, RELAY_GROUPS):
+                if not accounts.get(task_id):
+                    next_runs.pop(task_id, None)
+                    delay = None
+                else:
+                    delay = next_runs.setdefault(task_id, now + self._interval) - now
+                    if delay <= 0 and due is None:
+                        due = task_id
+                self._tasks.plan(task_id, interval_seconds=self._interval, delay_seconds=delay)
+            if self._stop.is_set():
+                break
+            if due is not None:
+                next_runs[due] = now + self._interval
+                self._run_due(due, accounts[due])
+            else:
+                self._wake.wait(min(next_runs.values()) - now if next_runs else None)
+        for task_id in (RELAY_LOGIN, RELAY_GROUPS):
+            self._tasks.plan(task_id, interval_seconds=self._interval, delay_seconds=None)
+
+    def _run_due(self, task_id: str, account_ids: Sequence[str]) -> None:
+        self._tasks.begin(task_id)
+        outcomes = []
+        for account_id in account_ids:
+            if self._stop.is_set():
+                outcomes.append("skipped")
+                continue
+            try:
+                outcomes.append(self._run(task_id, account_id, self._stop.is_set))
+            except Exception:
+                note("relay maintenance pass could not be completed")
+                outcomes.append("failed")
+        self._tasks.finish_batch(task_id, outcomes)

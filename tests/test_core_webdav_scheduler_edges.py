@@ -2,36 +2,50 @@
 
 from __future__ import annotations
 
-import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from young_router.core.webdav_scheduler import WebDAVSyncScheduler
+from young_router.core.domains.webdav import WebDAVSettingsDomain
+from young_router.core.service import CoreStore
 
 
 class WebDAVSyncSchedulerLoopTests(unittest.TestCase):
-    def test_an_idle_sleep_that_reports_no_kick_does_not_end_the_loop(self) -> None:
-        """Only stop() ends the loop; a wait returning False goes back to the top."""
+    def test_first_apply_wakes_a_scheduler_that_saw_the_saved_switch_off(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = WebDAVSettingsDomain(root / "webdav.json", state_path=root / "state.json")
+            core = CoreStore(domains=[domain])
+            idle = threading.Event()
+            ran = threading.Event()
+            read_state = core.webdav_auto_sync_state
 
-        class IdleScheduler(WebDAVSyncScheduler):
-            def __init__(self, **kwargs) -> None:
-                super().__init__(**kwargs)
-                self.waits = 0
+            def snapshot() -> dict:
+                state = read_state()
+                if not state["enabled"]:
+                    idle.set()
+                return state
 
-            def _wait(self, seconds: float | None) -> bool:
-                self.waits += 1
-                if self.waits >= 2:
-                    self._stop.set()
-                return False
-
-        scheduler = IdleScheduler(
-            snapshot=lambda: {"enabled": False, "configured": True, "sync_interval_minutes": 30},
-            sync=lambda: self.fail("a disabled scheduler must not sync"),
-        )
-        scheduler._loop()
-        self.assertEqual(2, scheduler.waits)
+            with (
+                mock.patch.object(core, "run_automatic_webdav_sync", side_effect=lambda: ran.set()),
+                mock.patch.object(core, "webdav_auto_sync_state", side_effect=snapshot),
+                mock.patch.object(core, "quiet_seconds", return_value=60.0),
+            ):
+                loop = core.webdav_scheduler()
+                loop._initial_delay = 0
+                loop.start()
+                try:
+                    self.assertTrue(idle.wait(2))
+                    core.dispatch({"domain": "webdav", "type": "patch", "payload": {
+                        "url": "https://example.test/dav/", "enabled": True,
+                    }})
+                    self.assertFalse(ran.is_set())
+                    core.apply("webdav")
+                    self.assertTrue(ran.wait(2))
+                finally:
+                    core.shutdown()
 
 
 if __name__ == "__main__":

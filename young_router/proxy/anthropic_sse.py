@@ -26,6 +26,7 @@ Boundaries this keeps:
 
 from __future__ import annotations
 
+import codecs
 import json
 import re
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
@@ -35,6 +36,7 @@ from . import anthropic_dsml as _anthropic_dsml_module
 #: SSE events end with a blank line, in any of the three line endings a proxy
 #: may pass through.
 _EVENT_SEPARATOR = re.compile(r"\r\n\r\n|\n\n|\r\r")
+_BYTE_EVENT_SEPARATOR = re.compile(_EVENT_SEPARATOR.pattern.encode("ascii"))
 _DATA_LINE = re.compile(r"^data:[ \t]?(.*)$", re.MULTILINE)
 #: The indices the synthesized blocks use, so they cannot collide with a block
 #: the route wrote itself.
@@ -62,6 +64,35 @@ def _sse_block(payload: Dict[str, Any]) -> bytes:
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\n\n"
     ).encode("utf-8")
+
+
+async def iter_messages_sse_frames(body: AsyncIterator[Any]) -> AsyncIterator[Any]:
+    """Group raw transport reads into complete Messages events.
+
+    The delimiter is ASCII, so it can be found before decoding a payload and
+    a read ending in the middle of a UTF-8 character stays intact.
+    """
+
+    pending = bytearray()
+    async for chunk in body:
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        if not isinstance(chunk, (bytes, bytearray)):
+            if pending:
+                yield bytes(pending)
+                pending.clear()
+            yield chunk
+            continue
+        pending.extend(chunk)
+        start = 0
+        for match in _BYTE_EVENT_SEPARATOR.finditer(pending):
+            end = match.end()
+            yield bytes(pending[start:end])
+            start = end
+        if start:
+            del pending[:start]
+    if pending:
+        yield bytes(pending)
 
 
 class MessagesSseRewriter:
@@ -304,12 +335,6 @@ class MessagesSseRewriter:
         return out
 
 
-def _decoded(chunk: Any) -> str:
-    if isinstance(chunk, (bytes, bytearray)):
-        return bytes(chunk).decode("utf-8", "replace")
-    return str(chunk)
-
-
 def _lead_block_events(index: int, block: Dict[str, Any]) -> List[bytes]:
     """One whole content block, as the frames that publish it.
 
@@ -367,8 +392,16 @@ async def rewrite_messages_sse(
     """Wrap a Messages body so its text never carries the route's markup."""
 
     rewriter = MessagesSseRewriter(lead_blocks=lead_blocks)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     async for chunk in body:
-        for frame in rewriter.feed(_decoded(chunk)):
+        if isinstance(chunk, (bytes, bytearray)):
+            text = decoder.decode(bytes(chunk))
+        else:
+            text = decoder.decode(b"", final=True) + str(chunk)
+            decoder.reset()
+        for frame in rewriter.feed(text):
             yield frame
+    for frame in rewriter.feed(decoder.decode(b"", final=True)):
+        yield frame
     for frame in rewriter.finish():
         yield frame

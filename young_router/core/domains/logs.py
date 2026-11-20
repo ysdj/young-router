@@ -1963,7 +1963,7 @@ class LogsDomain:
         self._online_usage_source_id = ""
         # Only the latest requested source may replace the view. A slower
         # answer for an earlier source ends that request, never this one.
-        self._online_usage_request = ""
+        self._online_usage_generation = 0
         runtime = self.root / ".litellm-runtime"
         self._recovery_path = Path(
             os.environ.get("YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")
@@ -3035,7 +3035,7 @@ class LogsDomain:
         if callable(gate):
             self._io_gate = gate  # type: ignore[assignment]
 
-    def _read_online_usage_page(self, tab: str, request: str = "") -> bool:
+    def _read_online_usage_page(self, tab: str) -> bool:
         """Read the page the pager names from the chosen relay.
 
         One read, one page.  The station owns the history, so the only honest
@@ -3047,6 +3047,8 @@ class LogsDomain:
         replaced: a slower read must never overwrite the newer choice.
         """
 
+        self._online_usage_generation += 1
+        generation = self._online_usage_generation
         source_id = self._online_usage_source_id
         self._online_usage_reason = ""
         try:
@@ -3070,7 +3072,7 @@ class LogsDomain:
                         page=max(1, self._online_usage_page),
                         rows_per_page=self._effective_page_rows(),
                     )
-                if request and request != self._online_usage_request:
+                if generation != self._online_usage_generation:
                     # This answer belongs to a source the user has since
                     # replaced, so it neither becomes a row nor ends the wait
                     # for the newer source.
@@ -3110,7 +3112,7 @@ class LogsDomain:
                 self._online_usage_records_source = source_id
             self._online_usage_reason = str(reason)[:512]
         except Exception:
-            if request and request != self._online_usage_request:
+            if generation != self._online_usage_generation:
                 return False
             # A read that failed is not a station that answered nothing, so the
             # rows already on screen stay: clearing them turned one slow or
@@ -3294,14 +3296,14 @@ class LogsDomain:
                 # scope keeps the current selection, so the pane's idle poll
                 # never re-reads a relay the user did not choose.
                 requested = data.get("source", data.get("source_id"))
-                request = data.get("request")
                 source_id = self._online_usage_source_id
-                if isinstance(requested, str) and requested.strip():
+                if isinstance(requested, str):
                     source_id = requested.strip()[:64]
+                if source_id != self._online_usage_source_id:
+                    self._online_usage_page = 1
+                    self._online_usage_total = 0
                 self._online_usage_source_id = source_id
-                if isinstance(request, str) and request:
-                    self._online_usage_request = request
-                if not self._read_online_usage_page(str(tab), request if isinstance(request, str) else ""):
+                if not self._read_online_usage_page(str(tab)):
                     # A newer source replaced this read while it was in flight.
                     return self.snapshot()
         else:

@@ -39,7 +39,8 @@ export type LogTab =
   | "actions"
   | "route-trace"
   | "recovery"
-  | "online-usage";
+  | "online-usage"
+  | "scheduled-tasks";
 
 export type ConfigDomain =
   | "providers_models"
@@ -481,6 +482,23 @@ export interface LogView extends LogSummary {
   /** Whether the store holds a 请求 row older than the window this view holds. */
   has_older?: boolean;
 }
+
+/** One task type and its most recent runs from the scheduled-tasks log view. */
+export type ScheduledTaskRecord = {
+  id: string;
+  state: "waiting" | "running" | "idle" | "blocked";
+  interval_seconds: number | null;
+  next_run_at: string | null;
+  running_since: string | null;
+  history: {
+    started_at: string;
+    finished_at: string;
+    outcome: "succeeded" | "partial" | "failed" | "skipped";
+    succeeded?: number;
+    failed?: number;
+    skipped?: number;
+  }[];
+};
 
 export interface CoreSnapshot {
   protocol_version: typeof IPC_PROTOCOL_VERSION;

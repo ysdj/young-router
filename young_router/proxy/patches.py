@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 
 from .. import api_base as _api_base_module
@@ -22,6 +23,7 @@ from . import responses_output as _responses_output_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import reasoning_replay as _reasoning_replay_module
+from . import relay_balance as _relay_balance_module
 from . import thinking_block_replay as _thinking_block_replay_module
 from . import thinking_signature_replay as _thinking_signature_replay_module
 from . import routing as _routing_module
@@ -39,6 +41,7 @@ from .base import (
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_SELECTED_DEPLOYMENT,
+    _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS,
     _CURRENT_ROUTING_REQUEST_KWARGS,
     _GENERIC_HELPER_PATCH_ATTR,
@@ -95,6 +98,8 @@ _RESPONSES_WEBSOCKET_HTTP_BRIDGE_PATCH_ATTR = (
     "_young_router_responses_websocket_http_bridge_patch"
 )
 _STREAM_CHUNK_RESTAMP_PATCH_ATTR = "_young_router_stream_chunk_restamp_patch"
+_RELAY_BALANCE_SELECTION_PATCH_ATTR = "_young_router_relay_balance_selection_patch"
+_RUST_DISPATCH_PATCH_ATTR = "_young_router_rust_dispatch_patch"
 
 
 def _install_stream_chunk_restamp_patch() -> None:
@@ -1047,6 +1052,56 @@ def _install_integer_order_tiers_patch() -> None:
     Router.__init__ = patched_init
 
 
+def _install_relay_balance_selection_patch() -> None:
+    """Exclude negative balances both before tier selection and for direct IDs."""
+    from litellm.router_rust.core import RustCore
+    from litellm.rust_bridge._native import RouterCoreHandle
+
+    original_select = RustCore._answer_select_sync
+    original_filter = RustCore._answer_callback_filters
+    if getattr(original_select, _RELAY_BALANCE_SELECTION_PATCH_ATTR, False):
+        return
+
+    def with_balance_exclusions(original: Any) -> Any:
+        @wraps(original)
+        def call(self: Any, name: str, request: dict, *args: Any) -> Any:
+            # The native call is handed the final routing document. Earlier
+            # merges overwrite any exclusions inserted into `_routing_fields`.
+            blocked = _relay_balance_module.blocked_deployment_ids(self.deployments)
+            if blocked:
+                blocked.update(request.get("excluded_ids", ()))
+                request = {**request, "excluded_ids": sorted(blocked)}
+            return original(self, name, request, *args)
+
+        return call
+
+    for name in ("start", "select", "healthy", "retry_stream", "fallback_stream"):
+        setattr(RouterCoreHandle, name, with_balance_exclusions(getattr(RouterCoreHandle, name)))
+
+    def without_excluded_candidates(step: dict) -> dict:
+        # Rust applies excluded_ids after choosing the tier. A group whose
+        # lowest tier is excluded still needs to be able to select the next.
+        if step.get("stage") == "callback_filters" and step.get("excluded_ids"):
+            excluded = set(step["excluded_ids"])
+            return {
+                **step,
+                "candidates": [item for item in step["candidates"] if item not in excluded],
+            }
+        return step
+
+    @wraps(original_select)
+    def select_sync(self: Any, step: dict, *args: Any, **kwargs: Any) -> Any:
+        return original_select(self, without_excluded_candidates(step), *args, **kwargs)
+
+    @wraps(original_filter)
+    async def filter_async(self: Any, step: dict, *args: Any, **kwargs: Any) -> Any:
+        return await original_filter(self, without_excluded_candidates(step), *args, **kwargs)
+
+    setattr(select_sync, _RELAY_BALANCE_SELECTION_PATCH_ATTR, True)
+    RustCore._answer_select_sync = select_sync
+    RustCore._answer_callback_filters = filter_async
+
+
 def _install_routing_constraint_patch() -> None:
     try:
         from litellm.router import Router
@@ -1812,7 +1867,7 @@ def _install_order_peer_failover_patch() -> None:
             # refusal never took one, so releasing is a no-op for it; a real
             # failure frees the slot now instead of waiting for the lease to age
             # out, so the peer this attempt advances to starts from a true count.
-            _routing_module._release_request_concurrency_slots(kwargs)
+            _routing_module._release_request_concurrency_slots(kwargs, deployment_only=True)
             _routing_module._mark_same_deployment_retry_exhausted(e)
             _routing_module._mark_exception_for_deployment_failover(e, kwargs)
         _routing_module._sync_failed_deployment_exclusions(kwargs, e)
@@ -2027,12 +2082,12 @@ def _install_generic_deployment_failover_patch() -> None:
             try:
                 # One hop's dispatch: the await that ends when the upstream has
                 # answered with a response object.  Streaming attempts bound it
-                # with the connect budget, because no stream watchdog times
-                # that phase and an unreachable host otherwise spends the
-                # operating system's SYN ladder here (271 s live, 2026-11-15).
-                # A whole-body call is left alone: its helper returns only
-                # after the answer is complete, and a dispatch budget there
-                # would cut legitimate long answers.
+                # with the request's first-event budget, because no stream
+                # watchdog times that phase and the wait ends when the upstream
+                # writes the response head -- after its prefill, not after the
+                # handshake.  A whole-body call is left alone: its helper
+                # returns only after the answer is complete, and a dispatch
+                # budget there would cut legitimate long answers.
                 dispatch = original_helper(
                     self,
                     model,
@@ -2375,11 +2430,179 @@ def _install_chat_dispatch_budget_patch() -> None:
         dispatch = original_make_call(self, original_function, *args, **kwargs)
         if kwargs.get("stream") is not True:
             return await dispatch
-        return await _streaming_module._await_upstream_dispatch(dispatch, kwargs)
+        # A chat relay that buffers its answer writes no response head until it
+        # has prefilled -- measured 2026-11-20: 504 s and one 13.69 s against
+        # the live wawapii routes -- so the head is exactly where the silence
+        # is and where a sibling has to be raced, the same way the generic
+        # helper already races it for Responses.
+        return await _streaming_module._await_upstream_dispatch_with_head_hedge(
+            dispatch, kwargs
+        )
 
     setattr(patched_make_call, _CHAT_DISPATCH_BUDGET_PATCH_ATTR, True)
     setattr(patched_make_call, "_original_make_call", original_make_call)
     Router.make_call = patched_make_call
+
+
+def _install_rust_dispatch_patch() -> None:
+    """Bound the provider await and race full routed Responses attempts.
+
+    The Rust driver bypasses the Python generic helper and make_call. Put the
+    deadline on its provider invocation and race outside the driver so the
+    winner owns its stream, routing metadata, and outcome callbacks.
+    """
+    from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
+    from litellm.router_python_host import PythonHost
+    from litellm.router_rust import core as rust_router
+    from litellm.router_rust.core import RustCore, _Driver
+    from litellm.types.llms.openai import ResponseCompletedEvent
+
+    original_drive = RustCore._drive
+    if getattr(original_drive, _RUST_DISPATCH_PATCH_ATTR, False):
+        return
+    original_attempt = _Driver._routed_attempt
+    original_invoke = PythonHost.invoke
+    original_open_stream = rust_router.open_attempt_stream
+    attempt_scope = ContextVar("young_router_rust_dispatch_scope", default=None)
+    routed_ops = {"acompletion", "aresponses", "anthropic_messages"}
+
+    @wraps(original_open_stream)
+    async def open_attempt_stream(attempt: Any, response: Any) -> Any:
+        stream = await original_open_stream(attempt, response)
+        if (
+            attempt.op != "aresponses"
+            or stream is response
+            or not isinstance(response, BaseResponsesAPIStreamingIterator)
+        ):
+            return stream
+        close = stream.aclose
+
+        async def close_responses_stream() -> None:
+            # Young Router stops reading at the terminal event. LiteLLM's
+            # deferred report otherwise runs only on an additional EOF read.
+            terminal = stream.completed_response
+            if isinstance(terminal, ResponseCompletedEvent):
+                usage = terminal.response.usage
+                attempt.report_success((usage.total_tokens or 0) if usage else 0, terminal)
+            try:
+                await close()
+            finally:
+                if not stream.yielded_first_chunk:
+                    # Closing a generator before its first read skips its
+                    # finally block; the losing hedge still owns a connection.
+                    await _streaming_module._close_async_iterator_safely(response)
+
+        stream.aclose = close_responses_stream
+        return stream
+
+    @wraps(original_attempt)
+    async def routed_attempt(self: Any, step: dict, attempt: Any) -> Any:
+        op = self._plan.host_op
+        if op not in routed_ops:
+            return await original_attempt(self, step, attempt)
+        selected_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+        if not isinstance(selected_box, dict):
+            selected_box = {}
+        box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
+        marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
+        scope_token = attempt_scope.set((op, self._request))
+        try:
+            return await original_attempt(self, step, attempt)
+        except asyncio.CancelledError:
+            # LiteLLM releases its own reservation in `_routed_attempt`.
+            # Young Router's lease belongs to this deployment and turn.
+            cancelled_request = dict(self._request)
+            if _routing_module._apply_current_selected_deployment_to_request(cancelled_request):
+                _routing_module._release_request_concurrency_slots(
+                    cancelled_request, deployment_only=True
+                )
+            raise
+        finally:
+            attempt_scope.reset(scope_token)
+            _CURRENT_SELECTED_DEPLOYMENT.reset(marker_token)
+            _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(box_token)
+
+    @wraps(original_invoke)
+    def invoke(self: Any, op: str) -> Any:
+        endpoint = original_invoke(self, op)
+        scope = attempt_scope.get()
+        if scope is None or scope[0] != op:
+            return endpoint
+
+        @wraps(endpoint)
+        async def bounded_endpoint(**kwargs: Any) -> Any:
+            request = {**scope[1], **kwargs, "call_type": op}
+            _routing_module._apply_current_selected_deployment_to_request(request)
+
+            async def dispatch(**payload: Any) -> Any:
+                pending = endpoint(**payload)
+                if payload.get("stream") is True:
+                    return await _streaming_module._await_upstream_dispatch(pending, request)
+                return await pending
+
+            provider_call = dispatch
+            if op in {"aresponses", "anthropic_messages"}:
+                provider_call = _responses_execution_module._wrap_generic_function_for_deployment_failover(
+                    dispatch, outer_request_kwargs=request
+                )
+            if op == "anthropic_messages":
+                provider_call = _anthropic_non_stream_module.wrap_deployment_function(
+                    provider_call, method_name=op, client_streaming=kwargs.get("stream") is True
+                )
+                provider_call = _thinking_signature_replay_module.wrap_deployment_function(provider_call)
+                provider_call = _thinking_block_replay_module.wrap_deployment_function(provider_call)
+
+            _routing_module._apply_current_selected_deployment_to_request(kwargs)
+            if op == "acompletion":
+                response = await _reasoning_replay_module.call_with_replay_repair(
+                    lambda: provider_call(**kwargs), kwargs
+                )
+            else:
+                response = await provider_call(**kwargs)
+            if op == "aresponses":
+                response = _stream_for_a_streaming_client(response, request)
+            return response
+
+        return bounded_endpoint
+
+    @wraps(original_drive)
+    async def drive(self: Any, plan: Any, request: dict, *args: Any, **kwargs: Any) -> Any:
+        if plan.host_op not in routed_ops:
+            return await original_drive(self, plan, request, *args, **kwargs)
+        selected_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+        if not isinstance(selected_box, dict):
+            selected_box = {}
+        box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
+        marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
+        try:
+            dispatch = original_drive(self, plan, request, *args, **kwargs)
+            if plan.host_op in {"aresponses", "acompletion"} and request.get("stream") is True:
+                routed_request = {**request, "call_type": plan.host_op}
+                response = await _streaming_module._await_upstream_dispatch_with_head_hedge(
+                    dispatch, routed_request, per_attempt_budget=True
+                )
+            else:
+                response = await dispatch
+            marker = _routing_module._selected_deployment_marker_from_response(response)
+            if marker is None:
+                marker = selected_box.get("marker")
+                if isinstance(marker, dict) and hasattr(response, "__aiter__"):
+                    # Preserve LiteLLM's stream type and its billing/headers.
+                    # A bare async generator cannot hold attributes.
+                    try:
+                        response._young_router_selected_deployment_marker = marker
+                    except AttributeError:
+                        response = _routing_module._wrap_response_with_selected_deployment_marker(response, marker)
+            return response
+        finally:
+            _CURRENT_SELECTED_DEPLOYMENT.reset(marker_token)
+            _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(box_token)
+
+    setattr(drive, _RUST_DISPATCH_PATCH_ATTR, True)
+    _Driver._routed_attempt = routed_attempt
+    PythonHost.invoke = invoke
+    rust_router.open_attempt_stream = open_attempt_stream
+    RustCore._drive = drive
 
 
 def _install_same_deployment_retry_policy_patch() -> None:
@@ -4009,11 +4232,13 @@ def install_all() -> None:
     _install_chatgpt_account_credential_patch()
     _install_pre_call_token_count_patch()
     _install_integer_order_tiers_patch()
+    _install_relay_balance_selection_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()
     _install_generic_deployment_failover_patch()
     _install_chat_dispatch_budget_patch()
+    _install_rust_dispatch_patch()
     _install_same_deployment_retry_policy_patch()
     _install_responses_websocket_http_bridge_patch()
     _install_stream_chunk_restamp_patch()

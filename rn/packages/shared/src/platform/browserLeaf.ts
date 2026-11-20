@@ -146,6 +146,11 @@ const SERVICE_OPERATIONS: ReadonlySet<string> = new Set(["start", "stop", "resta
  * budget on every host.
  */
 const PROBE_TIMEOUT_MS = 900_000;
+const WEBDAV_OPERATIONS = new Set(["push", "pull", "sync", "webdav_push", "webdav_pull", "webdav_sync"]);
+const USAGE_READS = new Set(["logs.refresh_online_usage", "logs.refresh", "logs.reload", "logs.load_more", "logs.previous_page", "logs.first_page", "logs.last_page", "logs.goto_page", "logs.set_page_rows", "logs.set_time_range"]);
+// Core's long poll waits at most 25 seconds. Bound the connection as well:
+// a proxy replacement can leave a socket open after Core has stopped reading it.
+const EVENT_CALL_TIMEOUT_MS = 30_000;
 
 /**
  * How long one Core call may take, by what it asks Core to do.
@@ -156,13 +161,16 @@ const PROBE_TIMEOUT_MS = 900_000;
  */
 export function deadlineFor(request: string): number {
   try {
-    const parsed = JSON.parse(request) as { method?: unknown; params?: { action?: { type?: unknown } } };
+    const parsed = JSON.parse(request) as { method?: unknown; params?: { action?: { type?: unknown; domain?: unknown; payload?: { tab?: unknown } } } };
     if (parsed?.method === "probe") return PROBE_TIMEOUT_MS;
     const type = parsed?.params?.action?.type;
     if (parsed?.method === "dispatch" && typeof type === "string") {
       const operation = type.replace(/[.-]/g, "_").toLowerCase();
       const name = operation.startsWith("service_") ? operation.slice("service_".length) : operation;
-      if (SERVICE_OPERATIONS.has(name)) return SERVICE_OPERATION_TIMEOUT_MS;
+      const domain = parsed.params?.action?.domain;
+      if (domain === undefined && SERVICE_OPERATIONS.has(name)) return SERVICE_OPERATION_TIMEOUT_MS;
+      if (domain === "webdav" && WEBDAV_OPERATIONS.has(operation)) return SERVICE_OPERATION_TIMEOUT_MS;
+      if (domain === "logs" && parsed.params?.action?.payload?.tab === "online-usage" && USAGE_READS.has(type)) return SERVICE_OPERATION_TIMEOUT_MS;
       // The shared client starts a probe as a job: `dispatch` of type `probe`
       // answers with an id at once, and the *start* is the only part this
       // deadline covers (the wait for the result has its own budget in the
@@ -213,15 +221,6 @@ function withDeadline<T>(operation: (signal: AbortSignal | undefined) => Promise
   return operation(controller.signal).finally(() => clearTimeout(timer));
 }
 
-async function hello(transport: BrowserCoreTransport, signal?: AbortSignal): Promise<void> {
-  // No credential is presented here: the browser sends the session cookie Core
-  // set when this page signed in with the web password, and that cookie is what
-  // Core answers about.  The lease stays in it — a page may read neither the
-  // header nor the cookie — so there is nothing to keep on this side.
-  const response = await coreRequest(transport, "/ipc/hello", { method: "POST", body: "{}", signal });
-  if (!response.ok) throw new Error("Core IPC authentication failed");
-}
-
 /** The bridge plus the two host-route doors only a host process may use. */
 export type BrowserCoreBridge = NativeIpcBridge & {
   hostRoute(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -245,6 +244,12 @@ export type BrowserCoreBridge = NativeIpcBridge & {
 export function createBrowserIpcBridge(transport: BrowserCoreTransport): BrowserCoreBridge {
   let established = false;
   let pending: Promise<void> | undefined;
+  let leavingForSignIn = false;
+  const leaveForSignIn = (): void => {
+    if (leavingForSignIn) return;
+    leavingForSignIn = true;
+    window.location.reload();
+  };
 
   /**
    * Ask Core for this page's session, exactly once.
@@ -258,12 +263,15 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
   const establish = (): Promise<void> => {
     if (established) return Promise.resolve();
     if (pending !== undefined) return pending;
-    const exchange = withDeadline((signal) => hello(transport, signal)).then(() => {
+    const exchange = withDeadline(async (signal) => {
+      const response = await coreRequest(transport, "/ipc/hello", { method: "POST", body: "{}", signal });
+      if (response.status === 401) leaveForSignIn();
+      if (!response.ok) throw coreUnreachable();
       // One greeting per document: it queues this document behind Core's
       // session, so every later call carries the cookie Core just answered
       // for.  A greeting per call would be one extra round trip per control.
       established = true;
-    }, (reason: unknown) => {
+    }).catch((reason: unknown) => {
       // The greeting is the first exchange of every later call, so one that
       // hangs would hold them all: it carries the same deadline, and its
       // failure is the answer the caller's own strip states.
@@ -273,7 +281,8 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     // that arrive in the same tick both await the exchange instead of one of
     // them starting a second (and being refused).
     pending = exchange;
-    void exchange.finally(() => { if (pending === exchange) pending = undefined; });
+    const clear = (): void => { if (pending === exchange) pending = undefined; };
+    void exchange.then(clear, clear);
     return exchange;
   };
 
@@ -282,21 +291,10 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
    *
    * A 401 is not retried: the cookie either is a session or is not, and asking
    * twice cannot change Core's answer. It is, however, the moment this page has
-   * to leave: a Core that restarted (the app replaced it, or it was upgraded)
-   * forgot every session, so this document's tab would otherwise keep asking a
-   * server that will answer 401 forever — the app frozen on its last snapshot
-   * under a stream of failed requests, with no surface saying why. Reloading
-   * hands the decision back to Core, which answers the shell with its password
-   * form. One reload per document, so a Core that refuses the fresh sign-in
-   * cannot turn the page into a reload loop.
+   * to leave: reloading hands the decision back to Core, which answers the
+   * shell with its password form. A transient server failure stays on the
+   * current page so the snapshot and subscription can retry there.
    */
-  let leavingForSignIn = false;
-  const leaveForSignIn = (): void => {
-    if (leavingForSignIn) return;
-    leavingForSignIn = true;
-    window.location.reload();
-  };
-
   const call = async (path: string, body: string, signal?: AbortSignal): Promise<Response> => {
     await establish();
     let response: Response;
@@ -312,13 +310,13 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
       // fired, or the request never reached Core at all.  Both are the pane's
       // business, and neither may leave a caller waiting on a promise that can
       // no longer settle.
-      throw isAbort(reason) ? coreTimeout() : coreUnreachable();
+      throw isAbort(reason) ? reason : coreUnreachable();
     }
     if (response.status === 401) leaveForSignIn();
     return response;
   };
 
-  const send = async (request: string): Promise<string> => withDeadline(async (signal) => {
+  const exchange = async (request: string): Promise<string> => withDeadline(async (signal) => {
     const response = await call("/ipc", request, signal);
     if (response.status >= 500) throw new Error("The local core is unavailable.");
     // A 400 carries a protocol envelope the shared client renders itself; only
@@ -412,53 +410,65 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     }
   };
 
-  const subscribe = (listener: (event: string) => void): (() => void) => {
+  const listeners = new Set<(event: string) => void>();
+  let stopPolling: (() => void) | undefined;
+  const emit = (event: unknown): void => {
+    const text = JSON.stringify(event);
+    for (const next of listeners) next(text);
+  };
+
+  const startPolling = (firstId: string, params: Record<string, unknown>): (() => void) => {
     let cancelled = false;
-    let subscription: string | undefined;
+    let subscription: string | undefined = firstId;
+    let readMissedState = false;
     let controller: AbortController | undefined;
 
     const poll = async (): Promise<void> => {
       while (!cancelled) {
         try {
           if (subscription === undefined) {
-            const response = await call("/ipc", request("subscribe"));
-            const payload = await response.json() as { result?: { subscription_id?: string } };
-            subscription = payload.result?.subscription_id;
-            if (subscription === undefined) {
-              await new Promise((resolve) => setTimeout(resolve, 1_000));
-              continue;
-            }
+            const payload = JSON.parse(await exchange(request("subscribe", params)));
+            if (!payload.ok || !payload.result?.subscription_id) throw coreUnreachable();
+            subscription = String(payload.result.subscription_id);
           }
-          await establish();
+          if (readMissedState) {
+            // Establish the queue first so changes during this read are still
+            // delivered. An empty new queue cannot replay earlier changes.
+            const payload = JSON.parse(await exchange(request("snapshot")));
+            const snapshot = payload.result?.snapshot;
+            if (!payload.ok || !snapshot) throw coreUnreachable();
+            if (cancelled) return;
+            emit({ event: "snapshot", protocol_version: snapshot.protocol_version, revision: snapshot.revision, snapshot });
+            readMissedState = false;
+          }
+          if (cancelled) return;
           controller = new AbortController();
-          const response = await fetch(
-            `${transport.baseURL}/ipc/events?subscription_id=${encodeURIComponent(subscription)}&timeout=25`,
-            {
-              credentials: "include",
-              cache: "no-store",
-              signal: controller.signal,
-            },
-          );
-          if (response.status === 401) {
-            // The event stream is the page's first request after a Core
-            // restart notices nothing; a refused stream is the same answer a
-            // refused call gives, and the page leaves the same way.
-            leaveForSignIn();
-            return;
+          const active = controller;
+          const deadline = setTimeout(() => active.abort(), EVENT_CALL_TIMEOUT_MS);
+          try {
+            const response = await fetch(
+              `${transport.baseURL}/ipc/events?subscription_id=${encodeURIComponent(subscription)}&timeout=25`,
+              {
+                credentials: "include",
+                cache: "no-store",
+                signal: active.signal,
+              },
+            );
+            if (response.status === 401) {
+              leaveForSignIn();
+              return;
+            }
+            if (response.status === 410) subscription = undefined;
+            if (!response.ok) throw coreUnreachable();
+            const payload = await response.json() as { event?: unknown };
+            if (payload.event && !cancelled) emit(payload.event);
+          } finally {
+            clearTimeout(deadline);
           }
-          if (!response.ok) {
-            subscription = undefined;
-            await new Promise((resolve) => setTimeout(resolve, 1_000));
-            continue;
-          }
-          const payload = await response.json() as { event?: unknown };
-          // Core answers `{event: null}` when the long poll expires with
-          // nothing to report; that is a keep-alive, not a message.
-          if (payload.event) listener(JSON.stringify(payload.event));
         } catch {
           if (cancelled) return;
-          subscription = undefined;
-          await new Promise((resolve) => setTimeout(resolve, 1_500));
+          readMissedState = true;
+          await sleep(1000);
         }
       }
     };
@@ -469,30 +479,30 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     };
   };
 
-  /**
-   * One subscription for this page.
-   *
-   * The shared IPC client calls `subscribe` once per pane that wants events,
-   * and each call would otherwise open its own long poll against Core.  A page
-   * has one document and one set of panes, so they share one subscription:
-   * opening six log tabs must not create six event streams that all wait on
-   * the same idle queue and never answer.
-   */
-  let unsubscribeEvents: (() => void) | undefined;
-  const listeners = new Set<(event: string) => void>();
-  const sharedSubscribe = (listener: (event: string) => void): (() => void) => {
+  const send = async (message: string): Promise<string> => {
+    const text = await exchange(message);
+    const envelope = JSON.parse(message);
+    if (envelope.method === "subscribe") {
+      const reply = JSON.parse(text);
+      if (reply.ok && reply.request_id === envelope.request_id && typeof reply.result?.subscription_id === "string") {
+        stopPolling?.();
+        stopPolling = startPolling(reply.result.subscription_id, envelope.params);
+      }
+    }
+    return text;
+  };
+  const subscribe = (listener: (event: string) => void): (() => void) => {
     listeners.add(listener);
-    if (!unsubscribeEvents) unsubscribeEvents = subscribe((event) => { for (const next of listeners) next(event); });
     return () => {
       listeners.delete(listener);
-      if (listeners.size === 0 && unsubscribeEvents) {
-        unsubscribeEvents();
-        unsubscribeEvents = undefined;
+      if (listeners.size === 0) {
+        stopPolling?.();
+        stopPolling = undefined;
       }
     };
   };
 
-  return { send, subscribe: sharedSubscribe, hostRoute, hostBeacon, request, signOut };
+  return { send, subscribe, hostRoute, hostBeacon, request, signOut };
 }
 
 /** The service state in the app's words, as the title bar states it. */

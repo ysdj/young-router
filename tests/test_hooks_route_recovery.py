@@ -10,6 +10,66 @@ from young_router import runtime_store
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    async def test_chat_fallback_preserves_all_choices_and_trailing_usage(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        recovery = sys.modules["young_router.proxy.streaming_recovery"]
+        request = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "n": 2,
+            "stream_options": {"include_usage": True},
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+        payload = streaming._build_streaming_error_fallback_payload(
+            request, method_name="acompletion", allow_repeated_attempt=True
+        )
+        self.assertEqual(payload["n"], 2)
+
+        async def upstream():
+            yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield {"choices": [{"index": 1, "delta": {}, "finish_reason": "stop"}]}
+            yield {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+
+        chunks = [chunk async for chunk in recovery._yield_native_stream_after_terminal(upstream(), payload)]
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 2)
+
+    async def test_responses_fallback_credits_only_completed_terminals(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        routing = sys.modules["young_router.proxy.routing"]
+        request = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "hello",
+            "stream": True,
+        }
+
+        async def upstream():
+            yield {"type": "response.created"}
+
+        async def fallback(*_args, **_kwargs):
+            return upstream(), request.copy()
+
+        for terminal in ("response.failed", "response.completed"):
+            async def guarded(*_args, **_kwargs):
+                yield {"type": terminal, "response": {"id": "response"}}
+
+            with (
+                mock.patch.object(streaming, "_streaming_error_fallback_response", fallback),
+                mock.patch.object(streaming, "_yield_guarded_original_stream", guarded),
+                mock.patch.object(streaming, "_request_with_selected_deployment", return_value=request),
+                mock.patch.object(routing, "_record_deployment_success_for_cooldown") as record,
+            ):
+                chunks = [
+                    chunk async for chunk in streaming._stream_streaming_error_fallback_round(
+                        request.copy(), RuntimeError("upstream failed")
+                    )
+                ]
+            self.assertEqual(chunks[-1]["type"], terminal)
+            self.assertEqual(record.call_count, int(terminal == "response.completed"))
     async def test_messages_recovery_is_recognized_as_a_stream_by_litellm(self) -> None:
         from collections.abc import AsyncIterator
 
@@ -4079,7 +4139,21 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_poll_retries_failures_until_max_duration(self) -> None:
         hooks, proxy_server = load_hook_module()
-        calls = []
+        recovery = sys.modules["young_router.proxy.streaming_recovery"]
+        started_at = time.monotonic()
+        elapsed = 0.0
+        attempt_times = []
+        max_seconds = 0.375
+
+        async def advance_clock(delay_seconds, **_kwargs):
+            nonlocal elapsed
+            # A busy event loop can spend the entire budget before retrying.
+            # Advance only this poll's clock, leaving asyncio's clock intact.
+            self.assertGreater(delay_seconds, 0)
+            elapsed += delay_seconds
+            self.assertLessEqual(elapsed, max_seconds)
+            for event in ():
+                yield event
 
         class ServiceUnavailable(Exception):
             status_code = 503
@@ -4089,12 +4163,12 @@ class HookRouteRecoveryTests(HookTestCase):
                 return []
 
             async def aresponses(self, **payload):
-                calls.append(payload)
+                attempt_times.append(elapsed)
                 raise ServiceUnavailable("No deployments available for selected model")
 
         proxy_server.llm_router = FakeRouter()
-        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.02")
-        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, str(max_seconds))
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.25")
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Continue."}],
@@ -4103,15 +4177,22 @@ class HookRouteRecoveryTests(HookTestCase):
         }
         first_exception = ServiceUnavailable("upstream temporarily unavailable")
 
-        chunks = [
-            chunk
-            async for chunk in hooks._stream_route_recovery_poll(
-                request_data,
-                first_exception,
-            )
-        ]
+        with (
+            mock.patch.object(recovery, "time", types.SimpleNamespace(
+                monotonic=lambda: started_at + elapsed, time=time.time,
+            )),
+            mock.patch.object(recovery, "_sleep_route_recovery_poll_interval", advance_clock),
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    first_exception,
+                )
+            ]
 
-        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(attempt_times, [0.0, 0.25])
+        self.assertEqual(elapsed, max_seconds)
         self.assertFalse(any(isinstance(chunk, str) for chunk in chunks))
         assert_upstream_route_failed_terminal(self, chunks)
 

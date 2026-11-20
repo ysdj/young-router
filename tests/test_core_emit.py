@@ -639,6 +639,35 @@ class CoreEmitTests(unittest.TestCase):
         assert following is not None
         self.assertEqual("snapshot", following["event"])
 
+    def test_job_survives_state_queue_overflow(self) -> None:
+        """A probe result remains readable when patch delivery needs resync."""
+
+        core = CoreStore(domains=[MemoryDomain("runtime", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+        session = client._session_token
+        subscription_id = server._new_subscription(session)
+        patch = {"protocol_version": 1, "event": "patch", "revision": 0, "ops": []}
+        for _ in range(MAX_EVENTS):
+            server._publish(patch)
+        server._publish({
+            "protocol_version": 1,
+            "event": "job",
+            "job_id": "probe-1",
+            "state": "done",
+            "revision": 1,
+        })
+        server._publish(patch)
+
+        event = server.next_event(subscription_id, session_token=session, timeout=0)
+        self.assertIsNotNone(event)
+        self.assertEqual("job", event["event"])
+        self.assertEqual("probe-1", event["job_id"])
+        self.assertTrue(server._subscriptions[subscription_id].needs_resync)
+
 
 class CoalescingEmitterTests(unittest.TestCase):
     def test_the_window_is_capped(self) -> None:

@@ -51,6 +51,8 @@ import threading
 import time
 from typing import Any, Callable, Iterable
 
+from .scheduled_tasks import CLIENT_MODEL_SYNC, ScheduledTasks
+
 
 #: How often the watched document is stat'ed.  This is a metadata read, not a
 #: request, so it can be frequent without touching the proxy.
@@ -79,15 +81,17 @@ class ClientModelSyncScheduler:
     def __init__(
         self,
         *,
-        refresh: Callable[[], None],
+        refresh: Callable[[], str | None],
         watch_paths: Iterable[pathlib.Path | str] = (),
         poll_seconds: float = POLL_SECONDS,
         settle_seconds: Iterable[float] = SETTLE_SECONDS,
         fallback_seconds: float = FALLBACK_SECONDS,
         on_change: Callable[[], None] | None = None,
+        tasks: ScheduledTasks | None = None,
     ):
         self._refresh = refresh
         self._on_change = on_change
+        self._tasks = tasks
         self._paths = tuple(pathlib.Path(path).expanduser() for path in watch_paths)
         self._poll = max(0.05, float(poll_seconds))
         self._settle = tuple(float(value) for value in settle_seconds)
@@ -116,11 +120,12 @@ class ClientModelSyncScheduler:
         # One pass at start: an installation whose document never moves still
         # reconciles a list an older release left behind, and a document that
         # moved while this process was not watching is adopted once.
-        self._change_quietly()
-        self._refresh_quietly()
+        self._refresh_quietly(change_ok=self._change_quietly)
         self._last_signature = self._observe()
         next_fallback = time.monotonic() + self._fallback
         pending: list[float] = []
+        change_ok = True
+        self._plan(pending, next_fallback)
         while not self._stop.wait(self._poll):
             if self._paths:
                 observed = self._observe()
@@ -131,50 +136,70 @@ class ClientModelSyncScheduler:
                     # waiting for the router to catch up with a reload already
                     # queued; asking for another on each of them replaced its
                     # workers again for a change they were already serving.
-                    self._change_quietly()
+                    change_ok = self._change_quietly()
                     now = time.monotonic()
                     pending = [now + offset for offset in self._settle]
             now = time.monotonic()
             due = [at for at in pending if at <= now]
             if due:
                 pending = [at for at in pending if at > now]
-                self._refresh_quietly()
+                self._refresh_quietly(change_ok=lambda: change_ok)
+                change_ok = True
             elif self._fallback and now >= next_fallback:
                 next_fallback = now + self._fallback
                 self._refresh_quietly()
+            self._plan(pending, next_fallback)
+        self._plan([], None)
 
-    def _refresh_quietly(self) -> None:
+    def _plan(self, pending: list[float], fallback_at: float | None) -> None:
+        if self._tasks is None:
+            return
+        times = pending + ([fallback_at] if self._fallback and fallback_at is not None else [])
+        delay = max(0.0, min(times) - time.monotonic()) if times else None
+        self._tasks.plan(CLIENT_MODEL_SYNC, interval_seconds=self._fallback or None, delay_seconds=delay)
+
+    def _refresh_quietly(self, *, change_ok: Callable[[], bool] | None = None) -> None:
+        if self._tasks is not None:
+            self._tasks.begin(CLIENT_MODEL_SYNC)
+        adopted = change_ok is None or change_ok()
         try:
-            self._refresh()
+            result = self._refresh() or "succeeded"
         except Exception:
             # A refresh is bookkeeping about a client's file.  Whatever failed --
             # a proxy still starting, a document another process holds -- the
             # next pass tries again, and this process's health does not depend
             # on it.
-            return
+            result = "failed"
+        if self._tasks is not None:
+            if not adopted:
+                result = "partial" if result in {"succeeded", "partial"} else "failed"
+            self._tasks.finish(CLIENT_MODEL_SYNC, result)
 
-    def _change_quietly(self) -> None:
+    def _change_quietly(self) -> bool:
         if self._on_change is None:
-            return
+            return True
         try:
             self._on_change()
         except Exception:
             # An adoption is a request to reload, and the document is still on
             # disk if this pass could not make it: a later observed change or
             # the next launch adopts it again.
-            return
+            return False
+        return True
 
 
-def attach(core: Any, watch_paths: Iterable[Any] = ()) -> ClientModelSyncScheduler:
+def attach(
+    core: Any, watch_paths: Iterable[Any] = (), *, tasks: ScheduledTasks | None = None,
+) -> ClientModelSyncScheduler:
     """Wire the loop to one Core store and the documents its routes live in."""
 
     adopt = getattr(core, "adopt_external_route_change", None)
 
-    def refresh() -> None:
+    def refresh() -> str | None:
         # Both generated lists follow the routes: Codex's catalog and the Claude
         # picker Claude Code and the desktop Code tab share.  Claude Desktop's
         # own model list is not written here -- it discovers /v1/models.
-        core.refresh_client_model_lists(include_claude=True)
+        return core.refresh_client_model_lists(include_claude=True)
 
     def change() -> None:
         # A change this process did not make is also invisible to the running
@@ -185,7 +210,7 @@ def attach(core: Any, watch_paths: Iterable[Any] = ()) -> ClientModelSyncSchedul
         if callable(adopt):
             adopt()
 
-    return ClientModelSyncScheduler(refresh=refresh, on_change=change, watch_paths=watch_paths)
+    return ClientModelSyncScheduler(refresh=refresh, on_change=change, watch_paths=watch_paths, tasks=tasks)
 
 
 __all__ = [

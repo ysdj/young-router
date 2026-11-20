@@ -10,6 +10,7 @@ from typing import Callable
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import codex_contract as _codex_contract_module
 from . import anthropic_dsml as _anthropic_dsml_module
+from . import anthropic_sse as _anthropic_sse_module
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -35,6 +36,7 @@ from .base import (
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CHAT_REASONING_DELTA_KEYS,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
+    _CURRENT_SELECTED_DEPLOYMENT,
     _IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY,
     _JSONStreamEvent,
     _RESPONSES_STREAM_COMPLETED_TYPES,
@@ -49,6 +51,10 @@ from .base import (
     _STREAM_FALLBACK_METADATA_KEY,
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
     _STREAM_START_TIMEOUT_METADATA_KEY,
+    _STREAM_START_TIMEOUT_DISPATCH_PHASE,
+    _STREAM_START_TIMEOUT_FIRST_FRAME_PHASE,
+    _STREAM_START_TIMEOUT_HEDGE_LOSS_PHASE,
+    _STREAM_START_TIMEOUT_PHASE_ATTR,
     _START_TIMEOUT_OBSERVED_KEY,
     _TERMINAL_FAILURE_REQUEST_KEY,
     _UPSTREAM_INPUT_ITEM_LIMIT_ATTR,
@@ -2785,24 +2791,40 @@ def _synthesized_failed_response_event(
         terminal_event._young_router_terminal_failure = True  # type: ignore[attr-defined]
     except Exception:
         pass
+    _register_terminal_turn_failure(request_data, exception)
+    return terminal_event
+
+def _register_terminal_turn_failure(
+    request_data: dict,
+    exception: BaseException,
+) -> None:
+    """State on the turn that a terminal frame this proxy built is its ending.
+
+    The upstream call underneath such a frame closes normally -- for the
+    Responses wire because the ``response.failed`` event *is* the end of a
+    well-formed stream, and on Chat/Messages because the synthesized error is
+    the last frame the body carries.  LiteLLM's success callback is what reads
+    that close, so without this the turn is logged as a delivered answer and
+    the cooldown it just earned is cleared.
+
+    The request dict alone is not enough: LiteLLM hands the logging callback a
+    different copy of the request, so live 2026-11-19 09:18 the gateway still
+    recorded a success and cleared the cooldown 0.4 s after the failure.  The
+    verdict therefore also goes to the shared registry, keyed by the turn's own
+    request identifiers.
+    """
+
     if isinstance(request_data, dict):
-        # This turn's client-visible outcome is a failure this proxy built, and
-        # the upstream call underneath it closes normally.  LiteLLM's success
-        # callback is what would otherwise record a delivered answer -- a
-        # success row and a cleared cooldown for a route that just cut the turn.
-        # The callback reads both keys instead of the transport.
+        # Both keys, because the callback reads the exception off whichever copy
+        # reaches it: the marker for this proxy's own paths, ``exception`` for
+        # the record builder.
         try:
             request_data[_TERMINAL_FAILURE_REQUEST_KEY] = exception
             request_data.setdefault("exception", exception)
         except Exception:
             pass
-    # The dict above only reaches a callback handed *this* copy, and LiteLLM
-    # hands the logging callback a different one.  Live 2026-11-19 09:18 the
-    # gateway still recorded a success and cleared the cooldown 0.4 s after the
-    # failure.  The verdict therefore also goes to the shared registry, keyed by
-    # the turn's request identifiers.
     _routing_module._mark_terminal_failure_for_request(request_data, exception)
-    return terminal_event
+
 
 def _synthesized_native_stream_error_chunk(
     request_data: dict,
@@ -2850,12 +2872,14 @@ def _synthesized_native_stream_error_chunk(
             },
         }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        _register_terminal_turn_failure(request_data, exception)
         return f"event: error\ndata: {encoded}\n\n".encode("utf-8")
     # A Chat event is written by LiteLLM's SSE generator as ``f"data: {chunk}"``,
     # so a plain dict reaches the client as its Python repr (``data: {'error':
     # ...}``) -- not JSON, which every Chat client refuses to parse (Cherry
     # Studio reports it as ``Invalid JSON data``).  ``_JSONStreamEvent``
     # stringifies as JSON, the same way this repo's Responses events do.
+    _register_terminal_turn_failure(request_data, exception)
     return _json_stream_event(
         {
             "error": {
@@ -3264,6 +3288,15 @@ def _responses_incomplete_stream_exception(
                     reason=terminal_reason,
                     buffered_event_count=len(buffer or []),
                 )
+                # This route number the turn's own output, not the replay, and
+                # it is the route's budget: two of these inside five minutes is
+                # a route that cannot finish a long turn (measured 2026-11-20:
+                # tken cut at 100 and 98 generated items while the same model
+                # finished on flux/youyangai without ever stating this reason).
+                try:
+                    exception.item_cap_cut = True  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             else:
                 # The upstream said the replay carries too many items.  The
                 # router answers that by resending a shorter history, which is a
@@ -3690,17 +3723,17 @@ async def _await_upstream_dispatch(
     own retry -- 271 s on the live gateway on 2026-11-15, on a route that had
     sent and received nothing.
 
-    The budget is ``_upstream_dispatch_budget_seconds``: the connect budget plus
-    an upload allowance for the bytes this request carries, so a heavy replay
-    is not cut and an absent host is not waited on.  A timeout is this proxy's
+    The budget is ``_upstream_dispatch_budget_seconds``: the request's own
+    first-event budget (120 s ordinary, 300 s for a heavy Responses replay),
+    because both clocks end at the response head.  A timeout is this proxy's
     own verdict about the route, so it is raised as the start-timeout shape the
     failover, cooldown and recovery machinery already agree on: a sibling may
-    answer, the route is parked, and the client is told no upstream event
-    arrived rather than that its bytes were refused.
+    answer, the route is charged a failure, and the client is told no upstream
+    event arrived rather than that its bytes were refused.
 
     ``fallback_budget_seconds`` is for the callers that already bounded this
-    await with the first-event budget: when the operator turns the connect
-    budget off, that older bound is what should remain -- not "wait forever".
+    await with the first-event budget: when the budget above is disabled, that
+    older bound is what should remain -- not "wait forever".
     """
 
     budget_seconds = _routing_module._upstream_dispatch_budget_seconds(request_data)
@@ -3730,33 +3763,20 @@ async def _await_upstream_dispatch(
     # its own ``TimeoutError`` into this proxy's verdict, losing the real cause.
     # ``asyncio.timeout`` raises only on its own expiry and passes an inner
     # ``TimeoutError`` through untouched.
+    timeout = asyncio.timeout(budget_seconds)
     try:
-        async with asyncio.timeout(budget_seconds):
+        async with timeout:
             return await awaitable
-    except TimeoutError as exc:
-        if _is_dispatch_budget_expiry(exc):
+    except TimeoutError:
+        if timeout.expired():
             raise _stream_start_timeout_exception(
                 request_data,
                 start_seconds=budget_seconds,
                 saw_chunk=False,
                 buffered_chunks=0,
+                phase=_STREAM_START_TIMEOUT_DISPATCH_PHASE,
             ) from None
         raise
-
-
-def _is_dispatch_budget_expiry(exception: TimeoutError) -> bool:
-    """Whether this ``TimeoutError`` is the dispatch budget's own verdict.
-
-    ``asyncio.timeout`` raises its ``TimeoutError`` with no message of its own,
-    while the failures this proxy already classifies (and every upstream that
-    wraps one) carry a reason on ``body`` or at least a sentence.  The check
-    exists so a route's own timeout keeps its own reason and its own route
-    identity instead of being reported as this proxy's silence.
-    """
-
-    if getattr(exception, "body", None) is not None:
-        return False
-    return not str(exception).strip()
 
 
 def _stream_start_timeout_exception(
@@ -3765,10 +3785,15 @@ def _stream_start_timeout_exception(
     start_seconds: float,
     saw_chunk: bool,
     buffered_chunks: int,
+    phase: str = _STREAM_START_TIMEOUT_FIRST_FRAME_PHASE,
 ) -> Exception:
     exception = TimeoutError(
         f"Young Router stream start timeout after {start_seconds:g}s without the first stream event"
     )
+    try:
+        setattr(exception, _STREAM_START_TIMEOUT_PHASE_ATTR, phase)
+    except Exception:
+        pass
     try:
         exception.status_code = 504  # type: ignore[attr-defined]
     except Exception:
@@ -3776,6 +3801,7 @@ def _stream_start_timeout_exception(
     try:
         exception.body = {  # type: ignore[attr-defined]
             "reason": "stream_start_timeout",
+            "phase": phase,
             "start_seconds": start_seconds,
             "saw_chunk": saw_chunk,
             "buffered_chunks": buffered_chunks,
@@ -3975,17 +4001,16 @@ async def _dispatch_stream_hedge(
     )
     if payload is None:
         return None
-    excluded = set(
-        _responses_request_module._request_excluded_deployment_ids(payload)
-    )
+    excluded = _responses_request_module._request_excluded_deployment_ids(request_data)
     current_id = _routing_module._deployment_id_from_request(request_data)
-    if current_id:
-        excluded.add(current_id)
-    if not excluded:
+    if not current_id:
         # Without a route to exclude the "sibling" would be the same deployment,
         # which is a second paid prefill for this route and not a hedge.
         return None
+    excluded.add(current_id)
     payload["_excluded_deployment_ids"] = sorted(excluded)
+    payload["disable_fallbacks"] = True
+    payload["num_retries"] = 0
     # The point of the hedge is the healthiest route, not the next order: a
     # slow order-0 route is exactly what the hedge is there to overtake.
     payload.pop("_target_order", None)
@@ -3995,6 +4020,10 @@ async def _dispatch_stream_hedge(
     updated_hedge_metadata = hedge_metadata.copy()
     updated_hedge_metadata[_HEAD_HEDGE_METADATA_KEY] = True
     payload["litellm_metadata"] = updated_hedge_metadata
+    # The sibling picks its own origin and credentials. Copying a shaped
+    # request's API key pins the primary relay's key on a different relay.
+    for key in ("api_key", "api_base", "api_version", "custom_llm_provider", "litellm_params", "model_info"):
+        payload.pop(key, None)
     router_method = getattr(llm_router, method_name, None)
     if router_method is None:
         return None
@@ -4003,6 +4032,9 @@ async def _dispatch_stream_hedge(
         stage=stage,
         excluded_deployment_ids=sorted(excluded),
     )
+    selected_box: dict = {}
+    box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
+    marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
     try:
         response = await _await_upstream_dispatch(
             router_method(**_streaming_error_fallback_dispatch_kwargs(payload)),
@@ -4011,14 +4043,70 @@ async def _dispatch_stream_hedge(
                 payload
             ),
         )
-    except Exception as exc:
+    except BaseException as exc:
+        if _routing_module._apply_current_selected_deployment_to_request(
+            payload, selected_box=selected_box
+        ):
+            _routing_module._release_request_concurrency_slots(payload, deployment_only=True)
+        if not isinstance(exc, Exception):
+            raise
         _trace_module._request_route_trace(
             "stream_hedge_error", request_data,
             stage=stage,
             exception=_routing_module._trace_exception(exc),
         )
         return None
+    finally:
+        _CURRENT_SELECTED_DEPLOYMENT.reset(marker_token)
+        _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(box_token)
+    marker = _routing_module._selected_deployment_marker_from_response(response) or selected_box.get("marker")
+    _routing_module._apply_selected_deployment_marker_to_request(payload, marker)
     return response, payload
+
+
+#: Model names that generate an image as the answer.  A name is a weaker
+#: signal than an explicit tool or modality, but a chat turn sent straight at
+#: one of these models has no ``image_generation`` tool to detect.
+_IMAGE_GENERATION_MODEL_MARKERS = (
+    "gpt-image",
+    "dall-e",
+    "imagen",
+    "flux",
+    "seedream",
+    "stable-diffusion",
+    "sdxl",
+    "qwen-image",
+    "wanx",
+    "kolors",
+    "recraft",
+)
+
+
+def _request_is_image_generation(request_data: dict) -> bool:
+    """Whether this turn asks a route to produce an image.
+
+    A sibling race is only safe when losing it costs a prefill.  The image is
+    the expensive, non-idempotent part of the answer: a hedge that fires before
+    the image is ready asks a second route to generate one too, and cancelling
+    the loser does not un-bill it.  The standalone Images API is non-streaming
+    and never reaches these hedges; this covers the streaming Chat/Responses
+    turns that carry an image tool, ask for the image modality, or name an
+    image model directly.
+    """
+
+    if _tools_module._request_has_image_generation_tool(request_data):
+        return True
+    if _routing_module._request_is_standalone_image_generation(request_data):
+        return True
+    modalities = request_data.get("modalities")
+    if isinstance(modalities, (list, tuple)) and any(
+        str(value).strip().lower() == "image" for value in modalities
+    ):
+        return True
+    model = str(request_data.get("model") or "").strip().lower()
+    if any(marker in model for marker in _IMAGE_GENERATION_MODEL_MARKERS):
+        return True
+    return "-image" in model or model.startswith("image-")
 
 
 def _head_hedge_eligible(request_data: dict) -> bool:
@@ -4037,7 +4125,20 @@ def _head_hedge_eligible(request_data: dict) -> bool:
         return False
     if request_data.get("stream") is not True:
         return False
-    if not _responses_request_module._request_is_responses_api(request_data):
+    if request_data.get("specific_deployment") is True:
+        return False
+    if _request_is_image_generation(request_data):
+        # A lost race would generate a second image, not a second prefill.
+        return False
+    # A plain Chat client buffers the same response head for the same reason a
+    # Codex replay does: the relay writes no head until it has prefilled.  The
+    # first-frame hedge stays Responses-only (its iterator shapes differ), but
+    # the head race has the same payload builder for both wires, so a chat
+    # dispatch may race a sibling too -- and must, or a hung relay holds the
+    # turn for the whole 120 s first-event budget.
+    if not _responses_request_module._request_is_responses_api(request_data) and (
+        _streaming_error_fallback_method_name(request_data) != "acompletion"
+    ):
         return False
     if _routing_module._stream_hedge_delay_seconds() <= 0:
         return False
@@ -4056,9 +4157,10 @@ def _head_hedge_eligible(request_data: dict) -> bool:
     return _routing_module._request_group_deployment_count(request_data) != 1
 
 
-async def _head_hedge_after(delay: float, request_data: dict) -> Optional[tuple[Any, dict]]:
-    await asyncio.sleep(delay)
-    return await _dispatch_stream_hedge(request_data, stage="head")
+async def _head_hedge(request_data: dict) -> Optional[tuple[Any, dict]]:
+    primary_request = request_data.copy()
+    _routing_module._apply_current_selected_deployment_to_request(primary_request)
+    return await _dispatch_stream_hedge(primary_request, stage="head")
 
 
 def _adopt_head_hedge_winner(
@@ -4076,7 +4178,7 @@ def _adopt_head_hedge_winner(
 
     marker = _routing_module._selected_deployment_marker_from_response(response)
     if marker is None:
-        marker = _routing_module._selected_deployment_marker_from_box()
+        marker = _routing_module._selected_deployment_request_marker(payload)
     if isinstance(marker, dict):
         _routing_module._merge_request_routing_state_into_selected_deployment_marker(
             marker,
@@ -4086,6 +4188,10 @@ def _adopt_head_hedge_winner(
             request_data,
             marker,
         )
+        _CURRENT_SELECTED_DEPLOYMENT.set(marker)
+        selected_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+        if isinstance(selected_box, dict):
+            selected_box["marker"] = marker
         _routing_module._remember_attempt_route(request_data, marker)
     _trace_module._request_route_trace(
         "stream_hedge_won",
@@ -4100,90 +4206,159 @@ async def _await_upstream_dispatch_with_head_hedge(
     request_data: dict,
     *,
     fallback_budget_seconds: float = 0.0,
+    per_attempt_budget: bool = False,
 ) -> Any:
     """Await one attempt's dispatch, racing a sibling once the delay passes.
 
     The first *response head* wins, not the first frame: for this gateway's
     heavy replays the head is the whole wait.  The attempt that loses is closed
-    and its concurrency slot released; it was never a failure, so no route is
-    parked and nothing is charged to it beyond the prefill it spent.
+    and its concurrency slot released.  If it never produced a head, the loss
+    is charged as one ordinary failure -- a hung route that keeps losing must
+    not keep being selected first and keep costing a duplicate prefill -- but
+    it is not the turn's failure: the sibling already won it.
     """
 
-    delay = _routing_module._stream_hedge_delay_seconds()
+    delay = _routing_module._head_hedge_delay_seconds(request_data)
     budget_seconds = _routing_module._upstream_dispatch_budget_seconds(request_data)
     if budget_seconds <= 0:
         budget_seconds = fallback_budget_seconds
-    if (
-        delay <= 0
-        or budget_seconds <= 0
-        or not _head_hedge_eligible(request_data)
-    ):
+    if not _head_hedge_eligible(request_data):
+        if per_attempt_budget:
+            return await awaitable
         return await _await_upstream_dispatch(
-            awaitable,
-            request_data,
-            fallback_budget_seconds=fallback_budget_seconds,
+            awaitable, request_data, fallback_budget_seconds=fallback_budget_seconds,
         )
 
     # Keep the attempt's marker where this task can still read it: the primary
     # below runs in a child task, whose context is a copy.
-    if not isinstance(_CURRENT_SELECTED_DEPLOYMENT_BOX.get(), dict):
-        _CURRENT_SELECTED_DEPLOYMENT_BOX.set({})
+    primary_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+    if not isinstance(primary_box, dict):
+        primary_box = {}
+        _CURRENT_SELECTED_DEPLOYMENT_BOX.set(primary_box)
     primary = asyncio.ensure_future(awaitable)
-    hedge: Optional["asyncio.Future[Any]"] = asyncio.ensure_future(
-        _head_hedge_after(delay, request_data)
-    )
+    hedge = None
+    winner = None
+    primary_lost_without_a_head = False
     try:
-        async with asyncio.timeout(budget_seconds):
-            while True:
-                done, _pending = await asyncio.wait(
-                    {task for task in (primary, hedge) if task is not None},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if hedge is not None and hedge in done:
-                    hedge_result = hedge.result()
-                    hedge = None
-                    if hedge_result is not None:
-                        winner_response, winner_payload = hedge_result
-                        primary.cancel()
-                        await asyncio.gather(primary, return_exceptions=True)
-                        # The loser's slot is not released here: the release
-                        # this proxy has is keyed by the turn, and the winner
-                        # shares that key.  Its own completion gives the slot
-                        # back, and a lease that outlives that ages out -- the
-                        # documented cost of a hop this proxy did not observe.
-                        _adopt_head_hedge_winner(
-                            request_data,
-                            winner_response,
-                            winner_payload,
-                        )
-                        return winner_response
+        async with asyncio.timeout(None if per_attempt_budget or budget_seconds <= 0 else budget_seconds) as timeout:
+            done, _ = await asyncio.wait({primary}, timeout=delay)
+            if done:
+                result = primary.result()
+                winner = primary
+                return result
+            hedge = asyncio.create_task(_head_hedge(request_data))
+            pending = {primary, hedge}
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 if primary in done:
+                    if not primary.cancelled() and primary.exception() is None:
+                        winner = primary
+                        return primary.result()
+                if hedge in done and not hedge.cancelled():
+                    hedge_result = hedge.result()
+                    if hedge_result is not None:
+                        winner = hedge
+                        primary_lost_without_a_head = not primary.done()
+                        return hedge_result[0]
+                if primary.done() and hedge.done():
                     return primary.result()
-    except TimeoutError as exc:
-        for task in (primary, hedge):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *[task for task in (primary, hedge) if task is not None],
-            return_exceptions=True,
-        )
-        if _is_dispatch_budget_expiry(exc):
+    except TimeoutError:
+        if timeout.expired():
             raise _stream_start_timeout_exception(
                 request_data,
                 start_seconds=budget_seconds,
                 saw_chunk=False,
                 buffered_chunks=0,
+                phase=_STREAM_START_TIMEOUT_DISPATCH_PHASE,
             ) from None
         raise
-    except BaseException:
-        for task in (primary, hedge):
-            if task is not None:
+    finally:
+        losers = [task for task in (primary, hedge) if task is not None and task is not winner]
+        for task in losers:
+            if not task.done():
                 task.cancel()
-        await asyncio.gather(
-            *[task for task in (primary, hedge) if task is not None],
-            return_exceptions=True,
+        for task, result in zip(losers, await asyncio.gather(*losers, return_exceptions=True)):
+            if task is primary:
+                if not isinstance(result, BaseException):
+                    await _close_async_iterator_safely(result)
+                if winner is None or winner is hedge:
+                    primary_request = request_data.copy()
+                    if _routing_module._apply_current_selected_deployment_to_request(
+                        primary_request, selected_box=primary_box
+                    ) or _routing_module._deployment_id_from_request(primary_request):
+                        _routing_module._release_request_concurrency_slots(primary_request, deployment_only=True)
+            elif result is not None and not isinstance(result, BaseException):
+                response, payload = result
+                await _close_async_iterator_safely(response)
+                marker = _routing_module._selected_deployment_marker_from_response(response)
+                _routing_module._apply_selected_deployment_marker_to_request(payload, marker)
+                if _routing_module._deployment_id_from_request(payload):
+                    _routing_module._release_request_concurrency_slots(payload, deployment_only=True)
+        if hedge is not None and winner is hedge:
+            if primary_lost_without_a_head:
+                _charge_lost_head_race(
+                    request_data, primary_box, delay_seconds=delay
+                )
+            _adopt_head_hedge_winner(request_data, *hedge.result())
+        if hedge is not None and winner is not None:
+            marker = _routing_module._selected_deployment_marker_from_box()
+            if isinstance(marker, dict):
+                marker[_HEAD_HEDGE_METADATA_KEY] = True
+
+
+def _charge_lost_head_race(
+    request_data: dict,
+    primary_box: dict,
+    *,
+    delay_seconds: float,
+) -> None:
+    """Charge a route that produced no head while a sibling's head won.
+
+    Losing the race is not a timeout and does not end the turn, so the losing
+    route is not handled by the failure path.  But a route that keeps losing
+    has produced nothing for the whole hedge delay, and leaving it uncharged
+    would keep it first in the next selection and keep paying a duplicate
+    prefill.  The charge uses the configured cooldown threshold and the
+    ordinary cooldown duration.
+    """
+
+    primary_request = request_data.copy()
+    if not _routing_module._apply_current_selected_deployment_to_request(
+        primary_request, selected_box=primary_box
+    ) and not _routing_module._deployment_id_from_request(primary_request):
+        return
+    exception = TimeoutError(
+        f"young router head race lost after {delay_seconds:g}s without a response head"
+    )
+    try:
+        exception.status_code = 504  # type: ignore[attr-defined]
+        exception.body = {  # type: ignore[attr-defined]
+            "reason": "stream_start_timeout",
+            "phase": _STREAM_START_TIMEOUT_HEDGE_LOSS_PHASE,
+            "start_seconds": delay_seconds,
+            "saw_chunk": False,
+            "buffered_chunks": 0,
+        }
+        setattr(
+            exception,
+            _STREAM_START_TIMEOUT_PHASE_ATTR,
+            _STREAM_START_TIMEOUT_HEDGE_LOSS_PHASE,
         )
-        raise
+    except Exception:
+        pass
+    # This marks the lost hop and records the one ordinary failure; the
+    # recorder inside it is the single accounting path, so calling the
+    # recorder again here would charge the same race twice.  The attempt's
+    # context may still hold the winner's marker (the hedge adopted it), and
+    # the marker applies the context value over the request; clear it for the
+    # call so the primary's box is what names the route.
+    marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
+    try:
+        _routing_module._mark_exception_for_deployment_failover(
+            exception, primary_request
+        )
+    finally:
+        _CURRENT_SELECTED_DEPLOYMENT.reset(marker_token)
 
 
 def _stream_hedge_eligible(request_data: dict) -> bool:
@@ -4192,6 +4367,10 @@ def _stream_hedge_eligible(request_data: dict) -> bool:
     if request_data.get("stream") is not True:
         return False
     if not _responses_request_module._request_is_responses_api(request_data):
+        return False
+    if _request_is_image_generation(request_data):
+        # The silence while an image is generated is the image working, not a
+        # dead route; racing it would bill a second image.
         return False
     if _routing_module._stream_hedge_delay_seconds() <= 0:
         return False
@@ -4205,7 +4384,7 @@ def _stream_hedge_eligible(request_data: dict) -> bool:
     metadata = _request_context_module._request_metadata_dict(
         request_data, "litellm_metadata"
     ) or {}
-    if metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True:
+    if metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True or metadata.get(_HEAD_HEDGE_METADATA_KEY) is True:
         return False
     # A group of one has no sibling to hedge with; asking twice would only pay
     # this route's prefill twice.
@@ -4248,8 +4427,13 @@ async def _hedged_first_chunk(
     waiting on it.
     """
 
+    if not _stream_hedge_eligible(request_data):
+        # One caller checks this before entering, but the helper must not race
+        # an image turn if another one ever calls it directly.
+        return iterator, await iterator.__anext__(), None
     delay = _routing_module._stream_hedge_delay_seconds()
     current_deployment_id = _routing_module._deployment_id_from_request(request_data)
+    primary_request = request_data.copy()
     started_at = time.monotonic()
 
     def remaining() -> Optional[float]:
@@ -4264,17 +4448,30 @@ async def _hedged_first_chunk(
     hedge_response = None
     hedge_payload: Optional[dict] = None
     hedge_handed_over = False
+    hedge_dispatch_consumed = False
 
     async def abandon_hedge() -> None:
-        nonlocal hedge_iterator, hedge_payload, hedge_task
+        nonlocal hedge_iterator, hedge_payload, hedge_task, hedge_response
         await _settle_task(hedge_task)
         if hedge_iterator is not None:
             await _close_async_iterator_safely(hedge_iterator)
+        elif hedge_response is not None:
+            await _close_async_iterator_safely(hedge_response)
         if hedge_payload is not None:
-            _routing_module._release_request_concurrency_slots(hedge_payload)
+            marker = _routing_module._selected_deployment_marker_from_response(
+                hedge_response
+            )
+            if marker is not None:
+                _routing_module._apply_selected_deployment_marker_to_request(
+                    hedge_payload, marker
+                )
+                _routing_module._release_request_concurrency_slots(
+                    hedge_payload, deployment_only=True
+                )
         hedge_iterator = None
         hedge_payload = None
         hedge_task = None
+        hedge_response = None
 
     try:
         # Phase one: wait the hedge delay (never past this attempt's own first
@@ -4292,14 +4489,14 @@ async def _hedged_first_chunk(
         while True:
             budget = remaining()
             if budget is not None and budget <= 0:
-                raise asyncio.TimeoutError()
+                break
             done, _pending = await asyncio.wait(
                 pending,
                 return_when=asyncio.FIRST_COMPLETED,
                 timeout=budget,
             )
             if not done:
-                raise asyncio.TimeoutError()
+                break
             if primary_task in done:
                 await abandon_hedge()
                 return iterator, primary_task.result(), None
@@ -4313,6 +4510,7 @@ async def _hedged_first_chunk(
                         "stream_hedge_error", request_data,
                         exception=_routing_module._trace_exception(exc),
                     )
+                hedge_dispatch_consumed = True
                 if hedge is None:
                     # Nothing to race with; the first attempt still owns the
                     # turn and its remaining budget is unchanged.
@@ -4345,6 +4543,9 @@ async def _hedged_first_chunk(
                         )
                     await _settle_task(primary_task)
                     await _close_async_iterator_safely(iterator)
+                    _routing_module._release_request_concurrency_slots(
+                        primary_request, deployment_only=True
+                    )
                     hedge_handed_over = True
                     _trace_module._request_route_trace(
                         "stream_hedge_won", request_data,
@@ -4361,10 +4562,31 @@ async def _hedged_first_chunk(
                 )
                 await abandon_hedge()
                 continue
+        raise _stream_start_timeout_exception(
+            request_data,
+            start_seconds=start_timeout_seconds,
+            saw_chunk=False,
+            buffered_chunks=0,
+        )
     finally:
         await _settle_task(hedge_dispatch_task)
         await _settle_task(primary_task)
         if not hedge_handed_over:
+            # Dispatch and the primary read may complete in the same event-loop
+            # turn. The returned stream still needs closing even if the primary
+            # was selected before the dispatch result was consumed.
+            if (
+                hedge_response is None
+                and hedge_dispatch_task is not None
+                and not hedge_dispatch_consumed
+                and not hedge_dispatch_task.cancelled()
+            ):
+                try:
+                    dispatched = hedge_dispatch_task.result()
+                except Exception:
+                    dispatched = None
+                if dispatched is not None:
+                    hedge_response, hedge_payload = dispatched
             await abandon_hedge()
 
 
@@ -4373,6 +4595,24 @@ async def _stream_with_idle_timeout(
     request_data: dict,
     *,
     initial_chunk_count: int = 0,
+) -> AsyncIterator[Any]:
+    iterator_box = [response.__aiter__()]
+    reader = _stream_with_idle_timeout_reader(
+        iterator_box, request_data, initial_chunk_count=initial_chunk_count
+    )
+    try:
+        async for chunk in reader:
+            yield chunk
+    finally:
+        await _close_async_iterator_safely(reader)
+        await _close_async_iterator_safely(iterator_box[0])
+
+
+async def _stream_with_idle_timeout_reader(
+    iterator_box: list,
+    request_data: dict,
+    *,
+    initial_chunk_count: int,
 ) -> AsyncIterator[Any]:
     idle_timeout_seconds = _resolved_stream_timeout_seconds(
         request_data,
@@ -4384,7 +4624,7 @@ async def _stream_with_idle_timeout(
         "stream_start_timeout_seconds",
         _routing_module._stream_start_timeout_seconds_for_request,
     )
-    iterator = response.__aiter__()
+    iterator = iterator_box[0]
     chunk_count = max(0, initial_chunk_count)
     saw_chunk = chunk_count > 0
     hedge_pending = (not saw_chunk) and _stream_hedge_eligible(request_data)
@@ -4404,6 +4644,7 @@ async def _stream_with_idle_timeout(
         else:
             timeout_seconds = start_timeout_seconds
             effective_timeout = timeout_seconds if timeout_seconds > 0 else None
+        read_timeout = None
         try:
             if hedge_pending:
                 hedge_pending = False
@@ -4414,17 +4655,25 @@ async def _stream_with_idle_timeout(
                     request_data,
                     start_timeout_seconds=start_timeout_seconds,
                 )
+                iterator_box[0] = iterator
                 if hedge_payload is not None:
                     _routing_module._apply_current_selected_deployment_to_request(
                         request_data,
                     )
             elif effective_timeout is not None:
-                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=effective_timeout)
+                read_timeout = asyncio.timeout(effective_timeout)
+                async with read_timeout:
+                    chunk = await iterator.__anext__()
             else:
                 chunk = await iterator.__anext__()
         except StopAsyncIteration:
             return
         except asyncio.TimeoutError:
+            # The delivery guard can read another watchdog-wrapped iterator.
+            # Its timeout already owns a stuck row and route verdict. Only this
+            # read's own expiry may create a new local timeout here.
+            if read_timeout is None or not read_timeout.expired():
+                raise
             if not saw_chunk:
                 raise _stream_start_timeout_exception(
                     request_data,
@@ -4523,9 +4772,11 @@ async def _yield_codex_responses_initial_keepalive_stream(
     first-event timeout into an indefinitely live stream.
     """
 
-    iterator = response.__aiter__()
-    start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
-        request_data
+    iterator = _stream_with_idle_timeout(response, request_data).__aiter__()
+    start_timeout_seconds = _resolved_stream_timeout_seconds(
+        request_data,
+        "stream_start_timeout_seconds",
+        _routing_module._stream_start_timeout_seconds_for_request,
     )
     deadline = (
         time.monotonic() + start_timeout_seconds
@@ -4613,25 +4864,12 @@ async def _yield_codex_responses_initial_keepalive_stream(
                 next_chunk_task = None
                 break
 
-        if (
-            _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
-            and _stream_chunk_has_meaningful_delta(first_chunk)
-        ):
-            observed_at = datetime.now(timezone.utc)
-            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = observed_at
-            _routing_module._record_first_stream_output_time(
-                request_data,
-                observed_at,
-            )
         yield first_chunk
-        async for chunk in _stream_with_idle_timeout(
-            iterator,
-            request_data,
-            initial_chunk_count=1,
-        ):
+        async for chunk in iterator:
             yield chunk
     finally:
         await cancel_pending_read()
+        await _close_async_iterator_safely(iterator)
 
 def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
     """Return the thinking an arriving non-Responses frame carries, if any.
@@ -4855,6 +5093,7 @@ def _build_streaming_error_fallback_payload(
     )
     chat_completion_keys = (
         "messages",
+        "n",
         "max_tokens",
         "max_completion_tokens",
         "parallel_tool_calls",
@@ -5311,10 +5550,10 @@ async def _streaming_error_fallback_response(
             payload,
         )
         # The retry hop dispatches through the same budget as the first one: the
-        # route this round picks is just as capable of being absent, and the
-        # first-event clock still cannot see the phase that decides that.  The
-        # start budget stays as the fallback for an operator who turned the
-        # connect budget off.
+        # route this round picks is just as capable of being absent, and its
+        # wait for the response head ends after the same prefill.  The start
+        # budget stays as the fallback for the case the dispatch budget is
+        # disabled entirely.
         response = await _await_upstream_dispatch(
             router_method(**dispatch_kwargs),
             payload,
@@ -5336,6 +5575,7 @@ async def _streaming_error_fallback_response(
                 start_seconds=stream_start_timeout_seconds,
                 saw_chunk=False,
                 buffered_chunks=0,
+                phase=_STREAM_START_TIMEOUT_DISPATCH_PHASE,
             )
         _routing_module._mark_no_deployments_for_order_exhaustion(fallback_exception, payload)
         if _routing_module._is_request_scoped_priority_deployment_failover_error(
@@ -5469,7 +5709,9 @@ async def _stream_streaming_error_fallback_round(
                 fallback_payload,
                 synthesize_completed_on_clean_eof_after_visible_output=True,
             )
+        saw_completed = False
         async for chunk in guarded_chunks:
+            saw_completed = saw_completed or _responses_stream_chunk_is_completed(chunk)
             if _routing_module._apply_current_selected_deployment_to_request(
                 fallback_payload,
                 selected_box=selected_deployment_box,
@@ -5483,7 +5725,7 @@ async def _stream_streaming_error_fallback_round(
         # The replayed route delivered the whole answer without raising, which
         # is what makes it the route that served this request. The native
         # branch records its own success from its terminal frame.
-        if not _request_uses_native_event_stream(fallback_payload):
+        if saw_completed and not _request_uses_native_event_stream(fallback_payload):
             served_request = _request_with_selected_deployment(
                 fallback_payload,
                 selected_box=selected_deployment_box,
@@ -5785,6 +6027,9 @@ class _ResponsesStreamCompletionState:
         # client nor the next request keeps a copy to imitate.
         self.suppressed_note_item_ids: set[str] = set()
         self.note_text_by_item_id: dict[str, str] = {}
+        self.pending_note_chunks: dict[str, list[Any]] = {}
+        self.pending_note_chunk_ids: set[int] = set()
+        self.released_note_chunks: list[Any] = []
         self.model = (
             request_data.get("model")
             if isinstance((request_data or {}).get("model"), str)
@@ -5831,19 +6076,39 @@ class _ResponsesStreamCompletionState:
             if isinstance(note_item_id, str) and isinstance(delta, str):
                 candidate = self.note_text_by_item_id.get(note_item_id, "") + delta
                 self.note_text_by_item_id[note_item_id] = candidate
-                if _historical_note_module.is_note_text(candidate) or candidate.startswith(
-                    _historical_note_module.NOTE_PREFIX
-                ):
+                if _historical_note_module.is_note_text(candidate):
                     self.suppressed_note_item_ids.add(note_item_id)
+                    for pending in self.pending_note_chunks.pop(note_item_id, []):
+                        self.pending_note_chunk_ids.discard(id(pending))
+                    defer_text = True
+                elif _historical_note_module.is_possible_note_prefix(candidate):
+                    self.pending_note_chunks.setdefault(note_item_id, []).append(chunk)
+                    self.pending_note_chunk_ids.add(id(chunk))
+                    defer_text = True
+                else:
+                    pending = self.pending_note_chunks.pop(note_item_id, [])
+                    self.released_note_chunks.extend(pending)
+                    for released in pending:
+                        self.pending_note_chunk_ids.discard(id(released))
+                    for released in pending:
+                        released_text, _ = _stream_chunk_text_fragment(_stream_chunk_dump(released))
+                        if released_text:
+                            self._append_synthetic_text(released_text)
+                    defer_text = False
+            else:
+                defer_text = False
         elif chunk_type == "response.output_item.done":
             done_item = dumped.get("item")
             if _historical_note_module.is_note_item(done_item):
                 note_item_id = _stream_output_item_key(done_item)
                 if note_item_id:
                     self.suppressed_note_item_ids.add(note_item_id)
+            defer_text = False
+        else:
+            defer_text = False
 
         text_fragment, is_done_text = _stream_chunk_text_fragment(dumped)
-        if text_fragment and not self._is_suppressed_note_chunk(dumped):
+        if text_fragment and not defer_text and not self._is_suppressed_note_chunk(dumped):
             if is_done_text:
                 self.synthetic_done_text = text_fragment
             else:
@@ -6053,6 +6318,16 @@ class _ResponsesStreamCompletionState:
         item_id = dumped.get("item_id") or dumped.get("id")
         if isinstance(item_id, str) and item_id in self.suppressed_note_item_ids:
             return True
+        # Callers may inspect a delta before feeding it through ``remember``
+        # (the stream tests and the delivery adapter both do this). Combine it
+        # with the text already seen so an exact note is suppressed without
+        # treating a bare prefix as proof.
+        if chunk_type == "response.output_text.delta" and isinstance(item_id, str):
+            delta = dumped.get("delta")
+            if isinstance(delta, str) and _historical_note_module.is_note_text(
+                self.note_text_by_item_id.get(item_id, "") + delta
+            ):
+                return True
         if chunk_type == "response.output_text.done":
             return _historical_note_module.is_note_text(dumped.get("text"))
         if chunk_type == "response.output_item.done":
@@ -6063,6 +6338,13 @@ class _ResponsesStreamCompletionState:
         """Whether this frame belongs to a note the client must not record."""
 
         return self._is_suppressed_note_chunk(_stream_chunk_dump(chunk))
+
+    def take_released_note_chunks(self) -> list[Any]:
+        chunks, self.released_note_chunks = self.released_note_chunks, []
+        return chunks
+
+    def _queue_or_release_text_chunk(self, chunk: Any) -> bool:
+        return id(chunk) in self.pending_note_chunk_ids
 
     def _drop_note_output_items(self, response: Any) -> bool:
         if not isinstance(response, dict):
@@ -6403,6 +6685,7 @@ async def _yield_native_stream_with_output_limit_continuation(
     # ceiling frame alone carries no count -- and a decision that could only
     # read that frame refused every route that answers a ceiling this way.
     answered_output_tokens: Optional[int] = None
+    highest_anthropic_index = -1
 
     def remember_route_accounting(chunk: Any) -> None:
         nonlocal answered_output_tokens
@@ -6411,7 +6694,16 @@ async def _yield_native_stream_with_output_limit_continuation(
             answered_output_tokens = tokens
 
     def remember_delivered_text(chunk: Any) -> Any:
-        text = _responses_output_module._response_text(chunk)
+        if is_anthropic_stream:
+            text = "".join(
+                str((frame.get("delta") or {}).get("text") or "")
+                for frame in _stream_chunk_dumps(chunk)
+                if frame.get("type") == "content_block_delta"
+                and isinstance(frame.get("delta"), dict)
+                and frame["delta"].get("type") == "text_delta"
+            )
+        else:
+            text = _responses_output_module._response_text(chunk)
         if text:
             delivered_text_parts.append(text)
         return chunk
@@ -6421,12 +6713,18 @@ async def _yield_native_stream_with_output_limit_continuation(
         nonlocal success_recorded
         nonlocal native_chunk_count
         nonlocal visible_output_delivered
+        nonlocal highest_anthropic_index
         chunk_exception = _stream_chunk_error_exception(chunk)
         if chunk_exception is not None:
             if saw_terminal:
                 return False
             raise chunk_exception
         native_chunk_count += 1
+        if is_anthropic_stream:
+            for frame in _stream_chunk_dumps(chunk):
+                index = frame.get("index")
+                if isinstance(index, int):
+                    highest_anthropic_index = max(highest_anthropic_index, index)
         visible_output_delivered = (
             visible_output_delivered or _stream_chunk_has_visible_output(chunk)
         )
@@ -6474,6 +6772,34 @@ async def _yield_native_stream_with_output_limit_continuation(
     # earlier block as never finished -- so the text block has to be closed
     # before the call's block opens.
     dsml_open_blocks: List[int] = []
+
+    def split_anthropic_ceiling_chunk(chunk: Any) -> List[Any]:
+        """Split a coalesced Messages read when it contains an output limit.
+
+        A socket read can contain the text delta that reaches the ceiling,
+        followed by ``message_delta`` and ``message_stop``. Treating that read
+        as one withheld chunk loses the text from the continuation prompt.
+        Reads without a ceiling stay intact so their original wire
+        representation is preserved.
+        """
+
+        if not is_anthropic_stream:
+            return [chunk]
+        frames = _stream_chunk_dumps(chunk)
+        if len(frames) <= 1:
+            return [chunk]
+        if not any(
+            _stream_continuation_module._native_stream_output_limit_reason(frame)
+            is not None
+            for frame in frames
+        ):
+            return [chunk]
+        # A Messages stream is SSE, and the event name is part of the wire
+        # protocol.  Returning dicts here would make LiteLLM's serializer emit
+        # only ``data:`` lines, so clients could no longer dispatch
+        # ``message_delta`` or ``message_stop``.  Keep each split frame as a
+        # complete SSE block, including its ``event:`` field.
+        return [_anthropic_sse_module._sse_block(frame) for frame in frames]
 
     def dsml_clean(chunk: Any) -> Optional[Any]:
         """The visible half of one frame, or ``None`` when it held only markup."""
@@ -6567,64 +6893,86 @@ async def _yield_native_stream_with_output_limit_continuation(
     async def deliver_route() -> AsyncIterator[Any]:
         nonlocal withheld_ceiling_terminal
         nonlocal native_chunk_count
-        for chunk in buffer:
-            if not inspect_native_chunk(chunk):
-                return
-            cleaned = dsml_clean(chunk)
-            if cleaned is not None:
-                yielded = remember_delivered_text(cleaned)
-                kind = str(_stream_chunk_type(yielded))
-                dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
-                yield yielded
-        # Whether the ceiling frame has been withheld.  Once it has, the
-        # frames that close the same answer belong to it: ``message_stop``
-        # and the ``finish_reason`` terminal state the same completion the
-        # withheld frame described, so they are withheld with it rather than
-        # delivered ahead of the continuation that has not run yet.
+        # Whether the ceiling frame has been withheld. Once it has, the
+        # frames that close the same answer belong to it.
         ceiling_withheld = False
+        for chunk in buffer:
+            for frame in split_anthropic_ceiling_chunk(chunk):
+                if (
+                    is_anthropic_stream
+                    and _stream_continuation_module._native_stream_output_limit_reason(
+                        frame
+                    )
+                    is not None
+                ):
+                    withheld_ceiling_terminal = frame
+                    ceiling_withheld = True
+                    native_chunk_count += 1
+                    remember_route_accounting(frame)
+                    continue
+                if ceiling_withheld and _native_stream_chunk_is_terminal(
+                    frame,
+                    request_data,
+                    finished_choice_indices,
+                ):
+                    withheld_ceiling_closers.append(frame)
+                    native_chunk_count += 1
+                    remember_route_accounting(frame)
+                    continue
+                if not inspect_native_chunk(frame):
+                    return
+                cleaned = dsml_clean(frame)
+                if cleaned is not None:
+                    yielded = remember_delivered_text(cleaned)
+                    kind = str(_stream_chunk_type(yielded))
+                    dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
+                    yield yielded
+        # A transport read may contain several Messages frames. Split only
+        # reads that carry a ceiling so text before that frame is delivered and
+        # becomes part of the continuation prompt.
         async for chunk in _stream_with_idle_timeout(
             response,
             request_data,
             initial_chunk_count=len(buffer),
         ):
-            chunk_exception = _stream_chunk_error_exception(chunk)
-            if chunk_exception is not None:
-                if saw_terminal:
+            for frame in split_anthropic_ceiling_chunk(chunk):
+                chunk_exception = _stream_chunk_error_exception(frame)
+                if chunk_exception is not None:
+                    if saw_terminal:
+                        return
+                    raise chunk_exception
+                if _stream_continuation_module._native_stream_output_limit_reason(
+                    frame
+                ) is not None:
+                    # This frame carries the answer's own completion state, so
+                    # the delivery below is what decides whether it is ever
+                    # sent.
+                    withheld_ceiling_terminal = frame
+                    ceiling_withheld = True
+                    native_chunk_count += 1
+                    remember_route_accounting(frame)
+                    # The terminal frame that closes this answer arrives in its
+                    # own transport read on some routes. Keep reading and
+                    # withhold the closing frames as well.
+                    continue
+                if ceiling_withheld and _native_stream_chunk_is_terminal(
+                    frame,
+                    request_data,
+                    finished_choice_indices,
+                ):
+                    # Same answer, so the same fate as the ceiling frame.
+                    withheld_ceiling_closers.append(frame)
+                    native_chunk_count += 1
+                    remember_route_accounting(frame)
+                    continue
+                if not inspect_native_chunk(frame):
                     return
-                raise chunk_exception
-            if _stream_continuation_module._native_stream_output_limit_reason(chunk) is not None:
-                # This frame carries the answer's own completion state, so the
-                # delivery below is what decides whether it is ever sent.
-                withheld_ceiling_terminal = chunk
-                ceiling_withheld = True
-                native_chunk_count += 1
-                remember_route_accounting(chunk)
-                # The terminal frame that closes this answer arrives in its own
-                # transport read on some routes.  Returning here read the
-                # ceiling and dropped the stop: with no continuation possible
-                # the client was handed the withheld ``max_tokens`` frame and
-                # never the ``message_stop`` that ends it, so a finished answer
-                # rendered as one cut off at the route's output limit.  Keep
-                # reading and withhold the closing frames instead.
-                continue
-            if ceiling_withheld and _native_stream_chunk_is_terminal(
-                chunk,
-                request_data,
-                finished_choice_indices,
-            ):
-                # Same answer, so the same fate as the ceiling frame.
-                withheld_ceiling_closers.append(chunk)
-                native_chunk_count += 1
-                remember_route_accounting(chunk)
-                continue
-            if not inspect_native_chunk(chunk):
-                return
-            cleaned = dsml_clean(chunk)
-            if cleaned is not None:
-                yielded = remember_delivered_text(cleaned)
-                kind = str(_stream_chunk_type(yielded))
-                dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
-                yield yielded
+                cleaned = dsml_clean(frame)
+                if cleaned is not None:
+                    yielded = remember_delivered_text(cleaned)
+                    kind = str(_stream_chunk_type(yielded))
+                    dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
+                    yield yielded
         # The answer is over: whatever markup is still held is all there will
         # be.  Its visible tail is delivered first (an unterminated block still
         # ends the answer the route wrote), then the calls it parsed to.  They
@@ -6712,6 +7060,7 @@ async def _yield_native_stream_with_output_limit_continuation(
             ),
             ceiling_chunk=withheld_ceiling_terminal,
             answered_output_tokens=answered_output_tokens,
+            anthropic_index_offset=highest_anthropic_index + 1,
         ):
             # The same test the continuation applies before it hands over a
             # route's closing frame: that frame is the only terminal it yields.
@@ -6864,6 +7213,8 @@ async def _yield_guarded_original_stream(
         )
 
     def deliver_client_chunk(chunk: Any) -> Any:
+        if completion_state._queue_or_release_text_chunk(chunk):
+            return None
         if completion_state.suppresses(chunk):
             return None
         return _responses_stream_chunk_for_delivery(
@@ -6873,7 +7224,10 @@ async def _yield_guarded_original_stream(
 
     def deliverable_client_chunks(chunk: Any):
         """Deliver one upstream frame unless this router withholds it."""
-
+        for released in completion_state.take_released_note_chunks():
+            delivered = deliver_client_chunk(released)
+            if delivered is not None:
+                yield delivered
         delivered = deliver_client_chunk(chunk)
         if delivered is not None:
             yield delivered
@@ -7160,6 +7514,8 @@ async def _yield_guarded_original_stream(
                 failure,
                 request_data,
             )
+        if getattr(failure, "item_cap_cut", False):
+            _register_terminal_turn_failure(request_data, failure)
         _trace_module._request_route_trace(
             "responses_upstream_incomplete_delivered",
             request_data,
@@ -7601,6 +7957,11 @@ async def _yield_guarded_original_stream(
                     if item_cap_leaves_the_turn_unanswered(chunk) and (
                         reopen_the_turn_after_a_thinking_only_cut(failure)
                     ):
+                        # The capped attempt closes its own body normally once
+                        # the hop starts, and that close would otherwise read as
+                        # a delivered answer and clear the count this cap just
+                        # earned.
+                        _register_terminal_turn_failure(request_data, failure)
                         # The route's cap is not this turn's answer: park it and
                         # let the same turn continue on a sibling route, inside
                         # this one client stream.  The capped attempt's body
@@ -8168,16 +8529,15 @@ async def _yield_start_buffered_stream_with_error_fallback(
         for opening_event in _response_opening_events(request_data, completion_state):
             yield opening_event
 
+    stream = None
     try:
-        stream = _stream_with_idle_timeout(
-            response,
-            request_data,
-        )
         if _should_emit_codex_responses_initial_sse_keepalive(request_data):
             stream = _yield_codex_responses_initial_keepalive_stream(
                 response,
                 request_data,
             )
+        else:
+            stream = _stream_with_idle_timeout(response, request_data)
         async for chunk in stream:
             _web_search_native_module._mark_provider_native_web_search_event(
                 request_data, chunk
@@ -8211,7 +8571,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     request_data,
                 ):
                     yield delivered_frame
-                await _close_async_iterator_safely(response)
+                await _close_async_iterator_safely(stream)
                 return
             chunk_exception = _stream_chunk_priority_error_exception(
                 chunk,
@@ -8270,7 +8630,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         ):
                             yield delivered_frame
                         yield completed_compat_chunk
-                        await _close_async_iterator_safely(response)
+                        await _close_async_iterator_safely(stream)
                         return
                     output_limit_terminal = (
                         _responses_incomplete_terminal_reason(chunk)
@@ -8281,6 +8641,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         buffer=buffer,
                         request_data=request_data,
                         delivered_output=bool(saw_visible_output or saw_delivered_output),
+                    )
+                    _mark_generated_output_item_cap(
+                        incomplete_exception,
+                        chunk,
+                        delivered=bool(saw_visible_output or saw_delivered_output),
                     )
                     _mark_generated_output_item_cap(
                         incomplete_exception,
@@ -8298,7 +8663,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                             incomplete_exception,
                         ):
                             yield fallback_chunk
-                        await _close_async_iterator_safely(response)
+                        await _close_async_iterator_safely(stream)
                         return
                     async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
                         request_data,
@@ -8361,6 +8726,9 @@ async def _yield_start_buffered_stream_with_error_fallback(
         ):
             yield fallback_chunk
         return
+    finally:
+        if stream_exhausted and stream is not None:
+            await _close_async_iterator_safely(stream)
 
     if is_responses_stream and stream_exhausted and not saw_responses_completed:
         completed_compat = _codex_compaction_done_item_completed_compat(
@@ -8411,28 +8779,31 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 yield fallback_chunk
             return
 
-    async for chunk in _yield_guarded_original_stream(
-        buffer,
-        response,
-        request_data,
-        saw_responses_completed=saw_responses_completed,
-        stream_started_at=stream_started_at,
-        # A Responses summary is a committed item in the client's transcript, so
-        # showing one ends the replay window there.  On the native chat shape a
-        # thinking-only turn must still reach a peer route -- a replay is the
-        # lesser cost there, and the recovery branch reads this flag to decide
-        # exactly that.
-        saw_visible_output=(
-            saw_visible_output
-            or (saw_delivered_output and _request_is_responses_stream(request_data))
-        ),
-        on_responses_completed=(
-            lambda: _routing_module._record_deployment_success_for_cooldown(
-                request_data
-            )
-        ),
-    ):
-        yield chunk
+    try:
+        async for chunk in _yield_guarded_original_stream(
+            buffer,
+            stream,
+            request_data,
+            saw_responses_completed=saw_responses_completed,
+            stream_started_at=stream_started_at,
+            # A Responses summary is a committed item in the client's transcript, so
+            # showing one ends the replay window there.  On the native chat shape a
+            # thinking-only turn must still reach a peer route -- a replay is the
+            # lesser cost there, and the recovery branch reads this flag to decide
+            # exactly that.
+            saw_visible_output=(
+                saw_visible_output
+                or (saw_delivered_output and _request_is_responses_stream(request_data))
+            ),
+            on_responses_completed=(
+                lambda: _routing_module._record_deployment_success_for_cooldown(
+                    request_data
+                )
+            ),
+        ):
+            yield chunk
+    finally:
+        await _close_async_iterator_safely(stream)
 
 # The recovery conversation moved to young_router.proxy.streaming_recovery; the
 # names stay importable here so every caller keeps its one entry point.

@@ -11,7 +11,11 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -26,6 +30,9 @@ class _Runtime:
     def environment(self, *, autostart: bool = False) -> dict[str, str]:
         self._calls.append(autostart)
         return dict(self._fragment)
+
+    def stop(self) -> None:
+        pass
 
 
 class _Worker:
@@ -105,24 +112,20 @@ class ManagedWorkersTest(unittest.TestCase):
 
         self.assertEqual(worker.calls, [False])
 
-    def test_main_execs_the_command_with_the_fragment_and_never_prints_values(self) -> None:
+    def test_main_runs_the_command_with_the_fragment_and_never_prints_values(self) -> None:
         worker = _Worker("worker", "SOME_BASE")
         self._write("a: os.environ/SOME_BASE\n")
-        captured: dict[str, object] = {}
-
-        def fake_execvpe(program: str, argv: list[str], env: dict[str, str]) -> None:
-            captured.update(program=program, argv=argv, env=dict(env))
-
+        process = mock.Mock()
+        process.wait.return_value = 0
         stderr = io.StringIO()
         with mock.patch.object(managed, "managed_worker_modules", return_value=[worker]), \
-             mock.patch.object(managed.os, "execvpe", side_effect=fake_execvpe), \
+             mock.patch.object(managed.subprocess, "Popen", return_value=process) as popen, \
              mock.patch("sys.stderr", stderr):
             code = managed.main(["--config", str(self.config), "--", "proxy", "--flag"])
 
         self.assertEqual(code, 0)
-        self.assertEqual(captured["program"], "proxy")
-        self.assertEqual(captured["argv"], ["proxy", "--flag"])
-        self.assertEqual(captured["env"]["SOME_BASE"], "http://127.0.0.1:1")
+        self.assertEqual(popen.call_args.args[0], ["proxy", "--flag"])
+        self.assertEqual(popen.call_args.kwargs["env"]["SOME_BASE"], "http://127.0.0.1:1")
         self.assertNotIn("127.0.0.1:1", stderr.getvalue(), "a bearer must never reach the log")
 
     def test_the_running_fragment_reaches_the_child_environment(self) -> None:
@@ -130,14 +133,41 @@ class ManagedWorkersTest(unittest.TestCase):
         self._write("a: os.environ/SOME_BASE\n")
 
         with mock.patch.object(managed, "managed_worker_modules", return_value=[worker]), \
-             mock.patch.object(managed.os, "execvpe") as execvpe, \
+             mock.patch.object(managed.subprocess, "Popen") as popen, \
              mock.patch.dict(os.environ, {}, clear=False), \
              mock.patch("sys.stderr", io.StringIO()):
-            execvpe.side_effect = lambda program, argv, env: env
+            popen.return_value.wait.return_value = 0
             managed.main(["--config", str(self.config), "--", "proxy"])
 
-        env = execvpe.call_args.args[2]
+        env = popen.call_args.kwargs["env"]
         self.assertEqual(env["SOME_BASE"], "http://127.0.0.1:1")
+
+    def test_worker_supervision_continues_until_the_proxy_exits(self) -> None:
+        marker = Path(self.directory.name) / "restarted"
+        worker = _Worker("worker", "SOME_BASE")
+        self._write("a: os.environ/SOME_BASE\n")
+
+        class Runtime(_Runtime):
+            def environment(self, *, autostart: bool = False) -> dict[str, str]:
+                def supervise() -> None:
+                    time.sleep(0.1)
+                    marker.write_text("restarted", encoding="utf-8")
+
+                threading.Thread(target=supervise, daemon=True).start()
+                return super().environment(autostart=autostart)
+
+        runtime = Runtime({"SOME_BASE": "http://127.0.0.1:1"}, worker.calls)
+        script = (
+            "import pathlib, sys, time\n"
+            "path = pathlib.Path(sys.argv[1])\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not path.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+            "sys.exit(0 if path.exists() else 1)\n"
+        )
+        with mock.patch.object(managed, "managed_worker_modules", return_value=[worker]), \
+             mock.patch.object(worker, "managed_runtime", return_value=runtime), \
+             mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(0, managed.main(["--config", str(self.config), "--", sys.executable, "-c", script, str(marker)]))
 
     def test_no_command_answers_variable_names_only(self) -> None:
         worker = _Worker("worker", "SOME_BASE")

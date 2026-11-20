@@ -84,7 +84,17 @@ export function publishSnapshot(next: CoreSnapshot | undefined): void {
   // A snapshot older than the state this layer already holds is not a newer
   // projection: it is a render from before an event landed, and publishing it
   // would move every subscribed pane backwards.
-  if (previous !== undefined && next !== undefined && next.revision < previous.revision) return;
+  // Revisions only order writes within one Core process.  A restarted Core
+  // starts at a lower revision, so an instance change must replace the held
+  // projection before applying the same stale-read guard.
+  const instanceChanged = Boolean(previous !== undefined
+    && next !== undefined
+    && previous.core_instance_id
+    && next.core_instance_id
+    && previous.core_instance_id !== next.core_instance_id);
+  if (!instanceChanged && previous !== undefined && next !== undefined && next.revision < previous.revision) {
+    return;
+  }
   current = next;
   if (!next) return;
   for (const [domain, set] of listeners) {

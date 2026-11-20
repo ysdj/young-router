@@ -96,6 +96,7 @@ class CoreIPCBridge {
       // The New API profile quota the host's own probe read; Core owns the
       // display unit that turns it into money.
       std::optional<double> const& quota = std::nullopt);
+  // Observers enqueue delivery and do not call back into the bridge.
   int AddEventHandler(std::function<void(std::string const&)> handler);
   void RemoveEventHandler(int token);
   void Stop();
@@ -146,14 +147,13 @@ class CoreIPCBridge {
       std::string const& body,
       bool retry_session = true,
       int receive_timeout_ms = 30000);
-  void StartPollingIfSubscription(std::string const& response_json, unsigned long generation);
-  void PollEvents(std::string subscription_id);
-  void RecoverSubscription();
+  void StartPolling(std::string const& request, std::string const& response, unsigned long generation);
+  void PollEvents();
   void InvalidateCore(bool preserve_subscription);
-  void InvalidateCoreIfGeneration(unsigned long generation, bool preserve_subscription);
+  void InvalidateCoreIfGeneration(
+      unsigned long generation, bool preserve_subscription, std::string const* subscription = nullptr);
   void InvalidateCoreLocked(bool preserve_subscription);
   void TakeCoreLocked(std::vector<void*>& processes, std::vector<std::wstring>& directories, bool preserve_subscription);
-  void JoinRetiredPollThread();
   static bool IsSessionFailure(unsigned long status) noexcept;
 
   std::mutex mutex_;
@@ -167,6 +167,7 @@ class CoreIPCBridge {
   unsigned long session_expires_at_tick_ = 0;
   std::string subscription_id_;
   std::string subscription_request_;
+  bool subscription_needs_snapshot_ = false;
   bool establishing_session_ = false;
   std::exception_ptr session_error_;
   unsigned long core_generation_ = 0;
@@ -177,7 +178,7 @@ class CoreIPCBridge {
   std::map<int, std::function<void(std::string const&)>> event_handlers_;
   int next_event_handler_token_ = 0;
   std::atomic<bool> stopping_{false};
-  std::mutex poll_mutex_;
+  std::condition_variable poll_condition_;
   std::thread poll_thread_;
   // Guards the cached transport only, and is never held across a request: it is
   // a separate mutex from `mutex_` so a settings control is not queued behind a

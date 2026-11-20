@@ -38,7 +38,7 @@ std::wstring AllowedRoute(std::wstring route) {
 
 std::wstring AllowedLogTab(std::wstring tab) {
   static constexpr std::wstring_view allowed[] = {
-      L"requests", L"service", L"actions", L"route-trace", L"recovery", L"online-usage"};
+      L"requests", L"service", L"actions", L"route-trace", L"recovery", L"online-usage", L"scheduled-tasks"};
   return std::find(std::begin(allowed), std::end(allowed), tab) == std::end(allowed)
       ? std::wstring{} : tab;
 }

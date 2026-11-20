@@ -1512,12 +1512,12 @@ class HookRoutingTests(HookTestCase):
         )
 
     def test_the_first_frame_hedge_has_a_default_and_a_switch(self) -> None:
-        """On by default at 30 s, and a user can turn it off either way."""
+        """On by default at 20 s, and a user can turn it off either way."""
 
         hooks, _ = load_hook_module()
         self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, None)
         self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, None)
-        self.assertEqual(hooks._stream_hedge_delay_seconds(), 30.0)
+        self.assertEqual(hooks._stream_hedge_delay_seconds(), 20.0)
         self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, "0")
         self.assertEqual(hooks._stream_hedge_delay_seconds(), 0.0)
         self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, "1")
@@ -2178,10 +2178,6 @@ class HookRoutingTests(HookTestCase):
             ),
             (hooks._STALL_TIMEOUT_SECONDS_ENV, hooks._STALL_TIMEOUT_DEFAULT_SECONDS),
             (
-                hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
-                hooks._UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
-            ),
-            (
                 hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
                 hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
             ),
@@ -2192,6 +2188,18 @@ class HookRoutingTests(HookTestCase):
             (
                 hooks._STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV,
                 hooks._STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS,
+            ),
+            (
+                hooks._STREAM_HEDGE_DELAY_SECONDS_ENV,
+                hooks._STREAM_HEDGE_DELAY_DEFAULT_SECONDS,
+            ),
+            (
+                hooks._STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV,
+                hooks._STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS,
+            ),
+            (
+                hooks._REPLAY_REASONING_ELISION_KEEP_ENV,
+                hooks._REPLAY_REASONING_ELISION_KEEP_DEFAULT,
             ),
             (hooks._RECOVERY_MAX_SECONDS_ENV, hooks._RECOVERY_MAX_DEFAULT_SECONDS),
             (hooks._RECOVERY_INTERVAL_SECONDS_ENV, hooks._RECOVERY_INTERVAL_DEFAULT_SECONDS),
@@ -2204,6 +2212,10 @@ class HookRoutingTests(HookTestCase):
             with self.subTest(key=key):
                 self.assertIn(key, documented)
                 self.assertEqual(float(documented[key]), float(actual))
+        self.assertEqual(documented["YOUNG_ROUTER_STREAM_HEDGE_ENABLED"], "1")
+        self.assertEqual(
+            documented["YOUNG_ROUTER_REPLAY_REASONING_ELISION_ENABLED"], "1"
+        )
 
     async def test_deployment_cooldown_does_not_count_stream_start_timeout_after_chunks(self) -> None:
         hooks, _ = load_hook_module()
@@ -2267,6 +2279,82 @@ class HookRoutingTests(HookTestCase):
             request_kwargs={},
         )
         self.assertEqual(filtered, [deployments[1]])
+
+    async def test_a_dispatch_start_timeout_takes_the_configured_threshold(self) -> None:
+        """Eleven seconds of no response head is not the 120 s silence rule.
+
+        Live 2026-11-20 15:28: both glm-5.3-flash routes were cooled after one
+        ``stream_start_timeout after 11.1409s`` each (``连续 1 次尝试失败``), and
+        the client's retry then answered ``RouterRateLimitError``.  The clock
+        that expired was the old dispatch budget (a connect allowance plus an
+        upload allowance), and a relay that buffers its answer writes no
+        response head until it has prefilled, so that expiry said nothing about
+        whether the route was dead.  The dispatch budget is now the request's
+        first-event budget; a dispatch expiry is charged like any other
+        transient failure, to the configured threshold (default 2), and it
+        never earns the heavy-replay 300 s park reserved for a route that held
+        the whole first-event budget after its head arrived.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        self.set_env(hooks._STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV, "1800")
+        deployments = [
+            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
+            {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
+        ]
+        request_kwargs = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "x" * 4096}],
+            "stream": True,
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "x-cheap", "order": 1},
+        }
+
+        def record_dispatch_timeout() -> Exception:
+            error = hooks._stream_start_timeout_exception(
+                request_kwargs,
+                start_seconds=11.1409,
+                saw_chunk=False,
+                buffered_chunks=0,
+                phase=hooks._STREAM_START_TIMEOUT_DISPATCH_PHASE,
+            )
+            self.assertEqual("dispatch", error.body.get("phase"))
+            hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+            return error
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.set_log_env(Path(tmp) / "recent-requests.jsonl")
+            record_dispatch_timeout()
+
+            # One strike is not a cooldown at the documented default.
+            filtered = await hook.async_filter_deployments(
+                "default-chat",
+                deployments,
+                messages=None,
+                request_kwargs={},
+            )
+            self.assertEqual(filtered, deployments)
+
+            record_dispatch_timeout()
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs={},
+        )
+        self.assertEqual(filtered, [deployments[1]])
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:x-cheap"]
+        self.assertEqual(state["failures"], 2)
+        self.assertLessEqual(
+            float(state["cooldown_until"]) - time.time(),
+            301.0,
+            "a dispatch expiry must not inherit the heavy-replay 1800 s park",
+        )
 
     async def test_deployment_cooldown_counts_quota_or_auth_failures(self) -> None:
         hooks, _ = load_hook_module()

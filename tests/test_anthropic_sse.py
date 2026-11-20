@@ -98,6 +98,26 @@ class RewriteTests(unittest.TestCase):
         )
         self.assertEqual({"command": "echo hi"}, json.loads(inputs))
 
+    def test_stream_preserves_utf8_split_across_chunks(self) -> None:
+        import asyncio
+
+        body = b"".join(frames(text="你好，世界"))
+
+        async def chunks():
+            for byte in body:
+                yield bytes([byte])
+
+        async def rewrite():
+            return b"".join([part async for part in sse.rewrite_messages_sse(chunks())])
+
+        events = parsed(asyncio.run(rewrite()))
+        text = "".join(
+            (item.get("delta") or {}).get("text", "")
+            for item in events
+            if item.get("type") == "content_block_delta"
+        )
+        self.assertEqual(text, "你好，世界")
+
     def test_the_stop_reason_names_the_call(self) -> None:
         events = parsed(run(b"".join(frames())))
 

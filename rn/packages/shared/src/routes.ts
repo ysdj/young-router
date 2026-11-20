@@ -80,6 +80,7 @@ export const LOG_TABS: readonly LogTab[] = [
   "actions",
   "recovery",
   "online-usage",
+  "scheduled-tasks",
 ];
 
 export function canonicalWindowRoute(route: AppRoute): AppRoute {

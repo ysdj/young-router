@@ -61,6 +61,33 @@ def is_note_text(value: Any) -> bool:
     return bool(_NOTE_PATTERN.match(text))
 
 
+def is_possible_note_prefix(value: Any) -> bool:
+    """Whether text can still become a complete synthetic note."""
+
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    if len(text) <= len(NOTE_PREFIX):
+        return NOTE_PREFIX.startswith(text)
+    if not text.startswith(NOTE_PREFIX):
+        return False
+    rest = text[len(NOTE_PREFIX):]
+    if NOTE_BODY.startswith(rest):
+        return True
+    if not rest.startswith("**"):
+        return False
+    closing = rest.find("**", 2)
+    if closing < 0:
+        title = rest[2:]
+        return len(title) <= 160 and "\n" not in title and "*" not in title
+    title = rest[2:closing]
+    if len(title) > 160 or "\n" in title or "*" in title:
+        return False
+    return NOTE_BODY.startswith(rest[closing + 2:])
+
+
 def _item_text(item: Any) -> str:
     if not isinstance(item, dict):
         return ""

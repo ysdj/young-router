@@ -281,15 +281,6 @@ setBrowserSecretReader(({ domain, field, target }) => core.hostRoute("/ipc/host/
   return core.hostRoute("/ipc/host/secret/read", { secret_read_token: token });
 }).then((lease) => ({ present: typeof lease.value === "string" && lease.value.length > 0, value: typeof lease.value === "string" ? lease.value : undefined })));
 
-void ipc.snapshot().catch(() => {
-  // The session cookie expired while this tab was open (Core was restarted, or
-  // the session aged out). Reloading is the honest recovery: Core then answers
-  // with its password form instead of this page sitting on a 401 it cannot
-  // explain. Nothing is done here if the reload itself fails, because a Core
-  // that stopped answering is not something a page can fix.
-  window.location.reload();
-});
-
 registerYoungRouter("YoungRouter", { ipc, native, translate });
 
 // The page's one React root. Re-rendering it with a new `initialRoute` is how

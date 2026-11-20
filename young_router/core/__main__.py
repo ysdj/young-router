@@ -222,6 +222,8 @@ def run(argv: list[str] | None = None) -> int:
     # The interval loop lives beside the IPC server: it reads the saved switch
     # and interval, so a machine nobody is looking at still syncs.
     webdav_scheduler = core.webdav_scheduler()
+    relay_balance_scheduler = core.relay_balance_scheduler()
+    relay_maintenance = core.relay_maintenance()
     # The generated client model lists follow the router with no window open:
     # a provider Apply regenerates them through the proxy reload, and this loop
     # is the path for a change that owed no reload.
@@ -324,6 +326,8 @@ def run(argv: list[str] | None = None) -> int:
             _publish_web_url(args.web_url_file, server.web_host_url)
             print(server.web_host_url, flush=True)
         webdav_scheduler.start()
+        relay_balance_scheduler.start()
+        relay_maintenance.start()
         if client_model_sync is not None:
             client_model_sync.start()
         image_context_sweeper.start()
@@ -348,6 +352,14 @@ def run(argv: list[str] | None = None) -> int:
             parent_watchdog.join(timeout=1.0)
         try:
             webdav_scheduler.stop()
+        except Exception:
+            pass
+        try:
+            relay_balance_scheduler.stop()
+        except Exception:
+            pass
+        try:
+            relay_maintenance.stop()
         except Exception:
             pass
         try:
