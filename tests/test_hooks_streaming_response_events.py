@@ -3100,6 +3100,123 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
         self.assertNotIn("response.failed", types)
 
+    async def test_a_heavy_cut_is_answered_by_repairing_the_request_not_the_route(
+        self,
+    ) -> None:
+        """A long replay that spent the item budget on thinking is the body's
+        problem: keep the route, drop the oldest reasoning, lower the effort.
+
+        Live 2026-11-20 thread 01a1ee60: 9,5xx items at ``effort: max`` were cut
+        with ``max_messages`` after ~100 reasoning items on the order-first
+        route; hopping the same body to a sibling paid another full prefill and
+        the siblings answered 524/500.  The repair makes the same route able to
+        finish: newest reasoning only, ``high`` instead of ``max``.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = importlib.import_module("young_router.proxy.streaming")
+        streaming._THINKING_CUT_REPAIRED_REQUESTS.clear()
+        self.addCleanup(streaming._THINKING_CUT_REPAIRED_REQUESTS.clear)
+        calls: list = []
+
+        def thinking_then_capped():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cut"}}
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "weighing the two explanations",
+                }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cut",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_1"}],
+                    },
+                }
+
+            return stream()
+
+        def answered():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return answered()
+
+        proxy_server.llm_router = FakeRouter()
+        reasoning_items = [
+            {"type": "reasoning", "id": f"rs-old-{index}", "summary": []}
+            for index in range(2100)
+        ]
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                *reasoning_items,
+                {"type": "message", "role": "user", "content": "Continue."},
+            ],
+            "reasoning": {"effort": "max", "summary": "detailed"},
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-heavy-cut-repair",
+            "client_metadata": {"thread_id": "thread-heavy-cut-repair"},
+            "model_info": {
+                "id": "order-0",
+                "order": 0,
+                "route_key": "provider / default-chat / key=primary",
+            },
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=thinking_then_capped(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(1, len(calls))
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        # The oldest reasoning is gone; messages and the newest reasoning stay.
+        self.assertLess(len(calls[0]["input"]), 50)
+        self.assertEqual("high", calls[0]["reasoning"]["effort"])
+        # The route did its job: it is not excluded from its own retry.
+        self.assertNotIn("order-0", calls[0].get("_excluded_deployment_ids") or [])
+
+    def test_a_heavy_replay_steps_the_hardest_effort_down(self) -> None:
+        load_hook_module()
+        reasoning = importlib.import_module("young_router.proxy.reasoning")
+        request = {
+            "reasoning": {"effort": "max", "summary": "detailed"},
+            "reasoning_effort": "max",
+        }
+
+        before, after = reasoning._reduce_reasoning_effort_in_place(request)
+
+        self.assertEqual(("max", "high"), (before, after))
+        self.assertEqual("high", request["reasoning"]["effort"])
+        self.assertEqual("high", request["reasoning_effort"])
+        # A request that already asked for high (or below) is left alone.
+        self.assertEqual(
+            ("high", None),
+            reasoning._reduce_reasoning_effort_in_place(
+                {"reasoning": {"effort": "high"}}
+            ),
+        )
+
     async def test_a_cap_after_a_progress_line_still_continues_on_a_sibling(
         self,
     ) -> None:

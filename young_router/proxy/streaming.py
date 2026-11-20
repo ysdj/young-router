@@ -18,6 +18,7 @@ from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
+from . import reasoning as _reasoning_module
 from . import historical_reasoning_note as _historical_note_module
 from . import responses_tools as _responses_tools_module
 from . import web_search_native as _web_search_native_module
@@ -4160,6 +4161,125 @@ def _settle_head_hedge_row(marker: Any) -> None:
         _state_module._settle_hedge_request(request_id)
 
 
+#: Set on the failure that a request repair answers.  The fallback round reads
+#: it to stay on the route that was cut: the route did its job, the body asked
+#: for more thinking than the route's budget allows.
+_REQUEST_REPAIRED_ATTR = "_young_router_request_repaired"
+
+#: One request repair per turn: the repaired body is a smaller version of the
+#: same conversation, and repairing it again would walk the thread's context
+#: down one hop at a time.  Keyed by the turn's identifiers, because the map
+#: and the retry run in copies of the request.
+_THINKING_CUT_REPAIRED_REQUESTS: dict[str, float] = {}
+_THINKING_CUT_REPAIRED_LOCK = threading.Lock()
+_THINKING_CUT_REPAIRED_TTL_SECONDS = 6 * 60 * 60.0
+_THINKING_CUT_REPAIRED_LIMIT = 4096
+#: Below this many replay items the cut says something about the route, not
+#: about the size of the request; those keep the sibling hop untouched.
+_THINKING_CUT_REPAIR_MIN_ITEMS = 2000
+
+
+def _claim_thinking_cut_request_repair(request_kwargs: Optional[dict]) -> bool:
+    """Claim this turn's one request repair."""
+
+    names = _routing_module._lease_identifier_candidates(request_kwargs)
+    if not names:
+        return True
+    now = time.time()
+    with _THINKING_CUT_REPAIRED_LOCK:
+        for name, marked_at in list(_THINKING_CUT_REPAIRED_REQUESTS.items()):
+            if now - marked_at > _THINKING_CUT_REPAIRED_TTL_SECONDS:
+                _THINKING_CUT_REPAIRED_REQUESTS.pop(name, None)
+        if any(name in _THINKING_CUT_REPAIRED_REQUESTS for name in names):
+            return False
+        for name in names:
+            _THINKING_CUT_REPAIRED_REQUESTS[name] = now
+        if len(_THINKING_CUT_REPAIRED_REQUESTS) > _THINKING_CUT_REPAIRED_LIMIT:
+            oldest = sorted(
+                _THINKING_CUT_REPAIRED_REQUESTS.items(),
+                key=lambda item: item[1],
+            )
+            for name, _marked_at in oldest[
+                : len(_THINKING_CUT_REPAIRED_REQUESTS)
+                - _THINKING_CUT_REPAIRED_LIMIT
+            ]:
+                _THINKING_CUT_REPAIRED_REQUESTS.pop(name, None)
+        return True
+
+
+def _repair_request_after_thinking_only_cut(
+    request_data: Optional[dict],
+    failure: Exception,
+) -> bool:
+    """Make a heavy replay fit the budget that just cut it.
+
+    A relay's ``max_messages`` is a per-response item budget: a long replay plus
+    the hardest reasoning tier can spend it all on thinking, and the turn ends
+    without an answer.  The route is not at fault, so the repair is the request:
+    drop the oldest reasoning items (keep the newest few, keep every message
+    and tool call) and step the hardest effort tier down to ``high``.  The same
+    route then gets the same conversation in a shape it can finish.
+
+    Only the first cut of a turn repairs, only for a genuinely long replay, and
+    only after thinking (a cut after a tool call or answer text is the caller's
+    stop, not a budget the request can fix).
+    """
+
+    if not isinstance(request_data, dict):
+        return False
+    if not getattr(failure, "item_cap_cut", False):
+        return False
+    if not _responses_request_module._request_is_responses_api(request_data):
+        return False
+    if _responses_request_module._request_already_attempted_streaming_error_fallback(
+        request_data
+    ):
+        return False
+    items = request_data.get("input")
+    if not isinstance(items, list) or len(items) < _THINKING_CUT_REPAIR_MIN_ITEMS:
+        return False
+    if not _claim_thinking_cut_request_repair(request_data):
+        return False
+
+    effort_before, effort_after = (
+        _reasoning_module._reduce_reasoning_effort_in_place(request_data)
+    )
+    elided = _responses_request_module._responses_input_with_elided_reasoning_items(
+        items,
+        keep=_routing_module._replay_reasoning_elision_keep(),
+        allow_signed=True,
+    )
+    if elided is not None:
+        request_data["input"] = elided
+        # The dispatch budget is derived from the serialized weight and cached
+        # on the request; the smaller body must not be charged for the bytes it
+        # no longer carries.
+        for container_key in ("litellm_metadata", "metadata"):
+            container = request_data.get(container_key)
+            if isinstance(container, dict):
+                container.pop(
+                    _responses_request_module._REPLAY_PAYLOAD_BYTES_METADATA_KEY,
+                    None,
+                )
+    if elided is None and effort_after is None:
+        return False
+    try:
+        setattr(failure, _REQUEST_REPAIRED_ATTR, True)
+    except Exception:
+        pass
+    _trace_module._request_route_trace(
+        "responses_thinking_cut_request_repaired",
+        request_data,
+        before_items=len(items),
+        after_items=len(elided) if elided is not None else len(items),
+        kept_reasoning=_routing_module._replay_reasoning_elision_keep(),
+        effort_before=effort_before,
+        effort_after=effort_after,
+        exception=_routing_module._trace_exception(failure),
+    )
+    return True
+
+
 # One sibling race per turn.  A turn runs the same dispatch through several
 # wrapper layers, and each layer's head race has its own timer; the payload
 # marker suppresses the hedge's own layers but not a *second layer of the same
@@ -5560,7 +5680,8 @@ async def _streaming_error_fallback_response(
     if method_name is None:
         return None
 
-    if getattr(exception, "stream_incomplete", False):
+    request_repaired = getattr(exception, _REQUEST_REPAIRED_ATTR, False)
+    if getattr(exception, "stream_incomplete", False) and not request_repaired:
         # The stream itself consumed this deployment attempt.  It is not an
         # additional same-route retry, so proceed to the next ordered route.
         _routing_module._mark_same_deployment_retry_exhausted(exception)
@@ -5569,6 +5690,7 @@ async def _streaming_error_fallback_response(
             exception,
             request_data,
         )
+        and not request_repaired
         and not _routing_module._should_retry_same_deployment_before_fallback(exception)
         # A refusal about the ciphertext says nothing about the route: the body
         # has just been repaired, and the repaired replay goes back to the same
@@ -7558,6 +7680,17 @@ async def _yield_guarded_original_stream(
         open is hours of thinking nobody can read.
         """
 
+        if _repair_request_after_thinking_only_cut(request_data, failure):
+            # The body, not the route, was the problem: retry the same turn --
+            # and the same order-first route -- with the repaired request.  The
+            # route is not charged and not excluded, and the fallback round
+            # stays on it (the repair already marked the failure).
+            _trace_module._request_route_trace(
+                "responses_cut_after_thinking_only_retried", request_data,
+                exception=_routing_module._trace_exception(failure),
+                request_repaired=True,
+            )
+            return True
         if not _routing_module._claim_thinking_only_cut_retry(request_data):
             return False
         if _routing_module._is_request_scoped_priority_deployment_failover_error(
