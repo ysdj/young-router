@@ -3115,8 +3115,8 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         hooks, proxy_server = load_hook_module()
         streaming = importlib.import_module("young_router.proxy.streaming")
-        streaming._THINKING_CUT_REPAIRED_REQUESTS.clear()
-        self.addCleanup(streaming._THINKING_CUT_REPAIRED_REQUESTS.clear)
+        streaming._REPAIRED_REQUESTS.clear()
+        self.addCleanup(streaming._REPAIRED_REQUESTS.clear)
         calls: list = []
 
         def thinking_then_capped():
@@ -3218,6 +3218,53 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                 {"reasoning": {"effort": "high"}}
             ),
         )
+
+    def test_a_heavy_replay_that_lost_its_connection_repairs_the_request(
+        self,
+    ) -> None:
+        """A body that never got a head is repaired before the hop.
+
+        Live 2026-11-21 02:16 on the gateway: the 9,641-item fork of thread
+        01a1ee60 lost its connection on the order-first route after 97 s with
+        no response head, twice.  The failure is the body's weight, not the
+        route's identity, so the same route deserves the smaller body before a
+        sibling is asked the same question.  An address that never accepted the
+        connection is the opposite case and keeps the hop.
+        """
+
+        load_hook_module()
+        streaming = importlib.import_module("young_router.proxy.streaming")
+        streaming._REPAIRED_REQUESTS.clear()
+        self.addCleanup(streaming._REPAIRED_REQUESTS.clear)
+        request = {
+            "input": [
+                {"type": "reasoning", "id": f"rs-{index}", "summary": []}
+                for index in range(2100)
+            ]
+            + [{"type": "message", "role": "user", "content": "Continue."}],
+            "reasoning": {"effort": "max"},
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-network-repair",
+        }
+
+        self.assertTrue(
+            streaming._should_repair_heavy_replay_request(
+                RuntimeError("connection reset by peer"), request
+            )
+        )
+        self.assertFalse(
+            streaming._should_repair_heavy_replay_request(
+                RuntimeError("Cannot connect to host relay.example:443"), request
+            )
+        )
+        self.assertTrue(
+            streaming._repair_heavy_replay_request(
+                request, RuntimeError("connection reset by peer"), trigger="network"
+            )
+        )
+        self.assertLess(len(request["input"]), 50)
+        self.assertEqual("high", request["reasoning"]["effort"])
 
     async def test_a_cap_after_a_progress_line_still_continues_on_a_sibling(
         self,

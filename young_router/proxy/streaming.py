@@ -4170,64 +4170,95 @@ _REQUEST_REPAIRED_ATTR = "_young_router_request_repaired"
 #: same conversation, and repairing it again would walk the thread's context
 #: down one hop at a time.  Keyed by the turn's identifiers, because the map
 #: and the retry run in copies of the request.
-_THINKING_CUT_REPAIRED_REQUESTS: dict[str, float] = {}
-_THINKING_CUT_REPAIRED_LOCK = threading.Lock()
-_THINKING_CUT_REPAIRED_TTL_SECONDS = 6 * 60 * 60.0
-_THINKING_CUT_REPAIRED_LIMIT = 4096
+_REPAIRED_REQUESTS: dict[str, float] = {}
+_REPAIRED_LOCK = threading.Lock()
+_REPAIRED_TTL_SECONDS = 6 * 60 * 60.0
+_REPAIRED_LIMIT = 4096
 #: Below this many replay items the cut says something about the route, not
 #: about the size of the request; those keep the sibling hop untouched.
-_THINKING_CUT_REPAIR_MIN_ITEMS = 2000
+_REQUEST_REPAIR_MIN_ITEMS = 2000
 
 
-def _claim_thinking_cut_request_repair(request_kwargs: Optional[dict]) -> bool:
+def _claim_request_repair(request_kwargs: Optional[dict]) -> bool:
     """Claim this turn's one request repair."""
 
     names = _routing_module._lease_identifier_candidates(request_kwargs)
     if not names:
         return True
     now = time.time()
-    with _THINKING_CUT_REPAIRED_LOCK:
-        for name, marked_at in list(_THINKING_CUT_REPAIRED_REQUESTS.items()):
-            if now - marked_at > _THINKING_CUT_REPAIRED_TTL_SECONDS:
-                _THINKING_CUT_REPAIRED_REQUESTS.pop(name, None)
-        if any(name in _THINKING_CUT_REPAIRED_REQUESTS for name in names):
+    with _REPAIRED_LOCK:
+        for name, marked_at in list(_REPAIRED_REQUESTS.items()):
+            if now - marked_at > _REPAIRED_TTL_SECONDS:
+                _REPAIRED_REQUESTS.pop(name, None)
+        if any(name in _REPAIRED_REQUESTS for name in names):
             return False
         for name in names:
-            _THINKING_CUT_REPAIRED_REQUESTS[name] = now
-        if len(_THINKING_CUT_REPAIRED_REQUESTS) > _THINKING_CUT_REPAIRED_LIMIT:
+            _REPAIRED_REQUESTS[name] = now
+        if len(_REPAIRED_REQUESTS) > _REPAIRED_LIMIT:
             oldest = sorted(
-                _THINKING_CUT_REPAIRED_REQUESTS.items(),
+                _REPAIRED_REQUESTS.items(),
                 key=lambda item: item[1],
             )
             for name, _marked_at in oldest[
-                : len(_THINKING_CUT_REPAIRED_REQUESTS)
-                - _THINKING_CUT_REPAIRED_LIMIT
+                : len(_REPAIRED_REQUESTS)
+                - _REPAIRED_LIMIT
             ]:
-                _THINKING_CUT_REPAIRED_REQUESTS.pop(name, None)
+                _REPAIRED_REQUESTS.pop(name, None)
         return True
 
 
-def _repair_request_after_thinking_only_cut(
+def _should_repair_heavy_replay_request(
+    exception: Exception,
+    request_data: Optional[dict],
+) -> bool:
+    """Whether this failure is evidence that the body is too heavy.
+
+    A connection that died after the request was sent and a dispatch that
+    spent its whole head budget are both what a relay does with a body it
+    cannot prefill in time.  A host that never accepted the connection is not:
+    a smaller body would not change an unreachable address.
+    """
+
+    if not isinstance(request_data, dict):
+        return False
+    if not _responses_request_module._request_is_responses_api(request_data):
+        return False
+    items = request_data.get("input")
+    if not isinstance(items, list) or len(items) < _REQUEST_REPAIR_MIN_ITEMS:
+        return False
+    if _routing_module._is_upstream_unreachable_error(exception):
+        return False
+    return (
+        _routing_module._is_network_recovery_exception(exception)
+        or _routing_module._is_local_stream_start_timeout_error(exception)
+    )
+
+
+def _repair_heavy_replay_request(
     request_data: Optional[dict],
     failure: Exception,
+    *,
+    trigger: str,
 ) -> bool:
     """Make a heavy replay fit the budget that just cut it.
 
     A relay's ``max_messages`` is a per-response item budget: a long replay plus
     the hardest reasoning tier can spend it all on thinking, and the turn ends
-    without an answer.  The route is not at fault, so the repair is the request:
-    drop the oldest reasoning items (keep the newest few, keep every message
-    and tool call) and step the hardest effort tier down to ``high``.  The same
-    route then gets the same conversation in a shape it can finish.
+    without an answer.  The same weight also shows up as a dispatch that never
+    gets a head before the relay closes the connection.  The route is not at
+    fault, so the repair is the request: drop the oldest reasoning items (keep
+    the newest few, keep every message and tool call) and step the hardest
+    effort tier down to ``high``.  The same route then gets the same conversation
+    in a shape it can finish.
 
-    Only the first cut of a turn repairs, only for a genuinely long replay, and
-    only after thinking (a cut after a tool call or answer text is the caller's
-    stop, not a budget the request can fix).
+    One repair per turn, only for a genuinely long replay, and only after
+    evidence that the body (not the route) was the problem: an item-cap cut
+    after thinking, a connection that died mid-stream, or a dispatch that
+    spent its whole budget without a head.  A cut after a tool call or answer
+    text is the caller's stop, not something a shorter body can fix.
     """
 
     if not isinstance(request_data, dict):
-        return False
-    if not getattr(failure, "item_cap_cut", False):
         return False
     if not _responses_request_module._request_is_responses_api(request_data):
         return False
@@ -4236,9 +4267,9 @@ def _repair_request_after_thinking_only_cut(
     ):
         return False
     items = request_data.get("input")
-    if not isinstance(items, list) or len(items) < _THINKING_CUT_REPAIR_MIN_ITEMS:
+    if not isinstance(items, list) or len(items) < _REQUEST_REPAIR_MIN_ITEMS:
         return False
-    if not _claim_thinking_cut_request_repair(request_data):
+    if not _claim_request_repair(request_data):
         return False
 
     effort_before, effort_after = (
@@ -4268,8 +4299,9 @@ def _repair_request_after_thinking_only_cut(
     except Exception:
         pass
     _trace_module._request_route_trace(
-        "responses_thinking_cut_request_repaired",
+        "responses_heavy_replay_request_repaired",
         request_data,
+        trigger=trigger,
         before_items=len(items),
         after_items=len(elided) if elided is not None else len(items),
         kept_reasoning=_routing_module._replay_reasoning_elision_keep(),
@@ -5680,6 +5712,13 @@ async def _streaming_error_fallback_response(
     if method_name is None:
         return None
 
+    if not getattr(exception, _REQUEST_REPAIRED_ATTR, False) and _should_repair_heavy_replay_request(
+        exception, request_data
+    ):
+        # The same heavy body that spent an item budget on thinking can also
+        # lose the connection before it produces a head.  Repair the request
+        # and give the same route the smaller body before moving on.
+        _repair_heavy_replay_request(request_data, exception, trigger="network")
     request_repaired = getattr(exception, _REQUEST_REPAIRED_ATTR, False)
     if getattr(exception, "stream_incomplete", False) and not request_repaired:
         # The stream itself consumed this deployment attempt.  It is not an
@@ -7680,7 +7719,9 @@ async def _yield_guarded_original_stream(
         open is hours of thinking nobody can read.
         """
 
-        if _repair_request_after_thinking_only_cut(request_data, failure):
+        if getattr(failure, "item_cap_cut", False) and _repair_heavy_replay_request(
+            request_data, failure, trigger="item_cap"
+        ):
             # The body, not the route, was the problem: retry the same turn --
             # and the same order-first route -- with the repaired request.  The
             # route is not charged and not excluded, and the fallback round
