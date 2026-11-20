@@ -914,7 +914,6 @@ def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
         _STREAM_START_TIMEOUT_METADATA_KEY,
         _XHIGH_REASONING_COMPAT_RETRY_METADATA_KEY,
         "codex_descendant_cleanup",
-        "codex_progress_barrier",
         "codex_compaction_optimized",
         "codex_compaction_max_output_tokens",
         "external_web_search_synthesis",

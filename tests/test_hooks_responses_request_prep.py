@@ -594,19 +594,17 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 }
             )
 
-        modified = contract.with_progress_message_contract(request)
+        with self.assertLogs("young_router.route_trace", level="WARNING") as logs:
+            modified = contract.with_progress_message_contract(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
         self.assertEqual(modified["tool_choice"], "required")
-        self.assertEqual(
-            modified["litellm_metadata"]["codex_progress_barrier"],
-            {
-                "trailing_progress_messages": 2,
-                "tool_choice": "required",
-                "thinking": True,
-            },
-        )
+        # The summary is taken before the deployment pre-call hook, so only an
+        # event can say an injected ``required`` came from here.
+        self.assertIn("codex_progress_barrier", logs.output[0])
+        self.assertIn("\"trailing_progress_messages\": 2", logs.output[0])
+        self.assertIn('"thinking": true', logs.output[0])
 
     def test_codex_progress_contract_counts_only_the_tail_after_a_call(self) -> None:
         """A call between two progress messages is work, not the loop."""

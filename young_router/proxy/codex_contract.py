@@ -62,11 +62,6 @@ _CODEX_COMMENTARY_DISCIPLINE_ENV = "YOUNG_ROUTER_CODEX_COMMENTARY_DISCIPLINE"
 #: Codex turn spent an hour and forty-two minutes emitting them).
 _CODEX_PROGRESS_LOOP_MESSAGES = 2
 
-#: Where the barrier states itself.  A request trace that shows the count and
-#: the choice is how the next investigation tells an injected ``required``
-#: from a client's own choice without reading the upstream body.
-_PROGRESS_BARRIER_METADATA_KEY = "codex_progress_barrier"
-
 # A call whose arguments name a tool the request never declared is answered
 # with this code so the turn ends as a stated protocol fact.
 UNDECLARED_TOOL_CODE = "young_router_undeclared_tool"
@@ -251,22 +246,20 @@ def with_progress_message_contract(
 
     modified_kwargs = request_kwargs.copy()
     modified_kwargs["tool_choice"] = "required"
-    metadata = (
-        _request_context_module._request_metadata_dict(
-            request_kwargs,
-            "litellm_metadata",
-        )
-        or {}
+    # The request summary is taken before the deployment pre-call hook runs, so
+    # a metadata flag written here would never appear in a trace.  The event is
+    # what makes an injected ``required`` tell itself apart from a client's own
+    # choice later.  Imported here because ``trace`` imports the callers of
+    # this module at import time.
+    from . import trace as _trace_module
+
+    _trace_module._request_route_trace(
+        "codex_progress_barrier",
+        request_kwargs,
+        trailing_progress_messages=trailing_progress,
+        thinking=thinking,
+        forced_tool_choice="required",
     )
-    barrier_metadata = {
-        "trailing_progress_messages": trailing_progress,
-        "tool_choice": "required",
-        "thinking": thinking,
-    }
-    if metadata.get(_PROGRESS_BARRIER_METADATA_KEY) != barrier_metadata:
-        next_metadata = metadata.copy()
-        next_metadata[_PROGRESS_BARRIER_METADATA_KEY] = barrier_metadata
-        modified_kwargs["litellm_metadata"] = next_metadata
     return modified_kwargs
 
 
