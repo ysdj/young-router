@@ -3225,6 +3225,7 @@ def _responses_incomplete_stream_exception(
     *,
     buffer: Optional[List[Any]] = None,
     request_data: Optional[dict] = None,
+    delivered_output: Optional[bool] = None,
 ) -> Exception:
     terminal_chunk = buffer[-1] if buffer else None
     terminal_summary = _responses_incomplete_terminal_summary(terminal_chunk)
@@ -3242,7 +3243,18 @@ def _responses_incomplete_stream_exception(
     try:
         terminal_reason = str(terminal_summary.get("reason") or "")
         if terminal_reason in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
-            if _incomplete_terminal_capped_generated_output(buffer, request_data):
+            # The caller that watched the whole stream knows whether anything
+            # reached the reader; the buffer it can hand over is often only the
+            # tail.  Live 2026-11-20 11:34: a hop whose buffer held just the
+            # terminal was read as a refused replay, wrote stage 3 on the
+            # thread, and every later turn was cut to 422 items with no
+            # reasoning -- the model then re-derived the same work for hours.
+            capped_generated = (
+                delivered_output
+                if delivered_output is not None
+                else _incomplete_terminal_capped_generated_output(buffer, request_data)
+            )
+            if capped_generated:
                 # The cap was on what this response generated.  Saying so keeps
                 # it out of the thread's ladder -- and keeps the two stops
                 # distinguishable for whoever reads the trace.
@@ -7583,6 +7595,7 @@ async def _yield_guarded_original_stream(
                         "terminal response event before response.completed",
                         buffer=event_tail,
                         request_data=request_data,
+                        delivered_output=True,
                     )
                     _mark_generated_output_item_cap(failure, chunk, delivered=True)
                     if item_cap_leaves_the_turn_unanswered(chunk) and (
@@ -8267,6 +8280,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         "terminal response event before response.completed",
                         buffer=buffer,
                         request_data=request_data,
+                        delivered_output=bool(saw_visible_output or saw_delivered_output),
                     )
                     _mark_generated_output_item_cap(
                         incomplete_exception,

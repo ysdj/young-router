@@ -5727,6 +5727,40 @@ def _remember_replay_too_large(request_kwargs: Optional[dict]) -> None:
                 _REPLAY_TOO_LARGE_SESSIONS.pop(name, None)
     _publish_replay_shortening(key, now, stage)
 
+def _forget_replay_too_large(request_kwargs: Optional[dict]) -> None:
+    """Drop this thread's replay-shortening mark after a turn that succeeded.
+
+    A stage is only evidence about the request that earned it: once the thread
+    has answered with the shorter history, the next turn must try the full one
+    again.  Leaving the mark in place is what kept a thread at the last stage
+    forever -- every later request was cut to 700 items with no reasoning left,
+    so the model re-derived work it had already done (live 2026-11-20, thread
+    ``01a1ee60``: 8,183 items became 449, ``kept_reasoning: 0``, on every turn
+    for hours).
+    """
+
+    key = _replay_session_key(request_kwargs)
+    if key is None:
+        return
+    with _REPLAY_TOO_LARGE_SESSIONS_LOCK:
+        _REPLAY_TOO_LARGE_SESSIONS.pop(key, None)
+    path = _state_module._replay_shortening_file_path()
+    if not path:
+        return
+
+    def update(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        entries = payload.get(_REPLAY_SHORTENING_STATE_KEY)
+        if isinstance(entries, dict):
+            entries.pop(key, None)
+
+    try:
+        _state_module._locked_json_state_update(path, update)
+    except Exception:
+        pass
+
+
 def _session_replay_shortening(
     request_kwargs: Optional[dict],
 ) -> Optional[tuple[int, Optional[int]]]:
@@ -9315,6 +9349,10 @@ def _record_deployment_success_for_cooldown(request_kwargs: Optional[dict]) -> N
     _release_request_concurrency_slots(request_kwargs)
     _record_session_deployment_affinity(request_kwargs)
     _trace_deployment_success(request_kwargs)
+    if _request_replay_reasoning_elided(request_kwargs):
+        # The shortened history answered, so it is no longer evidence that this
+        # thread is too large: the next turn tries the whole replay again.
+        _forget_replay_too_large(request_kwargs)
     cooldown_keys = _deployment_cooldown_keys_from_request(request_kwargs)
     if not cooldown_keys:
         return

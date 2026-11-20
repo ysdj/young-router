@@ -5255,6 +5255,55 @@ class ReplayLadderTests(HookTestCase):
         self.assertFalse(hooks._is_upstream_input_item_limit_error(exception))
         self.assertIsNone(hooks._session_replay_shortening(request))
 
+    def test_a_cap_that_followed_output_never_marks_the_thread(self) -> None:
+        """A hop's buffer is a tail, not evidence: delivered output is.
+
+        Live 2026-11-20 11:34: the hop's exception was built from a buffer that
+        held only the terminal, so a cap that had streamed thinking for three
+        minutes was read as a refused replay and wrote stage 3 on the thread --
+        every later turn was cut to 422 items with ``kept_reasoning: 0`` and the
+        model re-derived the same work for hours.
+        """
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-cap-after-output")
+        exception = hooks._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_1"}],
+                    },
+                },
+            ],
+            request_data=request,
+            delivered_output=True,
+        )
+
+        self.assertFalse(hooks._is_upstream_input_item_limit_error(exception))
+        self.assertIsNone(hooks._session_replay_shortening(request))
+
+    def test_a_turn_that_answers_with_a_shortened_replay_forgets_the_mark(
+        self,
+    ) -> None:
+        """A stage is evidence about one request, not a permanent sentence."""
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-shortened-then-answered")
+        hooks._remember_replay_too_large(request)
+        self.assertIsNotNone(hooks._session_replay_shortening(request))
+
+        request["litellm_call_id"] = "call-shortened-then-answered"
+        hooks._mark_request_replay_reasoning_elided(request)
+        self.assertTrue(hooks._request_replay_reasoning_elided(request))
+        hooks._record_deployment_success_for_cooldown(request)
+
+        self.assertIsNone(hooks._session_replay_shortening(request))
+
     def test_a_cap_before_anything_was_delivered_still_marks_the_thread(self) -> None:
         """A refusal that arrives before the response starts is about the replay."""
 
