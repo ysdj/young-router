@@ -3123,6 +3123,42 @@ class HookHeadHedgeTests(HookTestCase):
         self.assertEqual(1, len(dispatched))
         self.assertIn("primary-response", results)
 
+    async def test_the_winner_marks_the_losing_hedge_before_it_cancels(self) -> None:
+        """Only the race's own cancellation may be read as a lost hedge.
+
+        The cancellation path settles the hedge's log row as "another route
+        answered first" -- but a cancellation because the client left or the
+        process stopped must keep the ending that path owns.  The winner marks
+        the task it cancels; nothing else sets that mark.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        streaming._HEAD_HEDGED_REQUESTS.clear()
+        self.addCleanup(streaming._HEAD_HEDGED_REQUESTS.clear)
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        request = self._chat_request()
+        hedge_tasks: list = []
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            hedge_tasks.append(asyncio.current_task())
+            await asyncio.sleep(10)
+
+        async def primary():
+            await asyncio.sleep(0.05)
+            return "primary-response"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await streaming._await_upstream_dispatch_with_head_hedge(
+                primary(), request
+            )
+
+        self.assertEqual("primary-response", response)
+        self.assertEqual(1, len(hedge_tasks))
+        self.assertTrue(
+            getattr(hedge_tasks[0], "_young_router_hedge_lost", False)
+        )
+
     async def test_a_hedge_does_not_hedge_again_when_the_router_drops_the_marker(
         self,
     ) -> None:
