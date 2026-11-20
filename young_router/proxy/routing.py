@@ -5758,6 +5758,37 @@ def _mark_request_replay_reasoning_elided(request_kwargs: Optional[dict]) -> Non
             _REASONING_ELIDED_REQUESTS[name] = now
 
 
+# One turn earns one more route after a route cut it while it was still only
+# thinking.  Both relay spellings -- ``response.incomplete`` + ``max_messages``
+# after the summary, and a body closed with no terminal at all -- arrive with no
+# answer text, so the sibling can re-derive the thinking; that is a far cheaper
+# answer than the reconnect Codex would otherwise do (live 2026-11-20 thread
+# 01a1ee60 reconnected on these every few turns).  The limit is one hop: the
+# same bytes reaching the same cap twice is a stop the reader is owed, and the
+# recovery window this would otherwise open is four hours of thinking nobody
+# can read.
+_THINKING_ONLY_CUT_RETRY_REQUESTS: dict[str, float] = {}
+_THINKING_ONLY_CUT_RETRY_LOCK = threading.Lock()
+
+
+def _claim_thinking_only_cut_retry(request_kwargs: Optional[dict]) -> bool:
+    """Claim this turn's one internal retry after a thinking-only cut."""
+
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return False
+    now = time.time()
+    with _THINKING_ONLY_CUT_RETRY_LOCK:
+        for name, marked_at in list(_THINKING_ONLY_CUT_RETRY_REQUESTS.items()):
+            if now - marked_at > _TERMINAL_FAILURE_REQUEST_TTL_SECONDS:
+                _THINKING_ONLY_CUT_RETRY_REQUESTS.pop(name, None)
+        if any(name in _THINKING_ONLY_CUT_RETRY_REQUESTS for name in names):
+            return False
+        for name in names:
+            _THINKING_ONLY_CUT_RETRY_REQUESTS[name] = now
+        return True
+
+
 def _mark_terminal_failure_for_request(
     request_kwargs: Optional[dict],
     exception: Optional[BaseException],

@@ -6,6 +6,8 @@ import importlib
 
 import re
 
+from unittest import mock
+
 
 class HookStreamingResponseEventTests(HookTestCase):
 
@@ -3014,6 +3016,163 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             request_data=responses_request,
         )
         self.assertFalse(hooks._is_upstream_incomplete_terminal_error(named))
+
+    async def test_a_cut_that_only_delivered_thinking_is_retried_inside_the_turn(self) -> None:
+        """The reader keeps the connection; a sibling route re-derives the thinking.
+
+        Live 2026-11-20 thread 01a1ee60: both relays ended long thinking turns
+        with ``response.incomplete`` + ``max_messages`` after the summary had
+        been streamed, and each of those became a ``response.failed`` -- which
+        Codex reads as a transport failure and retries as ``正在重新连接 1/5``.
+        Nothing of the answer existed yet, so the turn can be reopened on
+        another route instead of being handed back to the reader.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        routing = importlib.import_module("young_router.proxy.routing")
+        routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
+        self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
+        calls: list = []
+
+        def thinking_then_capped():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cut"}}
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "weighing the two explanations",
+                }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cut",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_1"}],
+                    },
+                }
+
+            return stream()
+
+        def answered():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return answered()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-thinking-only-cut",
+            "client_metadata": {"thread_id": "thread-thinking-only-cut"},
+            "model_info": {
+                "id": "order-0",
+                "order": 0,
+                "route_key": "provider / default-chat / key=primary",
+            },
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=thinking_then_capped(),
+                request_data=request_data,
+            )
+        ]
+        types = [chunk.get("type") for chunk in chunks]
+
+        self.assertEqual(1, len(calls))
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertNotIn("response.failed", types)
+
+    async def test_a_second_cut_in_the_same_turn_ends_it(self) -> None:
+        """One hop is the whole allowance; the second cut is the reader's.
+
+        The same body reaching the same cap on two routes is a verdict, not a
+        reason to keep the client's connection open: the recovery window this
+        would otherwise enter is measured in hours.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        routing = importlib.import_module("young_router.proxy.routing")
+        routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
+        self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
+        calls: list = []
+
+        def thinking_then_capped():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cut"}}
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "still weighing them",
+                }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cut",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_1"}],
+                    },
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                raise AssertionError("a second cut must not start another stream")
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-thinking-only-cut-twice",
+            "client_metadata": {"thread_id": "thread-thinking-only-cut-twice"},
+            "model_info": {
+                "id": "order-1",
+                "order": 1,
+                "route_key": "provider / default-chat / key=secondary",
+            },
+        }
+        # The turn already spent its one hop on an earlier attempt.
+        with mock.patch.object(
+            routing, "_claim_thinking_only_cut_retry", return_value=False
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=None,
+                    response=thinking_then_capped(),
+                    request_data=request_data,
+                )
+            ]
+        types = [chunk.get("type") for chunk in chunks]
+
+        # The reader is told the turn ended; no second answer is invented, and
+        # at most the one-shot fallback round a failure terminal already earns.
+        self.assertIn("response.failed", types)
+        self.assertNotIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertLessEqual(len(calls), 1)
 
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.

@@ -6982,6 +6982,35 @@ async def _yield_guarded_original_stream(
     # and every request in that window fell to a relay seven times slower.
     empty_completion_ended_stream = False
 
+    def reopen_the_turn_after_a_thinking_only_cut(failure: Exception) -> bool:
+        """Ask the route machinery for one more route instead of the reader.
+
+        Only thinking has reached the client: answer text and tool calls cannot
+        be sent twice, thinking can be derived again, and a sibling route is a
+        far cheaper answer than the reconnect Codex does when this terminal
+        reaches it (``stream disconnected before completion``, ``1/5``).  The
+        route is parked first so the hop that follows picks a different one.
+        This is offered to a turn once -- the same body reaching the same cap
+        twice is a stop the reader is owed, and the window this would otherwise
+        open is hours of thinking nobody can read.
+        """
+
+        if not _routing_module._claim_thinking_only_cut_retry(request_data):
+            return False
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            failure,
+            request_data,
+        ):
+            _routing_module._mark_exception_for_deployment_failover(
+                failure,
+                request_data,
+            )
+        _trace_module._request_route_trace(
+            "responses_cut_after_thinking_only_retried", request_data,
+            exception=_routing_module._trace_exception(failure),
+        )
+        return True
+
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
         failure = exception or _responses_incomplete_stream_exception(
             reason,
@@ -7175,7 +7204,20 @@ async def _yield_guarded_original_stream(
                     await _close_async_iterator_safely(response)
                     return
             if visible_output_seen:
-                yield failed_terminal_event("terminal response event before response.completed")
+                failure = _responses_incomplete_stream_exception(
+                    "terminal response event before response.completed",
+                    buffer=event_tail,
+                    request_data=request_data,
+                )
+                if (
+                    not answer_output_seen
+                    and reopen_the_turn_after_a_thinking_only_cut(failure)
+                ):
+                    raise failure
+                yield failed_terminal_event(
+                    "terminal response event before response.completed",
+                    failure,
+                )
                 await _close_async_iterator_safely(response)
                 return
             raise _responses_incomplete_stream_exception(
@@ -7523,6 +7565,11 @@ async def _yield_guarded_original_stream(
                 yield _synthesized_failed_response_event(request_data, incomplete_exception)
                 await _close_async_iterator_safely(response)
                 return
+            if (
+                not answer_output_seen
+                and reopen_the_turn_after_a_thinking_only_cut(incomplete_exception)
+            ):
+                raise incomplete_exception
             if synthesize_completed_on_clean_eof_after_visible_output:
                 terminal_items = terminal_completed_output_items()
                 synthetic_completed = _synthesized_completed_response_event(
