@@ -1929,6 +1929,55 @@ def _synthesized_completed_response_event(
         completed_event["model"] = model
     return _json_stream_event(completed_event)
 
+def _synthesized_incomplete_response_event(
+    created_response: Optional[dict[str, Any]],
+    model: Optional[str],
+    *,
+    terminal: Any,
+    output_items: Optional[dict[int, dict[str, Any]]] = None,
+) -> _JSONStreamEvent:
+    """Hand the client the outcome the route itself stated.
+
+    Codex's Responses reader maps ``response.incomplete`` to
+    ``ApiError::ResponseIncomplete`` and ``is_terminal_sampling_outcome`` keeps
+    it out of the retry loop: the turn ends, the partial output stays, and the
+    bytes are not sent again.  Every unrecognised ``response.failed`` code is
+    the opposite -- retried as a transport failure.  Turning a route's own
+    ``response.incomplete`` into a failure is what made every capped turn read
+    as ``正在重新连接 1/5`` (live 2026-11-20, thread ``01a1ee60``).
+    """
+
+    dumped = _stream_chunk_dump(terminal)
+    upstream_response = dumped.get("response") if isinstance(dumped, dict) else None
+    upstream_response = (
+        upstream_response if isinstance(upstream_response, dict) else {}
+    )
+    response = (
+        copy.deepcopy(created_response) if isinstance(created_response, dict) else {}
+    )
+    response.setdefault("id", upstream_response.get("id") or "resp_synthesized")
+    response.setdefault("object", "response")
+    if model and not response.get("model"):
+        response["model"] = model
+    response["status"] = "incomplete"
+    details = upstream_response.get("incomplete_details")
+    if not isinstance(details, dict) or not details.get("reason"):
+        details = {
+            "reason": _responses_incomplete_terminal_reason(dumped) or "incomplete"
+        }
+    response["incomplete_details"] = details
+    # The spend is real and the client records it from this frame.
+    usage = upstream_response.get("usage")
+    if isinstance(usage, dict):
+        response["usage"] = usage
+    if output_items:
+        response["output"] = [
+            item for _index, item in sorted(output_items.items(), key=lambda entry: entry[0])
+        ]
+    else:
+        response.setdefault("output", [])
+    return _json_stream_event({"type": "response.incomplete", "response": response})
+
 def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
@@ -7011,6 +7060,49 @@ async def _yield_guarded_original_stream(
         )
         return True
 
+    def stated_incomplete_terminal_event(
+        chunk: Any,
+        failure: Exception,
+    ) -> Optional[_JSONStreamEvent]:
+        """The route's own ``response.incomplete``, as the outcome it is.
+
+        Codex's Responses reader maps an incomplete response to a terminal
+        sampling outcome -- it records the spend, keeps what it already
+        rendered and does not re-send the bytes -- while a failure with a code
+        it does not know is retried as transport.  Handing it a failure instead
+        is what made every capped turn read as ``正在重新连接 1/5`` and replay
+        the same history (live 2026-11-20, thread ``01a1ee60``).
+        """
+
+        if _stream_chunk_type(_stream_chunk_dump(chunk)) != "response.incomplete":
+            return None
+        if pending_tool_items:
+            # A half-written tool call is not an outcome: the work it stands for
+            # never started, so this turn has to be resent instead of accepted
+            # as a partial answer.
+            return None
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            failure,
+            request_data,
+        ):
+            _routing_module._mark_exception_for_deployment_failover(
+                failure,
+                request_data,
+            )
+        _trace_module._request_route_trace(
+            "responses_upstream_incomplete_delivered",
+            request_data,
+            reason=_responses_incomplete_terminal_reason(chunk),
+            exception=_routing_module._trace_exception(failure),
+            already_yielded_visible_output=True,
+        )
+        return _synthesized_incomplete_response_event(
+            completion_state.created_response,
+            completion_state.model,
+            terminal=chunk,
+            output_items=completed_output_items,
+        )
+
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
         failure = exception or _responses_incomplete_stream_exception(
             reason,
@@ -7214,6 +7306,11 @@ async def _yield_guarded_original_stream(
                     and reopen_the_turn_after_a_thinking_only_cut(failure)
                 ):
                     raise failure
+                stated_outcome = stated_incomplete_terminal_event(chunk, failure)
+                if stated_outcome is not None:
+                    yield stated_outcome
+                    await _close_async_iterator_safely(response)
+                    return
                 yield failed_terminal_event(
                     "terminal response event before response.completed",
                     failure,
@@ -7423,7 +7520,20 @@ async def _yield_guarded_original_stream(
                         await _close_async_iterator_safely(response)
                         return
                 if visible_output_seen:
-                    yield failed_terminal_event("terminal response event before response.completed")
+                    failure = _responses_incomplete_stream_exception(
+                        "terminal response event before response.completed",
+                        buffer=event_tail,
+                        request_data=request_data,
+                    )
+                    stated_outcome = stated_incomplete_terminal_event(chunk, failure)
+                    if stated_outcome is not None:
+                        yield stated_outcome
+                        await _close_async_iterator_safely(response)
+                        return
+                    yield failed_terminal_event(
+                        "terminal response event before response.completed",
+                        failure,
+                    )
                     await _close_async_iterator_safely(response)
                     return
                 raise _responses_incomplete_stream_exception(

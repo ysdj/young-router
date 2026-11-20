@@ -3174,6 +3174,70 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertNotIn("the answer", [chunk.get("delta") for chunk in chunks])
         self.assertLessEqual(len(calls), 1)
 
+    async def test_a_route_that_states_incomplete_is_not_reported_as_a_failure(self) -> None:
+        """Codex ends the turn on ``response.incomplete``; it reconnects on our failures.
+
+        The relay's own terminal is the truth about this response.  Codex maps
+        ``response.incomplete`` to a terminal sampling outcome (no retry, spend
+        recorded), while any ``response.failed`` code it does not know is
+        retried as transport -- which is why a capped turn read as
+        ``正在重新连接 1/5`` and replayed the same history (2026-11-20, thread
+        01a1ee60).
+        """
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("a stated outcome must not dispatch another route")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def incomplete_stream():
+            yield {"type": "response.created", "response": {"id": "resp-cap"}}
+            yield {"type": "response.output_text.delta", "delta": "working on it"}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-cap",
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+                    "output": [{"type": "reasoning", "id": "rs_1", "status": "incomplete"}],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "client_metadata": {"thread_id": "thread-stated-incomplete"},
+            "litellm_call_id": "call-stated-incomplete",
+            "model_info": {"id": "order-2", "order": 2},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=incomplete_stream(),
+                request_data=request_data,
+            )
+        ]
+        types = [chunk.get("type") for chunk in chunks]
+
+        self.assertNotIn("response.failed", types)
+        self.assertEqual("response.incomplete", types[-1])
+        terminal = chunks[-1]["response"]
+        self.assertEqual("incomplete", terminal["status"])
+        self.assertEqual({"reason": "max_messages"}, terminal["incomplete_details"])
+        # The spend is real and the client records it from this frame.
+        self.assertEqual(11, terminal["usage"]["input_tokens"])
+        self.assertEqual(7, terminal["usage"]["output_tokens"])
+        self.assertEqual(18, terminal["usage"]["total_tokens"])
+
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.
 
