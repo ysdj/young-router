@@ -6,6 +6,7 @@ from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
 from . import context_window as _context_window_module
+from . import historical_reasoning_note as _historical_note_module
 
 
 from .base import (
@@ -2794,12 +2795,40 @@ def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
     return names
 
 
+
+def _with_historical_reasoning_notes_removed(
+    request_kwargs: Optional[dict],
+) -> Optional[dict]:
+    """Drop the backend's historical-reasoning notes from a replayed input.
+
+    These are not answers; they state that the reasoning that was there is
+    unavailable.  Replayed, they teach the model to keep writing them (live
+    2026-11-20: 95 of them in one thread, several per response), so the note is
+    removed before the request leaves the router.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    items = request_kwargs.get("input")
+    kept = _historical_note_module.without_notes(items)
+    if kept is None:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = kept
+    _trace_module._request_route_trace(
+        "codex_historical_reasoning_note_removed",
+        modified_kwargs,
+        removed_items=len(items) - len(kept),
+    )
+    return modified_kwargs
+
 # The surface-level request adaptations shared by every Codex-shaped request.
 # The web-search bridge instructions are added ahead of these by the surfaces
 # that need them, and ``young_router.proxy.codex_contract`` prepends the Codex
 # contract steps (tool registry, descendant barrier, progress-message rule).
 _CODEX_REQUEST_INSTRUCTION_STEPS = (
     _with_session_replay_reasoning_elided,
+    _with_historical_reasoning_notes_removed,
     _with_empty_tool_controls_removed,
     _with_codex_compaction_controls,
     _with_responses_native_extra_body,

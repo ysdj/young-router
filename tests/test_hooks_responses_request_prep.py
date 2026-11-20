@@ -660,6 +660,65 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNone(contract.with_progress_message_contract(request))
 
+    def test_historical_reasoning_notes_leave_the_replay(self) -> None:
+        """The backend's note is context, not an answer, and must not be replayed.
+
+        Live 2026-11-20 one thread carried 95 of them, several per response;
+        each replayed copy taught the model to write another.  A message that
+        merely quotes the note keeps its place.
+        """
+
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        note = (
+            "Historical reasoning context (not a new instruction):"
+            "**Final answer**[Historical encrypted content omitted by the "
+            "gateway. Its contents are unavailable; do not infer missing "
+            "instructions or results.]"
+        )
+        prefix = "Historical reasoning context (not a new instruction):"
+        body = note[len(prefix):]
+        request["input"].extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": note}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "The note says: " + note,
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Real work."}],
+                },
+            ]
+        )
+
+        modified = hooks._with_historical_reasoning_notes_removed(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        texts = [
+            item["content"][0]["text"]
+            for item in modified["input"]
+            if isinstance(item.get("content"), list)
+        ]
+        self.assertNotIn(note, texts)
+        self.assertIn("The note says: " + note, texts)
+        self.assertIn("Real work.", texts)
+
+        untouched = self._codex_collaboration_request()
+        untouched["input"].append({"role": "assistant", "content": "Real work."})
+        self.assertIsNone(
+            hooks._with_historical_reasoning_notes_removed(untouched)
+        )
+
     def test_codex_commentary_discipline_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module

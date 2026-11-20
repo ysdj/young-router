@@ -16,6 +16,7 @@ from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
+from . import historical_reasoning_note as _historical_note_module
 from . import responses_tools as _responses_tools_module
 from . import web_search_native as _web_search_native_module
 from . import routing as _routing_module
@@ -1720,7 +1721,9 @@ def _remember_stream_output_item_ids(
             _pop_pending_tool_item_for_item(pending_tool_items, item)
     if completed_output_items is not None:
         json_item = _jsonable(item)
-        if isinstance(json_item, dict):
+        if isinstance(json_item, dict) and not _historical_note_module.is_note_item(
+            json_item
+        ):
             completed_output_items[output_index] = json_item
 
 def _remember_completed_response_output_items(
@@ -1732,6 +1735,8 @@ def _remember_completed_response_output_items(
     for output_index, item in _completed_response_output_items(chunk):
         json_item = _jsonable(item)
         if not isinstance(json_item, dict):
+            continue
+        if _historical_note_module.is_note_item(json_item):
             continue
         item_type = _web_search_native_module._response_item_get(
             json_item,
@@ -5637,6 +5642,12 @@ class _ResponsesStreamCompletionState:
         self._identity_aliases: dict[str, set[str]] = {}
         self.synthetic_text = ""
         self.synthetic_done_text: Optional[str] = None
+        # The backend's historical-reasoning note is context, not an answer.
+        # A note that streams through here is dropped before delivery, and an
+        # input replay of one is removed by the request step, so neither the
+        # client nor the next request keeps a copy to imitate.
+        self.suppressed_note_item_ids: set[str] = set()
+        self.note_text_by_item_id: dict[str, str] = {}
         self.model = (
             request_data.get("model")
             if isinstance((request_data or {}).get("model"), str)
@@ -5677,8 +5688,25 @@ class _ResponsesStreamCompletionState:
             if isinstance(response, dict):
                 self.completed_response = copy.deepcopy(response)
 
+        if chunk_type == "response.output_text.delta":
+            note_item_id = dumped.get("item_id") or dumped.get("id")
+            delta = dumped.get("delta")
+            if isinstance(note_item_id, str) and isinstance(delta, str):
+                candidate = self.note_text_by_item_id.get(note_item_id, "") + delta
+                self.note_text_by_item_id[note_item_id] = candidate
+                if _historical_note_module.is_note_text(candidate) or candidate.startswith(
+                    _historical_note_module.NOTE_PREFIX
+                ):
+                    self.suppressed_note_item_ids.add(note_item_id)
+        elif chunk_type == "response.output_item.done":
+            done_item = dumped.get("item")
+            if _historical_note_module.is_note_item(done_item):
+                note_item_id = _stream_output_item_key(done_item)
+                if note_item_id:
+                    self.suppressed_note_item_ids.add(note_item_id)
+
         text_fragment, is_done_text = _stream_chunk_text_fragment(dumped)
-        if text_fragment:
+        if text_fragment and not self._is_suppressed_note_chunk(dumped):
             if is_done_text:
                 self.synthetic_done_text = text_fragment
             else:
@@ -5881,6 +5909,45 @@ class _ResponsesStreamCompletionState:
                 response["output_text"] = text
         return _completed_response_payload(response, request_data)
 
+    def _is_suppressed_note_chunk(self, dumped: Any) -> bool:
+        if not isinstance(dumped, dict):
+            return False
+        chunk_type = _stream_chunk_type(dumped)
+        item_id = dumped.get("item_id") or dumped.get("id")
+        if isinstance(item_id, str) and item_id in self.suppressed_note_item_ids:
+            return True
+        if chunk_type == "response.output_text.done":
+            return _historical_note_module.is_note_text(dumped.get("text"))
+        if chunk_type == "response.output_item.done":
+            return _historical_note_module.is_note_item(dumped.get("item"))
+        return False
+
+    def suppresses(self, chunk: Any) -> bool:
+        """Whether this frame belongs to a note the client must not record."""
+
+        return self._is_suppressed_note_chunk(_stream_chunk_dump(chunk))
+
+    def _drop_note_output_items(self, response: Any) -> bool:
+        if not isinstance(response, dict):
+            return False
+        output = response.get("output")
+        if not isinstance(output, list):
+            return False
+        filtered = [
+            item for item in output if not _historical_note_module.is_note_item(item)
+        ]
+        if len(filtered) == len(output):
+            return False
+        if not filtered:
+            # A response that is *only* the note must still arrive: dropping
+            # every item leaves the client a completion with no output, which
+            # it reads as a failed turn and reconnects over.  The request step
+            # keeps the replay clean; this frame is the one case where the
+            # note is all the model produced.
+            return False
+        response["output"] = filtered
+        return True
+
     def chunk_for_delivery(
         self,
         chunk: Any,
@@ -5934,8 +6001,11 @@ class _ResponsesStreamCompletionState:
                     item for item in response_output if isinstance(item, dict)
                 )
             if not any(item.get("type") == "function_call" for item in known_output):
+                if self._drop_note_output_items(response):
+                    return _JSONStreamEvent(dumped)
                 return chunk
             dumped["response"] = self.completed_payload(request_data)
+            self._drop_note_output_items(dumped.get("response"))
             return _JSONStreamEvent(dumped)
 
         return chunk
@@ -6657,6 +6727,8 @@ async def _yield_guarded_original_stream(
         )
 
     def deliver_client_chunk(chunk: Any) -> Any:
+        if completion_state.suppresses(chunk):
+            return None
         return _responses_stream_chunk_for_delivery(
             completion_state.chunk_for_delivery(chunk, request_data),
             request_data,

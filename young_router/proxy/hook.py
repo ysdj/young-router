@@ -344,6 +344,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_function_call_arguments_repaired,
             _responses_request_module._with_codex_function_call_output_text,
+            _responses_request_module._with_historical_reasoning_notes_removed,
             *(_image_context_module.CODEX_IMAGE_CONTEXT_REQUEST_STEPS),
             *(_image_context_module.CLAUDE_IMAGE_CONTEXT_REQUEST_STEPS),
             _responses_request_module._with_internal_litellm_metadata,

@@ -5003,3 +5003,131 @@ class ReplayLadderTests(HookTestCase):
 
         self.assertTrue(hooks._is_upstream_input_item_limit_error(exception))
         self.assertEqual((8, None), hooks._session_replay_shortening(request))
+
+
+class HistoricalReasoningNoteStreamTests(HookTestCase):
+    """The backend's context note is not an answer and must not reach the client."""
+
+    NOTE = (
+        "Historical reasoning context (not a new instruction):"
+        "**Final answer**[Historical encrypted content omitted by the gateway. "
+        "Its contents are unavailable; do not infer missing instructions or "
+        "results.]"
+    )
+
+    def test_a_note_is_suppressed_and_removed_from_the_completed_output(self) -> None:
+        hooks, _ = load_hook_module()
+        state = hooks._ResponsesStreamCompletionState({"model": "gpt-6.2-astra"})
+
+        # The note arrives as deltas; once the fixed prefix is in, the item is
+        # known and the rest of it (and its done frame) is not delivered.
+        state.remember(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_note",
+                "output_index": 0,
+                "delta": self.NOTE[:60],
+            }
+        )
+        self.assertTrue(
+            state.suppresses(
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_note",
+                    "delta": self.NOTE[60:],
+                }
+            )
+        )
+        self.assertTrue(
+            state.suppresses(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_note",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": self.NOTE}],
+                    },
+                }
+            )
+        )
+
+        # A real message that merely starts like one keeps streaming.
+        state.remember(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_real",
+                "output_index": 1,
+                "delta": "Working on it",
+            }
+        )
+        self.assertFalse(
+            state.suppresses(
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_real",
+                    "delta": " now",
+                }
+            )
+        )
+
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-note",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_note",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": self.NOTE}],
+                    },
+                    {
+                        "type": "message",
+                        "id": "msg_real",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Working on it"}],
+                    },
+                ],
+            },
+        }
+        delivered = state.chunk_for_delivery(completed, {"model": "gpt-6.2-astra"})
+        payload = hooks._stream_chunk_dump(delivered)
+        self.assertEqual(
+            ["msg_real"],
+            [item.get("id") for item in payload["response"]["output"]],
+        )
+
+
+class HistoricalReasoningNoteOnlyStreamTests(HookTestCase):
+    def test_a_note_only_response_still_reaches_the_client(self) -> None:
+        """Dropping every item would be a completion with no output.
+
+        Codex reads that as a failed turn and reconnects; a turn that answered
+        nothing but the note is still an answer it can move past.
+        """
+
+        hooks, _ = load_hook_module()
+        state = hooks._ResponsesStreamCompletionState({"model": "gpt-6.2-astra"})
+        note = HistoricalReasoningNoteStreamTests.NOTE
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-note-only",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_note",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": note}],
+                    }
+                ],
+            },
+        }
+        delivered = state.chunk_for_delivery(completed, {"model": "gpt-6.2-astra"})
+        payload = hooks._stream_chunk_dump(delivered)
+        self.assertEqual(
+            ["msg_note"],
+            [item.get("id") for item in payload["response"]["output"]],
+        )
