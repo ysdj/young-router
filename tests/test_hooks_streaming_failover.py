@@ -819,6 +819,57 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(1, state.get("failures"))
         self.assertFalse(state.get("cooldown_until"))
 
+    async def test_a_success_between_two_caps_does_not_erase_the_first(self) -> None:
+        """The tally has to survive the capped attempt's own "success".
+
+        The capped attempt's body closes normally once the hop starts, and the
+        success callback clears the cooldown entry 0.4 s later (live 2026-11-20
+        12:02:53, ``deployment_cooldown_cleared failures=1``).  If the strike
+        record lived in that entry, two caps in five minutes could never add up
+        -- and the gateway runs five workers, so a per-process tally sees a
+        fifth of them.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        capped = self._capped_turn("the answer, written out at length. " * 20)
+
+        async def run(call_id: str) -> None:
+            request_data = {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "litellm_call_id": call_id,
+                "client_metadata": {"thread_id": "thread-" + call_id},
+                "model_info": {
+                    "id": "capping-route",
+                    "route_key": "provider / openai/default-chat / key=primary / order=1",
+                    "order": 1,
+                },
+            }
+            async for _chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=capped(),
+                request_data=request_data,
+            ):
+                pass
+            # The capped attempt's body closes normally; that is the callback
+            # that used to wipe the count.
+            hooks._record_deployment_success_for_cooldown(request_data)
+
+        await run("cap-first")
+        state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
+        self.assertEqual(1, state.get("failures"))
+        self.assertEqual(1, len(state.get("item_cap_strikes") or []))
+
+        await run("cap-second")
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"]
+        self.assertEqual(2, state["failures"])
+        self.assertGreater(state["cooldown_until"], time.time())
+
     async def test_an_item_cap_from_ten_minutes_ago_does_not_count(self) -> None:
         """The rule is a rate: a cap an hour old says nothing about this minute."""
 
