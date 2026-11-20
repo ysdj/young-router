@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import re
+import threading
 import time
 import uuid
 from typing import Callable
@@ -4028,6 +4029,10 @@ async def _dispatch_stream_hedge(
     router_method = getattr(llm_router, method_name, None)
     if router_method is None:
         return None
+    if not _claim_head_hedge_race(request_data):
+        # Another layer of this same turn already asked a sibling.  One race is
+        # the design; a race per layer is three prefills for one head.
+        return None
     _trace_module._request_route_trace(
         "stream_hedge_start", request_data,
         stage=stage,
@@ -4132,6 +4137,53 @@ def _is_head_hedge_attempt(request_kwargs: Optional[dict] = None) -> bool:
         request_kwargs,
         _HEAD_HEDGE_METADATA_KEY,
     )
+
+
+# One sibling race per turn.  A turn runs the same dispatch through several
+# wrapper layers, and each layer's head race has its own timer; the payload
+# marker suppresses the hedge's own layers but not a *second layer of the same
+# turn*, which starts its own timer over the parent's request data.  Live
+# 2026-11-20: one 8,512-item replay started three sibling dispatches inside
+# four seconds, every one excluding only the primary -- three full prefills for
+# one head, and three copies of the same question for a relay that could not
+# answer one.  The claim is keyed by the turn's identifiers rather than by a
+# context value because each layer runs in a child task whose context is a
+# copy; the dict is the one thing all of them share.
+_HEAD_HEDGED_REQUESTS: dict[str, float] = {}
+_HEAD_HEDGED_REQUESTS_LOCK = threading.Lock()
+_HEAD_HEDGED_REQUEST_TTL_SECONDS = 6 * 60 * 60.0
+_HEAD_HEDGED_REQUEST_LIMIT = 4096
+
+
+def _claim_head_hedge_race(request_kwargs: Optional[dict]) -> bool:
+    """Claim this turn's one sibling race; False when another layer has it.
+
+    The identifiers are the same set the concurrency slots use: a request
+    reaches these layers in copies that drop different fields, so a claim that
+    matched only one spelling would miss the layer asking next.
+    """
+
+    names = _routing_module._lease_identifier_candidates(request_kwargs)
+    if not names:
+        return True
+    now = time.time()
+    with _HEAD_HEDGED_REQUESTS_LOCK:
+        for name, marked_at in list(_HEAD_HEDGED_REQUESTS.items()):
+            if now - marked_at > _HEAD_HEDGED_REQUEST_TTL_SECONDS:
+                _HEAD_HEDGED_REQUESTS.pop(name, None)
+        if any(name in _HEAD_HEDGED_REQUESTS for name in names):
+            return False
+        for name in names:
+            _HEAD_HEDGED_REQUESTS[name] = now
+        if len(_HEAD_HEDGED_REQUESTS) > _HEAD_HEDGED_REQUEST_LIMIT:
+            oldest = sorted(
+                _HEAD_HEDGED_REQUESTS.items(), key=lambda item: item[1]
+            )
+            for name, _marked_at in oldest[
+                : len(_HEAD_HEDGED_REQUESTS) - _HEAD_HEDGED_REQUEST_LIMIT
+            ]:
+                _HEAD_HEDGED_REQUESTS.pop(name, None)
+        return True
 
 
 def _head_hedge_eligible(request_data: dict) -> bool:

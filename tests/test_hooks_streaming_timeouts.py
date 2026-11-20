@@ -3078,6 +3078,51 @@ class HookHeadHedgeTests(HookTestCase):
         self.assertEqual("primary-response", response)
         self.assertEqual([], calls)
 
+    async def test_a_turn_asks_at_most_one_sibling_across_its_dispatch_layers(
+        self,
+    ) -> None:
+        """One head race per turn, however many wrapper layers run it.
+
+        A turn passes the same dispatch through several layers (the tool
+        adapter, the Responses helper, its bridge), and the head race runs in
+        each of them with its own timer and the parent's request data.  The
+        payload marker does not reach those sibling layers, so live 2026-11-20
+        one replay asked three siblings inside four seconds.  The claim is
+        keyed by the turn's identifiers and shared across the layers.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        streaming._HEAD_HEDGED_REQUESTS.clear()
+        self.addCleanup(streaming._HEAD_HEDGED_REQUESTS.clear)
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.02")
+        request = self._chat_request()
+        hedge_response, _hedge_payload = self._hedge_response("order1-b")
+        dispatched: list = []
+
+        class FakeRouter:
+            async def acompletion(self, **kwargs):
+                dispatched.append(kwargs)
+                return hedge_response
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def primary():
+            await asyncio.sleep(0.3)
+            return "primary-response"
+
+        results = await asyncio.gather(
+            streaming._await_upstream_dispatch_with_head_hedge(
+                primary(), request
+            ),
+            streaming._await_upstream_dispatch_with_head_hedge(
+                primary(), request
+            ),
+        )
+
+        self.assertEqual(1, len(dispatched))
+        self.assertIn("primary-response", results)
+
     async def test_a_hedge_does_not_hedge_again_when_the_router_drops_the_marker(
         self,
     ) -> None:
@@ -3093,6 +3138,8 @@ class HookHeadHedgeTests(HookTestCase):
 
         hooks, proxy_server = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
+        streaming._HEAD_HEDGED_REQUESTS.clear()
+        self.addCleanup(streaming._HEAD_HEDGED_REQUESTS.clear)
         self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
         request = self._chat_request()
         eligible: list = []
