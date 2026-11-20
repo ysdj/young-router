@@ -4184,6 +4184,13 @@ _REPAIRED_LIMIT = 4096
 #: Below this many replay items the cut says something about the route, not
 #: about the size of the request; those keep the sibling hop untouched.
 _REQUEST_REPAIR_MIN_ITEMS = 2000
+#: The repair keeps at least this many of the newest reasoning items.  The
+#: refusal ladder's 8 is enough to fit a replay under a route's cap, but a
+#: repair is also where a long agentic turn continues: one capped response
+#: produces ~100 reasoning items, and keeping that whole last turn's thinking
+#: costs ~1 KB of text (the 9,013 old items in the live 2026-11-21 repair were
+#: only 104 KB in total), so there is no reason to cut it to a fragment.
+_REQUEST_REPAIR_KEEP_REASONING = 100
 
 
 def _claim_request_repair(request_kwargs: Optional[dict]) -> bool:
@@ -4279,9 +4286,13 @@ def _repair_heavy_replay_request(
     if not _claim_request_repair(request_data):
         return False
 
+    keep_reasoning = max(
+        _routing_module._replay_reasoning_elision_keep(),
+        _REQUEST_REPAIR_KEEP_REASONING,
+    )
     elided = _responses_request_module._responses_input_with_elided_reasoning_items(
         items,
-        keep=_routing_module._replay_reasoning_elision_keep(),
+        keep=keep_reasoning,
         allow_signed=True,
     )
     if elided is not None:
@@ -4308,7 +4319,7 @@ def _repair_heavy_replay_request(
         trigger=trigger,
         before_items=len(items),
         after_items=len(elided) if elided is not None else len(items),
-        kept_reasoning=_routing_module._replay_reasoning_elision_keep(),
+        kept_reasoning=keep_reasoning,
         exception=_routing_module._trace_exception(failure),
     )
     return True

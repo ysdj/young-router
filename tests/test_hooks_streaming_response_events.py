@@ -3191,7 +3191,7 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertEqual(1, len(calls))
         self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
         # The oldest reasoning is gone; messages and the newest reasoning stay.
-        self.assertLess(len(calls[0]["input"]), 50)
+        self.assertLess(len(calls[0]["input"]), 150)
         # The repair is the replay, not the client's reasoning depth: only the
         # body was too heavy, and what the answer costs is the caller's choice.
         self.assertEqual("max", calls[0]["reasoning"]["effort"])

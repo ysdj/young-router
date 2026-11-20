@@ -2540,6 +2540,49 @@ class HookStreamingHedgeTests(HookTestCase):
         self.assertEqual(first["delta"], "primary")
         self.assertTrue(hedge.closed)
 
+    async def test_primary_thinking_cancels_a_sibling_still_waiting_for_headers(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        requests_log = Path(scratch.name) / "recent-requests.jsonl"
+        self.set_env("LITELLM_RECENT_REQUESTS_LOG", str(requests_log))
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        hook = hooks.YoungRouterHook()
+
+        class Router:
+            async def aresponses(self, **request):
+                request["litellm_call_id"] = "slow-sibling"
+                request["model_info"] = {"id": "order1-b"}
+                hooks._remember_selected_deployment(request)
+                hook._record_recent_request_started(request)
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+
+        proxy_server.llm_router = Router()
+
+        async def primary():
+            await started.wait()
+            yield {"type": "response.reasoning_summary_text.delta", "delta": "thinking"}
+
+        async with asyncio.timeout(2):
+            reader, first, _ = await streaming._hedged_first_chunk(
+                primary(), self._request(), start_timeout_seconds=1
+            )
+            await reader.aclose()
+
+        self.assertEqual("thinking", first["delta"])
+        self.assertTrue(cancelled.is_set())
+        rows = [json.loads(line) for line in runtime_store.read_records(requests_log, limit=10)]
+        self.assertEqual("slow-sibling", rows[-1]["request_id"])
+        self.assertEqual("aborted", rows[-1]["status"])
+        self.assertEqual("head_hedge_lost", rows[-1]["aborted"]["reason"])
+
     async def test_releasing_one_hedge_route_preserves_the_other_lease(self) -> None:
         hooks, _ = load_hook_module()
         routing = sys.modules["young_router.proxy.routing"]
@@ -2734,6 +2777,48 @@ class HookHeadHedgeTests(HookTestCase):
         self.assertIs(hedge_response, response)
         self.assertEqual(["head"], calls)
         self.assertEqual("order1-b", hooks._request_model_info(request).get("id"))
+
+    async def test_sibling_thinking_closes_the_primary_row_before_delivery(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        requests_log = Path(scratch.name) / "recent-requests.jsonl"
+        self.set_env("LITELLM_RECENT_REQUESTS_LOG", str(requests_log))
+        hook = hooks.YoungRouterHook()
+        request = self._chat_request()
+        request.update(model="openai/wire-model", litellm_call_id="primary-turn")
+        request["model_info"]["route_key"] = "model=public-alias / order=1"
+        cancelled = asyncio.Event()
+        calls = []
+
+        async def primary():
+            hooks._remember_selected_deployment(request)
+            hook._record_recent_request_started(request)
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        class Router:
+            async def acompletion(self, **payload):
+                calls.append((payload["model"], payload["_excluded_deployment_ids"]))
+                return _HedgeStream([{"choices": [{"delta": {"reasoning_content": "thinking"}}]}])
+
+        proxy_server.llm_router = Router()
+
+        async with asyncio.timeout(2):
+            winner = await streaming._await_upstream_dispatch_with_head_hedge(primary(), request)
+            chunk = await anext(winner.__aiter__())
+
+        self.assertEqual("thinking", chunk["choices"][0]["delta"]["reasoning_content"])
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual([("public-alias", ["order1-a"])], calls)
+        rows = [json.loads(line) for line in runtime_store.read_records(requests_log, limit=10)]
+        self.assertEqual("primary-turn", rows[-1]["request_id"])
+        self.assertEqual("aborted", rows[-1]["status"])
+        self.assertEqual("head_hedge_lost", rows[-1]["aborted"]["reason"])
 
     async def test_an_image_generation_tool_is_not_raced_for_a_head(self) -> None:
         """A lost race would generate a second image, not a second prefill.
