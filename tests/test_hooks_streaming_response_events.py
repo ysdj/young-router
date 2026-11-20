@@ -3193,8 +3193,10 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         # The oldest reasoning is gone; messages and the newest reasoning stay.
         self.assertLess(len(calls[0]["input"]), 50)
         self.assertEqual("high", calls[0]["reasoning"]["effort"])
-        # The route did its job: it is not excluded from its own retry.
+        # The route did its job: it is not excluded from its own retry, and the
+        # retry is pinned to the same deployment.
         self.assertNotIn("order-0", calls[0].get("_excluded_deployment_ids") or [])
+        self.assertEqual("order-0", (calls[0].get("model_info") or {}).get("id"))
 
     def test_a_heavy_replay_steps_the_hardest_effort_down(self) -> None:
         load_hook_module()
