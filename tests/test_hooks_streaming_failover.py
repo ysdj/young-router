@@ -4854,6 +4854,20 @@ class ResponsesReasoningElisionStreamTests(HookTestCase):
 class ReplayLadderTests(HookTestCase):
     """A refused thread walks down the ladder, keeping as much history as fits."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        # The mark is shared through a runtime document now; a test must not
+        # write into the real runtime root, and each test starts with none.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.set_env(
+            "YOUNG_ROUTER_REPLAY_SHORTENING_FILE",
+            str(Path(directory.name) / "replay-shortening.json"),
+        )
+        hooks, _ = load_hook_module()
+        hooks._REPLAY_TOO_LARGE_SESSIONS.clear()
+        self.addCleanup(hooks._REPLAY_TOO_LARGE_SESSIONS.clear)
+
     def _request(self, thread: str) -> dict:
         items: list = [{"type": "additional_tools"}]
         for turn in range(6):
@@ -4916,3 +4930,45 @@ class ReplayLadderTests(HookTestCase):
 
         self.assertIsNone(hooks._session_replay_shortening(other))
         self.assertIsNone(hooks._with_session_replay_reasoning_elided(other))
+
+    def test_the_mark_is_read_under_the_public_model_group(self) -> None:
+        """The refusal and the pre-call hook spell one thread's group differently.
+
+        The mark is written while streaming, where ``model`` still carries the
+        group the client asked for; the replay step runs in the deployment
+        pre-call hook, where LiteLLM has rewritten ``model`` to the deployment's
+        upstream name (``openai/gpt-6.2-astra``).  A key built from ``model``
+        alone never matched, so the shortened replay was never sent and every
+        request in the thread was refused the same way (2026-11-20).
+        """
+
+        hooks, _ = load_hook_module()
+        refused = self._request("thread-model-group")
+        hooks._remember_replay_too_large(refused)
+
+        pre_call = copy.deepcopy(refused)
+        pre_call["model"] = "openai/gpt-6.2-astra"
+        pre_call["model_info"] = {
+            "id": "deployment-1",
+            "model_group": "gpt-6.2-astra",
+        }
+
+        self.assertEqual((8, None), hooks._session_replay_shortening(pre_call))
+
+    def test_another_worker_reads_the_mark_from_the_shared_document(self) -> None:
+        """A reconnect lands on a different worker and must still shorten.
+
+        ``_REPLAY_TOO_LARGE_SESSIONS`` is per process and the proxy runs sixteen
+        workers, so a mark that never leaves its author is not remembered at
+        all -- the reconnect asks a worker that has never seen the refusal.
+        """
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-shared")
+        hooks._remember_replay_too_large(request)
+        self.assertEqual((8, None), hooks._session_replay_shortening(request))
+
+        # Another worker: same shared document, empty process-local registry.
+        hooks._REPLAY_TOO_LARGE_SESSIONS.clear()
+
+        self.assertEqual((8, None), hooks._session_replay_shortening(request))

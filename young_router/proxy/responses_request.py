@@ -1275,6 +1275,7 @@ def _responses_input_with_elided_reasoning_items(
     items: Any,
     *,
     keep: int,
+    allow_signed: bool = False,
 ) -> Optional[List[Any]]:
     """Drop the oldest reasoning items, keeping the newest ``keep`` of them.
 
@@ -1283,6 +1284,16 @@ def _responses_input_with_elided_reasoning_items(
     Reasoning items are the only part of a replay that the API lets a client
     drop without changing what the turn asked for, which is why a size refusal
     is answered by shortening exactly this tail of history.
+
+    ``allow_signed`` is the refused-thread path, and it exists because the
+    unsigned-only rule cannot shorten a Codex replay at all: its reasoning
+    arrives as ``encrypted_content``, so a thread refused as ``max_messages``
+    kept refilling the same 2,200 items and every request ended the same way
+    (2026-11-20).  Measured through this proxy against the same relay, one
+    history twice: with the signed reasoning item and with it removed both
+    answered ``Six`` -- the item is a link the upstream accepts being absent,
+    not a chain it verifies.  Nothing is dropped before a route has refused
+    the thread.
     """
 
     if not isinstance(items, list):
@@ -1295,18 +1306,15 @@ def _responses_input_with_elided_reasoning_items(
     dropped = len(reasoning_indexes) - keep
     if dropped <= 0:
         return None
-    # An encrypted reasoning item is a signed link in the replay: the client
-    # sends it back for the upstream to verify, and a body with one of them
-    # missing is not the history that was refused.  Signed items are therefore
-    # never dropped -- the oldest *unsigned* ones are, which on a Codex replay
-    # is the whole difference, since its reasoning arrives as plain text.
     # The newest ``keep`` reasoning items always stay; the drop candidates are
-    # the ones before them, and only the unsigned of those go.
+    # the ones before them.  By default a signed item is never cut (a body with
+    # one missing is not the history that was refused), so only the unsigned
+    # ones go; a refused thread cannot afford that rule.
     elided = set()
     for index in reasoning_indexes[: len(reasoning_indexes) - keep]:
         if len(elided) >= dropped:
             break
-        if _responses_reasoning_item_is_signed(items[index]):
+        if not allow_signed and _responses_reasoning_item_is_signed(items[index]):
             continue
         elided.add(index)
     if not elided:
@@ -1389,7 +1397,9 @@ def _with_session_replay_reasoning_elided(
     items = request_kwargs.get("input")
     if not isinstance(items, list):
         return None
-    elided_items = _responses_input_with_elided_reasoning_items(items, keep=keep)
+    elided_items = _responses_input_with_elided_reasoning_items(
+        items, keep=keep, allow_signed=True
+    )
     if target_items is not None:
         shortened_history = _responses_input_with_elided_history(
             elided_items if elided_items is not None else items,
@@ -1453,6 +1463,7 @@ def _responses_reasoning_elision_fallback_kwargs(
     elided_items = _responses_input_with_elided_reasoning_items(
         items,
         keep=_routing_module._replay_reasoning_elision_keep(),
+        allow_signed=True,
     )
     if elided_items is None:
         return None

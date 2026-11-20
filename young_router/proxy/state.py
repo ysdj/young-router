@@ -15,6 +15,7 @@ from .. import runtime_store
 from .launcher_settings import (
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _RECENT_REQUESTS_LOG_ENV,
+    _REPLAY_SHORTENING_FILE_ENV,
     _ROUTE_RECOVERY_STATE_FILE_ENV,
     _SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
 )
@@ -537,6 +538,26 @@ def _deployment_cooldown_file_path() -> Optional[str]:
     if not runtime_root:
         return None
     return os.path.join(runtime_root, ".litellm-runtime", "deployment-cooldowns.json")
+
+
+def _replay_shortening_file_path() -> Optional[str]:
+    """Where the threads a route refused as too large are remembered.
+
+    Beside the cooldowns rather than inside them: this document is written once
+    per refusal, while the cooldown document is read on every attempt and also
+    carries state that must not be rewritten at request rate.  Sixteen workers
+    share it through the runtime store, which is the point -- a mark that lives
+    only in the worker that saw the refusal is missed by the next request,
+    because the client's reconnect lands on a different worker.
+    """
+
+    value = os.getenv(_REPLAY_SHORTENING_FILE_ENV, "").strip()
+    if value:
+        return value
+    runtime_root = _runtime_root_from_this_file()
+    if not runtime_root:
+        return None
+    return os.path.join(runtime_root, ".litellm-runtime", "replay-shortening.json")
 
 
 def _route_recovery_state_file_path() -> Optional[str]:

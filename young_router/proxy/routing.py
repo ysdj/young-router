@@ -5553,17 +5553,107 @@ _REPLAY_TOO_LARGE_SHORTENING_LADDER: tuple[tuple[int, Optional[int]], ...] = (
 _REPLAY_TOO_LARGE_SESSIONS_LOCK = threading.Lock()
 _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS = 2 * 60 * 60.0
 _REPLAY_TOO_LARGE_SESSION_LIMIT = 2048
+_REPLAY_SHORTENING_STATE_KEY = "sessions"
 
 
 def _replay_session_key(request_kwargs: Optional[dict]) -> Optional[str]:
-    """This turn's thread, as the client names it, plus its model group."""
+    """This turn's thread, as the client names it, plus its public model group."""
 
     session = _trace_session_context(request_kwargs or {})
     session_id = session.get("id")
     if not isinstance(session_id, str) or not session_id.strip():
         return None
-    model_group = _responses_execution_module._request_model_group(request_kwargs)
+    # ``model`` alone is the route's upstream name in the deployment pre-call
+    # hook (``openai/gpt-6.2-astra``) and the public group while the answer
+    # streams (``gpt-6.2-astra``); one thread must not be two keys.
+    model_group = _request_public_model(request_kwargs)
     return f"{session_id.strip()}|{model_group or ''}"
+
+
+def _clean_replay_shortening_entry(
+    entry: Any,
+    now: float,
+) -> Optional[tuple[float, int]]:
+    if not isinstance(entry, dict):
+        return None
+    try:
+        marked_at = float(entry.get("marked_at") or 0.0)
+        stage = int(entry.get("stage"))
+    except (TypeError, ValueError):
+        return None
+    if marked_at <= 0 or now - marked_at > _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS:
+        return None
+    return marked_at, max(
+        0, min(stage, len(_REPLAY_TOO_LARGE_SHORTENING_LADDER) - 1)
+    )
+
+
+def _shared_replay_shortening(
+    key: str,
+    now: float,
+) -> Optional[tuple[float, int]]:
+    """Read the mark another worker may have written.
+
+    The registry is per process and the proxy runs sixteen workers; the client's
+    reconnect after a refusal is a new request and usually a different worker.
+    A mark that never leaves the worker that saw the refusal is not remembered
+    at all, which is what kept this ladder from ever running on the gateway.
+    """
+
+    path = _state_module._replay_shortening_file_path()
+    if not path:
+        return None
+
+    def lookup(payload: Any) -> Optional[tuple[float, int]]:
+        entries = (
+            payload.get(_REPLAY_SHORTENING_STATE_KEY)
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(entries, dict):
+            return None
+        return _clean_replay_shortening_entry(entries.get(key), now)
+
+    try:
+        return _state_module._locked_json_state_update(
+            path,
+            lookup,
+            read_only=True,
+        )
+    except Exception:
+        # A store that cannot answer reads like one with nothing to say: the
+        # request still asks the route, and the next refusal can try again.
+        return None
+
+
+def _publish_replay_shortening(
+    key: str,
+    marked_at: float,
+    stage: int,
+) -> None:
+    path = _state_module._replay_shortening_file_path()
+    if not path:
+        return
+    now = time.time()
+
+    def update(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        entries = payload.get(_REPLAY_SHORTENING_STATE_KEY)
+        if not isinstance(entries, dict):
+            entries = {}
+            payload[_REPLAY_SHORTENING_STATE_KEY] = entries
+        for name, entry in list(entries.items()):
+            if _clean_replay_shortening_entry(entry, now) is None:
+                entries.pop(name, None)
+        entries[key] = {"marked_at": marked_at, "stage": stage}
+
+    try:
+        _state_module._locked_json_state_update(path, update)
+    except Exception:
+        # Remembering this thread is best-effort: the refusal has already been
+        # answered, and a store that could not commit must not hide it.
+        pass
 
 
 def _remember_replay_too_large(request_kwargs: Optional[dict]) -> None:
@@ -5594,7 +5684,7 @@ def _remember_replay_too_large(request_kwargs: Optional[dict]) -> None:
                 - _REPLAY_TOO_LARGE_SESSION_LIMIT
             ]:
                 _REPLAY_TOO_LARGE_SESSIONS.pop(name, None)
-
+    _publish_replay_shortening(key, now, stage)
 
 def _session_replay_shortening(
     request_kwargs: Optional[dict],
@@ -5607,16 +5697,23 @@ def _session_replay_shortening(
     key = _replay_session_key(request_kwargs)
     if key is None:
         return None
+    now = time.time()
     with _REPLAY_TOO_LARGE_SESSIONS_LOCK:
         entry = _REPLAY_TOO_LARGE_SESSIONS.get(key)
+        if entry is not None:
+            marked_at, stage = entry
+            if now - marked_at > _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS:
+                _REPLAY_TOO_LARGE_SESSIONS.pop(key, None)
+                entry = None
+    if entry is None:
+        entry = _shared_replay_shortening(key, now)
         if entry is None:
             return None
-        marked_at, stage = entry
-        if time.time() - marked_at > _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS:
-            _REPLAY_TOO_LARGE_SESSIONS.pop(key, None)
-            return None
-        stage = max(0, min(int(stage), len(_REPLAY_TOO_LARGE_SHORTENING_LADDER) - 1))
-        return _REPLAY_TOO_LARGE_SHORTENING_LADDER[stage]
+        with _REPLAY_TOO_LARGE_SESSIONS_LOCK:
+            _REPLAY_TOO_LARGE_SESSIONS[key] = entry
+    _marked_at, stage = entry
+    stage = max(0, min(int(stage), len(_REPLAY_TOO_LARGE_SHORTENING_LADDER) - 1))
+    return _REPLAY_TOO_LARGE_SHORTENING_LADDER[stage]
 
 
 # One turn may elide its replay's old reasoning only once, and the turn is
