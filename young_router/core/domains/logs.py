@@ -1338,6 +1338,8 @@ def _is_hidden_internal_attempt(record: Mapping[str, Any]) -> bool:
         _string_record_value(aborted.get("reason"))
         in _INTERNAL_ATTEMPT_ABORT_REASONS
     )
+
+
 REQUEST_STALE_SECONDS_KEY = "YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS"
 DEFAULT_REQUEST_STALE_SECONDS = 900.0
 MAX_REQUEST_STALE_SECONDS = 86400.0
