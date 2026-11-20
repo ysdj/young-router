@@ -3195,6 +3195,31 @@ def _incomplete_terminal_capped_generated_output(
     return False
 
 
+def _mark_generated_output_item_cap(
+    exception: Exception,
+    terminal_chunk: Any,
+    *,
+    delivered: bool,
+) -> None:
+    """Mark the route's own item budget as the cause of this stop.
+
+    The exception builder can only look at the frames it was handed; the guards
+    that saw the whole stream know whether the reader had already been shown
+    output, which is the fact that separates "this response ran out of items"
+    from "this replay was refused".  Only the first shape is a rate to charge
+    to the route (two inside five minutes).
+    """
+
+    if not delivered:
+        return
+    if _responses_incomplete_terminal_reason(terminal_chunk) not in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
+        return
+    try:
+        exception.item_cap_cut = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _responses_incomplete_stream_exception(
     reason: str,
     *,
@@ -7559,12 +7584,16 @@ async def _yield_guarded_original_stream(
                         buffer=event_tail,
                         request_data=request_data,
                     )
+                    _mark_generated_output_item_cap(failure, chunk, delivered=True)
                     if item_cap_leaves_the_turn_unanswered(chunk) and (
                         reopen_the_turn_after_a_thinking_only_cut(failure)
                     ):
                         # The route's cap is not this turn's answer: park it and
                         # let the same turn continue on a sibling route, inside
-                        # this one client stream.
+                        # this one client stream.  The capped attempt's body
+                        # closes normally once the hop starts, and that close
+                        # would otherwise read as a delivered answer and clear
+                        # the failure this cap just earned.
                         async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
                             request_data,
                             failure,
@@ -8238,6 +8267,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         "terminal response event before response.completed",
                         buffer=buffer,
                         request_data=request_data,
+                    )
+                    _mark_generated_output_item_cap(
+                        incomplete_exception,
+                        chunk,
+                        delivered=bool(saw_visible_output or saw_delivered_output),
                     )
                     if output_limit_terminal:
                         _trace_module._request_route_trace(

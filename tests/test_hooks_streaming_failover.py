@@ -686,6 +686,177 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(cooldown["failures"], 1)
         self.assertGreater(cooldown["cooldown_until"], time.time())
 
+    def _capped_turn(self, text: str = "") -> "callable":
+        def capped():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cap"}}
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "weighing the two explanations",
+                }
+                if text:
+                    yield {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_1",
+                        "output_index": 1,
+                        "delta": text,
+                    }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_1"}],
+                    },
+                }
+
+            return stream()
+
+        return capped
+
+    async def test_two_item_cap_cuts_inside_five_minutes_park_the_route(self) -> None:
+        """A route that runs out of items twice in five minutes is out.
+
+        Measured 2026-11-20: tken cut long thinking turns at 100 and 98
+        generated items while the same model finished on flux/youyangai without
+        stating ``max_messages`` at all.  That is the route's own budget, so it
+        is charged like any other transient failure -- two inside five minutes
+        -- not the one strike a cut answer earns.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        capped = self._capped_turn("the answer, written out at length. " * 20)
+
+        async def run(call_id: str) -> None:
+            request_data = {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "litellm_call_id": call_id,
+                "client_metadata": {"thread_id": "thread-" + call_id},
+                "model_info": {
+                    "id": "capping-route",
+                    "route_key": "provider / openai/default-chat / key=primary / order=1",
+                    "order": 1,
+                },
+            }
+            async for _chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=capped(),
+                request_data=request_data,
+            ):
+                pass
+
+        await run("cap-one")
+        state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
+        self.assertEqual(1, state.get("failures"))
+        self.assertFalse(state.get("cooldown_until"))
+
+        await run("cap-two")
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"]
+        self.assertEqual(2, state["failures"])
+        self.assertGreater(state["cooldown_until"], time.time())
+
+    async def test_an_item_cap_hop_charges_the_route_once(self) -> None:
+        """The hop is the turn staying alive; the route still pays for the cap."""
+
+        hooks, proxy_server = load_hook_module()
+        routing = importlib.import_module("young_router.proxy.routing")
+        routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
+        self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+
+        def answered():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                return answered()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-cap-hop",
+            "client_metadata": {"thread_id": "thread-cap-hop"},
+            "model_info": {
+                "id": "capping-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=self._capped_turn("Sending now")(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
+        self.assertEqual(1, state.get("failures"))
+        self.assertFalse(state.get("cooldown_until"))
+
+    async def test_an_item_cap_from_ten_minutes_ago_does_not_count(self) -> None:
+        """The rule is a rate: a cap an hour old says nothing about this minute."""
+
+        hooks, _proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"] = {
+            "failures": 1,
+            "last_failure_at": time.time() - 600,
+            "deployment_id": "capping-route",
+        }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "litellm_call_id": "cap-late",
+            "client_metadata": {"thread_id": "thread-cap-late"},
+            "model_info": {
+                "id": "capping-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+        capped = self._capped_turn("the answer, written out at length. " * 20)
+        async for _chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None,
+            response=capped(),
+            request_data=request_data,
+        ):
+            pass
+
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"]
+        self.assertEqual(1, state["failures"])
+        self.assertFalse(state.get("cooldown_until"))
+
     def test_route_recovery_rejects_reasoning_only_completed_response(self) -> None:
         hooks, _proxy_server = load_hook_module()
         request_data = {

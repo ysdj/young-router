@@ -1874,6 +1874,35 @@ def _should_return_failed_responses_stream(
     return _is_terminal_responses_stream_failure_error(exception)
 
 
+# How far back an item-cap cut still counts against a route.  The rule is two
+# such cuts inside this window: a route that caps a long turn twice in five
+# minutes cannot finish them, while a cap an hour old says nothing about now.
+_ITEM_CAP_COOLDOWN_WINDOW_SECONDS = 300.0
+
+
+# Item-cap cuts counted per route, kept out of the cooldown state on purpose:
+# the success callback clears that state 0.4 s after a capped attempt's body
+# closes (live 2026-11-20 11:08:29), and a tally a success can wipe is not a
+# rate.  The window is five minutes.
+_ITEM_CAP_STRIKES: dict[str, list[float]] = {}
+_ITEM_CAP_STRIKES_LOCK = threading.Lock()
+
+
+def _note_item_cap_strikes(cooldown_keys: list[str], now: float) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    with _ITEM_CAP_STRIKES_LOCK:
+        for key in cooldown_keys:
+            times = [
+                stamp
+                for stamp in _ITEM_CAP_STRIKES.get(key, [])
+                if now - stamp <= _ITEM_CAP_COOLDOWN_WINDOW_SECONDS
+            ]
+            times.append(now)
+            _ITEM_CAP_STRIKES[key] = times
+            counts[key] = len(times)
+    return counts
+
+
 def _deployment_cooldown_failure_threshold() -> int:
     value = os.getenv(_DEPLOYMENT_COOLDOWN_FAILURES_ENV, "").strip()
     if not value:
@@ -9119,8 +9148,11 @@ def _record_deployment_failure_for_cooldown(
     # closed mid-stream is the same evidence: the route cut a turn the reader
     # was already consuming, and the next request must not select it again.
     start_timeout = _is_local_stream_start_timeout_error(exception)
+    item_cap_cut = bool(getattr(exception, "item_cap_cut", False))
     threshold = (
-        1
+        _deployment_cooldown_failure_threshold()
+        if item_cap_cut
+        else 1
         if getattr(exception, "stream_incomplete", False)
         or _is_route_cut_stream_error(exception)
         # A route that accepted the socket and sent no first byte for the
@@ -9137,6 +9169,11 @@ def _record_deployment_failure_for_cooldown(
         else _deployment_cooldown_seconds()
     )
     request_log = _request_log_record("cooldown", request_kwargs)
+    strike_counts = (
+        _note_item_cap_strikes(list(cooldown_keys), time.time())
+        if item_cap_cut
+        else {}
+    )
 
     def record(cooldowns: dict[str, Any], now: float) -> list[tuple[str, int, float]]:
         started: list[tuple[str, int, float]] = []
@@ -9151,7 +9188,15 @@ def _record_deployment_failure_for_cooldown(
                     state["failures"] = 0
                     state["cooldown_until"] = 0.0
 
-            failures = int(state.get("failures") or 0) + 1
+            if item_cap_cut:
+                # The user-facing rule for this one is a rate, not a tally: two
+                # turns cut by the route's own item budget inside five minutes
+                # park it.  A cap an hour ago says nothing about this minute --
+                # the route was finishing turns in between.
+                failures = strike_counts.get(cooldown_key, 1)
+                state["item_cap_cut"] = True
+            else:
+                failures = int(state.get("failures") or 0) + 1
             state["failures"] = failures
             state["last_failure_at"] = now
             state["deployment_id"] = deployment_id
@@ -9277,6 +9322,16 @@ def _record_deployment_success_for_cooldown(request_kwargs: Optional[dict]) -> N
     def clear(cooldowns: dict[str, Any], _now: float) -> list[dict[str, Any]]:
         cleared: list[dict[str, Any]] = []
         for cooldown_key in cooldown_keys:
+            existing = cooldowns.get(cooldown_key)
+            if (
+                isinstance(existing, dict)
+                and existing.get("item_cap_cut")
+                and float(existing.get("cooldown_until") or 0.0) > _now
+            ):
+                # The route's own item budget parked it; the capped attempt's
+                # body closing "normally" is not evidence it can finish a long
+                # turn, so the rate that started this cooldown stands.
+                continue
             state = cooldowns.pop(cooldown_key, None)
             if isinstance(state, dict) and state:
                 state = state.copy()
