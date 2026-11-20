@@ -3100,6 +3100,107 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
         self.assertNotIn("response.failed", types)
 
+    async def test_a_cap_after_a_progress_line_still_continues_on_a_sibling(
+        self,
+    ) -> None:
+        """A cap that only produced narration is still not this turn's answer.
+
+        Live 2026-11-20: the capped turns had already emitted a short progress
+        message ("Sending now") when the relay stated ``max_messages``, so the
+        thinking-only branch above never saw them and the turn was handed to
+        the reader as an incomplete response -- 每轮停一下，而不是把活干完。
+        A cap is the route's budget, so a route that has said a line or two is
+        still one the turn can be moved off; only a finished tool call or a
+        real answer makes the stop the reader's.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        routing = importlib.import_module("young_router.proxy.routing")
+        routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
+        self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
+        calls: list = []
+
+        def progress_then_capped():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cut"}}
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "weighing the two explanations",
+                }
+                yield {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 1,
+                    "delta": "Sending now",
+                }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cut",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [
+                            {"type": "reasoning", "id": "rs_1"},
+                            {
+                                "type": "message",
+                                "id": "msg_1",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "Sending now"}],
+                            },
+                        ],
+                    },
+                }
+
+            return stream()
+
+        def answered():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return answered()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-cap-after-progress",
+            "client_metadata": {"thread_id": "thread-cap-after-progress"},
+            "model_info": {
+                "id": "order-0",
+                "order": 0,
+                "route_key": "provider / default-chat / key=primary",
+            },
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=progress_then_capped(),
+                request_data=request_data,
+            )
+        ]
+        types = [chunk.get("type") for chunk in chunks]
+
+        self.assertEqual(1, len(calls))
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertNotIn("response.failed", types)
+        self.assertNotIn("response.incomplete", types)
+
     async def test_a_second_cut_in_the_same_turn_ends_it(self) -> None:
         """One hop is the whole allowance; the second cut is the reader's.
 
@@ -3193,9 +3294,13 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
 
+        # A cap that lands on a real answer -- not on a progress line -- is the
+        # reader's stop: the text is too long to say again on another route.
+        answered_text = "the answer, written out at length. " * 20
+
         async def incomplete_stream():
             yield {"type": "response.created", "response": {"id": "resp-cap"}}
-            yield {"type": "response.output_text.delta", "delta": "working on it"}
+            yield {"type": "response.output_text.delta", "delta": answered_text}
             yield {
                 "type": "response.incomplete",
                 "response": {

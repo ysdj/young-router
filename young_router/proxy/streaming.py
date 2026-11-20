@@ -3169,6 +3169,13 @@ _UPSTREAM_INPUT_ITEM_LIMIT_REASONS = frozenset(
 )
 
 
+# How much answer text may already have reached the reader when a route's item
+# cap ends the turn and a sibling route takes it over.  Below this the cost is
+# a repeated progress line; above it the reader is reading an answer that must
+# not be written twice.
+_CAP_CUT_RESUMABLE_TEXT_CHARS = 400
+
+
 def _incomplete_terminal_capped_generated_output(
     buffer: Optional[List[Any]],
     request_data: Optional[dict] = None,
@@ -7060,6 +7067,33 @@ async def _yield_guarded_original_stream(
         )
         return True
 
+    def item_cap_leaves_the_turn_unanswered(chunk: Any) -> bool:
+        """Whether a route's item cap ended a turn that has not answered yet.
+
+        ``max_messages`` counts what one response may generate, so a route that
+        hits it mid-thinking has not answered anything -- the reader got a few
+        progress lines and a stop.  Measured 2026-11-20 on the tken relay: two
+        capped turns had produced 100 and 98 reasoning items when the terminal
+        arrived (1m49s and 3m45s in) while every turn that finished stayed
+        around ten, and the same model finished the same kind of turn on
+        flux/youyangai without ever stating this reason.  So this is a route
+        limit, and a sibling route continues the turn instead of the reader
+        being told to send it again.
+
+        A finished tool call is work that already happened and a long answer is
+        text the reader is reading; neither may be produced twice, so both keep
+        the stop.  What remains is the short-progress case, where the duplicate
+        is a line or two of narration.
+        """
+
+        if _responses_incomplete_terminal_reason(chunk) not in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
+            return False
+        if pending_tool_items:
+            return False
+        if completion_state.finished_argument_item_ids:
+            return False
+        return len(synthesized_text().strip()) < _CAP_CUT_RESUMABLE_TEXT_CHARS
+
     def stated_incomplete_terminal_event(
         chunk: Any,
         failure: Exception,
@@ -7525,6 +7559,19 @@ async def _yield_guarded_original_stream(
                         buffer=event_tail,
                         request_data=request_data,
                     )
+                    if item_cap_leaves_the_turn_unanswered(chunk) and (
+                        reopen_the_turn_after_a_thinking_only_cut(failure)
+                    ):
+                        # The route's cap is not this turn's answer: park it and
+                        # let the same turn continue on a sibling route, inside
+                        # this one client stream.
+                        async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+                            request_data,
+                            failure,
+                        ):
+                            yield fallback_chunk
+                        await _close_async_iterator_safely(response)
+                        return
                     stated_outcome = stated_incomplete_terminal_event(chunk, failure)
                     if stated_outcome is not None:
                         yield stated_outcome
