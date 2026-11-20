@@ -10539,6 +10539,7 @@ def _request_has_tool_compatibility_candidate(
             isinstance(item, dict)
             and item.get("type")
             in {
+                "additional_tools",
                 "function_call",
                 "function_call_output",
                 "namespace",

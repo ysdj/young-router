@@ -54,6 +54,19 @@ def _tool_definition_name(tool: Any) -> Optional[str]:
 _CODEX_DESCENDANT_CLEANUP_ENV = "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP"
 _CODEX_COMMENTARY_DISCIPLINE_ENV = "YOUNG_ROUTER_CODEX_COMMENTARY_DISCIPLINE"
 
+#: How many trailing tool-free progress messages make a replay a loop rather
+#: than a continuation.  One is the ordinary shape: the client recorded the
+#: previous turn's progress sentence and asks the model to pick the work back
+#: up.  The second one means the model answered that continuation with another
+#: progress sentence, and the client will ask again forever (2026-11-19: one
+#: Codex turn spent an hour and forty-two minutes emitting them).
+_CODEX_PROGRESS_LOOP_MESSAGES = 2
+
+#: Where the barrier states itself.  A request trace that shows the count and
+#: the choice is how the next investigation tells an injected ``required``
+#: from a client's own choice without reading the upstream body.
+_PROGRESS_BARRIER_METADATA_KEY = "codex_progress_barrier"
+
 # A call whose arguments name a tool the request never declared is answered
 # with this code so the turn ends as a stated protocol fact.
 UNDECLARED_TOOL_CODE = "young_router_undeclared_tool"
@@ -203,6 +216,15 @@ def with_progress_message_contract(
     turn's outcome.  Where the replay already proves that happened,
     ``tool_choice`` is the half that still holds: it makes the next response a
     call, which is a continuation by the client's own protocol.
+
+    A thinking wire refuses every forced choice (measured on the official
+    DeepSeek endpoint: ``tool_choice: required`` answers 400 "thinking mode
+    does not support this tool_choice", the same body with ``auto`` answers
+    200), so one trailing progress message is left to ``auto`` there.  Two or
+    more is the loop, and it cannot end while the model is allowed to answer
+    with prose; the barrier is spent there even on a thinking wire.  A wire
+    that still refuses it is answered by the same 400-to-``auto`` retry that
+    covers a client's own forced choice.
     """
 
     if not _routing_module._env_bool(_CODEX_COMMENTARY_DISCIPLINE_ENV, True):
@@ -212,23 +234,39 @@ def with_progress_message_contract(
     # A request that declares no tool cannot make a call instead of talking.
     if not _responses_request_module._codex_declared_tool_names(request_kwargs):
         return None
-    if not _responses_request_module._codex_replay_has_tool_free_progress_message(request_kwargs):
+    trailing_progress = (
+        _responses_request_module._codex_replay_trailing_progress_messages(
+            request_kwargs
+        )
+    )
+    if trailing_progress < 1:
         return None
     if _routing_module._protocol_fallback_relax_tool_choice(request_kwargs):
         return None
     if request_kwargs.get("tool_choice") not in (None, "auto"):
         return None
-    if _request_thinks(request_kwargs):
-        # A thinking wire refuses every forced choice, so this one cannot be
-        # kept: measured on the official DeepSeek endpoint with the same
-        # history, ``tool_choice: required`` answers 400 "thinking mode does
-        # not support this tool_choice" and the same request without the field
-        # answers 200.  Forcing here did not hold the turn open -- it ended it,
-        # with an error the client could only resend.
+    thinking = _request_thinks(request_kwargs)
+    if thinking and trailing_progress < _CODEX_PROGRESS_LOOP_MESSAGES:
         return None
 
     modified_kwargs = request_kwargs.copy()
     modified_kwargs["tool_choice"] = "required"
+    metadata = (
+        _request_context_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        )
+        or {}
+    )
+    barrier_metadata = {
+        "trailing_progress_messages": trailing_progress,
+        "tool_choice": "required",
+        "thinking": thinking,
+    }
+    if metadata.get(_PROGRESS_BARRIER_METADATA_KEY) != barrier_metadata:
+        next_metadata = metadata.copy()
+        next_metadata[_PROGRESS_BARRIER_METADATA_KEY] = barrier_metadata
+        modified_kwargs["litellm_metadata"] = next_metadata
     return modified_kwargs
 
 

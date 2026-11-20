@@ -569,6 +569,99 @@ class HookResponsesRequestPrepTests(HookTestCase):
         request["model_reasoning_summary"] = "auto"
         self.assertIsNone(contract.with_progress_message_contract(request))
 
+    def test_codex_progress_contract_breaks_a_progress_loop_even_while_thinking(self) -> None:
+        """The second tool-free progress message is a loop, not a continuation.
+
+        Codex re-asks whenever a response ends with commentary and no call.
+        One such message is the ordinary continuation request; a model that
+        answers it with another progress sentence would be asked again
+        forever.  Measured live 2026-11-19: `gpt-6.2-astra` through a relay
+        answered 46 consecutive requests with `**完成核对**`-style commentary,
+        each replay carrying the growing pile, and this contract declined to
+        act because the turn asked the model to think.  ``auto`` cannot end
+        that loop, so the barrier is spent at the second message.
+        """
+
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["reasoning"] = {"effort": "ultra", "summary": "detailed"}
+        for text in ("**完成核对**", "**完成复核**"):
+            request["input"].append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            )
+
+        modified = contract.with_progress_message_contract(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["litellm_metadata"]["codex_progress_barrier"],
+            {
+                "trailing_progress_messages": 2,
+                "tool_choice": "required",
+                "thinking": True,
+            },
+        )
+
+    def test_codex_progress_contract_counts_only_the_tail_after_a_call(self) -> None:
+        """A call between two progress messages is work, not the loop."""
+
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["reasoning"] = {"effort": "ultra", "summary": "detailed"}
+        request["input"].extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "**完成核对**"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "**完成复核**"}],
+                },
+            ]
+        )
+
+        self.assertIsNone(contract.with_progress_message_contract(request))
+
+    def test_codex_progress_contract_ignores_text_before_the_latest_user_message(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["reasoning"] = {"effort": "ultra", "summary": "detailed"}
+        request["input"].extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "**完成核对**"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "**完成复核**"}],
+                },
+                {"role": "user", "content": "A new request."},
+            ]
+        )
+
+        self.assertIsNone(contract.with_progress_message_contract(request))
+
     def test_codex_commentary_discipline_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module

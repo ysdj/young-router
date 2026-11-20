@@ -2707,33 +2707,61 @@ def _codex_descendant_cleanup_has_history(request_kwargs: dict) -> bool:
     return False
 
 
-def _codex_replay_has_tool_free_progress_message(request_kwargs: dict) -> bool:
-    """Whether the replay already contains a progress message with no tool call.
+_CODEX_REPLAY_CALL_ITEM_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "tool_search_call",
+        "tool_search_output",
+    }
+)
 
-    Such a message was recorded as a completed turn outcome, so a client that
-    sends one mid-turn has already ended a turn it meant to continue.  The
-    next request is the model being asked to pick the work back up, and a
-    second tool-free response would end that one too -- which is how a long
-    investigation stops partway with its own progress sentence as the answer.
+
+def _codex_replay_trailing_progress_messages(request_kwargs: dict) -> int:
+    """How many assistant messages at the tail carry nothing but text.
+
+    A tool-free progress message is recorded as a completed turn outcome, so a
+    client that sends one mid-turn has already ended a turn it meant to
+    continue; the next request is the model being asked to pick the work back
+    up, and a second tool-free response would end that one too.  That is one
+    progress message, and auto selection usually answers it with the call the
+    turn needs.
+
+    Two or more in a row is a different event: the model answered the
+    continuation with another progress sentence instead of acting, so the
+    client continues again and the pattern repeats.  Measured live 2026-11-19
+    on `gpt-6.2-astra` through a relay: one Codex turn emitted 167 progress
+    messages (``**完成核对**``, ``**完成复核**``...) over an hour and
+    forty-two minutes, every response a tool-free commentary burst, and the
+    client re-asked 45 times while each request replayed the growing pile
+    (7.6M input tokens).  Counting only the tail after the last call or message
+    keeps an ordinary continuation (one message) apart from that loop.
     """
 
     input_value = request_kwargs.get("input")
     if not isinstance(input_value, list):
-        return False
-    saw_assistant_text = False
+        return 0
+    trailing = 0
     for item in input_value:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if item_type in {"function_call", "custom_tool_call"}:
-            saw_assistant_text = False
+        if item_type in _CODEX_REPLAY_CALL_ITEM_TYPES:
+            trailing = 0
             continue
-        if item_type in {"function_call_output", "custom_tool_call_output"}:
+        role = str(item.get("role") or "").lower()
+        if role and role != "assistant":
+            # A replayed user/developer message starts a request of its own;
+            # assistant text before it is not the tail the client continued.
+            trailing = 0
             continue
-        if str(item.get("role") or "").lower() != "assistant":
+        if role != "assistant":
             continue
-        saw_assistant_text = bool(_codex_message_text(item).strip())
-    return saw_assistant_text
+        if _codex_message_text(item).strip():
+            trailing += 1
+    return trailing
 
 
 def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:

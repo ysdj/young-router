@@ -3424,6 +3424,32 @@ class HookRoutingTests(HookTestCase):
             hooks._is_forced_tool_choice_auto_retry_error(error, request)
         )
 
+        # Codex declares its tools in a leading ``additional_tools`` item, not
+        # in ``tools``.  A fresh turn has no function-call history to stand in
+        # for it, so the declaration itself has to count as a tool payload —
+        # otherwise a thinking wire that refuses the injected ``required`` has
+        # no retry and the turn ends on this proxy's own field.
+        codex_request = {
+            "tool_choice": "required",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [{"type": "function", "name": "exec_command"}],
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Implement the change."},
+            ],
+        }
+        self.assertTrue(
+            hooks._is_forced_tool_choice_auto_retry_error(error, codex_request)
+        )
+
     def test_route_key_canonicalizes_api_base_host(self) -> None:
         hooks, _ = load_hook_module()
         old_route_key = "compat_provider / openai/default-chat / key=x-plus / order=2"
