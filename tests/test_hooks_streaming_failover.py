@@ -5045,6 +5045,93 @@ class ReplayLadderTests(HookTestCase):
 
         self.assertEqual((8, None), hooks._session_replay_shortening(request))
 
+    def test_a_cap_that_follows_delivered_thinking_is_not_a_replay_refusal(self) -> None:
+        """The cap was counting what the response generated, not the replay.
+
+        Live 2026-11-20 thread ``01a1ee60``: both relays ended four-minute
+        thinking turns with ``response.incomplete`` ``max_messages`` right after
+        the summary had been streamed.  Every one of those was remembered as
+        "this replay is too large", the ladder reached its last step inside one
+        afternoon, and from then on each turn was dispatched with 197 of the
+        thread's 5,160 items -- the model answered blind and was asked again.
+        """
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-cap-after-thinking")
+        exception = hooks._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[
+                {"type": "response.created", "response": {"id": "resp-cap"}},
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "weighing the two explanations",
+                },
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"type": "reasoning", "id": "rs_1"}],
+                    },
+                },
+            ],
+            request_data=request,
+        )
+
+        self.assertFalse(hooks._is_upstream_input_item_limit_error(exception))
+        self.assertIsNone(hooks._session_replay_shortening(request))
+
+    def test_a_cap_before_anything_was_delivered_still_marks_the_thread(self) -> None:
+        """A refusal that arrives before the response starts is about the replay."""
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-cap-before-output")
+        exception = hooks._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[
+                {"type": "response.created", "response": {"id": "resp-cap"}},
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [],
+                    },
+                },
+            ],
+            request_data=request,
+        )
+
+        self.assertTrue(hooks._is_upstream_input_item_limit_error(exception))
+        self.assertEqual(
+            hooks._REPLAY_TOO_LARGE_SHORTENING_LADDER[0],
+            hooks._session_replay_shortening(request),
+        )
+
+    def test_a_mark_written_before_the_cap_was_told_apart_is_not_evidence(self) -> None:
+        """Old entries meant "some item cap", so they cannot keep shortening."""
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-legacy-mark")
+        hooks._remember_replay_too_large(request)
+        path = hooks._state_module._replay_shortening_file_path()
+
+        def strip_version(payload: dict) -> None:
+            for entry in (payload.get("sessions") or {}).values():
+                entry.pop("version", None)
+
+        hooks._state_module._locked_json_state_update(path, strip_version)
+        # Another worker: the process-local registry is empty, so only the
+        # shared document can answer.
+        hooks._REPLAY_TOO_LARGE_SESSIONS.clear()
+
+        self.assertIsNone(hooks._session_replay_shortening(request))
+
+
     def test_an_item_cap_terminal_names_the_thread_it_refused(self) -> None:
         """The terminal the sanitizer builds itself must carry the request.
 

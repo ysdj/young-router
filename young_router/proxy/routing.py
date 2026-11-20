@@ -5554,6 +5554,12 @@ _REPLAY_TOO_LARGE_SESSIONS_LOCK = threading.Lock()
 _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS = 2 * 60 * 60.0
 _REPLAY_TOO_LARGE_SESSION_LIMIT = 2048
 _REPLAY_SHORTENING_STATE_KEY = "sessions"
+# A mark says one thing: a route refused this thread's *replay* as too large.
+# Entries written before that was the only thing a mark meant are not evidence
+# -- a cap on the items a response generated used to land here too, and keeping
+# those would shorten threads no route ever refused -- so an entry without this
+# version reads as absent and the next write prunes it.
+_REPLAY_SHORTENING_ENTRY_VERSION = 2
 
 
 def _replay_session_key(request_kwargs: Optional[dict]) -> Optional[str]:
@@ -5575,6 +5581,8 @@ def _clean_replay_shortening_entry(
     now: float,
 ) -> Optional[tuple[float, int]]:
     if not isinstance(entry, dict):
+        return None
+    if entry.get("version") != _REPLAY_SHORTENING_ENTRY_VERSION:
         return None
     try:
         marked_at = float(entry.get("marked_at") or 0.0)
@@ -5646,7 +5654,11 @@ def _publish_replay_shortening(
         for name, entry in list(entries.items()):
             if _clean_replay_shortening_entry(entry, now) is None:
                 entries.pop(name, None)
-        entries[key] = {"marked_at": marked_at, "stage": stage}
+        entries[key] = {
+            "marked_at": marked_at,
+            "stage": stage,
+            "version": _REPLAY_SHORTENING_ENTRY_VERSION,
+        }
 
     try:
         _state_module._locked_json_state_update(path, update)

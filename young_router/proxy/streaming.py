@@ -3092,11 +3092,23 @@ def _native_stream_error_message(
         request_data,
     )
 
-# Terminal reasons that mean "the replay carried too many items", not "the
+# Terminal reasons that can mean "the replay carried too many items", not "the
 # model cannot hold this conversation".  Live 2026-11-19 the tken relay ended a
 # 311 s turn with ``response.incomplete`` and ``reason: max_messages``; the same
 # payload had been served minutes earlier, so the router treats this as a
 # refusal to resend smaller first, and only then as a stop.
+#
+# The reason alone does not say *which* cap was hit.  Both relays state
+# ``max_messages`` when the model spends a whole response's item budget
+# thinking, and that terminal arrives after the reasoning has been streamed:
+# live 2026-11-20 thread ``01a1ee60`` was cut that way after four minutes, and
+# each of those terminals was remembered as "this replay is too large".  The
+# thread walked the entire ladder in one afternoon -- 5,160 items became 197
+# with no reasoning left -- so the model answered blind with the same sentence,
+# Codex asked again, and the next turn was cut the same way.  A mark is
+# therefore only written when the route had delivered nothing before its
+# terminal: a route that had already started this response was counting what it
+# generated, and a shorter replay cannot clear that cap.
 _UPSTREAM_INPUT_ITEM_LIMIT_REASONS = frozenset(
     {
         "max_messages",
@@ -3106,6 +3118,25 @@ _UPSTREAM_INPUT_ITEM_LIMIT_REASONS = frozenset(
         "too_many_items",
     }
 )
+
+
+def _incomplete_terminal_capped_generated_output(
+    buffer: Optional[List[Any]],
+    request_data: Optional[dict] = None,
+) -> bool:
+    """Whether this response had already shown the reader something.
+
+    The frames before the terminal are the evidence.  A reasoning summary delta
+    reaches the client the moment it arrives, so a cap that follows one was
+    counting the items this response generated -- not the replay it was given.
+    """
+
+    if not buffer:
+        return False
+    for chunk in buffer[:-1]:
+        if _stream_chunk_has_delivered_output(chunk, request_data):
+            return True
+    return False
 
 
 def _responses_incomplete_stream_exception(
@@ -3128,16 +3159,29 @@ def _responses_incomplete_stream_exception(
     candidate = RuntimeError(message)
     exception = candidate
     try:
-        if str(terminal_summary.get("reason") or "") in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
-            # The upstream said the replay carries too many items.  The router
-            # answers that by resending a shorter history, which is a different
-            # verdict from "this conversation no longer fits" -- Codex must not
-            # be told to compact over a cap that a shorter replay clears.
-            setattr(exception, _UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
-            # Whatever this turn can still do about it, the thread is now known
-            # to be too large for this route -- and the client replays the same
-            # history on its next turn.
-            _routing_module._remember_replay_too_large(request_data)
+        terminal_reason = str(terminal_summary.get("reason") or "")
+        if terminal_reason in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
+            if _incomplete_terminal_capped_generated_output(buffer, request_data):
+                # The cap was on what this response generated.  Saying so keeps
+                # it out of the thread's ladder -- and keeps the two stops
+                # distinguishable for whoever reads the trace.
+                _trace_module._request_route_trace(
+                    "responses_item_cap_after_delivered_output",
+                    request_data,
+                    reason=terminal_reason,
+                    buffered_event_count=len(buffer or []),
+                )
+            else:
+                # The upstream said the replay carries too many items.  The
+                # router answers that by resending a shorter history, which is a
+                # different verdict from "this conversation no longer fits" --
+                # Codex must not be told to compact over a cap that a shorter
+                # replay clears.
+                setattr(exception, _UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
+                # Whatever this turn can still do about it, the thread is now
+                # known to be too large for this route -- and the client replays
+                # the same history on its next turn.
+                _routing_module._remember_replay_too_large(request_data)
     except Exception:
         pass
     try:
