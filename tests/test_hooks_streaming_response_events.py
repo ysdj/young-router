@@ -3333,15 +3333,13 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         ]
         types = [chunk.get("type") for chunk in chunks]
 
+        # A cap that lands after a real answer ends *this step*, not the turn:
+        # ``response.incomplete`` ends the agent's turn with "Incomplete
+        # response returned", while a completed step lets it ask for the next
+        # one -- and no failure code it might reconnect on.
         self.assertNotIn("response.failed", types)
-        self.assertEqual("response.incomplete", types[-1])
-        terminal = chunks[-1]["response"]
-        self.assertEqual("incomplete", terminal["status"])
-        self.assertEqual({"reason": "max_messages"}, terminal["incomplete_details"])
-        # The spend is real and the client records it from this frame.
-        self.assertEqual(11, terminal["usage"]["input_tokens"])
-        self.assertEqual(7, terminal["usage"]["output_tokens"])
-        self.assertEqual(18, terminal["usage"]["total_tokens"])
+        self.assertNotIn("response.incomplete", types)
+        self.assertEqual("response.completed", types[-1])
 
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.

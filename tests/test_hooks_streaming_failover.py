@@ -717,6 +717,96 @@ class HookStreamingFailoverTests(HookTestCase):
 
         return capped
 
+    async def test_a_cap_after_a_finished_tool_call_ends_the_step_not_the_turn(
+        self,
+    ) -> None:
+        """Work that already happened must reach the loop, not a stop.
+
+        Live 2026-11-20 13:35: tken cut thread 01a1ee60 again while the response
+        held a finished tool call.  Delivered as ``response.incomplete`` that
+        became "Incomplete response returned, reason: max_messages" and the
+        turn ended; delivered as the end of *this step*, Codex runs the call and
+        asks for the next one, so the agent keeps working.
+        """
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("a step that produced work is not replayed")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def capped_after_tool_call():
+            yield {"type": "response.created", "response": {"id": "resp-cap"}}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "call-1", "type": "function_call", "name": "exec", "arguments": ""},
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "call-1",
+                    "type": "function_call",
+                    "name": "exec",
+                    "arguments": '{"cmd":"rg -n report.md"}',
+                    "call_id": "call-1",
+                    "status": "completed",
+                },
+            }
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-cap",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "output": [
+                        {
+                            "id": "call-1",
+                            "type": "function_call",
+                            "name": "exec",
+                            "arguments": '{"cmd":"rg -n report.md"}',
+                            "call_id": "call-1",
+                            "status": "completed",
+                        }
+                    ],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-cap-with-work",
+            "client_metadata": {"thread_id": "thread-cap-with-work"},
+            "model_info": {
+                "id": "capping-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=capped_after_tool_call(),
+                request_data=request_data,
+            )
+        ]
+        types = [chunk.get("type") for chunk in chunks]
+
+        self.assertNotIn("response.incomplete", types)
+        self.assertNotIn("response.failed", types)
+        self.assertEqual("response.completed", types[-1])
+        output = chunks[-1]["response"].get("output") or []
+        self.assertTrue(
+            any(item.get("type") == "function_call" for item in output),
+            output,
+        )
+
     async def test_two_item_cap_cuts_inside_five_minutes_park_the_route(self) -> None:
         """A route that runs out of items twice in five minutes is out.
 

@@ -7975,6 +7975,39 @@ async def _yield_guarded_original_stream(
                             yield fallback_chunk
                         await _close_async_iterator_safely(response)
                         return
+                    if _responses_incomplete_terminal_reason(chunk) in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
+                        # The route ran out of its own item budget after real
+                        # work: a tool call it finished, or text the reader is
+                        # already reading.  Ending the response as completed
+                        # keeps the agent's loop going -- Codex runs the calls,
+                        # records the step and asks for the next one -- while
+                        # ``response.incomplete`` ends the whole turn with
+                        # "Incomplete response returned", which is the stop the
+                        # user is still seeing every few minutes.  Only items
+                        # the route had already completed go in; a half-written
+                        # tool call is excluded by ``pending_tool_items`` below.
+                        if not pending_tool_items:
+                            completed = completed_terminal_event(
+                                "route item cap after delivered work",
+                                allow_tool_call_only=True,
+                            )
+                            if completed is not None:
+                                # The reader gets a finished step, but the
+                                # route still spent its budget mid-turn: charge
+                                # it, so two such caps inside five minutes park
+                                # a route that cannot finish long turns.
+                                if _routing_module._is_request_scoped_priority_deployment_failover_error(
+                                    failure,
+                                    request_data,
+                                ):
+                                    _routing_module._mark_exception_for_deployment_failover(
+                                        failure,
+                                        request_data,
+                                    )
+                                remember(completed)
+                                yield completed
+                                await _close_async_iterator_safely(response)
+                                return
                     stated_outcome = stated_incomplete_terminal_event(chunk, failure)
                     if stated_outcome is not None:
                         yield stated_outcome
