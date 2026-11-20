@@ -4060,6 +4060,13 @@ async def _dispatch_stream_hedge(
         ):
             _routing_module._release_request_concurrency_slots(payload, deployment_only=True)
         if not isinstance(exc, Exception):
+            if getattr(asyncio.current_task(), "_young_router_hedge_lost", False):
+                # The winner cancelled this hedge: it never produced a head and
+                # will get no terminal callback.  Close its row now, saying why.
+                # A cancellation for any other reason (the client left, the
+                # process is stopping) is not a lost race and is left to the
+                # path that owns that ending.
+                _settle_head_hedge_row(selected_box.get("marker"))
             raise
         _trace_module._request_route_trace(
             "stream_hedge_error", request_data,
@@ -4137,6 +4144,20 @@ def _is_head_hedge_attempt(request_kwargs: Optional[dict] = None) -> bool:
         request_kwargs,
         _HEAD_HEDGE_METADATA_KEY,
     )
+
+
+def _settle_head_hedge_row(marker: Any) -> None:
+    """Close the log row of a sibling that will never report its own outcome.
+
+    A losing hedge produces no response head, so LiteLLM has no terminal
+    callback for it; the winner just closes its iterator.  The row itself is
+    worth showing -- it is a real dispatch -- but its state has to be the race's
+    outcome (another route answered first), not the viewer's stale clock.
+    """
+
+    request_id = _routing_module._pending_request_log_id_from_marker(marker)
+    if request_id:
+        _state_module._settle_hedge_request(request_id)
 
 
 # One sibling race per turn.  A turn runs the same dispatch through several
@@ -4355,6 +4376,10 @@ async def _await_upstream_dispatch_with_head_hedge(
     finally:
         losers = [task for task in (primary, hedge) if task is not None and task is not winner]
         for task in losers:
+            if task is hedge and winner is not None:
+                # The race ended here, not with a client leaving: this hedge
+                # never produced a head and will get no terminal callback.
+                setattr(task, "_young_router_hedge_lost", True)
             if not task.done():
                 task.cancel()
         for task, result in zip(losers, await asyncio.gather(*losers, return_exceptions=True)):
@@ -4369,8 +4394,13 @@ async def _await_upstream_dispatch_with_head_hedge(
                         _routing_module._release_request_concurrency_slots(primary_request, deployment_only=True)
             elif result is not None and not isinstance(result, BaseException):
                 response, payload = result
-                await _close_async_iterator_safely(response)
                 marker = _routing_module._selected_deployment_marker_from_response(response)
+                if winner is not None:
+                    # This hedge answered with a head but the primary's head won
+                    # first.  Its row is real, and the outcome of the race is
+                    # what the row should say -- not the stale window.
+                    _settle_head_hedge_row(marker)
+                await _close_async_iterator_safely(response)
                 _routing_module._apply_selected_deployment_marker_to_request(payload, marker)
                 if _routing_module._deployment_id_from_request(payload):
                     _routing_module._release_request_concurrency_slots(payload, deployment_only=True)
@@ -4529,18 +4559,23 @@ async def _hedged_first_chunk(
     hedge_payload: Optional[dict] = None
     hedge_handed_over = False
     hedge_dispatch_consumed = False
+    hedge_lost_race = False
 
     async def abandon_hedge() -> None:
         nonlocal hedge_iterator, hedge_payload, hedge_task, hedge_response
         await _settle_task(hedge_task)
+        marker = _routing_module._selected_deployment_marker_from_response(
+            hedge_response
+        )
+        if hedge_lost_race:
+            # The primary's first frame decided the race; this hedge produced
+            # none and will get no terminal callback of its own.
+            _settle_head_hedge_row(marker)
         if hedge_iterator is not None:
             await _close_async_iterator_safely(hedge_iterator)
         elif hedge_response is not None:
             await _close_async_iterator_safely(hedge_response)
         if hedge_payload is not None:
-            marker = _routing_module._selected_deployment_marker_from_response(
-                hedge_response
-            )
             if marker is not None:
                 _routing_module._apply_selected_deployment_marker_to_request(
                     hedge_payload, marker
@@ -4578,6 +4613,7 @@ async def _hedged_first_chunk(
             if not done:
                 break
             if primary_task in done:
+                hedge_lost_race = True
                 await abandon_hedge()
                 return iterator, primary_task.result(), None
             if hedge_dispatch_task in done:

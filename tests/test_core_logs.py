@@ -1601,16 +1601,13 @@ model_list:
             )
             self.assertEqual("stale", aborted["aborted"]["reason"])
 
-    def test_internal_hedge_rows_are_hidden_until_they_are_a_real_answer(
-        self,
-    ) -> None:
-        """A sibling race's bookkeeping is not a request the client made.
+    def test_hedge_rows_stay_in_the_view_with_their_own_state(self) -> None:
+        """A sibling dispatch is a real row; only its state has to be honest.
 
-        A losing head hedge never reports a terminal state, so its row used to
-        read 发送中 for the whole stale window and then 已中断 with "no terminal
-        callback" -- three phantom rows per heavy turn on the gateway
-        (2026-11-20).  The race's outcome is on the turn's own row; a hedge row
-        only earns a place once it is a terminal answer of its own.
+        A losing hedge never reports a terminal state.  The runtime now closes
+        it with ``head_hedge_lost`` instead of leaving it to the stale window;
+        the view must carry that row (its route and duration are evidence), and
+        must carry the marker that tells the pane it was a sibling dispatch.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1636,15 +1633,7 @@ model_list:
                     "request_id": "hedge-lost",
                     "deployment_id": "sibling",
                     "status": "aborted",
-                    "aborted": {"reason": "no_terminal_callback"},
-                    "internal_attempt": "head_hedge",
-                },
-                {
-                    "ts": stamp,
-                    "request_id": "hedge-cut-by-restart",
-                    "deployment_id": "sibling",
-                    "status": "aborted",
-                    "aborted": {"reason": "service_restart"},
+                    "aborted": {"reason": "head_hedge_lost"},
                     "internal_attempt": "head_hedge",
                 },
                 {
@@ -1652,14 +1641,6 @@ model_list:
                     "request_id": "hedge-won",
                     "deployment_id": "sibling",
                     "status": "success",
-                    "internal_attempt": "head_hedge",
-                },
-                {
-                    "ts": stamp,
-                    "request_id": "hedge-refused",
-                    "deployment_id": "sibling",
-                    "status": "failure",
-                    "error": {"reason": "upstream-status-524"},
                     "internal_attempt": "head_hedge",
                 },
             ]
@@ -1671,8 +1652,16 @@ model_list:
             projected = LogsDomain(root).view("requests")["log"]["records"]
 
             self.assertEqual(
-                ["turn", "hedge-won", "hedge-refused"],
+                ["turn", "hedge-running", "hedge-lost", "hedge-won"],
                 [record["request_id"] for record in projected],
+            )
+            self.assertEqual(
+                "head_hedge",
+                next(
+                    record["internal_attempt"]
+                    for record in projected
+                    if record["request_id"] == "hedge-lost"
+                ),
             )
 
     def test_request_stale_window_follows_runtime_settings(self) -> None:

@@ -14474,6 +14474,9 @@ function requestAbortedDetail(value: unknown, translate: Translate): string {
     // says so instead of borrowing the runtime's own words for a stream that
     // simply never reported back.
     case "client_disconnect": return translate("logs.aborted.reasonClientDisconnect");
+    // A head hedge that lost its race is not an interrupted turn: the turn
+    // went on, on the route that answered first.
+    case "head_hedge_lost": return translate("logs.aborted.reasonHeadHedgeLost");
     default: return reason;
   }
 }
@@ -14858,6 +14861,12 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const cacheWriteTokens = compactLogValue(usage.cache_write_tokens ?? value.cache_write_tokens);
   const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens, cacheWriteTokens);
   const details: string[] = [];
+  if (tab === "requests" && compactLogValue(value.internal_attempt) === "head_hedge") {
+    // A sibling dispatch is a second route asked in parallel by the same turn;
+    // the row is real (it may answer, or lose to another route), so it says
+    // which kind of attempt it was instead of borrowing the turn's words.
+    details.push(translate("logs.siblingDispatch"));
+  }
   const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
   if (abortedDetail) details.push(abortedDetail);
   const directDetail = value.error === undefined

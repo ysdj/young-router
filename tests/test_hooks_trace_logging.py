@@ -1180,6 +1180,43 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual("aborted", rows[-1]["status"])
             self.assertEqual("service_restart", rows[-1]["aborted"]["reason"])
 
+    def test_a_losing_hedge_row_is_closed_with_the_race_outcome(self) -> None:
+        """A sibling that never answers still ends with a truth, not a clock.
+
+        The winner closes the loser's iterator and LiteLLM never reports that
+        attempt, so the row used to say 发送中 for the stale window and then
+        "no terminal callback".  The race itself knows the outcome: another
+        route answered first.
+        """
+
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            hooks._append_recent_request(
+                {
+                    "ts": "2026-06-09T12:00:00Z",
+                    "request_id": "hedge-1",
+                    "status": "pending",
+                    "internal_attempt": "head_hedge",
+                }
+            )
+
+            self.assertTrue(hooks._settle_hedge_request("hedge-1"))
+            # A terminal callback or the boot settlement may already own the
+            # entry; the second close is a no-op, never a duplicate row.
+            self.assertFalse(hooks._settle_hedge_request("hedge-1"))
+
+            rows = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=10)
+                if line.strip()
+            ]
+            self.assertEqual("aborted", rows[-1]["status"])
+            self.assertEqual("head_hedge_lost", rows[-1]["aborted"]["reason"])
+            self.assertEqual("head_hedge", rows[-1]["internal_attempt"])
+            self.assertIsInstance(rows[-1].get("duration_ms"), int)
+
     async def test_stream_request_log_advances_to_terminal_status(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

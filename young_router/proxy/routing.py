@@ -373,6 +373,28 @@ def _remember_pending_request_log_id(request_id: Any) -> None:
         marker[_PENDING_REQUEST_LOG_ID_KEY] = request_id.strip()
 
 
+def _pending_request_log_id_from_marker(marker: Any) -> Optional[str]:
+    """The request-log row pinned on a selected-deployment marker.
+
+    A hedge's row belongs to the *sibling* dispatch, whose request id only the
+    marker knows (LiteLLM rebuilds the callback kwargs).  Reading it here is
+    what lets the race close that row when the sibling never reports back.
+    """
+
+    if not isinstance(marker, dict):
+        return None
+    value = marker.get(_PENDING_REQUEST_LOG_ID_KEY)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _pending_request_log_id_from_response(response: Any) -> Optional[str]:
+    return _pending_request_log_id_from_marker(
+        _selected_deployment_marker_from_response(response)
+    )
+
+
 def _settle_failed_attempt(
     request_data: Optional[dict],
     exception: BaseException,

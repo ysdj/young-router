@@ -291,6 +291,35 @@ def _settle_recent_request(
     return True
 
 
+def _settle_hedge_request(request_id: Any, *, reason: str = "head_hedge_lost") -> bool:
+    """Close a sibling hedge's row the moment its race is over.
+
+    A losing hedge gets no terminal callback: the winner closes its iterator,
+    and LiteLLM only logs an attempt that produced a response.  Left in the
+    registry, that row said 发送中 for the whole stale window and then 已中断
+    with "no terminal callback" -- a state that describes the viewer's clock,
+    not the race.  The loser's real outcome is that another route answered
+    first, so the row says exactly that.  A winner still runs its own logging
+    callbacks and replaces this row with its own success/failure; whichever
+    side gets here first finds the registry entry.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return False
+    request_id = request_id.strip()
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.pop(request_id, None)
+    if entry is None:
+        return False
+    record = entry.get("record") if isinstance(entry.get("record"), Mapping) else {}
+    aborted = _aborted_recent_request_record(record, reason)
+    duration = _elapsed_milliseconds(record.get("ts"), _utc_now_iso())
+    if duration is not None:
+        aborted["duration_ms"] = duration
+    _append_recent_request(aborted)
+    return True
+
+
 def _settle_failed_request(
     request_id: Any,
     error: Mapping[str, Any],
