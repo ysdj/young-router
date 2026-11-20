@@ -6867,7 +6867,16 @@ async def _yield_guarded_original_stream(
     empty_completion_ended_stream = False
 
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
-        failure = exception or _responses_incomplete_stream_exception(reason, buffer=event_tail)
+        failure = exception or _responses_incomplete_stream_exception(
+            reason,
+            buffer=event_tail,
+            # The event is built here when no lower layer raised one, and the
+            # constructor is where an item-cap refusal (`max_messages`) is
+            # recorded against the thread.  Without the request it has no
+            # thread to record, so the client's reconnect replayed the same
+            # 2,000 items and every request ended this way (2026-11-20).
+            request_data=request_data,
+        )
         # Once part of a Responses stream has reached Codex, replaying that
         # stream could duplicate a tool call or visible output.  Keep the
         # terminal failure for this response, but quarantine the route before

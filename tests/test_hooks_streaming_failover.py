@@ -4972,3 +4972,34 @@ class ReplayLadderTests(HookTestCase):
         hooks._REPLAY_TOO_LARGE_SESSIONS.clear()
 
         self.assertEqual((8, None), hooks._session_replay_shortening(request))
+
+    def test_an_item_cap_terminal_names_the_thread_it_refused(self) -> None:
+        """The terminal the sanitizer builds itself must carry the request.
+
+        ``response.incomplete`` with ``max_messages`` is recorded against the
+        thread in the exception constructor.  One caller built that exception
+        without the request, so the register stayed empty and the client's
+        reconnect replayed the same items -- live 2026-11-20, 2,229 of them,
+        every request ending the same way.
+        """
+
+        hooks, _ = load_hook_module()
+        request = self._request("thread-cap")
+        terminal = {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp-cap",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_messages"},
+                "output": [],
+            },
+        }
+
+        exception = hooks._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[terminal],
+            request_data=request,
+        )
+
+        self.assertTrue(hooks._is_upstream_input_item_limit_error(exception))
+        self.assertEqual((8, None), hooks._session_replay_shortening(request))
