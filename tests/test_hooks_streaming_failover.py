@@ -2093,6 +2093,78 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(len(sizes), 2)
         self.assertLess(sizes[1], sizes[0])
 
+    async def test_a_tool_adapter_refusal_is_retried_shorter(self) -> None:
+        """The adapter is the deployment's first call, so nothing retries it.
+
+        Live 2026-11-20 05:46Z: a 387-item Codex replay was refused by the relay
+        at 1,048,636 tokens > 1,048,576 -- 60 tokens over.  The preemptive tool
+        adapter had rewritten the Codex namespace tools, so the 400 surfaced
+        inside ``_execute_responses_tool_adapter_call`` and the turn ended as
+        "Codex ran out of room": the truncation fallback below it only wraps
+        the plain dispatch, which this branch had already returned from.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        context_window = hooks._context_window_module
+        sizes = []
+
+        async def original_generic_function(**kwargs):
+            sizes.append(len(str(kwargs.get("input"))))
+            if len(sizes) == 1:
+                exc = RuntimeError(
+                    "litellm.BadRequestError: OpenAIException - "
+                    '{"error":{"message":"prompt is too long: '
+                    '1048636 tokens > 1048576 maximum"}}'
+                )
+                exc.status_code = 400
+                raise exc
+            return {"ok": True}
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        context_window._MEASURED_INPUT_TOKENS.set(1048636)
+        response = await wrapped(
+            call_type="aresponses",
+            model="deepseek-v4.1-flash",
+            input=[
+                {
+                    "type": "function_call",
+                    "call_id": "call_big",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_big",
+                    "output": "x" * 900000,
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue."}],
+                },
+            ],
+            tools=[
+                {"type": "custom", "name": "apply_patch", "description": "Edit files."},
+                {"type": "tool_search"},
+            ],
+            stream=True,
+            model_info={
+                "id": "third-party-responses",
+                "provider": "youyangai",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
+                "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
+            },
+            client_metadata={"thread_id": "thread-tool-adapter-ceiling"},
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(sizes), 2)
+        self.assertLess(sizes[1], sizes[0])
+
     async def test_generic_response_wrapper_does_not_context_retry_compaction_request(self) -> None:
         hooks, _proxy_server = load_hook_module()
         calls = []

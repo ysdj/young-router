@@ -1408,6 +1408,28 @@ async def _execute_responses_tool_adapter_call(
                 start_event="responses_chat_bridge_native_web_search_fallback_start",
                 error_event="responses_chat_bridge_native_web_search_fallback_error",
             )
+        # The adapter is the deployment's *first* call whenever Codex's
+        # namespace tools need rewriting, so a size refusal here never reaches
+        # the truncation fallback that wraps the plain dispatch.  Live
+        # 2026-11-20 05:46Z a 387-item replay was refused at 1,048,636 tokens
+        # against a 1,048,576 maximum -- sixty tokens over -- and the turn ended
+        # as "Codex ran out of room" with nothing tried.  The refusal is the
+        # evidence; shorten this body and ask the same route again.
+        shrink_attempt = 0
+        while _context_window_module.retry_for_refusal(
+            bridge_kwargs,
+            exc,
+            attempt=shrink_attempt,
+            model=_request_context_module._request_model_group(trace_request),
+        ):
+            shrink_attempt += 1
+            error_request_summary = _trace_module._trace_request_summary(
+                bridge_kwargs
+            )
+            try:
+                return await execute_once(bridge_kwargs)
+            except Exception as retry_exc:
+                exc = retry_exc
         _trace_module._request_route_trace(
             "responses_tool_adapter_error", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
             request=trace_request_summary,
