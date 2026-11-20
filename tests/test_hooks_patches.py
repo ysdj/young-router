@@ -5315,3 +5315,40 @@ if __name__ == "__main__":
         self.assertTrue(
             getattr(Router.make_call, hooks._CHAT_DISPATCH_BUDGET_PATCH_ATTR)
         )
+
+
+class RustRouterAbsenceTests(unittest.TestCase):
+    """A litellm build without the Rust router must not stop the gateway.
+
+    The gateway pins litellm 1.106.4, which ships ``rust_bridge`` but no
+    ``router_rust``/``router_python_host``.  On 2026-11-20 22:19 CST an
+    unconditional ``from litellm.router_rust.core import RustCore`` raised at
+    import time and the whole app refused to start: 220 "Application startup
+    failed. Exiting." lines, port 4401 dead, every in-flight Codex turn frozen.
+    """
+
+    def test_the_rust_patches_stand_down_when_the_subsystem_is_absent(self) -> None:
+        import importlib.util
+
+        from young_router.proxy import patches
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *args, **kwargs):
+            if name in {"litellm.router_rust", "litellm.router_python_host"}:
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        with mock.patch.object(importlib.util, "find_spec", find_spec):
+            self.assertFalse(patches._rust_router_subsystem())
+            # Neither installer may raise: install_all calls both unconditionally.
+            patches._install_relay_balance_selection_patch()
+            patches._install_rust_dispatch_patch()
+
+    def test_the_guard_reports_presence_on_a_build_that_has_it(self) -> None:
+        import importlib.util
+
+        from young_router.proxy import patches
+
+        has_module = importlib.util.find_spec("litellm.router_rust") is not None
+        self.assertEqual(has_module, patches._rust_router_subsystem())

@@ -1052,8 +1052,28 @@ def _install_integer_order_tiers_patch() -> None:
     Router.__init__ = patched_init
 
 
+def _rust_router_subsystem() -> bool:
+    """Whether this litellm build ships the Rust routing subsystem.
+
+    The gateway pins its own litellm (1.106.4 has ``rust_bridge`` but no
+    ``router_rust``/``router_python_host``), while a developer install may carry
+    the newer module layout.  A patch that only exists to correct the Rust
+    router must therefore say "not here" instead of raising: on 2026-11-20
+    22:19 CST the unconditional import below took the whole gateway down -- 220
+    "Application startup failed. Exiting." lines, port 4401 dead, every in-flight
+    Codex turn frozen.  Nothing about a missing optional subsystem is worth
+    refusing to serve.
+    """
+
+    import importlib.util
+
+    return importlib.util.find_spec("litellm.router_rust") is not None
+
+
 def _install_relay_balance_selection_patch() -> None:
     """Exclude negative balances both before tier selection and for direct IDs."""
+    if not _rust_router_subsystem():
+        return
     from litellm.router_rust.core import RustCore
     from litellm.rust_bridge._native import RouterCoreHandle
 
@@ -1454,6 +1474,8 @@ def _install_selected_deployment_marker_patch() -> None:
     )
     shaping_modules = ()
     if original_update_kwargs_with_deployment is None:
+        if not _rust_router_subsystem():
+            return
         from litellm.router_rust.invoke import endpoints, prompt_management, shaping
 
         shaping_modules = (shaping, endpoints, prompt_management)
@@ -2451,6 +2473,10 @@ def _install_rust_dispatch_patch() -> None:
     deadline on its provider invocation and race outside the driver so the
     winner owns its stream, routing metadata, and outcome callbacks.
     """
+    if not _rust_router_subsystem():
+        # Same reason as above: the pinned gateway build routes in Python, so
+        # the driver this patch rewrites is not installed at all.
+        return
     from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
     from litellm.router_python_host import PythonHost
     from litellm.router_rust import core as rust_router
