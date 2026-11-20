@@ -210,9 +210,61 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(cw.retry_for_refusal(data, exc, attempt=0))
         after = cw.count_tokens(data, _Router(10**9))
         self.assertLess(after, before)
-        self.assertLessEqual(after, int(before * 0.55) + 1)
+        # The refusal named its ceiling, so one retry has to fit under it --
+        # 55% of 900,000 still does not fit in 128,000.
+        self.assertLessEqual(after, 128000)
         # The current turn still arrives intact.
         self.assertEqual(data["input"][-1]["content"][0]["text"], "what changed?")
+
+    def test_a_refusal_that_names_its_ceiling_cuts_to_that_ceiling(self) -> None:
+        # Sixty tokens over a 1,048,576 wall must not ask for 55% of the
+        # thread: the ceiling is known, so the target is the ceiling.
+        data = {"model": "m", "input": _input()}
+        before = cw.count_tokens(data, _Router(10**9))
+        cw._MEASURED_INPUT_TOKENS.set(before)
+        ceiling = int(before * 0.97)
+        exc = RuntimeError(f"prompt is too long: {before} tokens > {ceiling} maximum")
+        events = []
+        with mock.patch.object(
+            cw, "_trace_retry", lambda _data, **fields: events.append(fields)
+        ):
+            self.assertTrue(cw.retry_for_refusal(data, exc, attempt=0))
+        self.assertEqual(events[0]["target"], int(ceiling * 0.8))
+        after = cw.count_tokens(data, _Router(10**9))
+        self.assertLessEqual(after, int(ceiling * 0.8) + 1)
+
+    def test_the_ceiling_is_read_from_the_sentences_relays_send(self) -> None:
+        self.assertEqual(
+            cw._refusal_maximum_tokens(
+                RuntimeError("prompt is too long: 1048636 tokens > 1048576 maximum")
+            ),
+            1048576,
+        )
+        self.assertEqual(
+            cw._refusal_maximum_tokens(
+                RuntimeError(
+                    "This model's maximum context length is 131,072 tokens. "
+                    "However, you requested 145,000 tokens."
+                )
+            ),
+            131072,
+        )
+        self.assertIsNone(
+            cw._refusal_maximum_tokens(RuntimeError("prompt is too long"))
+        )
+        self.assertIsNone(
+            cw._refusal_maximum_tokens(RuntimeError("400 maximum is 3 tokens"))
+        )
+
+    def test_a_refusal_without_a_named_ceiling_uses_the_fraction(self) -> None:
+        data = {"model": "m", "input": _input()}
+        before = cw.count_tokens(data, _Router(10**9))
+        cw._MEASURED_INPUT_TOKENS.set(before)
+        self.assertTrue(
+            cw.retry_for_refusal(data, RuntimeError("prompt is too long"), attempt=0)
+        )
+        after = cw.count_tokens(data, _Router(10**9))
+        self.assertLessEqual(after, int(before * 0.55) + 1)
 
     def test_a_non_context_error_is_left_alone(self) -> None:
         data = {"model": "m", "input": _input()}

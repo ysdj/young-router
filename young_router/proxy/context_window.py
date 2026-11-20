@@ -46,6 +46,7 @@ that re-read the same paper fifty times instead of once:
 from __future__ import annotations
 
 import json
+import re
 from contextvars import ContextVar
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -104,6 +105,22 @@ _TEXT_FIELDS = ("input_text", "output_text", "text", "summary_text")
 #: past every limit such a relay has been seen to enforce; the ladder is short
 #: on purpose, because each rung costs an upstream round trip.
 _RETRY_FRACTIONS = (0.55, 0.3)
+
+#: The ceilings a refusal can name, in the sentences relays forward.  The live
+#: one is ``prompt is too long: 1048636 tokens > 1048576 maximum``; the second
+#: is OpenAI's own ``maximum context length is 131072 tokens``.
+_REFUSAL_MAXIMUM_PATTERNS = (
+    re.compile(r"\d[\d,]*\s*tokens?\s*>\s*(\d[\d,]*)\s*maximum", re.IGNORECASE),
+    re.compile(
+        r"maximum context length (?:is|of)\s*(\d[\d,]*)\s*tokens", re.IGNORECASE
+    ),
+)
+
+#: When the refusal names its ceiling, cut to that ceiling instead of to
+#: ``_RETRY_FRACTIONS``: 55% of a body that was sixty tokens over the wall
+#: throws away history the route would have taken.  The second rung is the one
+#: that has to survive a relay whose count is denser than this router's.
+_NAMED_MAXIMUM_TARGET_FRACTIONS = (0.8, 0.5)
 
 #: The largest request each model group is known to have accepted upstream.  A
 #: relay that refused a prompt teaches the next turn where the real ceiling is,
@@ -1203,6 +1220,29 @@ def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List
     return rewritten
 
 
+def _refusal_maximum_tokens(exception: BaseException) -> Optional[int]:
+    """The ceiling a size refusal names, when it names one.
+
+    ``prompt is too long: 1048636 tokens > 1048576 maximum`` is the one refusal
+    that also says where the wall is.  It has to be read in the provider's own
+    units, and only when it is a plausible window: a sentence that names a
+    small candidate count is not a ceiling.
+    """
+
+    text = str(exception)
+    for pattern in _REFUSAL_MAXIMUM_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        try:
+            value = int(match.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if 1_000 <= value <= 10_000_000:
+            return value
+    return None
+
+
 def retry_for_refusal(
     data: Any,
     exception: BaseException,
@@ -1271,6 +1311,12 @@ def retry_for_refusal(
     if not measured or measured <= 0:
         return False
     target = int(measured * _RETRY_FRACTIONS[attempt])
+    named_maximum = _refusal_maximum_tokens(exception)
+    if named_maximum is not None and measured >= int(named_maximum * 0.9):
+        fraction = _NAMED_MAXIMUM_TARGET_FRACTIONS[
+            min(attempt, len(_NAMED_MAXIMUM_TARGET_FRACTIONS) - 1)
+        ]
+        target = min(int(named_maximum * fraction), int(measured * 0.95))
     rewritten = _fitted_items(payload, count=measured, target=target)
     if rewritten is None:
         return False
