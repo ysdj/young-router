@@ -33,7 +33,7 @@ DEFAULT_RECENT_REQUEST_STALE_SECONDS = 900.0
 _MIN_REQUEST_HEARTBEAT_SECONDS = 10.0
 _MAX_REQUEST_HEARTBEAT_SECONDS = 60.0
 _PENDING_RECENT_REQUESTS_MAX = 512
-_RECENT_REQUESTS_SCAN_BYTES = 1024 * 1024
+_RECENT_REQUESTS_SETTLE_ROWS = 4096
 _PENDING_RECENT_REQUESTS: dict[str, dict[str, Any]] = {}
 _PENDING_RECENT_REQUESTS_LOCK = threading.Lock()
 _PENDING_SETTLEMENT_TASKS: set[Any] = set()
@@ -463,16 +463,18 @@ def settle_stale_recent_requests(*, reason: str = "service_restart") -> int:
     path = _recent_requests_log_path()
     if not path:
         return 0
+    # Read the store, not the JSONL beside it.  The runtime appends to
+    # ``runtime-state.db`` and the JSONL stopped growing when that landed
+    # (2026-11-12); a boot that scanned the file found no in-flight row at all,
+    # so every restart left its turns 发送中 until the viewer's stale window
+    # renamed them 已中断 -- rows that had in fact been cut by the restart and
+    # could have said so at once (live 2026-11-20 23:46).
     try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - _RECENT_REQUESTS_SCAN_BYTES))
-            payload = handle.read().decode("utf-8", errors="replace")
-    except OSError:
+        rows = runtime_store.read_record_rows(path, limit=_RECENT_REQUESTS_SETTLE_ROWS)
+    except Exception:
         return 0
     last_records: dict[str, Mapping[str, Any]] = {}
-    for line in payload.splitlines():
+    for _seq, line in rows:
         if not line.strip():
             continue
         try:

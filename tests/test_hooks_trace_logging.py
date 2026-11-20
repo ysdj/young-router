@@ -1133,6 +1133,53 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual("service_restart", written[-1]["aborted"]["reason"])
             self.assertEqual("2026-06-09T12:00:00Z", written[-1]["ts"])
 
+    def test_boot_settlement_reads_the_store_not_the_frozen_jsonl(self) -> None:
+        """The rows a restart cut live in the store the runtime writes.
+
+        The JSONL stopped growing when the request store moved to SQLite
+        (2026-11-12).  A boot that scanned the file closed nothing, so every
+        restart left its in-flight turns 发送中 until the viewer's stale window
+        renamed them -- the same spring a cut by the restart could explain at
+        once (live 2026-11-20 23:46).
+        """
+
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-06-09T12:00:00Z",
+                        "request_id": "old-finished",
+                        "status": "success",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # This is how the runtime writes: beside the JSONL's name, into
+            # the store.  The file itself is not touched.
+            hooks._append_recent_request(
+                {
+                    "ts": "2026-06-09T12:00:01Z",
+                    "request_id": "cut-by-restart",
+                    "status": "pending",
+                }
+            )
+
+            settled = hooks.settle_stale_recent_requests(reason="service_restart")
+
+            self.assertEqual(1, settled)
+            rows = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=100)
+                if line.strip()
+            ]
+            self.assertEqual("cut-by-restart", rows[-1]["request_id"])
+            self.assertEqual("aborted", rows[-1]["status"])
+            self.assertEqual("service_restart", rows[-1]["aborted"]["reason"])
+
     async def test_stream_request_log_advances_to_terminal_status(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
