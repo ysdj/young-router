@@ -1053,6 +1053,17 @@ _CURRENT_SELECTED_DEPLOYMENT_BOX = contextvars.ContextVar(
     "current_selected_deployment_box",
     default=None,
 )
+# True while a sibling hedge's own dispatch runs.  The payload also carries
+# ``_HEAD_HEDGE_METADATA_KEY``, but that marker is the router's to re-shape and
+# on 2026-11-20 it did not reach the inner layers: one heavy Codex replay asked
+# three siblings inside four seconds (each a full prefill), and each losing
+# attempt left a request-log row saying 发送中.  A dispatch that runs inside a
+# hedge is a hedge's child whatever shape its kwargs arrive in, so the guard is
+# kept here as well as in the metadata.
+_CURRENT_HEAD_HEDGE_ATTEMPT = contextvars.ContextVar(
+    "current_head_hedge_attempt",
+    default=False,
+)
 _CURRENT_EXCLUDED_DEPLOYMENT_IDS = contextvars.ContextVar(
     "current_excluded_deployment_ids",
     default=None,

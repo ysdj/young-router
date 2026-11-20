@@ -3078,6 +3078,89 @@ class HookHeadHedgeTests(HookTestCase):
         self.assertEqual("primary-response", response)
         self.assertEqual([], calls)
 
+    async def test_a_hedge_does_not_hedge_again_when_the_router_drops_the_marker(
+        self,
+    ) -> None:
+        """The guard is a context fact, not only a payload field.
+
+        LiteLLM rebuilds the kwargs between router and deployment, and on
+        2026-11-20 the head-hedge marker did not survive that rebuild: one
+        heavy Codex replay asked three siblings inside four seconds, each a
+        full prefill, and each loser left a 发送中 row behind.  A dispatch that
+        runs inside a hedge must stay a hedge whatever shape its kwargs arrive
+        in.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
+        request = self._chat_request()
+        eligible: list = []
+        nested: list = []
+
+        async def inner_primary():
+            await asyncio.sleep(0.2)
+            return "inner-response"
+
+        async def head_hedge(request_data):
+            nested.append(request_data)
+            return None
+
+        class FakeRouter:
+            async def acompletion(self, **kwargs):
+                rebuilt = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key != "litellm_metadata"
+                }
+                rebuilt["litellm_metadata"] = {}
+                eligible.append(streaming._head_hedge_eligible(rebuilt))
+                with mock.patch.object(streaming, "_head_hedge", head_hedge):
+                    return await streaming._await_upstream_dispatch_with_head_hedge(
+                        inner_primary(), rebuilt
+                    )
+
+        proxy_server.llm_router = FakeRouter()
+
+        result = await asyncio.wait_for(
+            streaming._dispatch_stream_hedge(request, stage="head"),
+            3,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual([False], eligible)
+        self.assertEqual([], nested)
+
+    def test_the_hedge_marker_is_read_from_the_params_the_router_keeps(
+        self,
+    ) -> None:
+        """A rebuilt request keeps ``metadata`` under ``litellm_params``."""
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        request = self._chat_request()
+        request["litellm_metadata"] = {}
+        request["litellm_params"]["metadata"] = {
+            hooks._HEAD_HEDGE_METADATA_KEY: True,
+        }
+
+        self.assertFalse(streaming._head_hedge_eligible(request))
+
+    def test_a_hedge_dispatch_row_is_marked_as_internal(self) -> None:
+        """The request log can tell a sibling race from a hop of the turn."""
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        routing = sys.modules["young_router.proxy.routing"]
+        request = self._chat_request()
+        token = streaming._CURRENT_HEAD_HEDGE_ATTEMPT.set(True)
+        try:
+            record = routing._request_log_record("pending", request)
+        finally:
+            streaming._CURRENT_HEAD_HEDGE_ATTEMPT.reset(token)
+
+        self.assertEqual("head_hedge", record.get("internal_attempt"))
+
     async def test_a_head_that_never_arrives_is_cut_by_the_dispatch_budget(self) -> None:
         hooks, _ = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]

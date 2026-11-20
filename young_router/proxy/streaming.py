@@ -35,6 +35,7 @@ from .base import (
     Optional,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CHAT_REASONING_DELTA_KEYS,
+    _CURRENT_HEAD_HEDGE_ATTEMPT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _CURRENT_SELECTED_DEPLOYMENT,
     _IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY,
@@ -4035,6 +4036,11 @@ async def _dispatch_stream_hedge(
     selected_box: dict = {}
     box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
     marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
+    # Every layer this dispatch enters is inside the hedge: the router rebuilds
+    # the kwargs, but it cannot leave this context.  Without this one race could
+    # fan out into a race per layer (2026-11-20: three sibling dispatches of one
+    # replay inside four seconds).
+    hedge_token = _CURRENT_HEAD_HEDGE_ATTEMPT.set(True)
     try:
         response = await _await_upstream_dispatch(
             router_method(**_streaming_error_fallback_dispatch_kwargs(payload)),
@@ -4057,6 +4063,7 @@ async def _dispatch_stream_hedge(
         )
         return None
     finally:
+        _CURRENT_HEAD_HEDGE_ATTEMPT.reset(hedge_token)
         _CURRENT_SELECTED_DEPLOYMENT.reset(marker_token)
         _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(box_token)
     marker = _routing_module._selected_deployment_marker_from_response(response) or selected_box.get("marker")
@@ -4109,6 +4116,24 @@ def _request_is_image_generation(request_data: dict) -> bool:
     return "-image" in model or model.startswith("image-")
 
 
+def _is_head_hedge_attempt(request_kwargs: Optional[dict] = None) -> bool:
+    """Whether this dispatch is the sibling a head race asked for.
+
+    Two readers ask this question -- the eligibility check (one hedge must not
+    fan out) and the request log (a hedge is not a hop the client asked for) --
+    so it is answered once, here.  The context value covers a dispatch that is
+    already inside the hedge; the metadata covers a row written from a copy of
+    that request after the race returned, whose context is the parent's.
+    """
+
+    if _CURRENT_HEAD_HEDGE_ATTEMPT.get():
+        return True
+    return _request_context_module._request_metadata_flag(
+        request_kwargs,
+        _HEAD_HEDGE_METADATA_KEY,
+    )
+
+
 def _head_hedge_eligible(request_data: dict) -> bool:
     """Whether this attempt's *dispatch* may be raced with a sibling's.
 
@@ -4145,8 +4170,11 @@ def _head_hedge_eligible(request_data: dict) -> bool:
     metadata = _request_context_module._request_metadata_dict(
         request_data, "litellm_metadata"
     ) or {}
-    if metadata.get(_HEAD_HEDGE_METADATA_KEY) is True:
-        # This attempt *is* the hedge. One slow turn must not fan out.
+    if _is_head_hedge_attempt(request_data):
+        # This attempt *is* the hedge. One slow turn must not fan out.  The
+        # context value is what makes this hold for layers LiteLLM rebuilds
+        # the kwargs of; the payload marker alone was lost there on 2026-11-20
+        # and one replay asked three siblings inside four seconds.
         return False
     if _responses_request_module._request_already_attempted_streaming_error_fallback(
         request_data
@@ -4384,7 +4412,7 @@ def _stream_hedge_eligible(request_data: dict) -> bool:
     metadata = _request_context_module._request_metadata_dict(
         request_data, "litellm_metadata"
     ) or {}
-    if metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True or metadata.get(_HEAD_HEDGE_METADATA_KEY) is True:
+    if metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True or _is_head_hedge_attempt(request_data):
         return False
     # A group of one has no sibling to hedge with; asking twice would only pay
     # this route's prefill twice.

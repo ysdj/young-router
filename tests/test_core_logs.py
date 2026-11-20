@@ -1601,6 +1601,72 @@ model_list:
             )
             self.assertEqual("stale", aborted["aborted"]["reason"])
 
+    def test_internal_hedge_rows_are_hidden_until_they_are_a_real_answer(
+        self,
+    ) -> None:
+        """A sibling race's bookkeeping is not a request the client made.
+
+        A losing head hedge never reports a terminal state, so its row used to
+        read 发送中 for the whole stale window and then 已中断 with "no terminal
+        callback" -- three phantom rows per heavy turn on the gateway
+        (2026-11-20).  The race's outcome is on the turn's own row; a hedge row
+        only earns a place once it is a terminal answer of its own.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            stamp = now.isoformat()
+            records = [
+                {
+                    "ts": stamp,
+                    "request_id": "turn",
+                    "deployment_id": "primary",
+                    "status": "stream",
+                },
+                {
+                    "ts": stamp,
+                    "request_id": "hedge-running",
+                    "deployment_id": "sibling",
+                    "status": "pending",
+                    "internal_attempt": "head_hedge",
+                },
+                {
+                    "ts": stamp,
+                    "request_id": "hedge-lost",
+                    "deployment_id": "sibling",
+                    "status": "aborted",
+                    "aborted": {"reason": "no_terminal_callback"},
+                    "internal_attempt": "head_hedge",
+                },
+                {
+                    "ts": stamp,
+                    "request_id": "hedge-won",
+                    "deployment_id": "sibling",
+                    "status": "success",
+                    "internal_attempt": "head_hedge",
+                },
+                {
+                    "ts": stamp,
+                    "request_id": "hedge-refused",
+                    "deployment_id": "sibling",
+                    "status": "failure",
+                    "error": {"reason": "upstream-status-524"},
+                    "internal_attempt": "head_hedge",
+                },
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            self.assertEqual(
+                ["turn", "hedge-won", "hedge-refused"],
+                [record["request_id"] for record in projected],
+            )
+
     def test_request_stale_window_follows_runtime_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

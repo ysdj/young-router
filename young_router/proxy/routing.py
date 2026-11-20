@@ -4833,6 +4833,14 @@ def _request_log_record(
 
     if status in {"failure", "stuck"}:
         record["error"] = _request_log_error_summary(request_kwargs, response_obj)
+    if _streaming_module._is_head_hedge_attempt(request_kwargs):
+        # A head hedge is this router asking a sibling in parallel, not a hop
+        # the client's turn took.  The marker is written on every row of that
+        # dispatch, so the log view can keep the race's own bookkeeping out of
+        # 请求 -- it used to publish three 发送中 rows per heavy turn, each
+        # renamed 已中断 by the stale window because a losing hedge never gets
+        # a terminal callback (2026-11-20).
+        record["internal_attempt"] = "head_hedge"
     if status == "pending":
         started_at = _event_time(request_started_at or start_time)
         if started_at:

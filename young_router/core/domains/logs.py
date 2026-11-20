@@ -1191,6 +1191,10 @@ def _safe_request_record(
         # attempt and the retry that replaced it two rows instead of one (see
         # ``_request_projection_key``).
         "deployment_id",
+        # A head hedge's own bookkeeping row names the race it belongs to; the
+        # view keeps it out of 请求 while it is only that (see
+        # ``_is_hidden_internal_attempt``).
+        "internal_attempt",
     ):
         if key in raw:
             result[key] = _safe_scalar(raw[key])
@@ -1304,6 +1308,36 @@ _REQUEST_PENDING_STATUSES = frozenset({"pending", "sending"})
 # The runtime closes those rows itself; this window is the viewer's fallback for
 # rows written by an earlier runtime or by a process that died mid-flight.
 _REQUEST_PROGRESS_STATUSES = _REQUEST_PENDING_STATUSES | {"stream"}
+# A head hedge is a second dispatch of one turn, not a hop the client asked
+# for.  A losing hedge never reports a terminal state: the winner closes its
+# iterator and LiteLLM's logging callback never runs for an attempt that
+# produced no response.  The row then reads 发送中 for the whole stale window
+# and 已中断 ("no terminal callback") afterwards -- three phantom rows per heavy
+# Codex turn on the gateway (2026-11-20).  The race's outcome is already on the
+# turn's own row, so the bookkeeping row is hidden until it becomes a real
+# terminal row of its own (the sibling took over the turn, or it refused).
+_INTERNAL_ATTEMPT_FIELD = "internal_attempt"
+_INTERNAL_ATTEMPT_HEAD_HEDGE = "head_hedge"
+_INTERNAL_ATTEMPT_ABORT_REASONS = frozenset({"no_terminal_callback", "stale"})
+
+
+def _is_hidden_internal_attempt(record: Mapping[str, Any]) -> bool:
+    """Whether this row is only a hedge's own unfinished bookkeeping."""
+
+    if (
+        _string_record_value(record.get(_INTERNAL_ATTEMPT_FIELD))
+        != _INTERNAL_ATTEMPT_HEAD_HEDGE
+    ):
+        return False
+    if _request_record_status(record) in _REQUEST_PROGRESS_STATUSES:
+        return True
+    aborted = record.get("aborted")
+    if not isinstance(aborted, Mapping):
+        return False
+    return (
+        _string_record_value(aborted.get("reason"))
+        in _INTERNAL_ATTEMPT_ABORT_REASONS
+    )
 REQUEST_STALE_SECONDS_KEY = "YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS"
 DEFAULT_REQUEST_STALE_SECONDS = 900.0
 MAX_REQUEST_STALE_SECONDS = 86400.0
@@ -2748,6 +2782,14 @@ class LogsDomain:
                     )
                     for record in records
                 ]
+            # After the stale projection: a hedge row that just crossed the
+            # window is closed as stale, which is the same bookkeeping, and it
+            # belongs to the same hidden row.
+            records = [
+                record
+                for record in records
+                if not _is_hidden_internal_attempt(record)
+            ]
             needle = self._filters.get(tab, "").casefold()
             if needle:
                 records = [
