@@ -376,9 +376,8 @@ def _remember_pending_request_log_id(request_id: Any) -> None:
 def _pending_request_log_id_from_marker(marker: Any) -> Optional[str]:
     """The request-log row pinned on a selected-deployment marker.
 
-    A hedge's row belongs to the *sibling* dispatch, whose request id only the
-    marker knows (LiteLLM rebuilds the callback kwargs).  Reading it here is
-    what lets the race close that row when the sibling never reports back.
+    A sibling can have a different call id from the client turn whose kwargs
+    it inherited. Only the marker knows the ID used for its progress row.
     """
 
     if not isinstance(marker, dict):
@@ -389,17 +388,12 @@ def _pending_request_log_id_from_marker(marker: Any) -> Optional[str]:
     return None
 
 
-def _pending_request_log_id_from_response(response: Any) -> Optional[str]:
-    return _pending_request_log_id_from_marker(
-        _selected_deployment_marker_from_response(response)
-    )
-
-
 def _settle_failed_attempt(
     request_data: Optional[dict],
     exception: BaseException,
     *,
     event: str = "request_log_closed_for_stream_failure",
+    request_id: Optional[str] = None,
 ) -> bool:
     """Record an attempt that ended in an error, in the request log's own words.
 
@@ -433,7 +427,7 @@ def _settle_failed_attempt(
         # and no upstream refused anything.
         return False
     _apply_current_selected_deployment_to_request(request_data)
-    request_id = _trace_request_id(request_data)
+    request_id = request_id or _trace_request_id(request_data)
     if not request_id:
         return False
     error = _request_log_error_summary({"exception": exception}, None)
@@ -467,7 +461,9 @@ def _remember_failed_hop(
         return False
     if _proxy_shutdown_in_progress() or _is_local_shutdown_exception(exception):
         return False
-    request_id = _trace_request_id(request_kwargs)
+    request_id = _pending_request_log_id_from_marker(
+        _selected_deployment_marker_from_box()
+    ) or _trace_request_id(request_kwargs)
     if not request_id:
         return False
     error = _request_log_error_summary({"exception": exception}, None)
@@ -4762,6 +4758,13 @@ def _request_log_record(
         request_kwargs,
         end_time,
     )
+    request_id = _trace_request_id(request_kwargs)
+    if status == "stuck":
+        # A local watchdog may carry the parent turn's ID while timing the
+        # sibling. Finish the same row that its pre-call hook published.
+        request_id = _pending_request_log_id_from_marker(
+            _selected_deployment_marker_from_box()
+        ) or request_id
 
     record: dict[str, Any] = {
         "ts": request_timestamp
@@ -4805,7 +4808,7 @@ def _request_log_record(
         "api_key_name": api_key_name,
         "upstream_model": _state_module._safe_log_text(upstream_model, limit=180),
         "api_base_host": _state_module._safe_log_text(_responses_request_module._api_base_host(api_base), limit=180),
-        "request_id": _state_module._safe_log_text(_trace_request_id(request_kwargs), limit=180),
+        "request_id": _state_module._safe_log_text(request_id, limit=180),
         "session": _trace_session_context(request_kwargs),
         "tool_types": tools_summary["types"],
         "tool_names": tools_summary["names"],
@@ -4856,12 +4859,7 @@ def _request_log_record(
     if status in {"failure", "stuck"}:
         record["error"] = _request_log_error_summary(request_kwargs, response_obj)
     if _streaming_module._is_head_hedge_attempt(request_kwargs):
-        # A head hedge is this router asking a sibling in parallel, not a hop
-        # the client's turn took.  The marker is written on every row of that
-        # dispatch, so the log view can keep the race's own bookkeeping out of
-        # 请求 -- it used to publish three 发送中 rows per heavy turn, each
-        # renamed 已中断 by the stale window because a losing hedge never gets
-        # a terminal callback (2026-11-20).
+        # Keep the parallel dispatch distinguishable from a sequential retry.
         record["internal_attempt"] = "head_hedge"
     if status == "pending":
         started_at = _event_time(request_started_at or start_time)

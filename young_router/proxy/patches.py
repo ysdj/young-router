@@ -2498,7 +2498,13 @@ def _install_rust_dispatch_patch() -> None:
 
     @wraps(original_open_stream)
     async def open_attempt_stream(attempt: Any, response: Any) -> Any:
-        stream = await original_open_stream(attempt, response)
+        try:
+            stream = await original_open_stream(attempt, response)
+        except asyncio.CancelledError:
+            # The Chat driver may still be reading the first chunk after the
+            # HTTP head. The race has no stream result it can close yet.
+            await _streaming_module._close_async_iterator_safely(response)
+            raise
         if (
             attempt.op != "aresponses"
             or stream is response
@@ -2533,11 +2539,25 @@ def _install_rust_dispatch_patch() -> None:
         selected_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
         if not isinstance(selected_box, dict):
             selected_box = {}
+        previous_marker = selected_box.get("marker")
         box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
         marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         scope_token = attempt_scope.set((op, self._request))
         try:
-            return await original_attempt(self, step, attempt)
+            outcome = await original_attempt(self, step, attempt)
+            if outcome.get("ok") is False:
+                marker = selected_box.get("marker")
+                request_id = _routing_module._pending_request_log_id_from_marker(marker)
+                if marker is not previous_marker and request_id:
+                    # The driver's next attempt can overwrite this progress
+                    # entry. LiteLLM only logs the first failure on a shared
+                    # logging object, so settle later refused attempts here.
+                    _routing_module._settle_failed_attempt(
+                        dict(self._request), self.last_error,
+                        event="request_log_closed_for_dispatch_failure",
+                        request_id=request_id,
+                    )
+            return outcome
         except asyncio.CancelledError:
             # LiteLLM releases its own reservation in `_routed_attempt`.
             # Young Router's lease belongs to this deployment and turn.

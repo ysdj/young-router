@@ -291,8 +291,8 @@ def _settle_recent_request(
     return True
 
 
-def _settle_hedge_request(request_id: Any, *, reason: str = "head_hedge_lost") -> bool:
-    """Close a sibling hedge's row the moment its race is over.
+def _settle_hedge_request(request_id: Any) -> bool:
+    """Close a cancelled attempt's row the moment its race is over.
 
     A losing hedge gets no terminal callback: the winner closes its iterator,
     and LiteLLM only logs an attempt that produced a response.  Left in the
@@ -312,8 +312,8 @@ def _settle_hedge_request(request_id: Any, *, reason: str = "head_hedge_lost") -
     if entry is None:
         return False
     record = entry.get("record") if isinstance(entry.get("record"), Mapping) else {}
-    aborted = _aborted_recent_request_record(record, reason)
-    duration = _elapsed_milliseconds(record.get("ts"), _utc_now_iso())
+    aborted = _aborted_recent_request_record(record, "head_hedge_lost")
+    duration = _elapsed_milliseconds(record.get("ts"), aborted["aborted"]["settled_at"])
     if duration is not None:
         aborted["duration_ms"] = duration
     _append_recent_request(aborted)

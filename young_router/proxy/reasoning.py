@@ -396,57 +396,6 @@ _GOOGLE_THINKING_LEVEL_BY_EFFORT = {
 }
 
 
-#: The "think as hard as you can" tiers a heavy replay may step down from
-#: when a route cut it after thinking.  ``xhigh``/``max``/``ultra`` ask the same
-#: thing on most relays; ``high`` is the next level they actually serve.
-_REDUCED_REASONING_EFFORTS = {
-    "ultra": "high",
-    "max": "high",
-    "xhigh": "high",
-}
-
-
-def _reduce_reasoning_effort_in_place(
-    request_kwargs: Any,
-) -> tuple[str | None, str | None]:
-    """Step an extreme reasoning effort down one tier, in place.
-
-    A relay's per-response item budget is spent on thinking: a request that
-    asks for the hardest tier can spend the whole budget before it writes a
-    tool call, and the relay ends it with ``max_messages``.  Lowering the one
-    field that decides how deep the model goes is a repair of the request, not
-    a verdict about the route.  A request that already asked for ``high`` or
-    below is left alone.
-
-    Returns ``(before, after)``; ``after`` is None when nothing changed.
-    """
-
-    before = _request_reasoning_level(request_kwargs)
-    if before not in _REDUCED_REASONING_EFFORTS:
-        return before, None
-    after = _REDUCED_REASONING_EFFORTS[before]
-    changed = False
-
-    def rewrite(container: Any) -> None:
-        nonlocal changed
-        if not isinstance(container, dict):
-            return
-        for key in ("reasoning_effort", "effort"):
-            value = container.get(key)
-            if _canonical_reasoning_level(value) == before:
-                container[key] = after
-                changed = True
-
-    rewrite(request_kwargs)
-    for key in ("reasoning", "output_config", "extra_body", "litellm_params"):
-        nested = request_kwargs.get(key)
-        rewrite(nested)
-        if isinstance(nested, dict):
-            for inner in ("reasoning", "output_config"):
-                rewrite(nested.get(inner))
-    return before, after if changed else None
-
-
 def _request_reasoning_level(request_kwargs: Any) -> str | None:
     """Return the client's canonical reasoning level from any request shape."""
 
