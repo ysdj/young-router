@@ -101,6 +101,10 @@ _STREAM_CHUNK_RESTAMP_PATCH_ATTR = "_young_router_stream_chunk_restamp_patch"
 _RELAY_BALANCE_SELECTION_PATCH_ATTR = "_young_router_relay_balance_selection_patch"
 _RUST_DISPATCH_PATCH_ATTR = "_young_router_rust_dispatch_patch"
 
+# Patches that could not be installed in this build, by installer name.  Read by
+# whoever needs to know a capability is missing; never a reason to raise.
+_PATCH_INSTALL_FAILURES: dict[str, str] = {}
+
 
 def _install_stream_chunk_restamp_patch() -> None:
     """Stamp the client-facing model without flattening a chunk's wire form.
@@ -4235,54 +4239,82 @@ def _install_openai_responses_fake_stream_patch() -> None:
     OpenAIResponsesAPIConfig.should_fake_stream = patched_should_fake_stream
 
 
+def _install_one(name: str, install: Any) -> None:
+    """Apply one patch, recording rather than raising when it cannot load.
+
+    ``_PATCH_INSTALL_FAILURES`` is what a reader can consult afterwards: a
+    capability this build cannot patch is worth naming, but it is not worth an
+    outage.  Live 2026-11-20: the relay-balance installer imported
+    ``litellm.router_rust``, which the pinned gateway litellm does not ship, so
+    the exception escaped ``install_all`` -- "Application startup failed.
+    Exiting." 220 times and port 4401 never answered again.
+    """
+
+    try:
+        install()
+    except Exception as exc:  # pragma: no cover - driven through install_all
+        _PATCH_INSTALL_FAILURES[name] = repr(exc)
+        try:
+            import logging
+
+            logging.getLogger("young_router.patches").warning(
+                "patch %s not installed: %s", name, exc
+            )
+        except Exception:
+            pass
+
+
 def install_all() -> None:
-    _install_latin1_response_headers_patch()
-    _install_anthropic_unversioned_endpoint_patch()
-    _install_non_stream_client_disconnect_patch()
+    _install_one('_install_latin1_response_headers_patch', lambda: _install_latin1_response_headers_patch())
+    _install_one('_install_anthropic_unversioned_endpoint_patch', lambda: _install_anthropic_unversioned_endpoint_patch())
+    _install_one('_install_non_stream_client_disconnect_patch', lambda: _install_non_stream_client_disconnect_patch())
     # DeepSeek answers a tool request with its own markup; on ``/v1/messages``
     # the client's bytes are written after the post-call hook has had its say,
     # so the rewrite has to sit on the body the endpoint returns.
-    _install_messages_sse_markup_patch()
+    _install_one('_install_messages_sse_markup_patch', lambda: _install_messages_sse_markup_patch())
     # Anthropic caches only what the request marks, and a Responses turn has no
     # place to mark it: without this every Codex thread pays full input price.
-    _enable_anthropic_prompt_caching()
+    _install_one('_enable_anthropic_prompt_caching', lambda: _enable_anthropic_prompt_caching())
     # A Responses function call may state its arguments on the item instead of
     # streaming deltas; without this the Messages bridge sends ``input: {}``.
-    _install_anthropic_responses_tool_arguments_patch()
-    _install_model_listing_efforts_patch()
+    _install_one('_install_anthropic_responses_tool_arguments_patch', lambda: _install_anthropic_responses_tool_arguments_patch())
+    _install_one('_install_model_listing_efforts_patch', lambda: _install_model_listing_efforts_patch())
     # Claude Desktop's picker discovers from /v1/models; the view is installed
     # beside the listing patch so both listing branches publish it.
-    from . import claude_desktop_listing as _claude_desktop_listing
+    def _install_claude_desktop_listing() -> None:
+        from . import claude_desktop_listing as _claude_desktop_listing
 
-    _claude_desktop_listing.install_patch()
-    _install_chatgpt_account_credential_patch()
-    _install_pre_call_token_count_patch()
-    _install_integer_order_tiers_patch()
-    _install_relay_balance_selection_patch()
-    _install_routing_constraint_patch()
-    _install_selected_deployment_marker_patch()
-    _install_order_peer_failover_patch()
-    _install_generic_deployment_failover_patch()
-    _install_chat_dispatch_budget_patch()
-    _install_rust_dispatch_patch()
-    _install_same_deployment_retry_policy_patch()
-    _install_responses_websocket_http_bridge_patch()
-    _install_stream_chunk_restamp_patch()
-    _install_stream_chunk_builder_dict_function_call_patch()
-    _install_websocket_frame_limit_patch()
+        _claude_desktop_listing.install_patch()
+
+    _install_one("install_patch", _install_claude_desktop_listing)
+    _install_one('_install_chatgpt_account_credential_patch', lambda: _install_chatgpt_account_credential_patch())
+    _install_one('_install_pre_call_token_count_patch', lambda: _install_pre_call_token_count_patch())
+    _install_one('_install_integer_order_tiers_patch', lambda: _install_integer_order_tiers_patch())
+    _install_one('_install_relay_balance_selection_patch', lambda: _install_relay_balance_selection_patch())
+    _install_one('_install_routing_constraint_patch', lambda: _install_routing_constraint_patch())
+    _install_one('_install_selected_deployment_marker_patch', lambda: _install_selected_deployment_marker_patch())
+    _install_one('_install_order_peer_failover_patch', lambda: _install_order_peer_failover_patch())
+    _install_one('_install_generic_deployment_failover_patch', lambda: _install_generic_deployment_failover_patch())
+    _install_one('_install_chat_dispatch_budget_patch', lambda: _install_chat_dispatch_budget_patch())
+    _install_one('_install_rust_dispatch_patch', lambda: _install_rust_dispatch_patch())
+    _install_one('_install_same_deployment_retry_policy_patch', lambda: _install_same_deployment_retry_policy_patch())
+    _install_one('_install_responses_websocket_http_bridge_patch', lambda: _install_responses_websocket_http_bridge_patch())
+    _install_one('_install_stream_chunk_restamp_patch', lambda: _install_stream_chunk_restamp_patch())
+    _install_one('_install_stream_chunk_builder_dict_function_call_patch', lambda: _install_stream_chunk_builder_dict_function_call_patch())
+    _install_one('_install_websocket_frame_limit_patch', lambda: _install_websocket_frame_limit_patch())
     # A stream this process truncates while it is being replaced is not
     # upstream evidence, so the teardown is marked wherever uvicorn is run.
-    _install_uvicorn_shutdown_marker_patch()
-    _install_managed_responses_websocket_keepalive_patch()
-    _install_responses_completion_stream_patch()
-    _install_openai_responses_fake_stream_patch()
-    _install_responses_tool_search_bridge_patch()
+    _install_one('_install_uvicorn_shutdown_marker_patch', lambda: _install_uvicorn_shutdown_marker_patch())
+    _install_one('_install_managed_responses_websocket_keepalive_patch', lambda: _install_managed_responses_websocket_keepalive_patch())
+    _install_one('_install_responses_completion_stream_patch', lambda: _install_responses_completion_stream_patch())
+    _install_one('_install_openai_responses_fake_stream_patch', lambda: _install_openai_responses_fake_stream_patch())
+    _install_one('_install_responses_tool_search_bridge_patch', lambda: _install_responses_tool_search_bridge_patch())
     # The bridged replay is repaired here, before a thinking upstream judges it:
     # the client's reasoning item does not survive the Responses-to-Chat
     # transformation when its payload is only ``encrypted_content``.
-    _install_usage_cache_read_no_overwrite_patch()
-    _install_responses_bridge_cache_usage_patch()
-    _install_responses_chat_bridge_reasoning_replay_patch()
+    _install_one('_install_usage_cache_read_no_overwrite_patch', lambda: _install_usage_cache_read_no_overwrite_patch())
+    _install_one('_install_responses_bridge_cache_usage_patch', lambda: _install_responses_bridge_cache_usage_patch())
+    _install_one('_install_responses_chat_bridge_reasoning_replay_patch', lambda: _install_responses_chat_bridge_reasoning_replay_patch())
     # The managed proxy's idle loops are not part of request handling, but every
     # worker and the supervisor run them, so they are installed with the rest.
-    _proxy_idle_module.install_proxy_idle_patches()
+    _install_one('install_proxy_idle_patches', lambda: _proxy_idle_module.install_proxy_idle_patches())

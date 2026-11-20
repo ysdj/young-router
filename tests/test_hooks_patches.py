@@ -5352,3 +5352,54 @@ class RustRouterAbsenceTests(unittest.TestCase):
 
         has_module = importlib.util.find_spec("litellm.router_rust") is not None
         self.assertEqual(has_module, patches._rust_router_subsystem())
+
+
+class PatchIsolationTests(unittest.TestCase):
+    """No single patch may keep the gateway from starting.
+
+    Live 2026-11-20: ``install_all`` imported ``litellm.router_rust`` through one
+    installer, the exception escaped, and the app logged "Application startup
+    failed. Exiting." 220 times.  A capability that cannot be patched is a
+    degraded feature; refusing to serve is not.
+    """
+
+    def test_one_broken_installer_does_not_stop_the_others(self) -> None:
+        from young_router.proxy import patches
+
+        installed: list = []
+        failures = patches._PATCH_INSTALL_FAILURES
+        failures.clear()
+        self.addCleanup(failures.clear)
+
+        def broken() -> None:
+            raise ModuleNotFoundError("No module named 'litellm.router_rust'")
+
+        def fine() -> None:
+            installed.append("ok")
+
+        patches._install_one("broken_patch", broken)
+        patches._install_one("fine_patch", fine)
+
+        self.assertEqual(["ok"], installed)
+        self.assertIn("broken_patch", failures)
+        self.assertIn("router_rust", failures["broken_patch"])
+        self.assertNotIn("fine_patch", failures)
+
+    def test_install_all_survives_a_patch_that_cannot_load(self) -> None:
+        from young_router.proxy import patches
+
+        failures = patches._PATCH_INSTALL_FAILURES
+        failures.clear()
+        self.addCleanup(failures.clear)
+
+        def broken() -> None:
+            raise ModuleNotFoundError("No module named 'litellm.router_rust'")
+
+        with mock.patch.object(
+            patches, "_install_latin1_response_headers_patch", broken
+        ):
+            # The whole point: this returns instead of raising.
+            patches.install_all()
+
+        self.assertIn("_install_latin1_response_headers_patch", failures)
+        self.assertIn("router_rust", failures["_install_latin1_response_headers_patch"])
