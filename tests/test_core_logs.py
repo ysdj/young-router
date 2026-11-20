@@ -1641,6 +1641,14 @@ model_list:
                 },
                 {
                     "ts": stamp,
+                    "request_id": "hedge-cut-by-restart",
+                    "deployment_id": "sibling",
+                    "status": "aborted",
+                    "aborted": {"reason": "service_restart"},
+                    "internal_attempt": "head_hedge",
+                },
+                {
+                    "ts": stamp,
                     "request_id": "hedge-won",
                     "deployment_id": "sibling",
                     "status": "success",

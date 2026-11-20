@@ -1315,29 +1315,29 @@ _REQUEST_PROGRESS_STATUSES = _REQUEST_PENDING_STATUSES | {"stream"}
 # and 已中断 ("no terminal callback") afterwards -- three phantom rows per heavy
 # Codex turn on the gateway (2026-11-20).  The race's outcome is already on the
 # turn's own row, so the bookkeeping row is hidden until it becomes a real
-# terminal row of its own (the sibling took over the turn, or it refused).
+# terminal row of its own (the sibling took over the turn, or it refused); an
+# aborted hedge row says nothing the turn's row does not.
 _INTERNAL_ATTEMPT_FIELD = "internal_attempt"
 _INTERNAL_ATTEMPT_HEAD_HEDGE = "head_hedge"
-_INTERNAL_ATTEMPT_ABORT_REASONS = frozenset({"no_terminal_callback", "stale"})
 
 
 def _is_hidden_internal_attempt(record: Mapping[str, Any]) -> bool:
-    """Whether this row is only a hedge's own unfinished bookkeeping."""
+    """Whether this row is only a hedge's own unfinished bookkeeping.
+
+    A hedge row is worth showing only once it is a real terminal answer about
+    that sibling -- it refused the bytes, or it took the turn over (success).
+    "Aborted" is never that: the winner closing the loser, a client leaving, or
+    a restart cutting the process all end a hedge that produced nothing, and
+    the turn's own row already says what happened to the turn.
+    """
 
     if (
         _string_record_value(record.get(_INTERNAL_ATTEMPT_FIELD))
         != _INTERNAL_ATTEMPT_HEAD_HEDGE
     ):
         return False
-    if _request_record_status(record) in _REQUEST_PROGRESS_STATUSES:
-        return True
-    aborted = record.get("aborted")
-    if not isinstance(aborted, Mapping):
-        return False
-    return (
-        _string_record_value(aborted.get("reason"))
-        in _INTERNAL_ATTEMPT_ABORT_REASONS
-    )
+    status = _request_record_status(record)
+    return status in _REQUEST_PROGRESS_STATUSES or status == "aborted"
 
 
 REQUEST_STALE_SECONDS_KEY = "YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS"
