@@ -14218,6 +14218,23 @@ function logProtocolPair(client: string, upstream: string): string {
 }
 
 const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
+  "local-proxy-shutdown": "logs.routeTrace.reasonProxyStopped",
+  "upstream-relay-capacity": "logs.routeTrace.reasonRelayCapacity",
+  "upstream-channel-refused": "logs.recoveryReason.stationChannelRefused",
+  "upstream-session-rejected": "logs.routeTrace.reasonSessionRejected",
+  "upstream-account-restricted": "logs.routeTrace.reasonAccountRestricted",
+  "upstream-client-version-rejected": "logs.routeTrace.reasonClientVersion",
+  "upstream-model-unpriced": "logs.routeTrace.reasonModelUnpriced",
+  "upstream-model-not-found": "logs.routeTrace.reasonModelNotFound",
+  "thinking-tool-choice-refused": "logs.routeTrace.reasonThinkingToolChoice",
+  "upstream-tool-history-rejected": "logs.routeTrace.reasonToolHistory",
+  "encrypted-replay-refused": "logs.routeTrace.reasonEncryptedReplay",
+  "upstream-request-field-rejected": "logs.routeTrace.reasonRequestField",
+  "context-size-refused": "logs.routeTrace.reasonContextSize",
+  "upstream-request-body-too-large": "logs.recoveryReason.requestSize",
+  "upstream-incomplete-terminal": "logs.routeTrace.reasonIncompleteTerminal",
+  "upstream-truncated-stream": "logs.routeTrace.reasonTruncatedStream",
+  "upstream-body-read-failed": "logs.routeTrace.reasonBodyRead",
   "upstream-auth-or-balance": "logs.routeTrace.reasonAuth",
   "upstream-compatible-bad-request": "logs.routeTrace.reasonCompatibility",
   "upstream-gateway-bad-request": "logs.routeTrace.reasonGateway",
@@ -14259,15 +14276,15 @@ function routeTraceReasonLabel(value: string, translate: Translate): string {
     ?? translate(ROUTE_REASON_KEYS[normalized.toLowerCase()] ?? "logs.routeTrace.reasonUnknown");
 }
 
-function requestErrorReasonLabel(value: string, translate: Translate): string {
+function requestErrorReasonLabel(value: string, translate: Translate, fallback = value.trim()): string {
   const normalized = value.trim();
   const key = ROUTE_REASON_KEYS[normalized.toLowerCase()];
-  // An unmapped upstream reason stays readable instead of collapsing into the
-  // generic upstream-error label.
-  return upstreamStatusReasonLabel(normalized, translate) ?? (key ? translate(key) : normalized);
+  // Details retain unrecognized reasons verbatim; the status cell only uses
+  // a known label or the HTTP status the record actually carries.
+  return upstreamStatusReasonLabel(normalized, translate) ?? (key ? translate(key) : fallback);
 }
 
-function requestStatusLabel(value: string, translate: Translate): string {
+function requestStatusLabel(value: string, translate: Translate, record?: Record<string, unknown>): string {
   const labels: Record<string, Parameters<Translate>[0]> = {
     pending: "logs.sending",
     sending: "logs.sending",
@@ -14280,8 +14297,20 @@ function requestStatusLabel(value: string, translate: Translate): string {
     stuck: "logs.stuck",
     aborted: "logs.aborted",
   };
-  const key = labels[value.trim().toLowerCase()];
-  return key ? translate(key) : value;
+  const key = labels[value.trim().toLowerCase() || (record?.error ? "failure" : "")];
+  if (!key) return value;
+  const status = translate(key);
+  if (!record) return status;
+  let reason = "";
+  if (key === "logs.aborted") {
+    reason = requestAbortedDetail(record.aborted, translate, "");
+  } else if (key === "logs.failed" || key === "logs.stuck") {
+    const error = asRecord(record.error);
+    const reasonCode = compactLogValue(error.reason);
+    const httpStatus = compactLogValue(error.status_code);
+    reason = requestErrorReasonLabel(reasonCode === "other" ? "" : reasonCode, translate, httpStatus ? `HTTP ${httpStatus}` : "");
+  }
+  return reason ? `${status} · ${reason}` : status;
 }
 
 function logLevelLabel(value: string, translate: Translate): string {
@@ -14462,7 +14491,7 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
   }).filter(Boolean).join(" | ");
 }
 
-function requestAbortedDetail(value: unknown, translate: Translate): string {
+function requestAbortedDetail(value: unknown, translate: Translate, fallback?: string): string {
   const aborted = asRecord(value);
   const reason = compactLogValue(aborted.reason);
   if (!reason) return "";
@@ -14477,7 +14506,7 @@ function requestAbortedDetail(value: unknown, translate: Translate): string {
     // A head hedge that lost its race is not an interrupted turn: the turn
     // went on, on the route that answered first.
     case "head_hedge_lost": return translate("logs.aborted.reasonHeadHedgeLost");
-    default: return reason;
+    default: return fallback ?? reason;
   }
 }
 
@@ -14831,7 +14860,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const status = tab === "recovery"
     ? recoveryStatusLabel(rawStatus, translate)
     : tab === "requests"
-      ? requestStatusLabel(rawStatus, translate) || (value.error ? translate("logs.failed") : "")
+      ? requestStatusLabel(rawStatus, translate, value)
       : rawStatus || (value.error ? translate("logs.failed") : "");
   const rawEvent = compactLogValue(value.event);
   const event = tab === "route-trace" ? routeTraceEventLabel(rawEvent, translate) : rawEvent;
@@ -15185,7 +15214,9 @@ function logColumns(
     { label: translate("logs.upstreamModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 78, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 64, value: (row) => row.apiKeyName },
-    { ...status, width: 68 },
+    // Fit the status to this page's longest recorded cause. A success-only
+    // page still spends only the width of its short labels.
+    { ...status, width: 440 },
     // `耗时(s)` is 45.1 pt semibold in the header (48.5 by the estimator) and
     // the widest cell is `12.7`: the header decides at 66.
     { label: translate("logs.duration"), width: 66, value: (row) => row.duration },

@@ -7850,6 +7850,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         self.assert_ui_has('case "client_disconnect": return translate("logs.aborted.reasonClientDisconnect");')
+        # Only request status cells carry the attempt whose stop is explained.
+        # Online usage can report a status but has no local attempt to explain.
+        self.assert_ui_has('requestStatusLabel(rawStatus, translate, value)')
+        self.assert_ui_has('const status = rawStatus ? requestStatusLabel(rawStatus, translate) : "";')
         self.assertIn('"logs.aborted.reasonClientDisconnect": "Stopped in the client"', self.en)
         self.assertIn('"logs.aborted.reasonClientDisconnect": "客户端已停止"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
@@ -7955,6 +7959,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ("logs.level.critical", "严重", "Critical"),
             ("logs.routeTrace.reasonStreamIncomplete", "上游流未完整结束", "Upstream stream ended before completion"),
             ("logs.routeTrace.reasonBodyCapacity", "上游请求体容量不足", "Upstream rejected the request body size"),
+            ("logs.routeTrace.reasonRelayCapacity", "中转站暂无可用渠道", "No relay channel available"),
             ("logs.routeTrace.reasonImageUnsupported", "所有路由都不支持图像工具", "No route supports the image tool"),
             ("logs.routeTrace.reasonCompactionUnsupported", "上游不支持 Codex 压缩", "Upstream does not support Codex compaction"),
             ("logs.routeTrace.reasonImageFallback", "图像工具运行时回退", "Image tool runtime fallback"),
@@ -7964,10 +7969,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(f'"{key}": "{en}",', english)
             self.assertIn(f'"{key}": "{zh}",', chinese)
             self.assertIn(f'| "{key}"', translation_keys)
-        # The unmapped upstream reason stays readable in request details and
-        # reusable menu actions keep their pane/service labels.
+        # Relay capacity is a channel shortage, distinct from body capacity.
+        # Menu actions keep their pane/service labels.
         for marker in (
-            "return upstreamStatusReasonLabel(normalized, translate) ?? (key ? translate(key) : normalized);",
+            '"upstream-relay-capacity": "logs.routeTrace.reasonRelayCapacity",',
             '"open-providers-models": "status.providers",',
             '"service-restart": "service.restart",',
             '"no-available-deployment": "logs.noAvailableRoute",',
