@@ -44,6 +44,7 @@ from .base import (
     AsyncIterator,
     List,
     Optional,
+    _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     os,
 )
 
@@ -76,10 +77,8 @@ _CONTINUATION_INSTRUCTION = (
 _CONTINUATION_SOURCE_QUOTE_CHARS = 1500
 
 _CONTINUATION_PREAMBLE = (
-    "You were translating a document. The document is quoted below, then the "
-    "translation you had already produced before the output limit cut it off. "
-    "Continue the translation from where it stopped; the document is here only "
-    "so you can find your place, and it is not a new request."
+    "Use the source below as context for continuing the answer you already "
+    "started; it is not a new request."
 )
 
 _STREAM_CONTINUATION_ENV = "YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED"
@@ -142,14 +141,46 @@ def _native_stream_output_limit_reason(chunk: Any) -> Optional[str]:
     return None
 
 
+def _chat_chunk_with(chunk: Any, **fields: Any) -> Any:
+    if isinstance(chunk, dict):
+        from . import streaming as _streaming_module
+
+        return _streaming_module._json_stream_event({**chunk, **fields})
+    return chunk.model_copy(update=fields)
+
+
+def _split_chat_finish_chunk(chunk: Any) -> tuple[Optional[Any], Any]:
+    """Keep a last text delta separate from the finish reason we may withhold."""
+    from . import streaming as _streaming_module
+
+    frame = _streaming_module._stream_chunk_dump(chunk)
+    choices = frame.get("choices") or []
+    if len(choices) != 1:
+        return None, chunk
+    choice = choices[0]
+    delta = choice.get("delta")
+    if not isinstance(delta, dict) or not any(delta.values()):
+        return None, chunk
+    visible = {key: value for key, value in frame.items() if key != "usage"}
+    visible["choices"] = [{**choice, "finish_reason": None}]
+    terminal = {**frame, "choices": [{**choice, "delta": {}, "logprobs": None}]}
+    return _streaming_module._json_stream_event(visible), _streaming_module._json_stream_event(terminal)
+
+
+def _sum_chat_token_usage(total: dict, usage: dict) -> None:
+    """Combine the final counts from distinct upstream calls, including details."""
+    for key, value in usage.items():
+        if type(value) is int and key.endswith("tokens"):
+            total[key] = total.get(key, 0) + value
+        elif isinstance(value, dict) and key.endswith("_tokens_details"):
+            _sum_chat_token_usage(total.setdefault(key, {}), value)
+
+
 # The request keys a continuation call carries.  A native request holds the
 # router's own live dispatch objects (the original upstream callable, route
 # bookkeeping), and a deep copy of those is not only wasteful but can fail
 # outright, so the continuation is built from the chat payload's own fields.
 _CONTINUATION_REQUEST_KEYS = (
-    "call_type",
-    "model",
-    "messages",
     "temperature",
     "top_p",
     "reasoning_effort",
@@ -159,7 +190,6 @@ _CONTINUATION_REQUEST_KEYS = (
     "stop",
     "response_format",
     "stream",
-    "stream_options",
     "stream_timeout",
     "api_base",
     "api_key",
@@ -167,10 +197,7 @@ _CONTINUATION_REQUEST_KEYS = (
     "custom_llm_provider",
     "extra_body",
     "extra_headers",
-    "client_metadata",
     "prompt_cache_key",
-    "metadata",
-    "parallel_tool_calls",
 )
 
 
@@ -182,27 +209,33 @@ _ROUTE_CEILING_SHORTFALL_TOKENS = 256
 
 
 def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
-    """Whether this request is a native stream the router may ever extend.
-
-    Only a plain text answer is extended.  A turn that declares tools is
-    deliberately excluded: a ceiling inside a tool-call turn means the call
-    the model was writing is incomplete, and replaying that as more text would
-    hand the client a half-written call it cannot execute.
-
-    This is the shape test only.  Whether *this* ceiling belongs to the route
-    or to the client's own budget is :func:`_continuation_is_decided_by_the_engine`,
-    which needs the ceiling frame's own numbers.
-    """
+    """Whether this request can be rebuilt as a single text continuation."""
 
     from . import streaming as _streaming_module
 
     if not isinstance(request_data, dict):
         return False
-    if _responses_request_module._request_is_responses_api(request_data):
+    if not _streaming_module._request_uses_native_event_stream(request_data):
         return False
-    if not _streaming_module._request_supports_streaming_error_fallback(request_data):
+    is_chat = not _streaming_module._request_is_anthropic_messages_stream(request_data)
+    tools = request_data.get("tools")
+    if request_data.get("functions"):
         return False
-    if request_data.get("tools") or request_data.get("functions"):
+    if tools and (
+        not is_chat
+        or not isinstance(tools, list)
+        or any(not isinstance(tool, dict) or tool.get("type") != "function" for tool in tools)
+    ):
+        return False
+    # Chat clients may attach optional function declarations to every request.
+    # The stream checks whether the model actually started a call. A request
+    # that requires one can't be resumed with the declarations removed.
+    if is_chat and (
+        request_data.get("tool_choice") not in (None, "auto", "none")
+        or request_data.get("n") not in (None, 1)
+        or request_data.get("response_format") not in (None, {"type": "text"})
+        or request_data.get("modalities") not in (None, ["text"])
+    ):
         return False
     messages = request_data.get("messages")
     if not isinstance(messages, list):
@@ -226,12 +259,12 @@ def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
             continue
         if not isinstance(content, list) or any(
             not isinstance(part, dict)
-            or part.get("type") != "text"
-            or not isinstance(part.get("text"), str)
+            or not (
+                (part.get("type") == "text" and isinstance(part.get("text"), str))
+                or (is_chat and role == "user" and part.get("type") == "image_url")
+            )
             for part in content
         ):
-            # Images and other structured input cannot be represented by the
-            # text-only continuation conversation.
             return False
 
     return user_message_count == 1
@@ -250,24 +283,17 @@ def _stopped_at_the_routes_own_ceiling(
     ignores it.  The client asked for far more, so the stop is the route's
     truncation and this router is the only place that can continue it.
 
-    No number is proof either way, so an unknown one answers "the client's":
-    the client's own budget already ended the answer where it asked, and
-    continuing it would spend an upstream call to overrun a limit somebody
-    chose.
+    If the client gave a budget, a missing usage count cannot show that the
+    route stopped short of it. With no budget, the explicit length terminal is
+    enough: the client did not ask for a limit.
     """
 
     from . import streaming as _streaming_module
 
-    if not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
-        return False
-    if output_tokens <= 0:
-        return False
     budget = _streaming_module._request_output_token_budget(request_data)
     if budget is None:
-        # Nothing in the request stated a ceiling, so the ceiling that stopped
-        # this answer is the route's by definition.
         return True
-    return output_tokens < max(1, budget - _ROUTE_CEILING_SHORTFALL_TOKENS)
+    return type(output_tokens) is int and 0 < output_tokens < budget - _ROUTE_CEILING_SHORTFALL_TOKENS
 
 
 def _continuation_is_decided_by_the_engine(
@@ -326,13 +352,8 @@ def _continuation_request_payload(
     tail = delivered_text[-_CONTINUATION_TAIL_CHARS:]
     if not tail.strip():
         return None
-    payload: dict[str, Any] = {}
-    for key in _CONTINUATION_REQUEST_KEYS:
-        if key not in request_data:
-            continue
-        if key in ("messages", "client_metadata", "metadata", "stream_options"):
-            continue
-        payload[key] = request_data.get(key)
+    payload = {key: request_data[key] for key in _CONTINUATION_REQUEST_KEYS if key in request_data}
+    payload["model"] = _routing_module._request_public_model(request_data)
     payload["messages"] = _continuation_messages(messages, tail)
     if _streaming_module._request_is_anthropic_messages_stream(request_data):
         max_tokens = request_data.get("max_tokens")
@@ -352,6 +373,14 @@ def _continuation_request_payload(
         ):
             if key in request_data:
                 payload[key] = request_data[key]
+    else:
+        # A continuation follows the deployment that actually answered, which
+        # may be the last healthy sibling after several failed dispatches.
+        if deployment_id := _routing_module._deployment_id_from_request(request_data):
+            payload[_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY] = [deployment_id]
+        stream_options = request_data.get("stream_options")
+        if isinstance(stream_options, dict) and stream_options.get("include_usage") is True:
+            payload["stream_options"] = {"include_usage": True}
     # The continuation is the router's own call, not the client's turn: it must
     # not inherit the fallback bookkeeping, or a ceiling would be recorded as a
     # route failure and quarantine a healthy deployment.
@@ -360,29 +389,27 @@ def _continuation_request_payload(
 
 
 def _continuation_messages(messages: List[Any], tail: str) -> List[Any]:
-    """Build a resume-shaped conversation from the client's own messages.
-
-    The original user turn is replaced -- not repeated -- by a short quote of
-    the source plus the answer so far.  Replaying the client's "translate all
-    of this" instruction alongside a second copy of the answer is what made a
-    route restart the translation, and it also re-sent the whole document on
-    every round.
-    """
+    """Give the continuation the source and the text already delivered."""
 
     system_messages: List[Any] = []
-    user_text = ""
+    resume_turn: Any = _CONTINUATION_PREAMBLE
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
         if role == "system":
             system_messages.append(_message_copy(message))
-        elif role == "user" and not user_text:
-            user_text = _message_text(message)
-    source_quote = user_text[-_CONTINUATION_SOURCE_QUOTE_CHARS:]
-    resume_turn = _CONTINUATION_PREAMBLE
-    if source_quote.strip():
-        resume_turn = f"{resume_turn}\n\n--- document (tail) ---\n{source_quote}"
+        elif role == "user":
+            content = message.get("content")
+            if isinstance(content, list) and any(part.get("type") == "image_url" for part in content):
+                # For an image summary the unsummarized facts are in the
+                # images. A text tail can't stand in for them. Keep the entire
+                # source in order, with the partial answer as the next turn.
+                resume_turn = [{"type": "text", "text": _CONTINUATION_PREAMBLE}, *content]
+            else:
+                source_quote = _message_text(message)[-_CONTINUATION_SOURCE_QUOTE_CHARS:]
+                if source_quote.strip():
+                    resume_turn = f"{resume_turn}\n\n--- document (tail) ---\n{source_quote}"
     return [
         *system_messages,
         {"role": "user", "content": resume_turn},
@@ -424,6 +451,7 @@ async def _stream_native_continuation_rounds(
     ceiling_chunk: Any = None,
     answered_output_tokens: Optional[int] = None,
     anthropic_index_offset: int = 0,
+    chat_usage: Optional[dict] = None,
 ) -> AsyncIterator[Any]:
     """Ask the same route for the rest of an answer it cut off at its ceiling.
 
@@ -432,9 +460,8 @@ async def _stream_native_continuation_rounds(
     already read, so it is withheld here and re-emitted once the answer is
     actually complete.
 
-    ``ceiling_chunk`` and ``answered_output_tokens`` are what tell a ceiling of
-    the route's own from one the client asked for, so a caller that supplies
-    neither continues nothing (see :func:`_continuation_is_decided_by_the_engine`).
+    ``answered_output_tokens`` tells a route ceiling from a ceiling the client
+    asked for when the request included a budget.
     """
 
     from . import streaming as _streaming_module
@@ -454,6 +481,10 @@ async def _stream_native_continuation_rounds(
         return
 
     seen_text = delivered_text
+    chat_identity = {} if is_anthropic else {
+        k: v for k, v in _streaming_module._stream_chunk_dump(ceiling_chunk).items()
+        if k in ("id", "created", "model") and v is not None
+    }
     next_anthropic_index = anthropic_index_offset
     # Anthropic reports ``usage.output_tokens`` for each Messages request.  A
     # continuation is a second request that belongs to the same client answer,
@@ -476,7 +507,6 @@ async def _stream_native_continuation_rounds(
             request_data,
             round=round_number,
             delivered_chars=len(seen_text),
-            continuation_prompt_chars=len(str(payload.get("messages"))),
         )
         try:
             # A continuation round is a dispatch like any other: the route it
@@ -507,6 +537,7 @@ async def _stream_native_continuation_rounds(
         final_terminal: Optional[Any] = None
         final_message_delta: Optional[dict] = None
         round_anthropic_output_tokens: Optional[int] = None
+        round_chat_usage = None
         anthropic_indices: dict[int, int] = {}
         open_anthropic_indices: set[int] = set()
         stream_failed = False
@@ -562,19 +593,38 @@ async def _stream_native_continuation_rounds(
                         released = True
                         yield _anthropic_sse_module._sse_block(event)
                     continue
+                frame = _streaming_module._stream_chunk_dump(chunk)
+                if _streaming_module._response_has_tool_call_activity(frame):
+                    # The continuation request declares no tools. Never splice
+                    # an unsolicited call into the existing text answer.
+                    return
+                updates = dict(chat_identity)
+                if isinstance(frame.get("usage"), dict):
+                    # The last usage on this call is cumulative, not a delta.
+                    round_chat_usage = frame["usage"]
+                    if not frame.get("choices"):
+                        continue
+                    updates["usage"] = None
+                if updates:
+                    chunk = _chat_chunk_with(chunk, **updates)
                 reason = _native_stream_output_limit_reason(chunk)
                 if reason is not None:
                     round_ceiling_hit = True
-                    continue
-                if _streaming_module._native_stream_chunk_is_terminal(
+                if reason is not None or _streaming_module._native_stream_chunk_is_terminal(
                     chunk,
                     request_data,
                     set(),
                 ):
+                    visible, terminal = _split_chat_finish_chunk(chunk)
+                    if visible is not None:
+                        round_text += _responses_output_module._response_text(visible)
+                        released = True
+                        yield visible
                     # The route closed this continuation normally.  Its frame
                     # is the one the client must see: it states "stop", where
                     # the first route's withheld frame still says "length".
-                    final_terminal = chunk
+                    if not round_ceiling_hit:
+                        final_terminal = terminal
                     continue
                 chunk_text = _responses_output_module._response_text(chunk)
                 if chunk_text:
@@ -594,6 +644,8 @@ async def _stream_native_continuation_rounds(
                 await chunks.aclose()
             await stream.aclose()
             await _streaming_module._close_async_iterator_safely(response)
+            if chat_usage is not None and round_chat_usage is not None:
+                _sum_chat_token_usage(chat_usage, round_chat_usage)
 
         for index in sorted(open_anthropic_indices):
             yield _anthropic_sse_module._sse_block(

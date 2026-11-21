@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import aclosing
 from typing import Callable
 
 from . import codex_fast_tier as _codex_fast_tier_module
@@ -6970,6 +6971,7 @@ async def _yield_native_stream_with_output_limit_continuation(
     # They are withheld with it and re-emitted only when no continuation runs,
     # so the client always receives a complete terminal sequence.
     withheld_ceiling_closers: List[Any] = []
+    chat_usage_frame: Optional[Any] = None
     # Everything this answer has delivered, so a continuation resumes from the
     # end of it instead of restarting the answer.
     delivered_text_parts: List[str] = []
@@ -7002,17 +7004,12 @@ async def _yield_native_stream_with_output_limit_continuation(
             delivered_text_parts.append(text)
         return chunk
 
-    def inspect_native_chunk(chunk: Any) -> bool:
+    def inspect_native_chunk(chunk: Any) -> None:
         nonlocal saw_terminal
         nonlocal success_recorded
         nonlocal native_chunk_count
         nonlocal visible_output_delivered
         nonlocal highest_anthropic_index
-        chunk_exception = _stream_chunk_error_exception(chunk)
-        if chunk_exception is not None:
-            if saw_terminal:
-                return False
-            raise chunk_exception
         native_chunk_count += 1
         if is_anthropic_stream:
             for frame in _stream_chunk_dumps(chunk):
@@ -7033,7 +7030,6 @@ async def _yield_native_stream_with_output_limit_continuation(
                 request_data
             )
             success_recorded = True
-        return True
 
     # DeepSeek-V4 answers a tool request with its own markup instead of
     # ``tool_calls``.  On the Responses wire this proxy already parses that
@@ -7184,89 +7180,71 @@ async def _yield_native_stream_with_output_limit_continuation(
             )
         return events
 
+    async def route_chunks() -> AsyncIterator[Any]:
+        for chunk in buffer:
+            yield chunk
+        rest = _stream_with_idle_timeout(response, request_data, initial_chunk_count=len(buffer))
+        async with aclosing(rest) as stream:
+            async for chunk in stream:
+                yield chunk
+
     async def deliver_route() -> AsyncIterator[Any]:
         nonlocal withheld_ceiling_terminal
         nonlocal native_chunk_count
-        # Whether the ceiling frame has been withheld. Once it has, the
-        # frames that close the same answer belong to it.
-        ceiling_withheld = False
-        for chunk in buffer:
-            for frame in split_anthropic_ceiling_chunk(chunk):
-                if (
-                    is_anthropic_stream
-                    and _stream_continuation_module._native_stream_output_limit_reason(
-                        frame
-                    )
-                    is not None
-                ):
-                    withheld_ceiling_terminal = frame
-                    ceiling_withheld = True
-                    native_chunk_count += 1
-                    remember_route_accounting(frame)
-                    continue
-                if ceiling_withheld and _native_stream_chunk_is_terminal(
-                    frame,
-                    request_data,
-                    finished_choice_indices,
-                ):
-                    withheld_ceiling_closers.append(frame)
-                    native_chunk_count += 1
-                    remember_route_accounting(frame)
-                    continue
-                if not inspect_native_chunk(frame):
-                    return
-                cleaned = dsml_clean(frame)
-                if cleaned is not None:
-                    yielded = remember_delivered_text(cleaned)
-                    kind = str(_stream_chunk_type(yielded))
-                    dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
-                    yield yielded
-        # A transport read may contain several Messages frames. Split only
-        # reads that carry a ceiling so text before that frame is delivered and
-        # becomes part of the continuation prompt.
-        async for chunk in _stream_with_idle_timeout(
-            response,
-            request_data,
-            initial_chunk_count=len(buffer),
-        ):
-            for frame in split_anthropic_ceiling_chunk(chunk):
-                chunk_exception = _stream_chunk_error_exception(frame)
-                if chunk_exception is not None:
-                    if saw_terminal:
-                        return
-                    raise chunk_exception
-                if _stream_continuation_module._native_stream_output_limit_reason(
-                    frame
-                ) is not None:
-                    # This frame carries the answer's own completion state, so
-                    # the delivery below is what decides whether it is ever
-                    # sent.
-                    withheld_ceiling_terminal = frame
-                    ceiling_withheld = True
-                    native_chunk_count += 1
-                    remember_route_accounting(frame)
-                    # The terminal frame that closes this answer arrives in its
-                    # own transport read on some routes. Keep reading and
-                    # withhold the closing frames as well.
-                    continue
-                if ceiling_withheld and _native_stream_chunk_is_terminal(
-                    frame,
-                    request_data,
-                    finished_choice_indices,
-                ):
-                    # Same answer, so the same fate as the ceiling frame.
-                    withheld_ceiling_closers.append(frame)
-                    native_chunk_count += 1
-                    remember_route_accounting(frame)
-                    continue
-                if not inspect_native_chunk(frame):
-                    return
-                cleaned = dsml_clean(frame)
-                if cleaned is not None:
-                    yielded = remember_delivered_text(cleaned)
-                    kind = str(_stream_chunk_type(yielded))
-                    dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
-                    yield yielded
+        nonlocal chat_usage_frame
+        can_continue = _stream_continuation_module._request_is_continuable_native_stream(request_data)
+        async with aclosing(route_chunks()) as chunks:
+            async for chunk in chunks:
+                for frame in split_anthropic_ceiling_chunk(chunk):
+                    chunk_exception = _stream_chunk_error_exception(frame)
+                    if chunk_exception is not None:
+                        if saw_terminal:
+                            return
+                        raise chunk_exception
+                    dumped = _stream_chunk_dump(frame) if not is_anthropic_stream else None
+                    if can_continue and dumped is not None:
+                        # Optional tools are common even in an image summary.
+                        # A delivered call delta, including unfinished JSON,
+                        # is what makes a text continuation unsafe.
+                        can_continue = not _response_has_tool_call_activity(dumped)
+                    # Messages must withhold message_stop until any buffered
+                    # tool markup is emitted, even if this request can't resume.
+                    if (is_anthropic_stream or can_continue) and _stream_continuation_module._native_stream_output_limit_reason(
+                        frame if dumped is None else dumped
+                    ):
+                        if not is_anthropic_stream:
+                            visible, frame = _stream_continuation_module._split_chat_finish_chunk(frame)
+                            if visible is not None:
+                                inspect_native_chunk(visible)
+                                yield remember_delivered_text(visible)
+                        withheld_ceiling_terminal = frame
+                        native_chunk_count += 1
+                        remember_route_accounting(frame)
+                        continue
+                    if withheld_ceiling_terminal is not None and dumped is not None:
+                        # A Chat client expects final usage after the finish
+                        # reason. Hold the accounting chunk until we know
+                        # how many upstream calls belong to this answer.
+                        if dumped.get("usage") and not _stream_chunk_has_delivered_output(frame, request_data):
+                            chat_usage_frame = frame
+                            remember_route_accounting(frame)
+                            continue
+                    if withheld_ceiling_terminal is not None and _native_stream_chunk_is_terminal(
+                        frame, request_data, finished_choice_indices
+                    ):
+                        # A separate message_stop belongs to the withheld
+                        # ceiling, while usage still needs to be read.
+                        withheld_ceiling_closers.append(frame)
+                        native_chunk_count += 1
+                        remember_route_accounting(frame)
+                        continue
+                    inspect_native_chunk(frame)
+                    cleaned = dsml_clean(frame)
+                    if cleaned is not None:
+                        yielded = remember_delivered_text(cleaned)
+                        kind = str(_stream_chunk_type(yielded))
+                        dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
+                        yield yielded
         # The answer is over: whatever markup is still held is all there will
         # be.  Its visible tail is delivered first (an unterminated block still
         # ends the answer the route wrote), then the calls it parsed to.  They
@@ -7344,6 +7322,9 @@ async def _yield_native_stream_with_output_limit_continuation(
         # the continuation into this same answer; the withheld frame is sent
         # only when there is nothing more to ask for.
         continuation_closed = False
+        accounting_source = chat_usage_frame or withheld_ceiling_terminal
+        initial_chat_usage = None if is_anthropic_stream else _stream_chunk_dump(accounting_source).get("usage")
+        extra_chat_usage: dict = {}
         async for chunk in _stream_continuation_module._stream_native_continuation_rounds(
             request_data,
             "".join(delivered_text_parts),
@@ -7355,12 +7336,13 @@ async def _yield_native_stream_with_output_limit_continuation(
             ceiling_chunk=withheld_ceiling_terminal,
             answered_output_tokens=answered_output_tokens,
             anthropic_index_offset=highest_anthropic_index + 1,
+            chat_usage=extra_chat_usage,
         ):
             # The same test the continuation applies before it hands over a
             # route's closing frame: that frame is the only terminal it yields.
             if _native_stream_chunk_is_terminal(chunk, request_data, set()):
                 continuation_closed = True
-            yield remember_delivered_text(chunk)
+            yield chunk
         # The continuation owns the answer's last frame: when it reached a
         # natural stop it already emitted that frame, and when it ran out of
         # rounds the withheld "length" frame is the honest report that the
@@ -7373,12 +7355,24 @@ async def _yield_native_stream_with_output_limit_continuation(
         # writing, yield frames and no terminal.  Reading those as closed left
         # the client a stream with no end.
         if not continuation_closed:
+            if extra_chat_usage and _stream_chunk_dump(withheld_ceiling_terminal).get("usage"):
+                withheld_ceiling_terminal = _stream_continuation_module._chat_chunk_with(
+                    withheld_ceiling_terminal, usage=None
+                )
             yield withheld_ceiling_terminal
             # The frame that closes the withheld one travels with it.  Sending
             # the ceiling alone left the client on an answer that never ended,
             # which it renders as a reply cut off at the route's output limit.
             for closer in withheld_ceiling_closers:
                 yield closer
+        if not is_anthropic_stream:
+            if extra_chat_usage or (continuation_closed and initial_chat_usage):
+                _stream_continuation_module._sum_chat_token_usage(extra_chat_usage, initial_chat_usage or {})
+                options = request_data.get("stream_options") or {}
+                if options.get("include_usage") and not request_data.get("_litellm_strip_stream_usage"):
+                    yield _stream_continuation_module._chat_chunk_with(accounting_source, choices=[], usage=extra_chat_usage)
+            elif chat_usage_frame is not None:
+                yield chat_usage_frame
         return
 
     if not saw_terminal:

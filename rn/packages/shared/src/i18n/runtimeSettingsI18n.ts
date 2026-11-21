@@ -48,7 +48,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS: { label: "流保活间隔", help: "交付流静默期间按此间隔发送一个客户端可解析的保活事件，避免客户端字节空闲计时器早于代理预算触发。设为 0 可关闭保活。" },
   YOUNG_ROUTER_STREAM_HEDGE_ENABLED: { label: "兄弟抢跑", help: "第一个事件迟迟不来时，用同一份请求在兄弟线路再发一次，谁先回答就用谁。首个尝试不会被取消；输掉竞速的线路记 1 次普通失败。关闭后连响应头竞速也一起停用。生图、组里只有一条线路、以及重试轮次都不补发。" },
   YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS: { label: "兄弟抢跑等待", help: "第一个事件等多久后让兄弟线路加入。更早的响应头竞速受此值封顶，体积小的请求体会提前（10 秒加上传时间）。设为 0 即停用，关闭上面的开关也一样。" },
-  YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED: { label: "续写客户端上限的回答", help: "路由在自己的输出上限处截断回答时，路由器总会向同一路由索取剩余内容并接进正在阅读的答案。这个开关还会续写停在客户端自己声明上限处的回答——那会超出客户端选择的上限，所以默认关闭。仅适用于纯文本 Chat Completions 与 Anthropic 回答；带工具的轮次不受影响。" },
+  YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED: { label: "续写客户端上限的回答", help: "文字回答达到上游输出上限时，路由器可以接着续写。聊天补全请求可以带图片和可选工具；回答已经开始调用工具时不会续写。打开此项，还允许续写超过客户端指定的输出上限。" },
   YOUNG_ROUTER_STREAM_CONTINUATION_MAX_ROUNDS: { label: "续写轮数上限", help: "一条回答因路由撞到自身输出上限而最多可被续写的次数。每轮都是一次完整的上游调用，从已交付内容继续。设为 0 时保留路由留下的截断结果。" },
   YOUNG_ROUTER_REPLAY_REASONING_ELISION_ENABLED: { label: "裁剪过大的重放", help: "上游以「重放太大」拒绝后，删掉最老的推理项再试一次。消息、工具调用与结果、图片和托管工具都按原序保留；只裁推理，且只在被拒绝之后。关闭后重放保持原样。" },
   YOUNG_ROUTER_REPLAY_REASONING_ELISION_KEEP: { label: "保留推理条数", help: "裁剪重放时保留最新多少条推理项。设为 0 表示重试时删掉全部推理项。" },

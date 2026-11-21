@@ -3493,14 +3493,12 @@ class HookOutputStreamContinuationTests(HookTestCase):
             continuation_module._native_stream_output_limit_reason(stopped)
         )
 
-    async def test_a_tool_turn_is_never_extended(self) -> None:
-        # A ceiling inside a tool turn means the call the model was writing is
-        # incomplete; replaying that as more text would hand the client a
-        # half-written call it cannot execute.
+    async def test_a_request_that_requires_a_tool_is_never_extended(self) -> None:
         _, _proxy_server = load_hook_module()
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
         request_data = self._chat_request()
         request_data["tools"] = [{"type": "function", "function": {"name": "probe"}}]
+        request_data["tool_choice"] = "required"
 
         self.assertFalse(
             continuation_module._request_is_continuable_native_stream(request_data)
@@ -3518,13 +3516,13 @@ class HookOutputStreamContinuationTests(HookTestCase):
             continuation_module._request_is_continuable_native_stream(request_data)
         )
 
-    async def test_a_multimodal_user_message_is_never_extended(self) -> None:
+    async def test_an_unsupported_attachment_is_never_extended(self) -> None:
         _, _proxy_server = load_hook_module()
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
         request_data = self._chat_request()
         request_data["messages"][0]["content"] = [
-            {"type": "text", "text": "Describe this image."},
-            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+            {"type": "text", "text": "Transcribe this clip."},
+            {"type": "input_audio", "input_audio": {"data": "sample", "format": "wav"}},
         ]
 
         self.assertFalse(
@@ -3692,6 +3690,7 @@ class HookOutputStreamContinuationTests(HookTestCase):
         }
         tool_turn = self._chat_request()
         tool_turn["tools"] = [{"type": "function", "function": {"name": "probe"}}]
+        tool_turn["tool_choice"] = {"type": "function", "function": {"name": "probe"}}
 
         self.assertFalse(
             continuation_module._continuation_is_decided_by_the_engine(
@@ -4213,6 +4212,89 @@ class HookOutputStreamContinuationTests(HookTestCase):
             for choice in (chunk.get("choices") or [])
         )
         self.assertIn("| 25 | 2025-08-13 | 周疗 |", text)
+
+    async def test_chat_continues_the_image_answer_but_not_a_partial_tool_call(self) -> None:
+        """A text answer can hit the upstream limit even with tools available."""
+        _, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env("YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED", "0")
+        calls = []
+
+        def frame(delta, finish_reason=None, *, id="chatcmpl-first"):
+            return {
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "default-chat",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            }
+
+        class Router:
+            async def acompletion(self, **kwargs):
+                calls.append(kwargs)
+
+                async def stream():
+                    yield frame({"content": " from the figures."}, "stop", id="chatcmpl-resume")
+                    yield {**frame({}, id="chatcmpl-resume"), "choices": [], "usage": {"completion_tokens": 12}}
+
+                return stream()
+
+        with mock.patch.object(proxy_server, "llm_router", Router()):
+            for tool_called in (False, True):
+                with self.subTest(tool_called=tool_called):
+                    calls.clear()
+                    request = self._chat_request()
+                    request["reasoning_effort"] = "high"
+                    request["stream_options"] = {"include_usage": True}
+                    request["model_info"] = {"id": "vision-route"}
+                    parts = [
+                        {"type": "text", "text": "Summarize both figures"},
+                        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+                        {"type": "text", "text": "in this order."},
+                        {"type": "image_url", "image_url": {"url": "https://example.test/b.png"}},
+                    ]
+                    request["messages"][0]["content"] = parts
+                    request["tools"] = [{"type": "function", "function": {"name": "lookup"}}]
+                    request["tool_choice"] = "auto"
+                    partial_call = {"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}
+
+                    async def upstream():
+                        yield frame({"reasoning_content": "thinking"})
+                        yield frame({"content": "This is a finding"})
+                        if tool_called:
+                            yield frame(partial_call)
+                        yield frame({"content": ":"} if not tool_called else {}, "length")
+                        yield {**frame({}), "choices": [], "usage": {"completion_tokens": 325}}
+
+                    chunks = [
+                        chunk async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                            [], upstream(), request
+                        )
+                    ]
+                    choices = [choice for chunk in chunks for choice in chunk.get("choices", [])]
+                    reasons = [choice["finish_reason"] for choice in choices if choice.get("finish_reason")]
+                    if tool_called:
+                        self.assertEqual(calls, [])
+                        self.assertEqual(reasons, ["length"])
+                        self.assertIn(partial_call, [choice["delta"] for choice in choices])
+                        continue
+
+                    self.assertEqual(len(calls), 1)
+                    resume = calls[0]
+                    self.assertEqual(resume["messages"][0]["content"][1:], parts)
+                    self.assertEqual(resume["messages"][1]["content"], "This is a finding:")
+                    self.assertEqual(resume[streaming._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY], ["vision-route"])
+                    self.assertEqual(resume["stream_options"], {"include_usage": True})
+                    self.assertNotIn("tools", resume)
+                    self.assertNotIn("tool_choice", resume)
+                    self.assertEqual(reasons, ["stop"])
+                    self.assertEqual({chunk["id"] for chunk in chunks}, {"chatcmpl-first"})
+                    self.assertEqual([chunk.get("usage") for chunk in chunks if chunk.get("usage")], [{"completion_tokens": 337}])
+                    self.assertEqual(chunks[-1]["choices"], [])
+                    self.assertEqual(
+                        "".join(choice["delta"].get("content", "") for choice in choices),
+                        "This is a finding: from the figures.",
+                    )
 
     async def test_a_client_answered_to_its_own_ceiling_is_left_alone(self) -> None:
         """With the switch off, a ceiling the client chose is not overrun.
