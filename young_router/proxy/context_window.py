@@ -543,7 +543,7 @@ def _text_of(container: Any) -> str:
 
 
 def _item_text(item: Mapping[str, Any]) -> str:
-    if item.get("type") == "function_call_output":
+    if item.get("type") in {"function_call_output", "custom_tool_call_output"}:
         return _text_of(item.get("output"))
     if item.get("type") == "message":
         return _text_of(item.get("content"))
@@ -620,7 +620,7 @@ def _elide_item(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     if chars < _MIN_ELIDABLE_CHARS:
         return None
     marker = _marker(item, chars)
-    if item.get("type") == "function_call_output":
+    if item.get("type") in {"function_call_output", "custom_tool_call_output"}:
         output, replaced = _replace_text(item.get("output"), marker)
         if not replaced:
             output = marker
@@ -964,6 +964,45 @@ def _messages_step_anchor(items: List[Any]) -> int:
     return len(items)
 
 
+def _finished_responses_tool_outputs(items: List[Any]) -> List[int]:
+    """Text results in the current turn that a later sampling step has read."""
+
+    from . import tool_history
+
+    protected = _protected_index(items)
+    latest_results = len(items)
+    for index in range(len(items) - 1, protected, -1):
+        item = items[index]
+        kind = tool_history._item_type(item)
+        if kind in tool_history._OUTPUT_TYPES or kind == "tool_search_output":
+            latest_results = index
+        elif latest_results != len(items) and (
+            kind in tool_history._CALL_TYPES
+            or kind in ("reasoning", "tool_search_call")
+            or (kind == "message" and item.get("role") == "assistant")
+        ):
+            # Keep the whole newest batch, including parallel tool results.
+            break
+    if latest_results == len(items):
+        return []
+
+    calls: set[str] = set()
+    ranked: List[Tuple[int, int]] = []
+    for index in range(protected + 1, latest_results):
+        item = items[index]
+        kind = tool_history._item_type(item)
+        if kind in tool_history._CALL_TYPES:
+            calls.update(tool_history._identifiers(item))
+        elif kind in tool_history._OUTPUT_TYPES and any(
+            identifier in calls for identifier in tool_history._identifiers(item)
+        ):
+            text = _item_text(item)
+            if len(text) >= _MIN_ELIDABLE_CHARS:
+                ranked.append((len(text), index))
+    ranked.sort(reverse=True)
+    return [index for _, index in ranked]
+
+
 def _is_marker_item(item: Any) -> bool:
     if not isinstance(item, Mapping):
         return False
@@ -1155,7 +1194,9 @@ def shorten(
     return result
 
 
-def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List[Any]]:
+def _fitted_items(
+    items: List[Any], *, count: int, target: int, include_finished_outputs: bool = False
+) -> Optional[List[Any]]:
     """Drop or elide old bodies until the estimate reaches ``target`` tokens."""
 
     # The ratio has to be taken on the same text the count was taken on.  A
@@ -1172,7 +1213,10 @@ def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List
     changed = False
     # Phase one: keep every item, replace the body of the largest old ones
     # with a marker.  The transcript keeps its shape, so a replay stays valid.
-    for index in _elidable(items):
+    candidates = _elidable(items)
+    if include_finished_outputs:
+        candidates.extend(_finished_responses_tool_outputs(items))
+    for index in candidates:
         if count - freed <= target:
             break
         item = rewritten[index]
@@ -1317,7 +1361,15 @@ def retry_for_refusal(
             min(attempt, len(_NAMED_MAXIMUM_TARGET_FRACTIONS) - 1)
         ]
         target = min(int(named_maximum * fraction), int(measured * 0.95))
-    rewritten = _fitted_items(payload, count=measured, target=target)
+    # The adapter may be replaying hundreds of completed tool steps under one
+    # user message. Once upstream refuses the full replay, keep the latest
+    # step intact but allow older text results to pay for the retry.
+    rewritten = _fitted_items(
+        payload,
+        count=measured,
+        target=target,
+        include_finished_outputs=payload_key == "input",
+    )
     if rewritten is None:
         return False
     if not _shrank_enough({payload_key: rewritten}, before_bytes):

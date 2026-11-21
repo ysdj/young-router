@@ -1010,6 +1010,84 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
             "rewritten payload, or the next resend is refused the same way",
         )
 
+    def test_a_responses_tool_adapter_refusal_rewrites_finished_tool_outputs(
+        self,
+    ) -> None:
+        """A long run of completed tools is old context once the next call starts."""
+
+        items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "investigate"}],
+            }
+        ]
+        for index in range(14):
+            call_type = "custom_tool_call" if index == 0 else "function_call"
+            output_type = (
+                "custom_tool_call_output" if index == 0 else "function_call_output"
+            )
+            items.extend(
+                [
+                    {
+                        "type": call_type,
+                        "call_id": f"old_{index}",
+                        "name": "shell",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": output_type,
+                        "call_id": f"old_{index}",
+                        "output": "old tool output "
+                        + ("x" * (9000 if index == 0 else 2400)),
+                    },
+                ]
+            )
+        items.extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "latest",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "latest",
+                    "output": "latest output " + ("y" * 2400),
+                },
+            ]
+        )
+        data = {"model": "m", "input": items}
+        router = _Router(10**9)
+        with mock.patch.object(cw, "_router", return_value=router):
+            before = cw.measure_tokens(data, router)
+            cw._MEASURED_INPUT_TOKENS.set(before)
+            refused = RuntimeError(
+                f"prompt is too long: {before} tokens > {int(before * 0.9)} maximum"
+            )
+            self.assertTrue(cw.retry_for_refusal(data, refused, attempt=0, model="m"))
+
+        output_by_id = {
+            item["call_id"]: item["output"]
+            for item in data["input"]
+            if item.get("type") == "function_call_output"
+        }
+        self.assertEqual(output_by_id["latest"], "latest output " + ("y" * 2400))
+        self.assertTrue(
+            any(
+                "elided" in value
+                for call_id, value in output_by_id.items()
+                if call_id != "latest"
+            )
+        )
+        custom_output = next(
+            item
+            for item in data["input"]
+            if item.get("type") == "custom_tool_call_output"
+        )
+        self.assertIn("elided", custom_output["output"])
+
 
 class MessagesWireImageTests(unittest.TestCase):
     """A picture inside a tool result is not a picture to this upstream.
