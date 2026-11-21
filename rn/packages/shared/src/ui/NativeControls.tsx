@@ -1305,9 +1305,8 @@ function sameTableRow(previous: WindowsTableRowProps, next: WindowsTableRowProps
  * It is 6 pt of hover target — the width of the gutter it lives in — so it
  * never covers the header's own text, and it draws nothing at rest: a table
  * that showed a grip beside every heading would read as a table that is always
- * mid-edit.  The floor is the column's own starting width, not 0: a column
- * dragged to nothing is a column that has been lost, and the header is where it
- * would have been found.
+ * mid-edit.  A 24 pt minimum keeps a narrowed column available for another
+ * drag.
  */
 const RESIZE_CURSOR: ViewStyle = { cursor: "col-resize" } as unknown as ViewStyle;
 
@@ -1435,6 +1434,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     style={rowStyle}
   >
     {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: rowHeight / 2 - 8 }]} /> : null}
+    {!sourceList && selected ? <View pointerEvents="none" style={windowsTableStyles.rowSelectionIndicator} /> : null}
     {spanning ? <Text {...webTextHoverProps(row.tooltips?.[0], row.cells[0])} numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
       {columns.map((column, columnIndex) => {
         const cell = row.cells[columnIndex] ?? "";
@@ -1522,21 +1522,10 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // every row grew with it.
   const twoLine = rowDetails.some((detail) => detail.length > 0);
   const rowHeight = windowsRowHeight(compact) + (twoLine ? 14 : 0);
-  // Column widths a user dragged.  The macOS table lets a column be resized and
-  // the browser table did not at all, so a long 密钥名 could only be read by
-  // widening the whole window.  The drag is the one table behaviour that has to
-  // be the same on both hosts, so it is kept here as a per-column override on
-  // top of the caller's own widths: a table whose columns change (another
-  // provider selected, another public model expanded) drops the overrides,
-  // because a width dragged for one shape of table means nothing in another.
+  // Keep the user's widths while content and optional columns change. Logs can
+  // add or remove a column on a poll, but that does not change the other columns
+  // the reader has already sized.
   const [draggedWidths, setDraggedWidths] = React.useState<Record<string, number>>({});
-  const columnLabels = React.useMemo(() => columns.map((column) => column.label).join("\u001f"), [columns]);
-  const dragShape = React.useRef(columnLabels);
-  React.useEffect(() => {
-    if (dragShape.current === columnLabels) return;
-    dragShape.current = columnLabels;
-    setDraggedWidths({});
-  }, [columnLabels]);
   const laidOutColumns = React.useMemo(
     () => columns.map((column) => (draggedWidths[column.label] === undefined ? column : { ...column, width: draggedWidths[column.label] })),
     [columns, draggedWidths],
@@ -1900,7 +1889,7 @@ const windowsTableStyles = StyleSheet.create({
   borderless: { borderWidth: 0, borderRadius: 0, backgroundColor: "transparent" },
   header: { flexDirection: "row", alignItems: "center", minHeight: 30, backgroundColor: WINDOWS_CONTROL.fillSubtle, borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle },
   headerCell: { flexDirection: "row", alignItems: "center", height: "100%" },
-  headerText: { flexShrink: 1, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  headerText: { flex: 1, minWidth: 0, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   // The drag target is the gutter itself: 6 pt wide, full height of the header,
   // and invisible until the pointer is over it.
   resizeHandle: { width: 6, alignSelf: "stretch" },
@@ -1928,7 +1917,8 @@ const windowsTableStyles = StyleSheet.create({
   sourceRowHover: { backgroundColor: WINDOWS_CONTROL.fillHover },
   sourceSelectionIndicator: { position: "absolute", left: 0, width: 3, height: 16, borderRadius: 1.5, backgroundColor: WINDOWS_CONTROL.accent },
   rowStripe: { backgroundColor: WINDOWS_CONTROL.fillSubtle },
-  rowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderLeftWidth: 3, borderLeftColor: WINDOWS_CONTROL.accent },
+  rowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle },
+  rowSelectionIndicator: { position: "absolute", left: 0, top: 0, bottom: 0, width: 3, backgroundColor: WINDOWS_CONTROL.accent },
   rowDisabled: { opacity: 0.72 },
   // The cells row adds no inset of its own: a cell's inset is the table's
     // `cellHorizontalPadding`, applied per column below, and a container that

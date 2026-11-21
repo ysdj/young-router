@@ -17,7 +17,8 @@
 // Usage: node test_browser_edit_path.mjs <page-url> [--json]
 // Prints one JSON object on stdout; exit code 0 means every assertion held.
 
-import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,6 +26,7 @@ import path from "node:path";
 
 const pageUrl = process.argv[2];
 const jsonOnly = process.argv.includes("--json");
+const resizeColumnsIndex = process.argv.indexOf("--resize-columns");
 // Optional link shaping, so a local run states the same defect a published page
 // shows: `--latency 250 --downstream 125000` is the round trip and the bandwidth
 // measured between a home connection and a gateway in another country.
@@ -98,6 +100,11 @@ async function openTarget(port, url, shaping) {
   await cdp.send("Network.enable");
   await cdp.send("Runtime.enable");
   await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 950, deviceScaleFactor: 1, mobile: false });
+  if (resizeColumnsIndex >= 0) {
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `Object.defineProperty(navigator, "languages", { get: () => ["zh-CN"] });`,
+    });
+  }
   if (shaping) {
     await cdp.send("Network.emulateNetworkConditions", {
       offline: false,
@@ -228,6 +235,149 @@ async function waitForEnableBox(cdp) {
   throw new Error("the page never drew an enable checkbox");
 }
 
+async function columnGeometry(cdp, label, rowMarker) {
+  return evaluate(cdp, `(() => {
+    const handle = [...document.querySelectorAll('[role="separator"]')]
+      .find((node) => node.getAttribute("aria-label") === ${JSON.stringify(label)});
+    if (!handle) return null;
+    const header = handle.parentElement;
+    const index = [...header.parentElement.children].indexOf(header);
+    const row = [...document.querySelectorAll('button[aria-label]')]
+      .find((node) => node.getAttribute("aria-label").includes(${JSON.stringify(rowMarker)}));
+    const cell = row?.lastElementChild?.children[index];
+    if (!cell) return null;
+    const grip = handle.getBoundingClientRect();
+    const heading = header.getBoundingClientRect();
+    const value = cell.getBoundingClientRect();
+    return { x: grip.x, y: grip.y, height: grip.height, right: grip.right,
+      headerLeft: heading.left, headerRight: heading.right, headerWidth: heading.width,
+      cellLeft: value.left, cellRight: value.right, cellWidth: value.width,
+      cellTop: value.top, cellHeight: value.height, selected: row.getAttribute("aria-selected") === "true" };
+  })()`);
+}
+
+async function waitForColumn(cdp, label, rowMarker) {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    const geometry = await columnGeometry(cdp, label, rowMarker);
+    if (geometry) return geometry;
+    await sleep(100);
+  }
+  throw new Error(`column ${label} or row ${rowMarker} did not appear`);
+}
+
+async function waitForStableColumn(cdp, label, rowMarker) {
+  let previous;
+  let stable = 0;
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    const geometry = await columnGeometry(cdp, label, rowMarker);
+    stable = geometry && previous && geometry.headerWidth === previous.headerWidth ? stable + 1 : 0;
+    if (stable >= 3) return geometry;
+    previous = geometry;
+    await sleep(100);
+  }
+  throw new Error(`column ${label} did not settle`);
+}
+
+function assertColumnAligned(geometry) {
+  assert.ok(Math.abs(geometry.right - geometry.headerRight) < 1, "resize target is at the column edge");
+  assert.ok(Math.abs(geometry.headerWidth - geometry.cellWidth) < 1, "header and row widths match");
+  assert.ok(Math.abs(geometry.headerLeft - geometry.cellLeft) < 1, "header and row positions match");
+}
+
+async function dragColumn(cdp, geometry, distance) {
+  const x = geometry.headerRight - 3;
+  const y = geometry.y + geometry.height / 2;
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0 });
+  await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x + distance, y, button: "left", buttons: 1 });
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: x + distance, y, button: "left", buttons: 0, clickCount: 1 });
+  await sleep(150);
+}
+
+async function checkColumnResizing(cdp) {
+  let first = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assertColumnAligned(first);
+  await dragColumn(cdp, first, 70);
+  const widened = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assertColumnAligned(widened);
+  assert.equal(widened.headerWidth, first.headerWidth + 70);
+
+  const rowPoint = { x: widened.cellLeft + 10, y: widened.cellTop + widened.cellHeight / 2 };
+  await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...rowPoint, button: "left", buttons: 1, clickCount: 1 });
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...rowPoint, button: "left", buttons: 0, clickCount: 1 });
+  await sleep(150);
+  const selected = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assert.ok(selected.selected, "the row is selected");
+  assertColumnAligned(selected);
+
+  const python = process.argv[resizeColumnsIndex + 1];
+  const logPath = process.argv[resizeColumnsIndex + 2];
+  execFileSync(python, ["-c", `import json, sys
+from young_router import runtime_store
+runtime_store.append_record(sys.argv[1], json.dumps({
+    "timestamp": "2026-11-21T10:00:00Z", "request_id": "second",
+    "status": "success", "model_group": "public-0-0",
+    "usage": {"input_tokens": 1000, "output_tokens": 50, "cache_read_tokens": 500},
+}))`, logPath]);
+  await waitForColumn(cdp, "缓存命中", "public-0-0");
+  await sleep(200);
+  const afterUpdate = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assertColumnAligned(afterUpdate);
+  assert.equal(afterUpdate.headerWidth, widened.headerWidth, "a new optional column keeps the existing width");
+
+  await dragColumn(cdp, afterUpdate, -300);
+  const narrowed = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assertColumnAligned(narrowed);
+  assert.equal(narrowed.headerWidth, 24);
+  await dragColumn(cdp, narrowed, 80);
+  const restored = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assertColumnAligned(restored);
+  assert.equal(restored.headerWidth, 104);
+
+  await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
+  const touch = { x: restored.headerRight - 3, y: restored.y + restored.height / 2 };
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [touch] });
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ ...touch, x: touch.x + 40 }] });
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+  const touched = await waitForColumn(cdp, "本地时间", "public-0-0");
+  assertColumnAligned(touched);
+  assert.equal(touched.headerWidth, 144);
+
+  const scrollBox = await evaluate(cdp, `(() => {
+    let node = [...document.querySelectorAll('[role="separator"]')]
+      .find((item) => item.getAttribute("aria-label") === "本地时间");
+    while (node && !(getComputedStyle(node).overflowX === "auto" && node.scrollWidth > node.clientWidth)) {
+      node = node.parentElement;
+    }
+    if (!node) return null;
+    const bounds = node.getBoundingClientRect();
+    return { x: bounds.left + 100, y: bounds.top + 15 };
+  })()`);
+  assert.ok(scrollBox, "the widened table can scroll horizontally");
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", ...scrollBox, deltaX: 2000, deltaY: 0 });
+  await sleep(200);
+  const detail = await waitForColumn(cdp, "详情", "public-0-0");
+  assertColumnAligned(detail);
+  await dragColumn(cdp, detail, -60);
+  const scrolled = await waitForColumn(cdp, "详情", "public-0-0");
+  assertColumnAligned(scrolled);
+  assert.equal(scrolled.headerWidth, detail.headerWidth - 60);
+
+  await cdp.send("Page.navigate", { url: new URL("#/providers-models", pageUrl).href });
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    if (await evaluate(cdp, `document.body.innerText.includes("添加向导")`)) break;
+    await sleep(100);
+  }
+  first = await waitForStableColumn(cdp, "上游模型", "upstream-0-0");
+  assertColumnAligned(first);
+  await dragColumn(cdp, first, -60);
+  const model = await waitForColumn(cdp, "上游模型", "upstream-0-0");
+  assertColumnAligned(model);
+  assert.equal(model.headerWidth, first.headerWidth - 60, JSON.stringify({ first, model }));
+  return { logWidth: widened.headerWidth, minimumWidth: narrowed.headerWidth, modelWidth: model.headerWidth };
+}
+
 async function main() {
   if (!pageUrl) throw new Error("usage: test_browser_edit_path.mjs <page-url>");
   const chrome = chromePath();
@@ -257,6 +407,13 @@ async function main() {
       }
     }
     if (!ready) throw new Error("the browser did not open its debugging port");
+
+    if (resizeColumnsIndex >= 0) {
+      cdp = await openTarget(port, new URL("#/logs", pageUrl).href);
+      result.measured = await checkColumnResizing(cdp);
+      result.ok = true;
+      return;
+    }
 
     // The slow-link press first, and alone: two windows on one Core share its
     // drafts, so a second page sitting open would have its own auto-apply

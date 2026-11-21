@@ -34,9 +34,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
+from young_router import runtime_store
 from young_router.core import CoreIPCServer, CoreStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +148,28 @@ class BrowserEditCostTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    def test_table_columns_resize_at_their_edges_and_survive_log_updates(self) -> None:
+        log_path = Path(self._directory.name) / "recent-requests.jsonl"
+        runtime_store.append_record(
+            log_path,
+            json.dumps({
+                "timestamp": "2026-11-21T09:00:00Z",
+                "request_id": "first",
+                "status": "success",
+                "model_group": "public-0-0",
+            }),
+        )
+        endpoint = self.server.endpoint
+        url = f"http://{endpoint.address}:{endpoint.port}/ui/"
+        completed = subprocess.run(
+            ["node", str(DRIVER), url, "--json", "--resize-columns", sys.executable, str(log_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
 
     def test_one_settled_edit_asks_for_the_plan_not_the_projection(self) -> None:
         endpoint = self.server.endpoint
