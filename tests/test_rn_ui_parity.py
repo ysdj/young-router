@@ -4082,9 +4082,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_route_trace_uses_primary_text_except_active_selection(self) -> None:
         for style in (
-            "routeTraceRequestTime: { flexShrink: 0, color: systemColors.label",
-            "routeTraceRequestPath: { color: systemColors.label",
-            "routeTraceOutcomeDirect: { color: systemColors.label }",
+            "logSidebarMeta: { flexShrink: 0, color: systemColors.label",
+            "logSidebarDetail: { color: systemColors.label",
+            "logSidebarStatus: { color: systemColors.label",
             "routeTraceDetailMeta: { color: systemColors.label",
             "routeTracePathCount: { color: systemColors.label",
             "routeTraceStepLabel: { color: systemColors.label",
@@ -4094,7 +4094,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "routeTraceNoSelectionText: { color: systemColors.label",
         ):
             self.assertIn(style, self.ui)
-        self.assertIn("routeTraceRequestTextSelected: { color: systemColors.selectedControlText }", self.ui)
+        self.assertIn("logSidebarSelectedText: { color: systemColors.selectedControlText }", self.ui)
         self.assertIn('secondaryLabel: semanticColor("secondaryLabelColor", "TextFillColorSecondary", webInk.textSecondary)', self.ui)
         self.assertIn("routeTraceTimelineNodeStart: { backgroundColor: systemColors.secondaryLabel }", self.ui)
         # A picked route is a plan the request has not confirmed yet, so it
@@ -4509,7 +4509,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if len(candidates) != 1:", shared)
         self.assertIn("function clientRouteLabel(provider: string, model: string): string {", self.ui)
         self.assertIn("function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate)", self.ui)
-        self.assertIn("function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, modelList, modelListHint, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }", self.ui)
+        self.assertIn("function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }", self.ui)
 
     def test_external_settings_list_only_registered_client_files_with_paths(self) -> None:
         # The client controls and the file rows are two components because one
@@ -4577,24 +4577,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, self.ui)
         self.assertNotIn("AssistantFileEditorDialog", self.ui)
         self.assertNotIn("activeAssistantFile", self.ui)
-        # Codex keeps its own model-list switch: the pane writes the same
-        # managed catalog the status menu toggles, so checked replaces Codex's
-        # model list with this app's public one and unchecked restores the
-        # client's built-in list.  The switch writes and reports, and nothing
-        # asks the user to restart the client to pick the change up.
+        # Model-list controls manage the host plugin and offer installation
+        # after a successful API switch.
         for absent in ("CodexRestartNotice", "showCodexRestartConfirmation", "restartCodex"):
             self.assertNotIn(absent, self.ui)
         for marker in (
-            'accessibilityLabel={labelled("settings.useRouterModelList")}',
-            'translate("codex.modelCatalogHint")',
-            # The switch's own answer travels back to the control: a switch
-            # holds the value it was given until the write settles, so the
-            # request's promise is returned instead of dropped.
-            "const toggleCatalog = (enabled: boolean): Promise<unknown> | void => {",
-            "return onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));",
-            # This app's model list names models only its proxy serves, so the
-            # row is one of the pane's proxy-scoped switches: it is disabled,
-            # and says why, while the client points somewhere else.
+            'function ModelListPluginFields(',
+            'translate("settings.pluginLabel")',
+            '"settings.pluginInstalled"',
+            'translate("settings.pluginUninstall")',
+            'const useApiAndOfferPlugin = async',
+            'title: translate("settings.pluginInstallTitle")',
+            'if (success === false) return false;',
+            'await onApplyClientSettings();',
+            'await managePlugin(host, "install")',
             "proxyOnly={localApiActive}",
             "disabled={busy || !proxyOnly}",
             'translate("settings.useLocalApiRequired")',
@@ -4605,7 +4601,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "SETTINGS_FIELD_SWITCH_SLOT",
             'codexModelCatalogEnabled={codexModelCatalogEnabled}',
             'booleanValue(codexModelCatalogState(snapshot).enabled)',
-            'onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")}',
             'const CODEX_MODEL_CATALOG_FILE_ID = "codex_model_catalog";',
             "const openClientFile = (file: ClientFile): void => {",
             "if (file.id === CODEX_MODEL_CATALOG_FILE_ID) { generatedFileOpen(file, codexModelCatalogEnabled); return; }",
@@ -4680,7 +4675,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # own client so Core writes the right document.
             'onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")}',
             'onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")}',
-            'onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")}',
         ):
             self.assertIn(marker, self.ui if marker not in pane else pane)
         # Core -- not the pane -- remembers the route a client leaves: once the
@@ -4741,7 +4735,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('showsHorizontalScrollIndicator={false}', self.ui)
 
     def test_external_file_editor_route_owns_save_and_close(self) -> None:
-        editor = self.ui.split("function FileEditorWorkspace(", 1)[1].split("function AssistantSettingsWorkspace(", 1)[0]
+        editor = self.ui.split("function FileEditorWorkspace(", 1)[1].split("\n}\n", 1)[0]
         for marker in (
             "setAssistantEditorOpen(requested);",
             "return () => setAssistantEditorOpen(false);",
@@ -5729,8 +5723,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const claudeDesignated = (claudeCode.designated_route ?? claudeDesktop.designated_route) as UnknownRecord | undefined;",
             "const claudeRoute = claudeDesignated ? asRecord(claudeDesignated) : undefined;",
             "designatedSelection={claudeRoute}",
-            'for (const { app } of claudeApps) await action(app, selection);',
-            "onUseLocalApi={(selection) => forEveryClaudeApp(onClaudeUseLocalApi, selection)}",
+            'for (const { app } of claudeApps) if (await action(app, selection) === false) return false;',
+            'onUseLocalApi={(selection) => useApiAndOfferPlugin("claude", () => forEveryClaudeApp(onClaudeUseLocalApi, selection))}',
             "onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}",
             # Every Claude app's files under those controls.
             'files={claudeFiles}',
@@ -7951,6 +7945,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assert_ui_has(marker)
         for key, zh, en in (
             ("logs.success", "成功", "Success"),
+            ("logs.siblingDispatch", "抢发", "Hedge"),
+            ("logs.siblingSending", "另一路也在途", "Another route in flight"),
+            ("logs.fallbackSending", "换线", "Switched routes"),
+            ("logs.recoverySending", "恢复重试", "Recovery attempt"),
             ("logs.stuck", "停滞", "Stalled"),
             ("logs.level.debug", "调试", "Debug"),
             ("logs.level.info", "信息", "Info"),
@@ -7960,6 +7958,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ("logs.routeTrace.reasonStreamIncomplete", "上游流未完整结束", "Upstream stream ended before completion"),
             ("logs.routeTrace.reasonBodyCapacity", "上游请求体容量不足", "Upstream rejected the request body size"),
             ("logs.routeTrace.reasonRelayCapacity", "中转站暂无可用渠道", "No relay channel available"),
+            ("logs.routeTrace.reasonModelUnavailable", "上游模型暂不可用", "Upstream model temporarily unavailable"),
             ("logs.routeTrace.reasonImageUnsupported", "所有路由都不支持图像工具", "No route supports the image tool"),
             ("logs.routeTrace.reasonCompactionUnsupported", "上游不支持 Codex 压缩", "Upstream does not support Codex compaction"),
             ("logs.routeTrace.reasonImageFallback", "图像工具运行时回退", "Image tool runtime fallback"),
@@ -8043,8 +8042,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'initialNumToRender={12}',
             'maxToRenderPerBatch={12}',
             'windowSize={7}',
-            'length: ROUTE_TRACE_REQUEST_ROW_HEIGHT',
-            'offset: ROUTE_TRACE_REQUEST_ROW_HEIGHT * index',
+            'length: rowHeight',
+            'offset: rowHeight * index',
+            'rowHeight = LOG_SIDEBAR_ROW_HEIGHT',
+            'rowHeight={LOG_SIDEBAR_TWO_LINE_ROW_HEIGHT}',
             'removeClippedSubviews={false}',
             'const [visibleRequests, setVisibleRequests] = useState(requests);',
             'if (scrolling.current) {',
@@ -8052,19 +8053,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'data={visibleRequests}',
             'onScroll={deferLiveRequestRefresh}',
             'scrollEventThrottle={16}',
-            'routeTraceRequestRow: { height: ROUTE_TRACE_REQUEST_ROW_HEIGHT',
+            '{ height: rowHeight }',
             'translate("logs.routeTrace.actualPath")',
             'selected.attempts.map((attempt, index)',
             'routeTraceWorkspace:',
-            'routeTraceRequestPane:',
+            'logSidebar:',
             'AppState.addEventListener("change", (state) => setAppActive(state === "active"))',
-            'onFocus={() => onSelect(request.key)}',
+            'onFocus={() => keyboard.select(key)}',
             'accessibilityState={{ selected: isSelected }}',
             'selectedContentBackgroundColor',
             'unemphasizedSelectedContentBackgroundColor',
             'alternateSelectedControlTextColor',
-            'routeTraceRequestRowSelected: { backgroundColor: systemColors.selectedContent',
-            'routeTraceRequestTextSelected: { color: systemColors.selectedControlText }',
+            'logSidebarRowSelected: { backgroundColor: systemColors.selectedContent',
+            'logSidebarSelectedText: { color: systemColors.selectedControlText }',
             'routeTraceTimeline:',
             'const ROUTE_TRACE_TIMELINE_MIN_WIDTH = 400;',
             'routeTraceTimeline: { flexGrow: 1, minWidth: ROUTE_TRACE_TIMELINE_MIN_WIDTH, paddingHorizontal: 14',
@@ -8072,7 +8073,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'onContentSizeChange={(width) => setTimelineContentWidth(width)}',
             'onResponderMove={({ nativeEvent }) => scrollTimelineToIndicatorPosition(nativeEvent.locationX)}',
             'routeTraceTimelineHorizontalScrollbarTrack: { position: "absolute", left: 14, right: 14, bottom: 4',
-            'alwaysBounceHorizontal={false}\n        showsHorizontalScrollIndicator={false}\n        showsVerticalScrollIndicator',
+            'alwaysBounceHorizontal={false}\n      showsHorizontalScrollIndicator={false}\n      showsVerticalScrollIndicator',
             'translate("logs.routeTrace.stepProgress", { current: index + 1, total: selected.attempts.length })',
             'routeTraceAttemptIcon(attempt.state)',
             'routeTraceTimelineNodeSelected:',
@@ -8089,12 +8090,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('translate("logs.routePath")', self.ui)
         self.assertNotIn('logs.routeTrace.requestList', self.ui)
         self.assertNotIn('routeTracePaneHeader:', self.ui)
-        self.assertNotIn('routeTraceRequestRowSelected: { backgroundColor: systemColors.window, borderLeftWidth:', self.ui)
+        self.assertNotIn('logSidebarRowSelected: { backgroundColor: systemColors.window, borderLeftWidth:', self.ui)
         self.assertNotIn('hoveredKey', self.ui)
         self.assertNotIn('setHoveredKey', self.ui)
         self.assertNotIn('onHoverIn={() =>', self.ui)
         self.assertNotIn('onHoverOut={() =>', self.ui)
-        self.assertNotIn('routeTraceRequestRowHovered:', self.ui)
+        self.assertNotIn('logSidebarRowHovered:', self.ui)
         for marker in (
             "function routeTraceEventLabel(value: string, translate: Translate): string {",
             "function routeTraceReasonLabel(value: string, translate: Translate): string {",

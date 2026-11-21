@@ -3321,13 +3321,15 @@ class HookHeadHedgeTests(HookTestCase):
         streaming = sys.modules["young_router.proxy.streaming"]
         routing = sys.modules["young_router.proxy.routing"]
         request = self._chat_request()
-        token = streaming._CURRENT_HEAD_HEDGE_ATTEMPT.set(True)
+        parent = {"request_id": "primary-log-row", "deployment_id": "primary-route"}
+        token = streaming._CURRENT_HEAD_HEDGE_ATTEMPT.set(parent)
         try:
             record = routing._request_log_record("pending", request)
         finally:
             streaming._CURRENT_HEAD_HEDGE_ATTEMPT.reset(token)
 
         self.assertEqual("head_hedge", record.get("internal_attempt"))
+        self.assertEqual(parent, record.get("hedge_parent"))
 
     async def test_a_head_that_never_arrives_is_cut_by_the_dispatch_budget(self) -> None:
         hooks, _ = load_hook_module()

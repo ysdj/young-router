@@ -41,6 +41,7 @@ from .base import (
     _CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV,
     _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
+    _CURRENT_HEAD_HEDGE_ATTEMPT,
     _CURRENT_ATTEMPT_STARTED_AT,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
     _CURRENT_SELECTED_DEPLOYMENT,
@@ -1223,6 +1224,8 @@ def _same_deployment_retry_budget(exception: Exception) -> int:
     failure in nine, and after that the ordinary failure accounting takes over.
     """
 
+    if _is_upstream_model_unavailable_error(exception):
+        return 0
     configured = _same_deployment_retries()
     if _is_thinking_tool_choice_unsupported_error(exception):
         return max(configured, _THINKING_TOOL_CHOICE_RETRY_ATTEMPTS)
@@ -1308,7 +1311,8 @@ def _same_deployment_retry_pending(exception: Exception) -> bool:
     it is exhausted, all fallback paths must advance.
     """
     return (
-        _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
+        not _is_upstream_model_unavailable_error(exception)
+        and _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
         and not _same_deployment_retry_exhausted(exception)
     )
 
@@ -1473,7 +1477,10 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_BALANCE_ENV,
             _RECOVERY_POLICY_COOLDOWN,
         )
-    if _is_upstream_relay_capacity_error(exception):
+    if (
+        _is_upstream_relay_capacity_error(exception)
+        or _is_upstream_model_unavailable_error(exception)
+    ):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -1711,7 +1718,10 @@ def _is_refusal_about_the_request_body(exception: Exception) -> bool:
 
     if _is_model_concurrency_rejection_error(exception):
         return False
-    if _is_no_deployments_available_error(exception):
+    if (
+        _is_no_deployments_available_error(exception)
+        or _is_upstream_model_unavailable_error(exception)
+    ):
         return False
     status_code = _exception_status_code(exception)
     if status_code is None:
@@ -2299,19 +2309,11 @@ def _with_session_deployment_affinity(
     request_kwargs: Optional[dict],
     model_group: Optional[str],
 ) -> tuple[Any, Optional[str], bool]:
-    """Narrow this request's candidates to the session's last serving route.
+    """Prefer the conversation's warm route within the best eligible tier.
 
-    Affinity is about the upstream's warm prompt cache, and it answers one
-    question only: did some route already serve this conversation, and is it
-    still among the candidates this attempt may use?  It deliberately knows
-    nothing about ``order``, relay multipliers, or the content of the replay --
-    those decide which routes are candidates in the first place, and by the time
-    this runs the answer is already in the list.
-
-    The route that answers re-points the affinity (see
-    ``_record_session_success``), so a conversation follows whichever route
-    actually serves it; when the sticky route is absent, excluded, or cooling,
-    selection is unchanged and the configured order decides.
+    This callback precedes LiteLLM's order filter. Ask that same selector which
+    tier it will use so a successful fallback cannot hide a higher priority
+    route on the next turn.
     """
 
     if not _session_deployment_affinity_enabled():
@@ -2321,15 +2323,10 @@ def _with_session_deployment_affinity(
     sticky = _session_affinity_deployment_id(request_kwargs, model_group)
     if not sticky:
         return candidates, None, False
-    sticky_deployment = None
-    for deployment in candidates:
+    for deployment in litellm.utils.get_order_filtered_deployments(candidates):
         if _responses_request_module._deployment_id(deployment) == sticky:
-            sticky_deployment = deployment
-            break
-    if sticky_deployment is None:
-        return candidates, sticky, False
-
-    return [sticky_deployment], sticky, True
+            return [deployment], sticky, True
+    return candidates, sticky, False
 
 
 _CODEX_COMPACTION_CAPABILITY_PROBE_TIMEOUT_SECONDS = 15.0
@@ -4859,8 +4856,16 @@ def _request_log_record(
     if status in {"failure", "stuck"}:
         record["error"] = _request_log_error_summary(request_kwargs, response_obj)
     if _streaming_module._is_head_hedge_attempt(request_kwargs):
-        # Keep the parallel dispatch distinguishable from a sequential retry.
         record["internal_attempt"] = "head_hedge"
+        if parent := _CURRENT_HEAD_HEDGE_ATTEMPT.get():
+            record["hedge_parent"] = parent
+    elif deployment_id and _is_route_recovery_poll_payload(request_kwargs):
+        record["dispatch_mode"] = "recovery"
+    elif deployment_id and (
+        _responses_request_module._request_excluded_deployment_ids(request_kwargs)
+        - {deployment_id}
+    ):
+        record["dispatch_mode"] = "fallback"
     if status == "pending":
         started_at = _event_time(request_started_at or start_time)
         if started_at:
@@ -6984,6 +6989,8 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         # ``other`` is what this 400 read as while the trace kept pointing the
         # reader at the request instead of the station's missing price entry.
         reason = "upstream-model-unpriced"
+    elif _is_upstream_model_unavailable_error(exception):
+        reason = "upstream-model-unavailable"
     elif _is_thinking_tool_choice_unsupported_error(exception):
         # Named so triage can tell it from the generic compatibility refusal it
         # used to land in -- that label is what hid a refusal paid on every turn.
@@ -7141,6 +7148,12 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "detail": (
                 "The upstream has no available accounts or channels for this route."
             ),
+        }
+    elif _is_upstream_model_unavailable_error(exception):
+        result = {
+            "kind": "upstream_model_unavailable",
+            "title": "Upstream model temporarily unavailable",
+            "detail": "The upstream reported that this route cannot currently serve the model.",
         }
     elif _is_upstream_channel_refused_error(exception):
         result = {
@@ -8899,6 +8912,8 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         # was not dispatchable: the recovery poll opened on a cooldown-policy
         # seed and produced empty rounds until the window expired.
         return True
+    if _is_upstream_model_unavailable_error(exception):
+        return True
     if _is_upstream_channel_refused_error(exception):
         # The station's channel can differ per attempt, and a sibling route may
         # answer the same bytes: advance instead of ending the turn here.
@@ -10385,6 +10400,12 @@ def _sanitized_upstream_route_failure_message(
             "provider route or choose another model; sending this turn again "
             "meets the same answer."
         )
+    if _is_upstream_model_unavailable_error(exception):
+        return (
+            f"The upstream reported that {model_group} is currently unavailable "
+            "on its route, and no other candidate route answered this turn. "
+            "Please retry your request later or choose another model."
+        )
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
     if relay_message is not None:
@@ -10955,6 +10976,15 @@ def _is_upstream_model_not_found_error(exception: Exception) -> bool:
     )
 
 
+def _is_upstream_model_unavailable_error(exception: Exception) -> bool:
+    # The upstream sent this availability verdict in an invalid_request_error
+    # envelope. It serves the same model when available, so neither a schema
+    # conversion nor immediately resending the same body addresses this refusal.
+    return _exception_status_code(exception) == 400 and (
+        "the requested model is currently unavailable" in _exception_text(exception)
+    )
+
+
 def _is_responses_endpoint_not_found_error(
     exception: Exception,
     request_kwargs: Optional[dict],
@@ -10977,6 +11007,8 @@ def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     if _is_thinking_replay_contract_error(exception):
         return False
     if _is_responses_schema_unsupported_error(exception):
+        return False
+    if _is_upstream_model_unavailable_error(exception):
         return False
     if _is_upstream_client_version_rejected_error(exception):
         # A route whose bundled client is too old for the model states the

@@ -617,7 +617,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "payload": {"id": account_id, "label": "Draft"},
             })
             result = core.run_automatic_relay_balance_refresh([account_id], lambda: False)
-            self.assertEqual({account_id: "succeeded"}, result)
+            self.assertEqual("succeeded", result[account_id].outcome)
             self.assertEqual([profile], [path for _, path, _ in fake.requests])
             stored = RelayAccountsDomain(directory).snapshot()["accounts"][0]
             self.assertEqual("Original", stored["label"])
@@ -632,7 +632,8 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             fake.errors[profile] = RelayTransportError()
             result = core.run_automatic_relay_balance_refresh([account_id], lambda: False)
-            self.assertEqual({account_id: "failed"}, result)
+            self.assertEqual("failed", result[account_id].outcome)
+            self.assertEqual("Relay is unavailable", result[account_id].detail["message"])
             reloaded = RelayAccountsDomain(directory)
             stored = reloaded.snapshot()["accounts"][0]
             self.assertEqual(-2.5, stored["balance"])
@@ -643,7 +644,9 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             fake.errors.clear()
             fake.responses[profile] = {"code": 503, "data": {"balance": -99}}
-            self.assertEqual({account_id: "failed"}, core.run_automatic_relay_balance_refresh([account_id], lambda: False))
+            result = core.run_automatic_relay_balance_refresh([account_id], lambda: False)
+            self.assertEqual("failed", result[account_id].outcome)
+            self.assertEqual("Relay account balance is unavailable", result[account_id].detail["message"])
             self.assertEqual(-2.5, relay.snapshot()["accounts"][0]["balance"])
             self.assertEqual("", relay.snapshot()["accounts"][0]["balance_observed_at"])
 
@@ -675,12 +678,14 @@ class RelayAccountsDomainTests(unittest.TestCase):
             relay.apply()
             core = CoreStore(domains=[ProvidersModelsDomain(config), relay])
             try:
-                self.assertEqual("failed", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False))
+                outcome = core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False)
+                self.assertEqual("failed", outcome.outcome)
+                self.assertEqual(1, outcome.detail["pending_operations"])
                 self.assertEqual(1, relay.snapshot()["pending_operation_count"])
                 edit = core.dispatch({"domain": "relay_accounts", "type": "account.update", "payload": {
                     "id": account_id, "label": "Unsaved edit",
                 }})
-                self.assertEqual("skipped", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False))
+                self.assertEqual("skipped", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False).outcome)
                 self.assertEqual(edit["revision"], core.revision)
             finally:
                 core.shutdown()
@@ -692,7 +697,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             relay = RelayAccountsDomain(root, http_client=fake)
             core = CoreStore(domains=[ProvidersModelsDomain(config), relay])
             try:
-                self.assertEqual("succeeded", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False))
+                self.assertEqual("succeeded", core._run_relay_maintenance(RELAY_GROUPS, account_id, lambda: False).outcome)
                 self.assertEqual(0, relay.snapshot()["pending_operation_count"])
                 self.assertEqual(1, len(fake.post_requests))
                 self.assertEqual("Relay", relay.snapshot()["accounts"][0]["label"])

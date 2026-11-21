@@ -253,6 +253,7 @@ private enum NativeRelayOriginPolicy {
     private var groupManagerPendingApply: NativeGroupManagerResult?
     private var groupManagerApplyWaiter: ((NativeGroupManagerResult?) -> Void)?
     private var activeReadOnlyCodeController: NativeReadOnlyCodeController?
+    @MainActor private lazy var autoUpdater = YoungRouterAutoUpdater()
     // Official device-code browser flow. The controller is deliberately
     // separate from relay login: it never installs script message handlers or
     // reads credentials from the provider page.
@@ -318,6 +319,12 @@ private enum NativeRelayOriginPolicy {
     /// surface before a primary window exists.
     public func installStatusItem() {
         _ = statusItem
+    }
+
+    /// The Core preference is the source of truth; the native leaf only owns
+    /// the desktop check and applies it immediately when the snapshot arrives.
+    @MainActor public func setAutoUpdateEnabled(_ enabled: Bool) {
+        autoUpdater.setEnabled(enabled)
     }
 
     public func setReactHostStarter(_ starter: @escaping () -> Void) {
@@ -3077,7 +3084,8 @@ private enum NativeRelayOriginPolicy {
         NSApp.terminate(nil)
     }
 
-    public func prepareForTermination() {
+    @MainActor public func prepareForTermination() {
+        autoUpdater.prepareForTermination()
         activeReadOnlyCodeController?.close()
         activeReadOnlyCodeController = nil
         for controller in activeProviderAuthControllers.values { controller.cancelFromReact() }

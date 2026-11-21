@@ -10,6 +10,30 @@ from young_router import runtime_store
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    def test_chat_replay_stays_in_the_selected_public_model_group(self) -> None:
+        load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        streaming = sys.modules["young_router.proxy.streaming"]
+        request = {
+            "model": "public-chat",
+            "messages": [{"role": "user", "content": "Continue the answer."}],
+            "stream": True,
+        }
+        deployment = {
+            "model_name": "public-chat",
+            "litellm_params": {"model": "openai/shared-upstream", "order": 0},
+            "model_info": {"id": "primary"},
+        }
+        routing._apply_selected_deployment_marker_to_request(
+            request, routing._selected_deployment_request_marker(deployment)
+        )
+
+        payload = streaming._build_streaming_error_fallback_payload(
+            request, method_name="acompletion", allow_repeated_attempt=True
+        )
+
+        self.assertEqual(payload["model"], "public-chat")
+
     async def test_chat_fallback_preserves_all_choices_and_trailing_usage(self) -> None:
         hooks, _ = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
@@ -1054,6 +1078,32 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertTrue(hooks._is_upstream_model_not_found_error(exc))
         self.assertFalse(hooks._is_route_recovery_poll_error(exc))
         self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
+
+    def test_model_unavailable_is_cooled_down_not_request_incompatible(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exc = BadRequestError(
+            'OpenAIException - {"error":{"message":"The requested model is '
+            'currently unavailable. Please choose another model.",'
+            '"type":"invalid_request_error"}}'
+        )
+        exc.failed_deployment_id = "wawapii-route"
+
+        self.assertTrue(hooks._is_upstream_model_unavailable_error(exc))
+        self.assertFalse(hooks._is_deployment_compatible_bad_request_error(exc))
+        self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(exc))
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"],
+            "upstream-model-unavailable",
+        )
 
     async def test_route_recovery_stops_when_attempt_hits_upstream_model_not_found(self) -> None:
         hooks, proxy_server = load_hook_module()

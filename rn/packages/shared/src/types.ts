@@ -148,6 +148,7 @@ export interface ServiceStatus {
    * window, and the General pane's 启动后在后台运行 switch is off.
    */
   launch_background_state?: "enabled" | "disabled";
+  auto_update_enabled?: boolean;
   route_recovery?: {
     recovering?: number;
     cooldown?: number;
@@ -493,10 +494,13 @@ export type ScheduledTaskRecord = {
   history: {
     started_at: string;
     finished_at: string;
+    duration_ms: number;
     outcome: "succeeded" | "partial" | "failed" | "skipped";
     succeeded?: number;
     failed?: number;
     skipped?: number;
+    detail?: Record<string, string | number | boolean>;
+    issues?: Record<string, string | number | boolean>[];
   }[];
 };
 
@@ -1247,6 +1251,8 @@ export interface NativeLeafAdapter {
    * instead of a switch that answers `saved` and changes nothing.
    */
   setLaunchAtLogin?(enabled: boolean): Promise<void>;
+  /** Synchronize the saved Core preference with the desktop updater. */
+  setAutoUpdateEnabled?(enabled: boolean): void;
   /** Native About/version panel (app version and build). */
   showVersion?(): void;
   /** App and bundled LiteLLM versions for the shared About pane. */

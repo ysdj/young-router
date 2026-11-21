@@ -39,6 +39,7 @@ RCT_EXTERN_METHOD(clearRelayPassword:(NSString *)accountID resolver:(RCTPromiseR
 RCT_EXTERN_METHOD(clearRelayCredentials:(NSString *)accountID resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(systemLocale)
 RCT_EXTERN_METHOD(setLaunchAtLogin:(BOOL)enabled resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(setAutoUpdateEnabled:(BOOL)enabled)
 RCT_EXTERN_METHOD(showVersion)
 RCT_EXTERN_METHOD(versionInfo:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(openExternalURL:(NSString *)url)

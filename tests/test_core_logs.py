@@ -1664,6 +1664,61 @@ model_list:
                 ),
             )
 
+    def test_hedge_rows_only_name_a_parallel_route_while_both_are_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recent-requests.jsonl"
+            domain = LogsDomain(root)
+            stamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            runtime_store.append_record(
+                path,
+                json.dumps(
+                    {
+                        "ts": stamp,
+                        "request_id": "primary-row",
+                        "deployment_id": "primary-route",
+                        "status": "stream",
+                    }
+                ),
+            )
+            runtime_store.append_record(
+                path,
+                json.dumps(
+                    {
+                        "ts": stamp,
+                        "request_id": "hedge-row",
+                        "deployment_id": "sibling-route",
+                        "status": "pending",
+                        "internal_attempt": "head_hedge",
+                        "hedge_parent": {
+                            "request_id": "primary-row",
+                            "deployment_id": "primary-route",
+                        },
+                    }
+                ),
+            )
+
+            projected = domain.view("requests")["log"]["records"]
+            active = {record["request_id"]: record for record in projected}
+            self.assertTrue(active["primary-row"]["parallel_attempt_active"])
+            self.assertTrue(active["hedge-row"]["parallel_attempt_active"])
+
+            runtime_store.append_record(
+                path,
+                json.dumps(
+                    {
+                        "ts": stamp,
+                        "request_id": "primary-row",
+                        "deployment_id": "primary-route",
+                        "status": "success",
+                    }
+                ),
+            )
+            settled = domain.view("requests")["log"]["records"]
+            active = {record["request_id"]: record for record in settled}
+            self.assertNotIn("parallel_attempt_active", active["primary-row"])
+            self.assertNotIn("parallel_attempt_active", active["hedge-row"])
+
     def test_request_stale_window_follows_runtime_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

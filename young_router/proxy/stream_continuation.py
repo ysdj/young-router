@@ -359,6 +359,7 @@ def _continuation_request_payload(
         max_tokens = request_data.get("max_tokens")
         if not isinstance(max_tokens, int) or max_tokens <= 0:
             return None
+        payload["call_type"] = "anthropic_messages"
         payload["max_tokens"] = max_tokens
         payload["messages"] = [
             message for message in payload["messages"] if message.get("role") != "system"
@@ -452,6 +453,7 @@ async def _stream_native_continuation_rounds(
     answered_output_tokens: Optional[int] = None,
     anthropic_index_offset: int = 0,
     chat_usage: Optional[dict] = None,
+    continuation_error: Optional[dict[str, Exception]] = None,
 ) -> AsyncIterator[Any]:
     """Ask the same route for the rest of an answer it cut off at its ceiling.
 
@@ -497,54 +499,26 @@ async def _stream_native_continuation_rounds(
         and answered_output_tokens >= 0
         else None
     )
-    for round_number in range(1, _max_continuation_rounds() + 1):
-        payload = _continuation_request_payload(request_data, seen_text)
-        if payload is None:
-            return
-        payload["stream_idle_timeout_seconds"] = stream_idle_timeout_seconds
-        _trace_module._request_route_trace(
-            "native_stream_continuation_start",
-            request_data,
-            round=round_number,
-            delivered_chars=len(seen_text),
-        )
-        try:
-            # A continuation round is a dispatch like any other: the route it
-            # picks can be absent, and that phase has no clock of its own.
-            response = await _streaming_module._await_upstream_dispatch(
-                router_method(**payload),
-                payload,
-                fallback_budget_seconds=_routing_module._stream_start_timeout_seconds_for_request(
-                    payload
-                ),
-            )
-            response = await _responses_request_module._await_streaming_fallback_candidate_response(
-                response,
-                payload,
-            )
-        except Exception as exception:
-            _trace_module._request_route_trace(
-                "native_stream_continuation_error",
-                request_data,
-                round=round_number,
-                exception=_routing_module._trace_exception(exception),
-            )
-            return
 
-        round_text = ""
-        round_ceiling_hit = False
-        released = False
-        final_terminal: Optional[Any] = None
-        final_message_delta: Optional[dict] = None
-        round_anthropic_output_tokens: Optional[int] = None
+    async def consume_attempt(response: Any, payload: dict, state: dict) -> AsyncIterator[Any]:
+        nonlocal next_anthropic_index
+
+        round_text_parts: List[str] = []
         round_chat_usage = None
         anthropic_indices: dict[int, int] = {}
         open_anthropic_indices: set[int] = set()
-        stream_failed = False
-        stream = _streaming_module._stream_with_idle_timeout(response, payload)
+        stream = (
+            response
+            if state.get("route_recovery_poll")
+            else _streaming_module._stream_with_idle_timeout(response, payload)
+        )
         chunks = _anthropic_sse_module.iter_messages_sse_frames(stream) if is_anthropic else stream
         try:
             async for chunk in chunks:
+                if _streaming_module._is_route_recovery_sse_keepalive(chunk):
+                    yield chunk
+                    continue
+                state["chunk_count"] += 1
                 chunk_exception = _streaming_module._stream_chunk_error_exception(chunk)
                 if chunk_exception is not None:
                     raise chunk_exception
@@ -560,15 +534,15 @@ async def _stream_native_continuation_rounds(
                                     and not isinstance(output_tokens, bool)
                                     and output_tokens >= 0
                                 ):
-                                    round_anthropic_output_tokens = output_tokens
+                                    state["anthropic_output_tokens"] = output_tokens
                             if _native_stream_output_limit_reason(event) is not None:
-                                round_ceiling_hit = True
+                                state["round_ceiling_hit"] = True
                             else:
-                                final_message_delta = event
+                                state["final_message_delta"] = event
                             continue
                         if event_type == "message_stop":
-                            if not round_ceiling_hit:
-                                final_terminal = event
+                            if not state["round_ceiling_hit"]:
+                                state["final_terminal"] = event
                             continue
                         if event_type not in {
                             "content_block_start", "content_block_delta", "content_block_stop"
@@ -589,14 +563,16 @@ async def _stream_native_continuation_rounds(
                             open_anthropic_indices.discard(event["index"])
                         delta = event.get("delta")
                         if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                            round_text += str(delta.get("text") or "")
-                        released = True
+                            round_text_parts.append(str(delta.get("text") or ""))
+                        state["released"] = True
                         yield _anthropic_sse_module._sse_block(event)
                     continue
+
                 frame = _streaming_module._stream_chunk_dump(chunk)
                 if _streaming_module._response_has_tool_call_activity(frame):
                     # The continuation request declares no tools. Never splice
                     # an unsolicited call into the existing text answer.
+                    state["unsupported_tool_activity"] = True
                     return
                 updates = dict(chat_identity)
                 if isinstance(frame.get("usage"), dict):
@@ -609,7 +585,7 @@ async def _stream_native_continuation_rounds(
                     chunk = _chat_chunk_with(chunk, **updates)
                 reason = _native_stream_output_limit_reason(chunk)
                 if reason is not None:
-                    round_ceiling_hit = True
+                    state["round_ceiling_hit"] = True
                 if reason is not None or _streaming_module._native_stream_chunk_is_terminal(
                     chunk,
                     request_data,
@@ -617,28 +593,27 @@ async def _stream_native_continuation_rounds(
                 ):
                     visible, terminal = _split_chat_finish_chunk(chunk)
                     if visible is not None:
-                        round_text += _responses_output_module._response_text(visible)
-                        released = True
+                        round_text_parts.append(
+                            _responses_output_module._response_text(visible)
+                        )
+                        state["released"] = True
                         yield visible
-                    # The route closed this continuation normally.  Its frame
-                    # is the one the client must see: it states "stop", where
-                    # the first route's withheld frame still says "length".
-                    if not round_ceiling_hit:
-                        final_terminal = terminal
+                    if not state["round_ceiling_hit"]:
+                        state["final_terminal"] = terminal
                     continue
                 chunk_text = _responses_output_module._response_text(chunk)
                 if chunk_text:
-                    round_text += chunk_text
-                released = True
+                    round_text_parts.append(chunk_text)
+                state["released"] = True
                 yield chunk
         except Exception as exception:
+            state["exception"] = exception
             _trace_module._request_route_trace(
                 "native_stream_continuation_stream_error",
                 request_data,
-                round=round_number,
+                round=state["round_number"],
                 exception=_routing_module._trace_exception(exception),
             )
-            stream_failed = True
         finally:
             if chunks is not stream:
                 await chunks.aclose()
@@ -647,18 +622,219 @@ async def _stream_native_continuation_rounds(
             if chat_usage is not None and round_chat_usage is not None:
                 _sum_chat_token_usage(chat_usage, round_chat_usage)
 
+        state["round_text"] = "".join(round_text_parts)
         for index in sorted(open_anthropic_indices):
             yield _anthropic_sse_module._sse_block(
                 {"type": "content_block_stop", "index": index}
             )
-        if stream_failed:
-            return
 
-        if round_anthropic_output_tokens is not None:
+    def remember_error(exception: Exception) -> None:
+        if continuation_error is not None and "exception" not in continuation_error:
+            # This round exists only because the route ended its original
+            # answer at an output ceiling. If the resume cannot finish, the
+            # client's partial text is still an incomplete answer, regardless
+            # of whether the resume failed before dispatch or mid-stream.
+            exception.stream_incomplete = True
+            continuation_error["exception"] = exception
+
+    async def fallback_or_recover(
+        payload: dict,
+        exception: Exception,
+        *,
+        round_number: int,
+    ) -> tuple[Any, dict, bool]:
+        fallback_exception = exception
+        try:
+            fallback = await _streaming_module._streaming_error_fallback_response(
+                payload,
+                exception,
+                allow_repeated_attempt=True,
+            )
+        except Exception as exc:
+            fallback = None
+            fallback_exception = exc
+
+        if fallback is not None:
+            response, fallback_payload = fallback
+            _trace_module._request_route_trace(
+                "native_stream_continuation_failover",
+                request_data,
+                round=round_number,
+                exception=_routing_module._trace_exception(exception),
+            )
+            return response, fallback_payload, False
+
+        if _routing_module._should_return_route_recovery_stream(fallback_exception, payload):
+            _trace_module._request_route_trace(
+                "native_stream_continuation_recovery_poll_start",
+                request_data,
+                round=round_number,
+                exception=_routing_module._trace_exception(fallback_exception),
+            )
+            return (
+                _streaming_module._stream_route_recovery_poll(
+                    payload,
+                    fallback_exception,
+                ),
+                payload,
+                True,
+            )
+
+        _trace_module._request_route_trace(
+            "native_stream_continuation_error",
+            request_data,
+            round=round_number,
+            exception=_routing_module._trace_exception(fallback_exception),
+        )
+        remember_error(fallback_exception)
+        return None, payload, False
+
+    routing_request = request_data
+    max_rounds = _max_continuation_rounds()
+    for round_number in range(1, max_rounds + 1):
+        payload = _continuation_request_payload(request_data, seen_text)
+        if payload is None:
+            return
+        active_deployment_id = _routing_module._deployment_id_from_request(
+            routing_request
+        )
+        if active_deployment_id:
+            payload[_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY] = [active_deployment_id]
+        excluded_ids = _responses_request_module._request_excluded_deployment_ids(
+            routing_request
+        )
+        if excluded_ids:
+            payload["_excluded_deployment_ids"] = sorted(excluded_ids)
+        payload["stream_idle_timeout_seconds"] = stream_idle_timeout_seconds
+        _trace_module._request_route_trace(
+            "native_stream_continuation_start",
+            request_data,
+            round=round_number,
+            delivered_chars=len(seen_text),
+        )
+        try:
+            # A continuation round is a dispatch like any other: the route it
+            # picks can be absent, and that phase has no clock of its own.
+            response = await _streaming_module._await_upstream_dispatch(
+                router_method(**_streaming_module._streaming_error_fallback_dispatch_kwargs(payload)),
+                payload,
+                fallback_budget_seconds=_routing_module._stream_start_timeout_seconds_for_request(
+                    payload
+                ),
+            )
+            response = await _responses_request_module._await_streaming_fallback_candidate_response(
+                response,
+                payload,
+            )
+            _routing_module._apply_current_selected_deployment_to_request(payload)
+        except Exception as exception:
+            # The first continuation is pinned to the deployment that produced
+            # the ceiling so the answer does not restart on a random sibling.
+            # That route can still go silent on the *new* request, though.  In
+            # that case handing the original ``length`` frame to the client
+            # makes a recoverable continuation look like a completed answer.
+            # Reuse the normal streaming-fallback builder with this compact
+            # continuation payload: it excludes the failed deployment and
+            # selects the next healthy sibling while preserving the resume
+            # prompt and the same client-facing answer.
+            verified_ids = _responses_request_module._request_verified_fallback_deployment_ids(
+                payload
+            )
+            if verified_ids:
+                excluded_ids = _responses_request_module._request_excluded_deployment_ids(
+                    payload
+                )
+                excluded_ids.update(verified_ids)
+                payload["_excluded_deployment_ids"] = sorted(excluded_ids)
+            response, payload, route_recovery_poll = await fallback_or_recover(
+                payload,
+                exception,
+                round_number=round_number,
+            )
+            if response is None:
+                return
+            routing_request = payload
+        else:
+            route_recovery_poll = False
+
+        round_text = ""
+        released = False
+        attempt_state = {}
+        while True:
+            attempt_state = {
+                "round_number": round_number,
+                "round_text": "",
+                "round_ceiling_hit": False,
+                "released": False,
+                "final_terminal": None,
+                "final_message_delta": None,
+                "anthropic_output_tokens": None,
+                "chunk_count": 0,
+                "exception": None,
+                "unsupported_tool_activity": False,
+                "route_recovery_poll": route_recovery_poll,
+            }
+            async for chunk in consume_attempt(response, payload, attempt_state):
+                yield chunk
+            round_text += attempt_state["round_text"]
+            released = released or attempt_state["released"]
+            round_ceiling_hit = attempt_state["round_ceiling_hit"]
+            final_terminal = attempt_state["final_terminal"]
+            final_message_delta = attempt_state["final_message_delta"]
+            if attempt_state["unsupported_tool_activity"]:
+                remember_error(RuntimeError("The continuation emitted an unexpected tool call."))
+                return
+            if final_terminal is not None or round_ceiling_hit:
+                _routing_module._apply_current_selected_deployment_to_request(payload)
+                routing_request = payload
+                break
+
+            exception = attempt_state["exception"]
+            if exception is None:
+                exception = _streaming_module._native_stream_incomplete_exception(
+                    payload,
+                    buffered_chunks=attempt_state["chunk_count"],
+                )
+            if route_recovery_poll:
+                _trace_module._request_route_trace(
+                    "native_stream_continuation_recovery_poll_error",
+                    request_data,
+                    round=round_number,
+                    exception=_routing_module._trace_exception(exception),
+                )
+                remember_error(exception)
+                return
+            _routing_module._mark_same_deployment_retry_exhausted(exception)
+            _routing_module._apply_current_selected_deployment_to_request(payload)
+            resume_payload = _continuation_request_payload(
+                request_data,
+                f"{seen_text}{round_text}",
+            )
+            if resume_payload is None:
+                remember_error(exception)
+                return
+            fallback_source = payload.copy()
+            fallback_source["messages"] = resume_payload["messages"]
+            fallback_source["stream"] = True
+            fallback_source["stream_idle_timeout_seconds"] = stream_idle_timeout_seconds
+            response, payload, route_recovery_poll = await fallback_or_recover(
+                fallback_source,
+                exception,
+                round_number=round_number,
+            )
+            if response is None:
+                return
+            routing_request = payload
+
+        if attempt_state["anthropic_output_tokens"] is not None:
             if cumulative_anthropic_output_tokens is None:
-                cumulative_anthropic_output_tokens = round_anthropic_output_tokens
+                cumulative_anthropic_output_tokens = attempt_state[
+                    "anthropic_output_tokens"
+                ]
             else:
-                cumulative_anthropic_output_tokens += round_anthropic_output_tokens
+                cumulative_anthropic_output_tokens += attempt_state[
+                    "anthropic_output_tokens"
+                ]
 
         if is_anthropic and final_terminal is not None:
             if final_message_delta is not None:
@@ -692,6 +868,7 @@ async def _stream_native_continuation_rounds(
                 request_data,
                 round=round_number,
             )
+            remember_error(RuntimeError("The continuation reached the output limit without adding text."))
             return
         seen_text = f"{seen_text}{round_text}"
         if not round_ceiling_hit:
@@ -705,5 +882,8 @@ async def _stream_native_continuation_rounds(
             if final_terminal is not None:
                 yield final_terminal
             return
+
+    if max_rounds > 0:
+        remember_error(RuntimeError("Every continuation round reached the output limit."))
 
 

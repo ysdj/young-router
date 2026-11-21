@@ -2169,6 +2169,9 @@ class ClaudeSettingsDomain:
         refused by a prompt nobody sees.
         """
 
+        from ..model_list_plugin import target_initialized
+        if target_initialized("claude"):
+            return False
         names = self._public_models()
         if not names:
             return False

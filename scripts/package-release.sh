@@ -7,6 +7,7 @@ VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 BUILD_NUMBER="$(tr -d '[:space:]' < "$ROOT/BUILD_NUMBER")"
 ARCH="$(uname -m)"
 OUTPUT="${1:-$ROOT/artifacts/young-router-$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst}"
+ZIP_OUTPUT="$(dirname "$OUTPUT")/young-router-$VERSION-$BUILD_NUMBER-macos-$ARCH.zip"
 UV_BIN="${LITELLM_UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 ZSTD_BIN="${LITELLM_ZSTD_BIN:-$(command -v zstd 2>/dev/null || true)}"
 
@@ -27,7 +28,7 @@ elif ! xcodebuild -version >/dev/null 2>&1; then
   echo "A complete Xcode installation is required for release packaging." >&2
   exit 1
 fi
-for command in pnpm plutil codesign rsync; do
+for command in pnpm plutil codesign rsync ditto; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "Missing release tool: $command" >&2
     exit 1
@@ -53,6 +54,7 @@ CORE="$APP/Contents/Resources/Core"
 (
   cd "$ROOT/rn"
   YOUNG_ROUTER_MACOS_OUTPUT="$APP" \
+    YOUNG_ROUTER_MACOS_RELEASE_CHANNEL=stable \
     YOUNG_ROUTER_REFRESH_PODS=1 \
     YOUNG_ROUTER_RESET_METRO_CACHE=1 \
     LITELLM_UV_BIN="$UV_BIN" \
@@ -128,7 +130,13 @@ if grep -Eq 'Young Router\.app/Contents/Resources/Core/(\.venv|venv)(/|$)|Conten
   echo "Release archive contains a development runtime or legacy bundle path." >&2
   exit 1
 fi
+# Use the same signed app for Homebrew and the updater's native ZIP extractor.
+TEMP_ZIP="$ZIP_OUTPUT.tmp"
+rm -f "$TEMP_ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$TEMP_ZIP"
 mv "$TEMP_OUTPUT" "$OUTPUT"
+mv "$TEMP_ZIP" "$ZIP_OUTPUT"
 
 printf '%s\n' "$OUTPUT"
 shasum -a 256 "$OUTPUT"
+printf '%s\n' "$ZIP_OUTPUT"

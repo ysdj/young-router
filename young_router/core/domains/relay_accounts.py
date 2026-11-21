@@ -32,7 +32,7 @@ from ...browser_identity import browser_request_headers
 from ...public_names import imported_public_name
 from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
 from ..runtime_settings_schema import relay_balance_observation_epoch
-from ..scheduled_tasks import RELAY_NEGATIVE_BALANCE, RELAY_SIGNED_IN_BALANCE
+from ..scheduled_tasks import RELAY_NEGATIVE_BALANCE, RELAY_SIGNED_IN_BALANCE, TaskResult, task_exception_detail
 from ..security import safe_exception_message
 
 
@@ -4840,14 +4840,14 @@ class RelayAccountsDomain:
     def poll_session(
         self, account_id: str, *, io_gate: Callable[[], AbstractContextManager[None]],
         cancelled: Callable[[], bool],
-    ) -> tuple[str, bool]:
+    ) -> tuple[TaskResult, bool]:
         """Check the session Core already holds without attempting a sign-in."""
 
         account = next((row for row in self._accounts if row["id"] == account_id), None)
         if account is None or not self._has_session_credentials(account):
-            return "skipped", False
+            return TaskResult("skipped"), False
         if self.recent_login_check_answer(account_id) is not None:
-            return "skipped", False
+            return TaskResult("skipped"), False
         origin, kind = account["origin"], account["type"]
         observed_at = account["login_observed_at"]
         baseline = self._baseline_bytes
@@ -4857,14 +4857,14 @@ class RelayAccountsDomain:
                 payload = self._http.json(origin, self._session_profile_path(kind), headers=headers)
         except RelayAccountsError as error:
             if "expired" not in str(error).lower():
-                return "failed", False
+                return TaskResult("failed", task_exception_detail(error, phase="check_session")), False
             status = "expired"
         else:
             profile = _json_data(payload)
             if not isinstance(profile, Mapping) or not profile or (
                 isinstance(payload, Mapping) and payload.get("success") is False
             ):
-                return "failed", False
+                return TaskResult("failed", {"phase": "check_session", "message": "Relay returned an invalid session profile"}), False
             status = "signed_in"
 
         current = next((row for row in self._accounts if row["id"] == account_id), None)
@@ -4874,14 +4874,14 @@ class RelayAccountsDomain:
             or not self._has_session_credentials(current) or self._headers(current) != headers
             or self._baseline_bytes != baseline or self._read_storage_bytes() != baseline
         ):
-            return "skipped", False
+            return TaskResult("skipped"), False
         observed_at = _utc_now_iso()
         # Persist only the observation on the saved identity. A background
         # check can finish while this account has other edits in a draft.
         document = json.loads(baseline) if baseline else {}
         saved = next((row for row in document.get("accounts", ()) if row["id"] == account_id), None)
         if saved is None or any(saved.get(key) != current[key] for key in ("origin", "type", "username")):
-            return "skipped", False
+            return TaskResult("skipped"), False
         saved.update(login_status=status, login_observed_at=observed_at)
         if status == "expired":
             saved["balance_observed_at"] = ""
@@ -4891,7 +4891,7 @@ class RelayAccountsDomain:
         if status == "expired":
             self._invalidate_balance_observation(current)
         self.revision += 1
-        return "succeeded", True
+        return TaskResult("succeeded"), True
 
     def _headers(self, account: Mapping[str, Any]) -> dict[str, str]:
         """Resolve dashboard headers for one station read or write.
@@ -6059,7 +6059,7 @@ class RelayAccountsDomain:
         *,
         io_gate: Callable[[], AbstractContextManager[None]] = nullcontext,
         cancelled: Callable[[], bool] = lambda: False,
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, TaskResult], bool]:
         """Read profiles outside the write lane, then publish valid answers."""
 
         selected = set(account_ids)
@@ -6076,14 +6076,16 @@ class RelayAccountsDomain:
         if not targets or cancelled():
             return {}, False
 
-        def read(target: tuple[dict[str, Any], str, str, dict[str, str], tuple[float | None, str, str]]) -> tuple[float, str] | None:
+        def read(target: tuple[dict[str, Any], str, str, dict[str, str], tuple[float | None, str, str]]) -> tuple[tuple[float, str] | None, TaskResult]:
             _, origin, account_type, headers, _ = target
-            if not headers or cancelled():
-                return None
+            if cancelled():
+                return None, TaskResult("skipped")
+            if not headers:
+                return None, TaskResult("failed", {"phase": "read_balance", "message": "No saved relay session"})
             try:
-                return self._read_account_balance({"origin": origin, "type": account_type}, headers)
-            except RelayAccountsError:
-                return None
+                return self._read_account_balance({"origin": origin, "type": account_type}, headers), TaskResult("succeeded")
+            except RelayAccountsError as exc:
+                return None, TaskResult("failed", task_exception_detail(exc, phase="read_balance"))
 
         with io_gate(), ThreadPoolExecutor(max_workers=min(len(targets), RESOURCE_REFRESH_MAX_WORKERS)) as executor:
             readings = list(executor.map(read, targets))
@@ -6094,23 +6096,23 @@ class RelayAccountsDomain:
         # A deleted or replaced row cannot consume a reading made with its
         # predecessor's session, even when the result was a failed read.
         updates = [
-            (account, reading)
-            for (account, _, _, _, previous), reading in zip(targets, readings, strict=True)
+            (account, reading, result)
+            for (account, _, _, _, previous), (reading, result) in zip(targets, readings, strict=True)
             if current.get(account["id"]) is account
             and previous == (account["balance"], account["balance_observed_at"], account["login_status"])
+            and result.outcome != "skipped"
         ]
         if not updates or self._read_storage_bytes() != self._baseline_bytes:
             return {}, False
-        self._write_balance_observations(updates)
+        self._write_balance_observations([(account, reading) for account, reading, _ in updates])
         changed = False
         outcomes = {}
-        for account, reading in updates:
+        for account, reading, result in updates:
             before = account["balance"], account["balance_observed_at"]
+            outcomes[account["id"]] = result
             if reading is None:
-                outcomes[account["id"]] = "failed"
                 self._invalidate_balance_observation(account)
             else:
-                outcomes[account["id"]] = "succeeded"
                 self._record_balance(account, reading)
             changed |= before != (account["balance"], account["balance_observed_at"])
         if changed:

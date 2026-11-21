@@ -8,6 +8,7 @@ from young_router.core.scheduled_tasks import (
     RELAY_NEGATIVE_BALANCE,
     RELAY_SIGNED_IN_BALANCE,
     ScheduledTasks,
+    TaskResult,
 )
 
 
@@ -25,7 +26,8 @@ class RelayBalanceSchedulerTests(unittest.TestCase):
         def refresh(account_ids, cancelled):
             self.assertFalse(cancelled())
             calls.append(account_ids)
-            return {"negative": "failed", "shared": "succeeded"}
+            return {"negative": TaskResult("failed", {"phase": "read_balance", "message": "Relay is unavailable"}),
+                    "shared": TaskResult("succeeded")}
 
         scheduler = RelayBalanceScheduler(
             schedule=lambda: state, refresh=refresh, tasks=tasks,
@@ -46,6 +48,7 @@ class RelayBalanceSchedulerTests(unittest.TestCase):
         negative = histories[RELAY_NEGATIVE_BALANCE][0]
         signed = histories[RELAY_SIGNED_IN_BALANCE][0]
         self.assertEqual(("partial", 1, 1), (negative["outcome"], negative["succeeded"], negative["failed"]))
+        self.assertEqual([{"phase": "read_balance", "message": "Relay is unavailable", "accounts": 1}], negative["issues"])
         self.assertEqual(("succeeded", 1), (signed["outcome"], signed["succeeded"]))
 
     def test_runtime_change_and_manual_observation_recompute_next_due(self) -> None:
@@ -76,7 +79,7 @@ class RelayBalanceSchedulerTests(unittest.TestCase):
 
         def refresh(accounts, cancelled):
             performed.set()
-            return dict.fromkeys(accounts, "succeeded")
+            return dict.fromkeys(accounts, TaskResult("succeeded"))
 
         scheduler = RelayBalanceScheduler(schedule=schedule, refresh=refresh)
         try:

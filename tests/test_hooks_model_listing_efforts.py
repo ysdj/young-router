@@ -122,7 +122,18 @@ class ModelListingEffortsTests(HookTestCase):
                         "xhigh": "xhigh",
                         "max": "max",
                     }
-                )
+                ),
+                "openai/gpt-image-2.5": {
+                    "context_window": 1000,
+                    "max_context_window": 1000,
+                    "source": "test",
+                    "priority": 40,
+                    "image_model_metadata": {
+                        "type": "image",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["image"],
+                    },
+                },
             },
             ("claude-opus-5-5", "anthropic/claude-opus-5-5"),
             ("gpt-image-2.5", "openai/gpt-image-2.5"),
@@ -140,11 +151,17 @@ class ModelListingEffortsTests(HookTestCase):
         self.assertEqual("claude-opus-5-5", listed["id"])
         self.assertEqual("openai", listed["owned_by"])
         self.assertEqual(1677610602, listed["created"])
+        self.assertEqual(1000, listed["context_window"])
+        self.assertEqual(1000, listed["max_context_window"])
+        self.assertGreater(listed["effective_context_window_percent"], 0)
+        self.assertIn(listed["default_reasoning_level"], listed["supported_efforts"])
 
         # A model with no reasoning metadata keeps the vendor shape: an empty
         # array would read to Pi as "off only", which is a different claim
         # from "this route published nothing".
-        self.assertNotIn("supported_efforts", builder("gpt-image-2.5"))
+        image = builder("gpt-image-2.5")
+        self.assertNotIn("supported_efforts", image)
+        self.assertIs(image["conversation"], False)
 
     def test_every_reasoning_route_tops_out_at_max_and_ultra(self) -> None:
         """A reasoning route states the top of the client's dial, whatever it maps.

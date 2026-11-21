@@ -176,6 +176,7 @@ export interface NativeLeafBridge {
   clearRelayCredentials(accountId: string): Promise<void>;
   /** Absent on a host with no login item to register (the browser page). */
   setLaunchAtLogin?(enabled: boolean): Promise<void>;
+  setAutoUpdateEnabled?(enabled: boolean): void;
   showVersion?(): void;
   versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
   openExternalURL?(url: string): void;
@@ -276,6 +277,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),
     clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
     setLaunchAtLogin: bridge.setLaunchAtLogin ? (enabled) => bridge.setLaunchAtLogin!(enabled) : undefined,
+    setAutoUpdateEnabled: bridge.setAutoUpdateEnabled ? (enabled) => bridge.setAutoUpdateEnabled!(enabled) : undefined,
     showVersion: () => bridge.showVersion?.(),
     versionInfo: bridge.versionInfo ? () => bridge.versionInfo!() : undefined,
     openExternalURL: bridge.openExternalURL ? (url) => bridge.openExternalURL!(url) : undefined,

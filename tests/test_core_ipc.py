@@ -850,6 +850,10 @@ class CoreProtocolTests(unittest.TestCase):
         self.assertIn("ANTHROPIC_AUTH_TOKEN=configured", redacted)
         self.assertIn("token_configured=true", redacted)
 
+        nested = REDACT_TEXT("Failed to remove image: token=synthetic-nested-token")
+        self.assertIn("token=configured", nested)
+        self.assertNotIn("synthetic-nested-token", nested)
+
     def test_redaction_masks_a_bearer_token_that_carries_no_hyphen(self) -> None:
         # The bearer rule sat behind the guard written for the ``sk-``/``key-``
         # prefixes: a cheap test for a hyphen.  A bearer token needs none, so

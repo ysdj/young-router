@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 
 from .oplog import note
 from .persistence import AtomicJSONStore, PersistenceError
+from .security import safe_exception_message, safe_public
 
 RELAY_LOGIN = "relay-login"
 RELAY_GROUPS = "relay-groups"
@@ -26,8 +29,17 @@ TASK_IDS = (
     WEBDAV_SYNC, CLIENT_MODEL_SYNC, IMAGE_CONTEXT_CLEANUP, PROXY_SUPERVISION,
 )
 HISTORY_LIMIT = 20
+_ISSUE_LIMIT = 8
 _OUTCOMES = ("succeeded", "partial", "failed", "skipped")
 _COUNTS = ("succeeded", "failed", "skipped")
+
+TaskFacts = dict[str, str | int | bool]
+
+
+@dataclass(frozen=True)
+class TaskResult:
+    outcome: str
+    detail: TaskFacts | None = None
 
 
 def _stamp(seconds: float) -> str:
@@ -41,6 +53,35 @@ def _saved_stamp(value: object) -> bool:
         return datetime.fromisoformat(value).tzinfo is not None
     except ValueError:
         return False
+
+
+def _safe_detail(value: object) -> dict:
+    if not isinstance(value, Mapping):
+        return {}
+    return safe_public({
+        key: item for key, item in value.items()
+        if isinstance(key, str) and len(key) <= 80 and type(item) in (str, int, bool)
+    })
+
+
+def _safe_issues(issues: Iterable[object]) -> list[dict]:
+    return [detail for issue in islice(issues, _ISSUE_LIMIT) if (detail := _safe_detail(issue))]
+
+
+def _duration_ms(started_at: str, finished_at: str) -> int:
+    started = datetime.fromisoformat(started_at)
+    finished = datetime.fromisoformat(finished_at)
+    return max(0, round((finished - started).total_seconds() * 1000))
+
+
+def task_exception_detail(error: Exception, *, phase: str) -> TaskFacts:
+    """Keep a useful failure explanation without persisting a traceback."""
+
+    return {
+        "phase": phase,
+        "error_type": type(error).__name__,
+        "message": safe_exception_message(error),
+    }
 
 
 class ScheduledTasks:
@@ -68,18 +109,31 @@ class ScheduledTasks:
             rows = document.get(task_id)
             if not isinstance(rows, list):
                 continue
-            result[task_id] = [
-                {
-                    "started_at": row["started_at"], "finished_at": row["finished_at"],
+            cleaned_rows = []
+            for row in rows[:HISTORY_LIMIT]:
+                if not isinstance(row, dict):
+                    continue
+                started_at = row.get("started_at")
+                finished_at = row.get("finished_at")
+                if row.get("outcome") not in _OUTCOMES or not _saved_stamp(started_at) or not _saved_stamp(finished_at):
+                    continue
+                cleaned = {
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "duration_ms": _duration_ms(started_at, finished_at),
                     "outcome": row["outcome"],
                     **{key: row[key] for key in _COUNTS if type(row.get(key)) is int and row[key] >= 0},
                 }
-                for row in rows[:HISTORY_LIMIT]
-                if isinstance(row, dict)
-                and row.get("outcome") in _OUTCOMES
-                and _saved_stamp(row.get("started_at"))
-                and _saved_stamp(row.get("finished_at"))
-            ]
+                detail = _safe_detail(row.get("detail"))
+                if detail:
+                    cleaned["detail"] = detail
+                issues = row.get("issues")
+                if isinstance(issues, list):
+                    saved_issues = _safe_issues(issues)
+                    if saved_issues:
+                        cleaned["issues"] = saved_issues
+                cleaned_rows.append(cleaned)
+            result[task_id] = cleaned_rows
         return result
 
     def plan(
@@ -103,18 +157,28 @@ class ScheduledTasks:
     def finish(
         self, task_id: str, outcome: str = "succeeded", *,
         succeeded: int | None = None, failed: int | None = None, skipped: int | None = None,
+        detail: TaskFacts | None = None, issues: Iterable[TaskFacts] = (),
     ) -> None:
         finished = _stamp(time.time())
+        saved_detail = _safe_detail(detail)
+        saved_issues = _safe_issues(issues)
         # Serialize durable writes, but never hold the view lock during disk I/O.
         with self._writer:
             with self._lock:
                 started = self._running.pop(task_id, None)
                 if started is None:
                     return
-                row = {"started_at": started, "finished_at": finished, "outcome": outcome}
+                row = {
+                    "started_at": started, "finished_at": finished,
+                    "duration_ms": _duration_ms(started, finished), "outcome": outcome,
+                }
                 for key, count in zip(_COUNTS, (succeeded, failed, skipped)):
                     if count is not None:
                         row[key] = count
+                if saved_detail:
+                    row["detail"] = saved_detail
+                if saved_issues:
+                    row["issues"] = saved_issues
                 history = self._history.setdefault(task_id, [])
                 history.insert(0, row)
                 del history[HISTORY_LIMIT:]
@@ -126,25 +190,34 @@ class ScheduledTasks:
                 except PersistenceError:
                     note("scheduled task history could not be written")
 
-    def finish_batch(self, task_id: str, outcomes: Iterable[str]) -> None:
+    def finish_batch(self, task_id: str, outcomes: Iterable[TaskResult]) -> None:
         """Summarize account results; incomplete work counts as a failure."""
         succeeded = failed = skipped = 0
         partial = False
-        for outcome in outcomes:
-            if outcome == "succeeded":
+        issues: dict[tuple[tuple[str, str | int | bool], ...], tuple[TaskFacts, int]] = {}
+        for result in outcomes:
+            if result.outcome == "succeeded":
                 succeeded += 1
-            elif outcome == "skipped":
+            elif result.outcome == "skipped":
                 skipped += 1
             else:
                 failed += 1
-                partial |= outcome == "partial"
+                partial |= result.outcome == "partial"
+                if result.detail:
+                    identity = tuple(sorted(result.detail.items()))
+                    if identity in issues:
+                        detail, count = issues[identity]
+                        issues[identity] = (detail, count + 1)
+                    elif len(issues) < _ISSUE_LIMIT:
+                        issues[identity] = (result.detail, 1)
         if partial or (succeeded and (failed or skipped)):
             result = "partial"
         elif failed:
             result = "failed"
         else:
             result = "succeeded" if succeeded else "skipped"
-        self.finish(task_id, result, succeeded=succeeded, failed=failed, skipped=skipped)
+        self.finish(task_id, result, succeeded=succeeded, failed=failed, skipped=skipped,
+                    issues=({**detail, "accounts": count} for detail, count in issues.values()))
 
     def view(self, known_revision: int | None) -> tuple[int, list[dict] | None]:
         with self._lock:

@@ -2653,11 +2653,11 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
-    elif _routing_module._is_upstream_channel_refused_error(exception):
-        # The cause is specific -- the station's selected channel refused -- and
-        # the generic transient branch below would replace it with "produced no
-        # answer", inviting a resend without saying why one works.  The routing
-        # sentence carries the station's scope and the client's retry phrase.
+    elif (
+        _routing_module._is_upstream_channel_refused_error(exception)
+        or _routing_module._is_upstream_model_unavailable_error(exception)
+    ):
+        # Retain the station's own diagnosis in the client-facing error.
         message = _routing_module._sanitized_upstream_route_failure_message(
             model,
             exception,
@@ -2832,6 +2832,8 @@ def _register_terminal_turn_failure(
 def _synthesized_native_stream_error_chunk(
     request_data: dict,
     exception: Exception,
+    *,
+    incomplete_continuation: bool = False,
 ) -> Any:
     """Return a terminal error in the client's native streaming format.
 
@@ -2848,6 +2850,8 @@ def _synthesized_native_stream_error_chunk(
     )
     error_code = _native_stream_error_code(exception, request_data)
     message = _native_stream_error_message(model, exception, request_data)
+    if incomplete_continuation:
+        message = f"The answer is incomplete. {message}"
     # A refusal the client can act on is not a server failure.  Labelling a
     # context-window refusal ``server_error`` is what made a client reconnect
     # and resend the same oversized history; the wire type is what stops it.
@@ -2984,6 +2988,10 @@ def _native_stream_error_message(
         original = str(exception).strip()
         if original:
             return original
+    if _routing_module._is_upstream_model_unavailable_error(exception):
+        return _routing_module._sanitized_upstream_route_failure_message(
+            model, exception, request_data
+        )
     if _routing_module._is_local_shutdown_exception(exception):
         # Same contract as the Responses branch: the replacement is listening,
         # so the sentence has to read as the transient restart it is.
@@ -3143,8 +3151,7 @@ def _native_stream_error_message(
         return (
             "The upstream model route ended the stream before it reported the "
             "response as finished, so the stream ended without a terminal "
-            "response event. Send the message again and it will continue on a "
-            "working route."
+            "response event. Send the message again or choose another model route."
         )
     if _routing_module._is_route_cut_stream_error(exception):
         model_group = (
@@ -4045,6 +4052,10 @@ async def _dispatch_stream_hedge(
         stage=stage,
         excluded_deployment_ids=sorted(excluded),
     )
+    primary_id = _routing_module._pending_request_log_id_from_marker(
+        _routing_module._selected_deployment_marker_from_box()
+    ) or _routing_module._trace_request_id(request_data)
+    parent = {"request_id": primary_id, "deployment_id": current_id} if primary_id else {}
     selected_box: dict = {}
     box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
     marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
@@ -4052,7 +4063,7 @@ async def _dispatch_stream_hedge(
     # the kwargs, but it cannot leave this context.  Without this one race could
     # fan out into a race per layer (2026-11-20: three sibling dispatches of one
     # replay inside four seconds).
-    hedge_token = _CURRENT_HEAD_HEDGE_ATTEMPT.set(True)
+    hedge_token = _CURRENT_HEAD_HEDGE_ATTEMPT.set(parent)
     try:
         response = await _await_upstream_dispatch(
             router_method(**_streaming_error_fallback_dispatch_kwargs(payload)),
@@ -4154,7 +4165,7 @@ def _is_head_hedge_attempt(request_kwargs: Optional[dict] = None) -> bool:
     that request after the race returned, whose context is the parent's.
     """
 
-    if _CURRENT_HEAD_HEDGE_ATTEMPT.get():
+    if _CURRENT_HEAD_HEDGE_ATTEMPT.get() is not None:
         return True
     return _request_context_module._request_metadata_flag(
         request_kwargs,
@@ -4447,6 +4458,7 @@ def _adopt_head_hedge_winner(
     if marker is None:
         marker = _routing_module._selected_deployment_request_marker(payload)
     if isinstance(marker, dict):
+        marker[_HEAD_HEDGE_METADATA_KEY] = True
         _routing_module._merge_request_routing_state_into_selected_deployment_marker(
             marker,
             payload,
@@ -4581,10 +4593,6 @@ async def _await_upstream_dispatch_with_head_hedge(
                     request_data, primary_box, delay_seconds=delay
                 )
             _adopt_head_hedge_winner(request_data, *hedge.result())
-        if hedge is not None and winner is not None:
-            marker = _routing_module._selected_deployment_marker_from_box()
-            if isinstance(marker, dict):
-                marker[_HEAD_HEDGE_METADATA_KEY] = True
 
 
 def _charge_lost_head_race(
@@ -5463,6 +5471,8 @@ def _build_streaming_error_fallback_payload(
         and isinstance(selected_route_upstream_model, str)
         and selected_route_upstream_model.strip()
         and selected_route_upstream_model != payload_model
+        # Several public groups can share an upstream model ID.
+        and payload_model != selected_model_group
         and _should_prefer_selected_route_model(
             payload_model,
             selected_route_upstream_model,
@@ -7322,6 +7332,7 @@ async def _yield_native_stream_with_output_limit_continuation(
         # the continuation into this same answer; the withheld frame is sent
         # only when there is nothing more to ask for.
         continuation_closed = False
+        continuation_error: dict[str, Exception] = {}
         accounting_source = chat_usage_frame or withheld_ceiling_terminal
         initial_chat_usage = None if is_anthropic_stream else _stream_chunk_dump(accounting_source).get("usage")
         extra_chat_usage: dict = {}
@@ -7337,24 +7348,16 @@ async def _yield_native_stream_with_output_limit_continuation(
             answered_output_tokens=answered_output_tokens,
             anthropic_index_offset=highest_anthropic_index + 1,
             chat_usage=extra_chat_usage,
+            continuation_error=continuation_error,
         ):
             # The same test the continuation applies before it hands over a
             # route's closing frame: that frame is the only terminal it yields.
             if _native_stream_chunk_is_terminal(chunk, request_data, set()):
                 continuation_closed = True
             yield chunk
-        # The continuation owns the answer's last frame: when it reached a
-        # natural stop it already emitted that frame, and when it ran out of
-        # rounds the withheld "length" frame is the honest report that the
-        # answer is still unfinished.  Re-emitting the withheld frame on top of
-        # a natural stop would tell the client an answer that finished had hit
-        # the ceiling.
-        #
-        # "It closed the answer" is not "it yielded something": rounds that add
-        # text and hit the ceiling again, or one that fails after it started
-        # writing, yield frames and no terminal.  Reading those as closed left
-        # the client a stream with no end.
-        if not continuation_closed:
+        exception = continuation_error.get("exception")
+        # Restore the limit frame only if the continuation was ineligible or disabled.
+        if not continuation_closed and exception is None:
             if extra_chat_usage and _stream_chunk_dump(withheld_ceiling_terminal).get("usage"):
                 withheld_ceiling_terminal = _stream_continuation_module._chat_chunk_with(
                     withheld_ceiling_terminal, usage=None
@@ -7366,13 +7369,17 @@ async def _yield_native_stream_with_output_limit_continuation(
             for closer in withheld_ceiling_closers:
                 yield closer
         if not is_anthropic_stream:
-            if extra_chat_usage or (continuation_closed and initial_chat_usage):
+            if extra_chat_usage or ((continuation_closed or exception is not None) and initial_chat_usage):
                 _stream_continuation_module._sum_chat_token_usage(extra_chat_usage, initial_chat_usage or {})
                 options = request_data.get("stream_options") or {}
                 if options.get("include_usage") and not request_data.get("_litellm_strip_stream_usage"):
                     yield _stream_continuation_module._chat_chunk_with(accounting_source, choices=[], usage=extra_chat_usage)
             elif chat_usage_frame is not None:
                 yield chat_usage_frame
+        if exception is not None:
+            yield _synthesized_native_stream_error_chunk(
+                request_data, exception, incomplete_continuation=True
+            )
         return
 
     if not saw_terminal:

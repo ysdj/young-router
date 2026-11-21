@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 from young_router.core import CoreStore
+from young_router.core.image_context_cleanup import ImageContextSweeper
 from young_router.core.scheduled_tasks import IMAGE_CONTEXT_CLEANUP, WEBDAV_SYNC, ScheduledTasks
 from young_router.core.webdav_scheduler import CONFLICT_CODE, WebDAVSyncScheduler
 
@@ -57,3 +59,35 @@ class ScheduledTaskTests(unittest.TestCase):
         blocked = task_row(tasks, WEBDAV_SYNC)
         self.assertEqual(("blocked", None), (blocked["state"], blocked["next_run_at"]))
         self.assertEqual("failed", blocked["history"][0]["outcome"])
+
+    def test_failure_detail_is_redacted_before_persistence(self):
+        def fail():
+            raise PermissionError("Failed to remove the cached image: token=fixture-only-token")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            sweeper = ImageContextSweeper(sweep=fail, tasks=ScheduledTasks(path))
+            with mock.patch("young_router.core.scheduled_tasks.time.time", side_effect=(1_700_000_000.0, 1_700_000_000.125)):
+                sweeper.run_once()
+
+            run = task_row(ScheduledTasks(path), IMAGE_CONTEXT_CLEANUP)["history"][0]
+            self.assertEqual("failed", run["outcome"])
+            self.assertEqual(125, run["duration_ms"])
+            self.assertEqual("sweep", run["detail"]["phase"])
+            self.assertEqual("PermissionError", run["detail"]["error_type"])
+            self.assertIn("Failed to remove the cached image", run["detail"]["message"])
+            self.assertIn("token=configured", run["detail"]["message"])
+            self.assertNotIn("fixture-only-token", path.read_text())
+
+    def test_old_failure_has_a_duration_but_no_invented_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            path.write_text(json.dumps({IMAGE_CONTEXT_CLEANUP: [{
+                "started_at": "2026-01-01T00:00:00.000+00:00",
+                "finished_at": "2026-01-01T00:00:00.125+00:00",
+                "outcome": "failed",
+            }]}))
+            run = task_row(ScheduledTasks(path), IMAGE_CONTEXT_CLEANUP)["history"][0]
+            self.assertEqual(125, run["duration_ms"])
+            self.assertNotIn("detail", run)
+            self.assertNotIn("issues", run)

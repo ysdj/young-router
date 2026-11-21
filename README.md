@@ -49,7 +49,7 @@ Requirements: macOS 14+ (prebuilt Cask: Apple silicon); Windows via source build
 brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
 ```
 
-Open **Young Router** from Applications. Updates: `brew upgrade --cask young-router`.
+Open **Young Router** from Applications. Published macOS builds check for stable updates when the app starts and every six hours while it runs. The app installs the update and restarts automatically. **General → Automatic updates** is on by default. Development and prerelease builds are skipped. For a manual update, run `brew upgrade --cask young-router`.
 
 <details>
 <summary>Build from source</summary>
@@ -76,6 +76,8 @@ The copy is verified against the digest in `rn/scripts/react-native-windows-whee
 For UI work there is no build at all: `pnpm run dev:windows` (or `scripts\dev-loop-windows.ps1` directly, which takes `-Check`, `-NoRestart`, `-StopMetro`) syncs the JavaScript, fetches the bundle from a Metro server it keeps running, and restarts the app — 13–17 s per edit. On a machine whose checkout is on its own disk it debugs that checkout in place; a checkout reached through a shared folder needs `-InitTree` once, because `node_modules` cannot live there.
 
 Source builds also need Xcode, CocoaPods, Node.js 22+, pnpm 11, and [uv](https://docs.astral.sh/uv/).
+
+To publish a stable macOS release, run `scripts/package-release.sh` and attach both archives to the GitHub release tagged `vX.Y.Z` before publishing. The Cask uses the `.tar.zst`, and the in-app updater uses the `.zip`.
 
 </details>
 
@@ -157,7 +159,7 @@ MIT License. See [LICENSE](./LICENSE).
 brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
 ```
 
-安装后从“应用程序”打开**漾路由**。更新：`brew upgrade --cask young-router`。
+安装后从“应用程序”打开**漾路由**。macOS 正式版会在启动时及运行期间每六小时检查稳定更新，安装后自动重启。**常规 → 自动更新**默认开启，开发版和预发布版会被跳过。也可以运行 `brew upgrade --cask young-router` 手动更新。
 
 <details>
 <summary>从源码构建</summary>
@@ -173,6 +175,8 @@ YOUNG_ROUTER_MACOS_OUTPUT="$PWD/../artifacts/Young Router.app" pnpm run build:ma
 Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作负载）：`cd rn; pnpm install --frozen-lockfile; pnpm run build:windows`。
 
 源码构建还需要 Xcode、CocoaPods、Node.js 22+、pnpm 11 和 [uv](https://docs.astral.sh/uv/)。
+
+发布 macOS 正式版时，运行 `scripts/package-release.sh`，将两个归档都附到标签为 `vX.Y.Z` 的 GitHub Release 再发布。Cask 使用 `.tar.zst`，应用内更新使用 `.zip`。
 
 </details>
 

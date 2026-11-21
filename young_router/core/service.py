@@ -41,6 +41,9 @@ from .scheduled_tasks import (
     RELAY_GROUPS,
     RELAY_LOGIN,
     ScheduledTasks,
+    TaskFacts,
+    TaskResult,
+    task_exception_detail,
 )
 from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
@@ -2238,6 +2241,8 @@ class CoreStore:
             "launch_background_enable",
             "launch_background_disable",
             "launch_background_status",
+            "auto_update_enable",
+            "auto_update_disable",
         )
         service_handlers = {operation: controller.dispatch for operation in operations}
         # Staging the runtime document is what the proxy actually loads, so it
@@ -4868,6 +4873,8 @@ class CoreStore:
                 "resource_status": resource_status,
                 "resource_count": resource_count,
             }
+            if for_grouping and isinstance(result, Mapping) and result.get("resource_error"):
+                response["resource_error"] = result["resource_error"]
         if should_emit:
             self._request_emit()
         return response
@@ -4897,16 +4904,16 @@ class CoreStore:
 
     def _run_relay_maintenance(
         self, task_id: str, account_id: str, cancelled: Callable[[], bool],
-    ) -> str:
+    ) -> TaskResult:
         if cancelled():
-            return "skipped"
+            return TaskResult("skipped")
         if task_id == RELAY_GROUPS:
             names = self._apply_domain_hints("relay_accounts", None)
             with self._domain_scope(*names):
                 self._refresh_external_disk_state(names)
                 relay = self._domains["relay_accounts"]
                 if cancelled() or any(self._disk.get(name, {}).get("changed") for name in names):
-                    return "skipped"
+                    return TaskResult("skipped")
                 if relay.group_poll_retry_account() == account_id and (
                     not any(self._drafts.get(name, {}).get("dirty") for name in names)
                     or (self._group_retry is not None and self._group_retry[0] == account_id
@@ -4918,9 +4925,14 @@ class CoreStore:
                     return self._apply_automatic_groups(account_id, self._revision)
             result = self.refresh_relay_resources(account_id, revision=None, for_grouping=True)
             if result["resource_status"] == "skipped":
-                return "skipped"
+                return TaskResult("skipped")
             if result["resource_status"] != "ready":
-                return "failed"
+                return TaskResult("failed", {
+                    "phase": "read_groups",
+                    "code": result.get("resource_error") or result["resource_status"],
+                    "message": "Relay login has expired" if result.get("resource_error") == "login_expired"
+                    else "Relay did not provide the API groups and keys needed for automatic grouping",
+                })
             with self._domain_scope(*names):
                 self._refresh_external_disk_state(names)
                 relay = self._domains["relay_accounts"]
@@ -4934,13 +4946,13 @@ class CoreStore:
                     or self._relay_operation_count(relay)
                     or account_id not in relay.maintenance_account_ids(grouping=True)
                 ):
-                    return "skipped"
+                    return TaskResult("skipped")
                 staged = self.dispatch({
                     "domain": "relay_accounts", "type": "api_key.auto_group_align",
                     "payload": {"account_id": account_id},
                 })
                 if not self._drafts["relay_accounts"]["dirty"]:
-                    return "succeeded"
+                    return TaskResult("succeeded")
                 relay.mark_group_poll_operations()
                 return self._apply_automatic_groups(account_id, staged["revision"])
 
@@ -4955,15 +4967,21 @@ class CoreStore:
             self._request_emit()
         return outcome
 
-    def _apply_automatic_groups(self, account_id: str, revision: int) -> str:
+    def _apply_automatic_groups(self, account_id: str, revision: int) -> TaskResult:
         relay = self._domains["relay_accounts"]
         self._group_retry = (account_id, revision)
         applied = self.apply("relay_accounts", revision=revision)
         if applied["applied"] and not self._relay_operation_count(relay):
             self._group_retry = None
-            return "succeeded"
+            return TaskResult("succeeded")
         self._group_retry = (account_id, applied["revision"])
-        return "partial" if applied.get("completed_operations") else "failed"
+        completed = applied.get("completed_operations", 0)
+        return TaskResult("partial" if completed else "failed", {
+            "phase": "apply_groups",
+            "message": "Some relay group changes could not be applied",
+            "completed_operations": completed,
+            "pending_operations": applied.get("pending_operations", 0),
+        })
 
     def restore_relay_session(
         self,
@@ -5683,18 +5701,16 @@ class CoreStore:
         can only ask it again; measured on lv, a two-minute interval retried a
         conflict 300+ times overnight, and every retry wrote the same files and
         rolled the proxy reload over with them.  Any other failure is worth
-        another try, on a backing-off interval.
+        another try, on a backing-off interval. Let the loop record the error
+        together with its code before scheduling that retry.
         """
 
-        try:
-            self._dispatch_webdav_sync(
-                "sync",
-                {"sections": ["providers_models", "relay_accounts"]},
-                None,
-                automatic=True,
-            )
-        except CoreError as exc:
-            return str(exc.code or "webdav_sync_failed")
+        self._dispatch_webdav_sync(
+            "sync",
+            {"sections": ["providers_models", "relay_accounts"]},
+            None,
+            automatic=True,
+        )
         return "ok"
 
     def webdav_scheduler(self) -> Any:
@@ -5741,7 +5757,7 @@ class CoreStore:
 
     def run_automatic_relay_balance_refresh(
         self, account_ids: Sequence[str], cancelled: Callable[[], bool],
-    ) -> dict[str, str]:
+    ) -> dict[str, TaskResult]:
         """Read profile balances and publish the corresponding live state."""
 
         with self._domain_scope("relay_accounts"):
@@ -5843,7 +5859,7 @@ class CoreStore:
         *,
         include_claude: bool = True,
         refresh_contexts: bool = True,
-    ) -> str:
+    ) -> tuple[str, list[TaskFacts]]:
         """Regenerate the client model documents this app still generates.
 
         A provider Apply calls this with the default so the Claude picker
@@ -5859,21 +5875,22 @@ class CoreStore:
         only a difference.
         """
 
-        succeeded = failed = 0
+        succeeded = 0
+        issues: list[TaskFacts] = []
 
-        def refresh(action: object) -> None:
-            nonlocal succeeded, failed
+        def refresh(phase: str, action: object) -> None:
+            nonlocal succeeded
             if callable(action):
                 try:
                     action()
-                except Exception:
-                    failed += 1
+                except Exception as exc:
+                    issues.append(task_exception_detail(exc, phase=phase))
                 else:
                     succeeded += 1
 
         codex_domain = self._domains.get("codex")
         if refresh_contexts:
-            refresh(getattr(codex_domain, "refresh_model_contexts_if_due", None))
+            refresh("refresh_model_contexts", getattr(codex_domain, "refresh_model_contexts_if_due", None))
         live_domains = ("claude", "codex") if include_claude else ("codex",)
         revisions_before = {
             name: getattr(self._domains.get(name), "revision", None)
@@ -5885,8 +5902,8 @@ class CoreStore:
         # their own locks, so this work runs outside the store's: a window
         # polling its snapshot must never wait for a client document.
         if include_claude:
-            refresh(getattr(self._domains.get("claude"), "refresh_model_lists", None))
-        refresh(getattr(codex_domain, "refresh_model_catalog", None))
+            refresh("refresh_claude_model_list", getattr(self._domains.get("claude"), "refresh_model_lists", None))
+        refresh("refresh_codex_model_catalog", getattr(codex_domain, "refresh_model_catalog", None))
         # The live read belongs to this lane, not to ``snapshot``.  A window
         # polls the projection many times a second while the proxy reloads, and
         # a read taken there both blocks every other request on the store lock
@@ -5906,9 +5923,9 @@ class CoreStore:
                 except PersistenceError:
                     pass
             self._request_emit()
-        if failed:
-            return "partial" if succeeded else "failed"
-        return "succeeded" if succeeded else "skipped"
+        if issues:
+            return ("partial" if succeeded else "failed"), issues
+        return ("succeeded" if succeeded else "skipped"), issues
 
     def service_supervisor(self, *, initial_delay: float | None = None) -> Any:
         """The loop that restores the proxy without a person's click.
@@ -6357,7 +6374,7 @@ class CoreStore:
                 if isinstance(exc, webdav_core.SyncError):
                     # The remote's own sentence, redacted and held to the
                     # one-line/512-byte rule the envelope enforces.
-                    raise CoreError(cause_code, safe_error_message(exc)) from None
+                    raise CoreError(cause_code, safe_error_message(exc, known_secrets=(settings.password,))) from None
                 raise CoreError(cause_code, "WebDAV sync failed") from None
             should_emit = True
             if pulled:
@@ -6600,6 +6617,17 @@ class CoreStore:
             raise CoreError("invalid_action", "A Core action is required")
         domain_value = data.get("domain")
         normalized_action = action_type.replace("-", "_").replace(".", "_").lower()
+        if normalized_action == "model_list_plugin":
+            from . import model_list_plugin
+            payload = _as_mapping(data.get("payload"))
+            host, operation = payload.get("host"), payload.get("operation")
+            if host not in {"codex", "claude"} or operation not in {"status", "install", "uninstall", "enable", "disable", "configure", "sync"}:
+                raise CoreError("invalid_action", "Invalid model-list-plugin request")
+            try:
+                result = model_list_plugin.manage(host, operation, options=payload)
+            except Exception as exc:
+                raise CoreError("domain_error", safe_exception_message(exc)) from None
+            return {"revision": self._current_revision(), "action_summary": result}
         if domain_value is not None and normalized_action == "probe":
             # A probe is the one action whose answer is a job: it reads the
             # upstream, it can take minutes, and nothing else in the store has
@@ -7146,7 +7174,7 @@ class CoreStore:
         action_type = action.get("type", action.get("action"))
         if not isinstance(action_type, str):
             return
-        if action.get("domain") is None and action_type.startswith("service."):
+        if action.get("domain") is None and (action_type.startswith("service.") or action_type == "model_list_plugin"):
             return
         name = _canonical_domain(action.get("domain"))
         normalized = action_type.strip().lower().replace("-", "_").replace(".", "_")
@@ -7369,6 +7397,7 @@ class CoreStore:
             "detail",
             "auto_start_state",
             "launch_background_state",
+            "auto_update_enabled",
             "route_recovery",
             "webdav",
         ):
@@ -7787,7 +7816,7 @@ class CoreStore:
             )
         self._request_emit()
 
-    def supervise_service_once(self) -> str:
+    def supervise_service_once(self) -> TaskResult:
         """Restore an unwatched proxy instead of leaving 不健康 to a click.
 
         One pass reads the controller's real status and acts only on a state
@@ -7815,13 +7844,13 @@ class CoreStore:
         # One pass at a time.  The loop is single-threaded, but a caller may
         # also ask for one pass directly, and two recoveries must not overlap.
         if not self._service_supervision_guard.acquire(blocking=False):
-            return "skipped"
+            return TaskResult("skipped")
         try:
             return self._supervise_service_once()
         finally:
             self._service_supervision_guard.release()
 
-    def _supervise_service_once(self) -> str:
+    def _supervise_service_once(self) -> TaskResult:
         # A pass can replace the proxy, which takes seconds.  It holds the
         # mutation lane so a pane's edit cannot land mid-replacement, while
         # snapshots keep reading the last committed projection.
@@ -7830,47 +7859,48 @@ class CoreStore:
             with self._lock:
                 if self._service_supervision_stopping or self._service_intent != "running":
                     self._service_supervision_unhealthy_since = None
-                    return "skipped"
+                    return TaskResult("skipped")
                 if self._service_proxy_operations > 0:
-                    return "skipped"
+                    return TaskResult("skipped")
                 reload_thread = self._service_reload_thread
                 if reload_thread is not None and reload_thread.is_alive():
-                    return "skipped"
+                    return TaskResult("skipped")
                 handlers = dict(self._service_handlers)
             # A forced read: the settled cache would hide the death this pass is
             # looking for until it expired.
             status_handler = handlers.get("health") or handlers.get("status")
             if status_handler is None:
-                return "skipped"
+                return TaskResult("skipped")
             try:
                 current = status_handler("health" if handlers.get("health") is not None else "status")
-            except Exception:
-                return "failed"
+            except Exception as exc:
+                return TaskResult("failed", task_exception_detail(exc, phase="check_proxy_health"))
             if not isinstance(current, Mapping):
-                return "failed"
+                return TaskResult("failed", {"phase": "check_proxy_health", "message": "The proxy controller returned no state"})
             state = str(current.get("state"))
             now = time.monotonic()
             if state in {"running", "starting"}:
                 self._service_supervision_unhealthy_since = None
                 self._service_supervision_attempts = 0
                 self._service_supervision_retry_at = 0.0
-                return "succeeded"
+                return TaskResult("succeeded")
             if state == "unhealthy":
                 if self._service_supervision_unhealthy_since is None:
                     self._service_supervision_unhealthy_since = now
-                    return "skipped"
+                    return TaskResult("skipped")
                 if now - self._service_supervision_unhealthy_since < SERVICE_RECOVERY_PATIENCE_SECONDS:
-                    return "skipped"
+                    return TaskResult("skipped")
             elif state != "stopped":
                 # "unknown" is somebody else's listener on the configured port.
                 self._service_supervision_unhealthy_since = None
-                return "skipped"
+                return TaskResult("skipped")
             if now < self._service_supervision_retry_at:
-                return "skipped"
+                return TaskResult("skipped")
             operation = "restart" if state == "unhealthy" else "start"
+            recovery_detail: TaskFacts = {"phase": operation, "previous_state": state}
             handler = handlers.get(operation)
             if handler is None:
-                return "failed"
+                return TaskResult("failed", {**recovery_detail, "message": "No proxy recovery handler is configured"})
             # Stated before the attempt, not after: a recovery that hangs or
             # dies while replacing the proxy leaves this line as the only
             # record that anything was being done about it.
@@ -7882,9 +7912,9 @@ class CoreStore:
                     # shutdown, or a person's own start may have landed since
                     # the probe.
                     if self._service_supervision_stopping or self._service_intent != "running":
-                        return "skipped"
+                        return TaskResult("skipped")
                     if self._service_proxy_operations > 0:
-                        return "skipped"
+                        return TaskResult("skipped")
                     # Hold the replacement count for this pass exactly as an
                     # explicit operation does: every window must draw 启动中
                     # while the proxy is being replaced, never the failure it
@@ -7913,10 +7943,12 @@ class CoreStore:
                         result = handler(operation)
                     except Exception as exc:
                         _note("the proxy recovery (%s) failed" % operation, trace=exc)
+                        recovery_detail.update(task_exception_detail(exc, phase=operation))
                         result = None
                     with self._lock:
                         if isinstance(result, Mapping):
                             self._set_service_from_result(result, increment=False)
+                            recovery_detail["state"] = self._service["state"]
                         recovered = isinstance(result, Mapping) and str(result.get("state")) == "running"
                         if recovered:
                             self._service_supervision_unhealthy_since = None
@@ -7969,7 +8001,10 @@ class CoreStore:
             should_emit = True
         if should_emit:
             self._request_emit()
-        return "succeeded" if recovered else "failed"
+        if recovered:
+            return TaskResult("succeeded", recovery_detail)
+        recovery_detail.setdefault("message", "The proxy did not reach the running state after recovery")
+        return TaskResult("failed", recovery_detail)
 
     def _stop_service_after_reload_shutdown(self) -> None:
         stopper = self._shutdown_handler

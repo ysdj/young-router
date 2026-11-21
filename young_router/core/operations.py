@@ -296,6 +296,7 @@ class RuntimePaths:
     port: Path
     autostart: Path
     launch_background: Path
+    auto_update_disabled: Path
     webdav_enabled: Path
     webdav_status: Path
     webdav_sync_state: Path
@@ -327,6 +328,7 @@ class RuntimePaths:
                     runtime / "launch-background.enabled",
                 )
             ).expanduser(),
+            auto_update_disabled=runtime / "auto-update.disabled",
             webdav_enabled=Path(os.environ.get("LITELLM_WEBDAV_SYNC_ENABLED_FILE", runtime / "webdav-sync.enabled")).expanduser(),
             webdav_status=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATUS_FILE", runtime / "webdav-sync-status.json")).expanduser(),
             webdav_sync_state=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATE", runtime / "webdav-sync-state.json")).expanduser(),
@@ -1551,6 +1553,7 @@ class CoreServiceController:
             "state": state,
             "auto_start_state": self.autostart_status(),
             "launch_background_state": self.launch_background_status(),
+            "auto_update_enabled": not self.paths.auto_update_disabled.exists(),
         }
         if pid is not None:
             result["pid"] = pid
@@ -1581,6 +1584,8 @@ class CoreServiceController:
                 "launch_background_state": self.launch_background_status(),
                 **self.status(force=True),
             },
+            "auto_update_enable": lambda: self.set_auto_update(True),
+            "auto_update_disable": lambda: self.set_auto_update(False),
         }
         method = methods.get(normalized)
         if method is None:
@@ -1998,6 +2003,16 @@ class CoreServiceController:
 
     def launch_background_status(self) -> str:
         return "enabled" if self.paths.launch_background.is_file() else "disabled"
+
+    def set_auto_update(self, enabled: bool) -> dict[str, Any]:
+        # This is a desktop preference. It does not change the proxy environment
+        # or call a lifecycle operation.
+        if enabled:
+            self.paths.auto_update_disabled.unlink(missing_ok=True)
+        else:
+            atomic_write_text(self.paths.auto_update_disabled, "1\n")
+        self._invalidate_status_cache()
+        return self.status(force=False)
 
     def _recovery_summary(self) -> dict[str, Any]:
         try:

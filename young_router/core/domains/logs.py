@@ -1191,13 +1191,17 @@ def _safe_request_record(
         # attempt and the retry that replaced it two rows instead of one (see
         # ``_request_projection_key``).
         "deployment_id",
-        # A head hedge's own bookkeeping row names the race it belongs to; the
-        # view keeps it out of 请求 while it is only that (see
-        # ``_is_hidden_internal_attempt``).
         "internal_attempt",
+        "dispatch_mode",
     ):
         if key in raw:
             result[key] = _safe_scalar(raw[key])
+    hedge_parent = raw.get("hedge_parent")
+    if isinstance(hedge_parent, Mapping):
+        result["hedge_parent"] = {
+            key: _safe_scalar(hedge_parent.get(key))
+            for key in ("request_id", "deployment_id")
+        }
     _restate_client_surface_from_call_type(result)
     route_public_model = _public_model_from_route_key(result.get("route_key"))
     if route_public_model:
@@ -1414,9 +1418,31 @@ def _collapse_request_records(records: list[object]) -> list[object]:
         existing = projected.get(request_id)
         if existing is not None and not _should_replace_request_record(existing[1], value):
             continue
+        if existing is not None and _request_record_status(value) not in _REQUEST_PENDING_STATUSES:
+            # A stream/terminal callback can arrive with rebuilt kwargs. Keep
+            # the dispatch recorded at the start of this attempt.
+            for key in ("internal_attempt", "dispatch_mode", "hedge_parent"):
+                if key in existing[1]:
+                    value.setdefault(key, existing[1][key])
         projected[request_id] = (existing[0] if existing else index, value)
     result = list(projected.values()) + standalone
     return [record for _index, record in sorted(result, key=lambda x: x[0])]
+
+
+def _mark_parallel_request_attempts(records: list[object]) -> None:
+    active: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if isinstance(record, dict) and _request_record_status(record) in _REQUEST_PROGRESS_STATUSES:
+            if key := _request_projection_key(record):
+                active[key] = record
+    for record in active.values():
+        parent = record.get("hedge_parent")
+        if not isinstance(parent, dict):
+            continue
+        primary = active.get(_request_projection_key(parent))
+        if primary is not None and primary is not record:
+            primary["parallel_attempt_active"] = True
+            record["parallel_attempt_active"] = True
 
 
 # The words each mode is stated as, keyed by value of the record's own
@@ -2752,6 +2778,7 @@ class LogsDomain:
                     )
                     for record in records
                 ]
+            _mark_parallel_request_attempts(records)
             needle = self._filters.get(tab, "").casefold()
             if needle:
                 records = [

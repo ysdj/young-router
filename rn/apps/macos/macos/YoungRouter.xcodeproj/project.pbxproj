@@ -18,6 +18,7 @@
 		A10000000000000000000005 /* CoreIPCModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* CoreIPCModule.swift */; };
 		A10000000000000000000006 /* CoreIPCModuleBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* CoreIPCModuleBridge.m */; };
 		A10000000000000000000007 /* AppKitControlViews.mm in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* AppKitControlViews.mm */; };
+		A10000000000000000000009 /* AutoUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* AutoUpdater.swift */; };
 		A30000000000000000000011 /* zh-Hans in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000010 /* zh-Hans */; };
 		E511200ECC32B402B7D9928D /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E2318F980E7456952C37DF17 /* PrivacyInfo.xcprivacy */; };
 		F707ADE44AC324E48EBAA50C /* libPods-YoungRouter-macOS.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 73608344EA9C7EEF7E6AD32C /* libPods-YoungRouter-macOS.a */; };
@@ -43,6 +44,7 @@
 		A20000000000000000000006 /* CoreIPCModuleBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = CoreIPCModuleBridge.m; path = ../../src/native/macos/CoreIPCModuleBridge.m; sourceTree = "<group>"; };
 		A20000000000000000000007 /* AppKitControlViews.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = AppKitControlViews.mm; path = ../../src/native/macos/AppKitControlViews.mm; sourceTree = "<group>"; };
 		A20000000000000000000008 /* AppKitControlViews.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = AppKitControlViews.h; path = ../../src/native/macos/AppKitControlViews.h; sourceTree = "<group>"; };
+		A20000000000000000000009 /* AutoUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AutoUpdater.swift; path = ../../src/native/macos/AutoUpdater.swift; sourceTree = "<group>"; };
 		A30000000000000000000010 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/InfoPlist.strings"; sourceTree = "<group>"; };
 		E2318F980E7456952C37DF17 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; name = PrivacyInfo.xcprivacy; path = ../PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
@@ -126,6 +128,7 @@
 				A20000000000000000000006 /* CoreIPCModuleBridge.m */,
 				A20000000000000000000007 /* AppKitControlViews.mm */,
 				A20000000000000000000008 /* AppKitControlViews.h */,
+				A20000000000000000000009 /* AutoUpdater.swift */,
 			);
 			name = "Native Bridge";
 			sourceTree = "<group>";
@@ -310,6 +313,7 @@
 				A10000000000000000000003 /* AppKitNativeLeafBridge.m in Sources */,
 				A10000000000000000000002 /* AppKitNativeLeafModule.swift in Sources */,
 				A10000000000000000000001 /* AppKitNativeLeaf.swift in Sources */,
+				A10000000000000000000009 /* AutoUpdater.swift in Sources */,
 				514201582437B4B40078DB4F /* main.m in Sources */,
 				5142014D2437B4B30078DB4F /* AppDelegate.mm in Sources */,
 			);

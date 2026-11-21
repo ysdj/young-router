@@ -1113,6 +1113,10 @@ class CodexSettingsDomain:
         force_source_refresh: bool = False,
         require_stable_repair: bool = False,
     ) -> bool:
+        from ..model_list_plugin import target_initialized
+
+        if target_initialized("codex"):
+            return False
         pointer = self._catalog_pointer(self._raw)
         if pointer is None or pointer not in self._managed_catalog_paths():
             self._reset_catalog_repair_observation()

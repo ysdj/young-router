@@ -20,7 +20,7 @@ import threading
 from typing import Callable
 
 from .oplog import note as _note
-from .scheduled_tasks import PROXY_SUPERVISION, ScheduledTasks
+from .scheduled_tasks import PROXY_SUPERVISION, ScheduledTasks, TaskResult, task_exception_detail
 
 INITIAL_DELAY_SECONDS = 5.0
 """Let the app's own launch start run first, so two starts do not race."""
@@ -41,7 +41,7 @@ class ServiceSupervisor:
     def __init__(
         self,
         *,
-        supervise: Callable[[], str],
+        supervise: Callable[[], TaskResult],
         interval: float = CHECK_INTERVAL_SECONDS,
         initial_delay: float = INITIAL_DELAY_SECONDS,
         tasks: ScheduledTasks | None = None,
@@ -75,16 +75,16 @@ class ServiceSupervisor:
         if self._tasks is not None:
             self._tasks.begin(PROXY_SUPERVISION)
         try:
-            outcome = self._supervise()
+            result = self._supervise()
         except Exception as exc:
             # A pass that failed is simply due again next interval; it must
             # never take Core down or stop the loop.  It must still be said:
             # this loop exists for the installation nobody is looking at, and
             # a pass that keeps failing is invisible everywhere else.
             _note("a recovery pass failed", trace=exc)
-            outcome = "failed"
+            result = TaskResult("failed", task_exception_detail(exc, phase="supervise"))
         if self._tasks is not None:
-            self._tasks.finish(PROXY_SUPERVISION, outcome)
+            self._tasks.finish(PROXY_SUPERVISION, result.outcome, detail=result.detail)
 
     def _plan(self, delay: float | None) -> None:
         if self._tasks is not None:

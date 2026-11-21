@@ -874,6 +874,12 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc func setAutoUpdateEnabled(_ enabled: Bool) {
+        DispatchQueue.main.async {
+            self.leaf.setAutoUpdateEnabled(enabled)
+        }
+    }
+
     @objc func showVersion() {
         leaf.showVersion()
     }

@@ -76,6 +76,16 @@ class OneDerivedValueOneProducerTests(unittest.TestCase):
             UI_DIR / "providedKeyName.ts",
             r'resource\.(?:name|apiName).*translate\("relay\.apiKeyUngrouped"\)',
         ),
+        Producer(
+            "the last and next run times printed together in a task row",
+            UI_DIR / "YoungRouterApp.tsx",
+            r'translate\("tasks\.scheduleTimes"',
+        ),
+        Producer(
+            "a scheduled run's elapsed time",
+            ROOT / "young_router/core/scheduled_tasks.py",
+            r"Date\.parse\((?:run|execution)\.(?:started_at|finished_at)\)",
+        ),
     )
 
     def test_no_ui_surface_recomputes_a_derived_name(self) -> None:

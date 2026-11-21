@@ -422,7 +422,12 @@ def _redact_key_value_text(value: str) -> str:
     def replace(match: re.Match[str]) -> str:
         key = match.group("double_quoted_key") or match.group("single_quoted_key") or match.group("bare_key")
         if not is_secret_key(key):
-            return match.group(0)
+            # A preceding prose field can consume the start of the next
+            # key-value pair as its value, e.g. ``image: token=...``. Check
+            # that bounded value again so a non-secret label cannot shield an
+            # embedded credential from the outer text scan.
+            value = _redact_key_value_text(match.group("value"))
+            return match.group("prefix") + value if value != match.group("value") else match.group(0)
         bearer = "Bearer " if match.group("bearer") else ""
         return match.group("prefix") + bearer + REDACTED
 

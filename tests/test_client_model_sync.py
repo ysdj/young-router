@@ -25,6 +25,11 @@ def _wait_for(predicate, *, seconds: float = 6.0) -> bool:
     return False
 
 
+def _record_refresh(calls: list, value: object) -> tuple[str, list]:
+    calls.append(value)
+    return "succeeded", []
+
+
 class ClientModelSyncSchedulerTests(unittest.TestCase):
     def test_an_external_edit_to_the_document_triggers_a_pass(self) -> None:
         # The path this exists for: nobody told this process anything.  The
@@ -37,7 +42,7 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
 
         calls: list[float] = []
         scheduler = ClientModelSyncScheduler(
-            refresh=lambda: calls.append(time.monotonic()),
+            refresh=lambda: _record_refresh(calls, time.monotonic()),
             watch_paths=[document],
             poll_seconds=0.05,
             settle_seconds=(0.0,),
@@ -68,7 +73,7 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
         changes: list[int] = []
         refreshes: list[int] = []
         scheduler = ClientModelSyncScheduler(
-            refresh=lambda: refreshes.append(1),
+            refresh=lambda: _record_refresh(refreshes, 1),
             on_change=lambda: changes.append(1),
             watch_paths=[document],
             poll_seconds=0.02,
@@ -105,7 +110,7 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
 
         calls: list[float] = []
         scheduler = ClientModelSyncScheduler(
-            refresh=lambda: calls.append(time.monotonic()),
+            refresh=lambda: _record_refresh(calls, time.monotonic()),
             watch_paths=[document],
             poll_seconds=0.05,
             settle_seconds=(0.0, 0.3),
@@ -126,8 +131,8 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.refreshed: list[bool] = []
 
-            def refresh_client_model_lists(self, *, include_claude: bool = True) -> None:
-                self.refreshed.append(include_claude)
+            def refresh_client_model_lists(self, *, include_claude: bool = True) -> tuple[str, list]:
+                return _record_refresh(self.refreshed, include_claude)
 
             def adopt_external_route_change(self) -> None:
                 return None
@@ -161,7 +166,7 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
         # timestamp change to observe, so one slow pass keeps it honest.
         calls: list[int] = []
         scheduler = ClientModelSyncScheduler(
-            refresh=lambda: calls.append(1),
+            refresh=lambda: _record_refresh(calls, 1),
             poll_seconds=0.05,
             fallback_seconds=0.2,
         )

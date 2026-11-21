@@ -4057,6 +4057,24 @@ def _install_model_listing_efforts_patch() -> None:
         efforts = _reasoning_module._model_listing_efforts(response.get("id"))
         if efforts is not None:
             response[_reasoning_module._MODEL_LISTING_EFFORTS_KEY] = efforts
+        name = response.get("id")
+        if isinstance(name, str) and name.strip():
+            try:
+                registry = _reasoning_module._reasoning_registry()
+                context = registry.record_for(name)
+                if context.context_window > 0:
+                    response["context_window"] = context.context_window
+                    response["max_context_window"] = context.max_context_window
+                    response["effective_context_window_percent"] = context.effective_context_window_percent
+                capability = registry.reasoning_for(name) or registry.reasoning_for_model_id(name)
+                if capability is not None and capability.default_level:
+                    response["default_reasoning_level"] = capability.default_level
+                from ..core.model_catalog import route_serves_only_generation
+
+                if route_serves_only_generation(name, registry=registry):
+                    response["conversation"] = False
+            except Exception:
+                pass
         return response
 
     setattr(patched_create_model_info_response, _MODEL_LISTING_EFFORTS_PATCH_ATTR, True)

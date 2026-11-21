@@ -167,7 +167,7 @@ class SessionAffinityFilterTests(HookTestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["model_info"]["id"], "dep-b")
 
-    def test_affinity_is_independent_of_the_configured_order(self) -> None:
+    def test_higher_order_sticky_deployment_does_not_hide_lowest_order(self) -> None:
         hooks, _ = load_hook_module()
         with tempfile.TemporaryDirectory() as directory:
             self.set_env(
@@ -182,23 +182,18 @@ class SessionAffinityFilterTests(HookTestCase):
                 }
             )
             candidates = [
-                _deployment("dep-sticky", order=0.15),
-                _deployment("dep-preferred", order=0.11),
+                _deployment("dep-sticky", order=2),
+                _deployment("dep-preferred", order=1),
             ]
 
-            narrowed, sticky, applied = hooks._with_session_deployment_affinity(
+            unchanged, sticky, applied = hooks._with_session_deployment_affinity(
                 candidates,
                 self._request(),
                 "default-chat",
             )
-            # Warm cache is the only question here: order decided which routes
-            # were candidates before this ran, and it is not re-read.
-            self.assertTrue(applied)
+            self.assertFalse(applied)
             self.assertEqual(sticky, "dep-sticky")
-            self.assertEqual(
-                [deployment["model_info"]["id"] for deployment in narrowed],
-                ["dep-sticky"],
-            )
+            self.assertEqual(unchanged, candidates)
 
     def test_a_signed_replay_follows_the_same_affinity_rule(self) -> None:
         """Affinity never reads the replay: cache is the only question it asks.
@@ -223,26 +218,23 @@ class SessionAffinityFilterTests(HookTestCase):
                 }
             )
             candidates = [
-                _deployment("dep-sticky", order=0.15),
-                _deployment("dep-preferred", order=0.11),
+                _deployment("dep-sticky", order=2),
+                _deployment("dep-preferred", order=1),
             ]
             request = self._request()
             request["input"] = [
                 {"type": "reasoning", "encrypted_content": "gAAAA-signed"},
             ]
 
-            narrowed, sticky, applied = hooks._with_session_deployment_affinity(
+            unchanged, sticky, applied = hooks._with_session_deployment_affinity(
                 candidates,
                 request,
                 "default-chat",
             )
 
-            self.assertTrue(applied)
+            self.assertFalse(applied)
             self.assertEqual(sticky, "dep-sticky")
-            self.assertEqual(
-                [deployment["model_info"]["id"] for deployment in narrowed],
-                ["dep-sticky"],
-            )
+            self.assertEqual(unchanged, candidates)
 
     def test_a_chat_shaped_signed_replay_reads_no_content_either(self) -> None:
         hooks, _ = load_hook_module()
@@ -268,18 +260,18 @@ class SessionAffinityFilterTests(HookTestCase):
                 }
             ]
 
-            narrowed, sticky, applied = hooks._with_session_deployment_affinity(
+            unchanged, sticky, applied = hooks._with_session_deployment_affinity(
                 [
-                    _deployment("dep-sticky", order=0.15),
-                    _deployment("dep-preferred", order=0.11),
+                    _deployment("dep-sticky", order=2),
+                    _deployment("dep-preferred", order=1),
                 ],
                 request,
                 "default-chat",
             )
 
-            self.assertTrue(applied)
+            self.assertFalse(applied)
             self.assertEqual(sticky, "dep-sticky")
-            self.assertEqual(len(narrowed), 1)
+            self.assertEqual(len(unchanged), 2)
 
     def test_no_sticky_or_absent_sticky_keeps_candidates(self) -> None:
         hooks, _ = load_hook_module()
@@ -410,7 +402,7 @@ class HookFilterSessionAffinityTests(HookTestCase):
             self.assertEqual(len(filtered), 1)
             self.assertEqual(filtered[0]["model_info"]["id"], "dep-b")
 
-    async def test_filter_deployments_narrows_to_the_sticky_route(self) -> None:
+    async def test_filter_deployments_leaves_order_for_litellm_to_apply(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         with tempfile.TemporaryDirectory() as directory:
@@ -432,8 +424,8 @@ class HookFilterSessionAffinityTests(HookTestCase):
                 }
             )
             candidates = [
-                _deployment("dep-sticky", order=0.15),
-                _deployment("dep-preferred", order=0.11),
+                _deployment("dep-sticky", order=2),
+                _deployment("dep-preferred", order=1),
             ]
 
             filtered = await hook.async_filter_deployments(
@@ -442,10 +434,7 @@ class HookFilterSessionAffinityTests(HookTestCase):
                 messages=None,
                 request_kwargs=request_kwargs,
             )
-            self.assertEqual(
-                [deployment["model_info"]["id"] for deployment in filtered],
-                ["dep-sticky"],
-            )
+            self.assertEqual(filtered, candidates)
 
     async def test_sticky_deployment_in_cooldown_falls_back_to_peer(self) -> None:
         """Affinity never forces a cooled deployment: the peer wins instead."""

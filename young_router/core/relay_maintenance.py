@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 
 from .oplog import note
-from .scheduled_tasks import RELAY_GROUPS, RELAY_LOGIN, ScheduledTasks
+from .scheduled_tasks import RELAY_GROUPS, RELAY_LOGIN, ScheduledTasks, TaskResult, task_exception_detail
 
 RELAY_MAINTENANCE_SECONDS = 30 * 60
 
@@ -15,7 +15,7 @@ RELAY_MAINTENANCE_SECONDS = 30 * 60
 class RelayMaintenance:
     def __init__(
         self, *, tasks: ScheduledTasks, accounts: Callable[[], Mapping[str, Sequence[str]]],
-        run: Callable[[str, str, Callable[[], bool]], str], interval: float = RELAY_MAINTENANCE_SECONDS,
+        run: Callable[[str, str, Callable[[], bool]], TaskResult], interval: float = RELAY_MAINTENANCE_SECONDS,
     ) -> None:
         self._tasks = tasks
         self._accounts = accounts
@@ -49,11 +49,11 @@ class RelayMaintenance:
                 break
             try:
                 accounts = self._accounts()
-            except Exception:
+            except Exception as exc:
                 note("relay maintenance could not read the accounts")
                 for task_id in (RELAY_LOGIN, RELAY_GROUPS):
                     self._tasks.begin(task_id)
-                    self._tasks.finish(task_id, "failed")
+                    self._tasks.finish(task_id, "failed", detail=task_exception_detail(exc, phase="load_accounts"))
                     self._tasks.plan(task_id, interval_seconds=self._interval, delay_seconds=self._interval)
                 self._wake.wait(self._interval)
                 continue
@@ -83,11 +83,11 @@ class RelayMaintenance:
         outcomes = []
         for account_id in account_ids:
             if self._stop.is_set():
-                outcomes.append("skipped")
+                outcomes.append(TaskResult("skipped"))
                 continue
             try:
                 outcomes.append(self._run(task_id, account_id, self._stop.is_set))
-            except Exception:
+            except Exception as exc:
                 note("relay maintenance pass could not be completed")
-                outcomes.append("failed")
+                outcomes.append(TaskResult("failed", task_exception_detail(exc, phase="run_account")))
         self._tasks.finish_batch(task_id, outcomes)

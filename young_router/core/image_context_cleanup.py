@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from .scheduled_tasks import IMAGE_CONTEXT_CLEANUP, ScheduledTasks
+from .scheduled_tasks import IMAGE_CONTEXT_CLEANUP, ScheduledTasks, TaskFacts, task_exception_detail
 
 INTERVAL_SECONDS = 60 * 60
 """One hour: often enough for a one-day rule, rarely enough to stay idle."""
@@ -58,14 +58,18 @@ class ImageContextSweeper:
         if self._tasks is not None:
             self._tasks.begin(IMAGE_CONTEXT_CLEANUP)
         outcome = "succeeded"
+        detail: TaskFacts | None = None
         try:
-            self._sweep()
-        except Exception:
+            removed = self._sweep()
+            if type(removed) is int:
+                detail = {"removed": removed}
+        except Exception as exc:
             # A sweep that failed is simply due again next interval; it must
             # never take Core down or stop the loop.
             outcome = "failed"
+            detail = task_exception_detail(exc, phase="sweep")
         if self._tasks is not None:
-            self._tasks.finish(IMAGE_CONTEXT_CLEANUP, outcome)
+            self._tasks.finish(IMAGE_CONTEXT_CLEANUP, outcome, detail=detail)
 
     def _loop(self) -> None:
         while not self._stop.is_set():

@@ -7,7 +7,7 @@ import threading
 import time
 
 from .oplog import note
-from .scheduled_tasks import RELAY_NEGATIVE_BALANCE, RELAY_SIGNED_IN_BALANCE, ScheduledTasks
+from .scheduled_tasks import RELAY_NEGATIVE_BALANCE, RELAY_SIGNED_IN_BALANCE, ScheduledTasks, TaskResult, task_exception_detail
 
 
 # One task's configured interval and each eligible account's last reading.
@@ -23,7 +23,7 @@ class RelayBalanceScheduler:
         self,
         *,
         schedule: Callable[[], BalanceSchedule],
-        refresh: Callable[[list[str], Callable[[], bool]], Mapping[str, str]],
+        refresh: Callable[[list[str], Callable[[], bool]], Mapping[str, TaskResult]],
         tasks: ScheduledTasks | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -108,12 +108,15 @@ class RelayBalanceScheduler:
                 tasks.begin(task_id)
         try:
             outcomes = self._refresh(accounts, self._stop.is_set)
-        except Exception:
+        except Exception as exc:
             note("relay balance refresh could not be completed")
-            outcomes = dict.fromkeys(accounts, "failed")
+            outcomes = dict.fromkeys(accounts, TaskResult("failed", task_exception_detail(exc, phase="refresh_balances")))
         if tasks is not None:
             for task_id, batch in due.items():
-                tasks.finish_batch(task_id, (outcomes.get(account_id, "skipped") for account_id in batch))
+                tasks.finish_batch(
+                    task_id,
+                    (outcomes.get(account_id, TaskResult("skipped")) for account_id in batch),
+                )
 
     def _loop(self) -> None:
         while True:
@@ -123,12 +126,12 @@ class RelayBalanceScheduler:
                 break
             try:
                 delay, due = self._plan()
-            except Exception:
+            except Exception as exc:
                 note("relay balance scheduler could not read the accounts")
                 if self._tasks is not None:
                     for task_id in _BALANCE_TASKS:
                         self._tasks.begin(task_id)
-                        self._tasks.finish(task_id, "failed")
+                        self._tasks.finish(task_id, "failed", detail=task_exception_detail(exc, phase="read_schedule"))
                         self._tasks.plan(task_id, interval_seconds=self._intervals.get(task_id), delay_seconds=_PLAN_RETRY_SECONDS)
                 self._wake.wait(_PLAN_RETRY_SECONDS)
                 continue

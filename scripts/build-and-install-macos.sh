@@ -755,6 +755,7 @@ XCODE_BUILD_ARGS=()
 if [[ "$BUILD_ONLY" == "0" && "${YOUNG_ROUTER_FRESH_XCODE_BUILD:-0}" != "1" ]]; then
   XCODE_BUILD_ARGS=( -derivedDataPath "$STAGING_CACHE/xcode-install" )
 fi
+XCODE_BUILD_ARGS+=( "YOUNG_ROUTER_RELEASE_CHANNEL=${YOUNG_ROUTER_MACOS_RELEASE_CHANNEL:-dev}" )
 APP="$(xcodebuild -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" -scheme YoungRouter-macOS -configuration Release "${XCODE_DESTINATION[@]}" "${XCODE_BUILD_ARGS[@]+"${XCODE_BUILD_ARGS[@]}"}" -showBuildSettings 2>/dev/null | awk -F ' = ' '/TARGET_BUILD_DIR = / { target = $2 } /FULL_PRODUCT_NAME = / { product = $2 } END { if (target && product) print target "/" product }')"
 if [[ -z "$APP" ]]; then
   echo "Could not resolve the React Native macOS build product path." >&2

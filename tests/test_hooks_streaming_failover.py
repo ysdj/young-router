@@ -3900,16 +3900,8 @@ class HookOutputStreamContinuationTests(HookTestCase):
         self.assertEqual(chunks, [])
         self.assertEqual(calls, [])
 
-    async def test_exhausting_the_rounds_still_ends_with_the_ceiling_frame(self) -> None:
-        """An answer still unfinished after the last round must say so.
-
-        The withheld ceiling frame is emitted only when the continuation did
-        not close the answer itself.  A round that writes text and hits the
-        ceiling again yields frames and no terminal, so "it yielded something"
-        cannot stand in for "it closed": reading it that way left the client a
-        stream with no end.
-        """
-        hooks, proxy_server = load_hook_module()
+    async def test_exhausting_the_rounds_reports_an_incomplete_answer(self) -> None:
+        _, proxy_server = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
         self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
@@ -3968,16 +3960,16 @@ class HookOutputStreamContinuationTests(HookTestCase):
             for choice in (chunk.get("choices") or [])
             if choice.get("finish_reason")
         ]
-        # The answer is still unfinished, and the last thing the client reads
-        # says exactly that.
-        self.assertEqual(reasons, ["length"])
+        self.assertEqual(reasons, [])
+        self.assertEqual(proxy_server.llm_router.calls, 2)
+        self.assertEqual(delivered[-1]["error"]["code"], "upstream_stream_incomplete")
+        self.assertIn("The answer is incomplete.", delivered[-1]["error"]["message"])
         text = "".join(
             (choice.get("delta") or {}).get("content") or ""
             for chunk in delivered
             for choice in (chunk.get("choices") or [])
         )
-        self.assertIn("第一段。", text)
-        self.assertIn("继续写。", text)
+        self.assertEqual(text, "第一段。继续写。继续写。")
 
     async def test_the_continuation_does_not_resend_the_source_document(self) -> None:
         """Re-sending the document re-asks the original question.
@@ -4212,6 +4204,432 @@ class HookOutputStreamContinuationTests(HookTestCase):
             for choice in (chunk.get("choices") or [])
         )
         self.assertIn("| 25 | 2025-08-13 | 周疗 |", text)
+
+    async def test_a_silent_continuation_fails_over_to_a_sibling_route(self) -> None:
+        """A route that answered the ceiling must not own a silent resume forever."""
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+        calls: list[dict] = []
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise streaming._stream_start_timeout_exception(
+                        kwargs,
+                        start_seconds=0.01,
+                        saw_chunk=False,
+                        buffered_chunks=0,
+                        phase=streaming._STREAM_START_TIMEOUT_DISPATCH_PHASE,
+                    )
+
+                async def stream():
+                    yield {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "续写完成。"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                    yield {
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": "stop"}
+                        ]
+                    }
+
+                return stream()
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        request_data = self._chat_request()
+        request_data["model_info"] = {"id": "silent-ceiling-route"}
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "前半句。"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), request_data
+            )
+        ]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0][continuation_module._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY],
+            ["silent-ceiling-route"],
+        )
+        self.assertNotIn(
+            continuation_module._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
+            calls[1],
+        )
+        self.assertEqual(calls[1]["_excluded_deployment_ids"], ["silent-ceiling-route"])
+        reasons = [
+            choice.get("finish_reason")
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+            if choice.get("finish_reason")
+        ]
+        self.assertEqual(reasons, ["stop"])
+        text = "".join(
+            (choice.get("delta") or {}).get("content") or ""
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+        )
+        self.assertEqual(text, "前半句。续写完成。")
+
+    async def test_a_continuation_dispatch_failure_is_a_native_error(self) -> None:
+        """A partial answer must not be closed as a successful length stop."""
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+        calls: list[dict] = []
+
+        class RouterRateLimitError(Exception):
+            status_code = 429
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(kwargs)
+                raise RouterRateLimitError(
+                    "No deployments available for selected model"
+                )
+
+        async def no_sibling_fallback(*_args, **_kwargs):
+            return None
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        previous_fallback = streaming._streaming_error_fallback_response
+        proxy_server.llm_router = StubRouter()
+        streaming._streaming_error_fallback_response = no_sibling_fallback
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+        self.addCleanup(
+            setattr,
+            streaming,
+            "_streaming_error_fallback_response",
+            previous_fallback,
+        )
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "前半句。"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }
+
+        request_data = self._chat_request()
+        chunks = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), request_data
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            "前半句。",
+            "".join(
+                (choice.get("delta") or {}).get("content") or ""
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+            ),
+        )
+        self.assertFalse(
+            any(
+                choice.get("finish_reason") == "length"
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+            )
+        )
+        errors = [chunk["error"] for chunk in chunks if chunk.get("error")]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["code"], "upstream_stream_incomplete")
+
+    async def test_a_midstream_continuation_failure_keeps_text_and_reports_error(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+
+        class StubRouter:
+            async def acompletion(self, **_kwargs):
+                async def stream():
+                    yield {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "续写了一部分。"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                    raise RuntimeError("continuation connection closed")
+
+                return stream()
+
+        async def no_sibling_fallback(*_args, **_kwargs):
+            return None
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        previous_fallback = streaming._streaming_error_fallback_response
+        proxy_server.llm_router = StubRouter()
+        streaming._streaming_error_fallback_response = no_sibling_fallback
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+        self.addCleanup(
+            setattr,
+            streaming,
+            "_streaming_error_fallback_response",
+            previous_fallback,
+        )
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "前半句。"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }
+
+        chunks = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), self._chat_request()
+            )
+        ]
+        text = "".join(
+            (choice.get("delta") or {}).get("content") or ""
+            for chunk in chunks
+            for choice in (chunk.get("choices") or [])
+        )
+        self.assertEqual(text, "前半句。续写了一部分。")
+        self.assertFalse(
+            any(
+                choice.get("finish_reason") == "length"
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+            )
+        )
+        self.assertEqual(
+            [chunk["error"]["code"] for chunk in chunks if chunk.get("error")],
+            ["upstream_stream_incomplete"],
+        )
+
+    async def test_a_continuation_recovery_poll_can_finish_the_answer(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        calls: list[dict] = []
+        poll_calls: list[tuple[dict, Exception]] = []
+
+        class NoDeploymentsError(Exception):
+            status_code = 429
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(kwargs)
+                raise NoDeploymentsError(
+                    "No deployments available for selected model"
+                )
+
+        async def no_sibling_fallback(*_args, **_kwargs):
+            return None
+
+        async def recovered_poll(request_data, exception):
+            poll_calls.append((request_data, exception))
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "恢复完成。"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ]
+            }
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        previous_fallback = streaming._streaming_error_fallback_response
+        previous_poll = streaming._stream_route_recovery_poll
+        proxy_server.llm_router = StubRouter()
+        streaming._streaming_error_fallback_response = no_sibling_fallback
+        streaming._stream_route_recovery_poll = recovered_poll
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+        self.addCleanup(
+            setattr,
+            streaming,
+            "_streaming_error_fallback_response",
+            previous_fallback,
+        )
+        self.addCleanup(
+            setattr,
+            streaming,
+            "_stream_route_recovery_poll",
+            previous_poll,
+        )
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "前半句。"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }
+
+        chunks = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), self._chat_request()
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(poll_calls), 1)
+        self.assertEqual(
+            "前半句。恢复完成。",
+            "".join(
+                (choice.get("delta") or {}).get("content") or ""
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+            ),
+        )
+        self.assertEqual(
+            [
+                choice.get("finish_reason")
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+                if choice.get("finish_reason")
+            ],
+            ["stop"],
+        )
+
+    async def test_an_exhausted_continuation_recovery_poll_reports_error(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+
+        class NoDeploymentsError(Exception):
+            status_code = 429
+
+        class StubRouter:
+            async def acompletion(self, **_kwargs):
+                raise NoDeploymentsError(
+                    "No deployments available for selected model"
+                )
+
+        async def no_sibling_fallback(*_args, **_kwargs):
+            return None
+
+        async def exhausted_poll(_request_data, _exception):
+            if False:
+                yield None
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        previous_fallback = streaming._streaming_error_fallback_response
+        previous_poll = streaming._stream_route_recovery_poll
+        proxy_server.llm_router = StubRouter()
+        streaming._streaming_error_fallback_response = no_sibling_fallback
+        streaming._stream_route_recovery_poll = exhausted_poll
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+        self.addCleanup(
+            setattr,
+            streaming,
+            "_streaming_error_fallback_response",
+            previous_fallback,
+        )
+        self.addCleanup(
+            setattr,
+            streaming,
+            "_stream_route_recovery_poll",
+            previous_poll,
+        )
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "前半句。"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+            }
+
+        chunks = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [], upstream(), self._chat_request()
+            )
+        ]
+
+        self.assertEqual(
+            "前半句。",
+            "".join(
+                (choice.get("delta") or {}).get("content") or ""
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+            ),
+        )
+        self.assertFalse(
+            any(
+                choice.get("finish_reason") == "length"
+                for chunk in chunks
+                for choice in (chunk.get("choices") or [])
+            )
+        )
+        errors = [chunk["error"] for chunk in chunks if chunk.get("error")]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["code"], "upstream_stream_incomplete")
 
     async def test_chat_continues_the_image_answer_but_not_a_partial_tool_call(self) -> None:
         """A text answer can hit the upstream limit even with tools available."""
@@ -4774,16 +5192,7 @@ class HookCoalescedNativeReadTests(HookTestCase):
                 self.assertEqual("message_stop", types[-1])
 
 
-    async def test_a_continuation_that_ran_out_still_ends_the_answer(self) -> None:
-        """Rounds that add text but never reach a stop leave the withheld frame owed.
-
-        The continuation emits the answer's last frame only when it reaches a
-        natural stop.  When every round hits the ceiling again (or a round
-        fails after it started writing), it has yielded text and no terminal --
-        and "it yielded something" was read as "it closed the answer", so the
-        withheld ceiling frame and the stop behind it were never sent: a stream
-        with no end, which a client renders as a reply that hung.
-        """
+    async def test_a_disabled_continuation_restores_the_anthropic_stop(self) -> None:
         _, _proxy_server = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
@@ -4796,38 +5205,27 @@ class HookCoalescedNativeReadTests(HookTestCase):
             b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n'
         )
         stop = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-        more = (
-            b'event: content_block_delta\n'
-            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" and more"}}\n\n'
-        )
-
-        async def rounds_that_never_stop(*_args, **_kwargs):
-            yield more
-
         async def upstream():
             for read in (delta, ceiling, stop):
                 yield read
 
-        with mock.patch.object(
-            continuation_module, "_stream_native_continuation_rounds", rounds_that_never_stop
-        ):
-            delivered = [
-                chunk
-                async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
-                    [],
-                    upstream(),
-                    self._anthropic_request(),
-                    stream_started_at=0.0,
-                )
-            ]
+        self.set_env(continuation_module._MAX_CONTINUATION_ROUNDS_ENV, "0")
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                self._anthropic_request(),
+                stream_started_at=0.0,
+            )
+        ]
         frames = [
             frame for chunk in delivered for frame in streaming._stream_chunk_dumps(chunk)
         ]
         types = [frame.get("type") for frame in frames]
         self.assertEqual(["message_delta", "message_stop"], types[-2:])
         self.assertEqual("max_tokens", frames[-2]["delta"]["stop_reason"])
-        # ...after the text the continuation did add, not instead of it.
-        self.assertIn(" and more", "".join(str(frame) for frame in frames))
+        self.assertEqual(frames[0]["delta"]["text"], "Hi there")
 
     async def test_a_continuation_that_stopped_is_not_closed_twice(self) -> None:
         _, _proxy_server = load_hook_module()

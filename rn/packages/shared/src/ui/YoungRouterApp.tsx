@@ -1,6 +1,6 @@
 import type { TranslationKey } from "../i18n/types";
 import React, { createContext, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { AccessibilityInfo, Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { AccessibilityInfo, Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, codegenNativeCommands, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
@@ -961,7 +961,8 @@ function onlineUsageTimeLabel(option: OnlineUsageTimeOption, translate: Translat
 // from paying for the same station round trip twice; an explicit read (a
 // sign-in that just landed) passes ``force`` and never uses it.
 const RELAY_RESOURCE_REUSE_MS = 15_000;
-const ROUTE_TRACE_REQUEST_ROW_HEIGHT = 70;
+const LOG_SIDEBAR_ROW_HEIGHT = 70;
+const LOG_SIDEBAR_TWO_LINE_ROW_HEIGHT = 52;
 const ROUTE_TRACE_SCROLL_IDLE_MS = 150;
 const ROUTE_TRACE_TIMELINE_MIN_WIDTH = 400;
 const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
@@ -1893,7 +1894,9 @@ function isRevisionRetryableAction(type: string): boolean {
     // The background-launch promise is the same kind of write: an absolute
     // Core preference, never a staged draft.
     || normalized === "service_launch_background_enable"
-    || normalized === "service_launch_background_disable";
+    || normalized === "service_launch_background_disable"
+    || normalized === "service_auto_update_enable"
+    || normalized === "service_auto_update_disable";
 }
 
 function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): UnknownRecord {
@@ -1994,8 +1997,10 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   const [route, setRoute] = useState<AppRoute>(routeRequest ?? "home");
   const [snapshot, setSnapshot] = useState<CoreSnapshot | undefined>(initialSnapshot);
   const [error, setError] = useState<string | undefined>();
+  const [codexPluginMenuState, setCodexPluginMenuState] = useState<UnknownRecord>();
   const [serviceOperationPendingCount, setServiceOperationPendingCount] = useState(0);
   const serviceOperationPending = serviceOperationPendingCount > 0;
+  const autoUpdateEnabled = snapshot?.service.auto_update_enabled;
   const snapshotLanguage = snapshot?.language;
   const translate = useMemo<Translate>(() => !snapshotLanguage || snapshotLanguage === "system" ? hostTranslate : createTranslator(snapshotLanguage), [hostTranslate, snapshotLanguage]);
   const handledNativeActions = useRef(new Set<string>());
@@ -2166,6 +2171,12 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   useEffect(() => {
     if (snapshot) publishSnapshot(snapshot);
   }, [snapshot]);
+
+  useEffect(() => {
+    if (isPrimaryHost && autoUpdateEnabled !== undefined) {
+      native.setAutoUpdateEnabled?.(autoUpdateEnabled);
+    }
+  }, [autoUpdateEnabled, isPrimaryHost, native]);
 
   const runServiceOperation = useCallback((operation: ServiceOperation): Promise<CoreSnapshot | undefined> => {
     if (operation === "stop") serviceShouldBeRunning.current = false;
@@ -2511,18 +2522,28 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       })();
     } else if (action === "toggle-codex-model-catalog" && snapshot) {
       handledNativeActions.current.add(actionKey);
-      const enabled = !booleanValue(codexModelCatalogState(snapshot).enabled);
       void (async () => {
         try {
-          await ipc.dispatch({ domain: "codex", type: "codex.model_catalog.set", payload: { enabled } });
-          receiveSnapshot(await ipc.snapshot());
+          const current = asRecord((await ipc.dispatch({ type: "model_list_plugin", payload: { host: "codex", operation: "status" } })).action_summary);
+          const operation = current.installed !== true ? "install" : current.enabled === true ? "disable" : "enable";
+          const result = await ipc.dispatch({ type: "model_list_plugin", payload: { host: "codex", operation } });
+          setCodexPluginMenuState(asRecord(result.action_summary));
           await recordMenuAction(action);
-        } catch {
-          setError(hostTranslate("error.coreUnavailable"));
+        } catch (reason) {
+          setError(errorMessage(reason, hostTranslate));
         }
       })();
     }
   }, [hostTranslate, ipc, isPrimaryHost, nativeAction, receiveSnapshot, recordMenuAction, runServiceOperation, snapshot]);
+
+  useEffect(() => {
+    if (!isPrimaryHost || Platform.OS !== "macos" || !snapshot) return;
+    let active = true;
+    void ipc.dispatch({ type: "model_list_plugin", payload: { host: "codex", operation: "status" } })
+      .then((result) => { if (active) setCodexPluginMenuState(asRecord(result.action_summary)); })
+      .catch(() => { if (active) setCodexPluginMenuState(undefined); });
+    return () => { active = false; };
+  }, [ipc, isPrimaryHost, snapshot?.revision]);
 
   useEffect(() => {
     if (!isPrimaryHost || !snapshot) return;
@@ -2536,10 +2557,9 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // serializes the two operations on its own transition guard.
     const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown";
     const serviceReloadAvailable = !serviceOperationPending && (serviceState === "running" || serviceState === "unhealthy");
-    const catalog = codexModelCatalogState(snapshot);
     const actions = [
       { id: "toggle-autostart", title: translate("status.autoStart"), enabled: true, checked: snapshot.service.auto_start_state === "enabled" },
-      ...(Platform.OS === "macos" ? [{ id: "toggle-codex-model-catalog", title: translate("status.codexModelCatalog"), enabled: true, checked: booleanValue(catalog.enabled) }] : []),
+      ...(Platform.OS === "macos" ? [{ id: "toggle-codex-model-catalog", title: translate("status.codexModelCatalog"), enabled: codexPluginMenuState?.available === true, checked: codexPluginMenuState?.enabled === true }] : []),
       ...routeMenuActions(translate).filter(({ id }) => id !== "open-data-management" && id !== "open-logs"),
       { id: "webdav-status", title: `${translate("webdav.label")}: ${webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate)}`, enabled: false },
       ...routeMenuActions(translate).filter(({ id }) => id === "open-data-management"),
@@ -2553,7 +2573,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       { id: "quit", title: translate("status.quit"), enabled: true },
     ];
     native.menuBar.setActions(actions);
-  }, [isPrimaryHost, native, serviceOperationPending, snapshot, translate]);
+  }, [codexPluginMenuState, isPrimaryHost, native, serviceOperationPending, snapshot, translate]);
 
   // The native host keeps one window for every settings pane. Capture the
   // route the window was created with so a pane switch can still close that
@@ -4640,7 +4660,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
-    {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeDesktopAvailable={asRecord(claudeState.desktop).available !== false} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")} onToggleClaudeAutoMode={(enabled) => dispatch("claude.auto_mode.set", { enabled }, "claude")} onToggleClaudeAutoMemory={(enabled) => dispatch("claude.auto_memory.set", { enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onApplyClientSettings={applyStagedQuietly} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeDesktopAvailable={asRecord(claudeState.desktop).available !== false} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")} onToggleClaudeAutoMode={(enabled) => dispatch("claude.auto_mode.set", { enabled }, "claude")} onToggleClaudeAutoMemory={(enabled) => dispatch("claude.auto_memory.set", { enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} onStatus={setResult} /> : null}
@@ -11691,16 +11711,102 @@ function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate): Ar
   return [...providers].map(([provider, entry]) => ({ title: provider, labels: entry.labels, selections: entry.selections }));
 }
 
-/**
- * One client's backend, as fields of the shared settings grid.
- *
- * Codex and both Claude apps answer the same question — this app's proxy, or
- * one saved provider route — so the controls are drawn once here instead of
- * once per client.  What differs is only which Core action names the client
- * (the caller closes over that) and whether the client also carries a model
- * list of its own, which is what ``modelList`` decides.
- */
-function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, modelList, modelListHint, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }: {
+type ModelListPluginHost = "codex" | "claude";
+type ModelListPluginOperation = "install" | "uninstall" | "enable" | "disable" | "configure" | "sync";
+type ModelListPluginSource = { base_url: string; metadata_url: string; auth_env: string };
+type ModelListPluginInfo = { state?: UnknownRecord; error?: string };
+
+const MODEL_LIST_SOURCE_FIELDS = [
+  ["base_url", "settings.pluginBaseUrl"],
+  ["metadata_url", "settings.pluginMetadataUrl"],
+  ["auth_env", "settings.pluginAuthEnv"],
+] as const;
+
+function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
+  info?: ModelListPluginInfo;
+  busy: boolean;
+  pending?: ModelListPluginOperation;
+  translate: Translate;
+  onAction: (operation: ModelListPluginOperation, source?: ModelListPluginSource) => Promise<boolean>;
+}): React.JSX.Element {
+  const [source, setSource] = useState<ModelListPluginSource>();
+  const state = info?.state;
+  const installed = state?.installed === true;
+  const enabled = state?.enabled === true;
+  const status = state === undefined
+    ? translate(info?.error ? "settings.pluginStatusFailed" : "common.loading")
+    : translate(state.available === false ? "settings.pluginUnavailable" : installed ? "settings.pluginInstalled" : "settings.pluginNotInstalled");
+  const syncTime = state?.last_sync ? formatActionTimestamp(stringValue(state.last_sync)) : "";
+  const facts = [status, stringValue(state?.version), enabled && syncTime ? translate("settings.pluginLastSync", { time: syncTime }) : ""].filter(Boolean).join(" · ");
+  const error = info?.error || (enabled ? stringValue(state?.last_error) : "") || stringValue(state?.last_update_error);
+  const installAction = installed ? "uninstall" : "install";
+  const openSource = (): void => {
+    const provider = asRecord(state?.configured_provider);
+    setSource({ base_url: stringValue(provider.baseUrl), metadata_url: stringValue(provider.metadataUrl), auth_env: stringValue(provider.authEnv) });
+  };
+  const saveSource = async (): Promise<void> => {
+    if (!source || busy) return;
+    const saved = await onAction("configure", {
+      base_url: source.base_url.trim(), metadata_url: source.metadata_url.trim(), auth_env: source.auth_env.trim(),
+    });
+    if (saved) setSource(undefined);
+  };
+  return <View style={styles.pluginSection}>
+    <SettingsActionRow
+      title={<Text style={SETTINGS_SECTION_TITLE}>{translate("settings.pluginLabel")}</Text>}
+      detail={<Text style={SETTINGS_FIELD_HELP_TEXT}>{facts}</Text>}
+      action={<NativeButton
+        title={installed ? translate("settings.pluginUninstall") : translate("settings.pluginInstall")}
+        disabled={busy || state === undefined || state.available === false}
+        busy={pending === installAction}
+        onPress={() => { void onAction(installAction).then((ok) => { if (ok) setSource(undefined); }); }}
+      />}
+    />
+    {installed && (source === undefined ?
+      <View style={styles.pluginControls}>
+        <View style={SETTINGS_FIELD_ROW}>
+          <Text style={SETTINGS_FIELD_LABEL}>{translate("settings.pluginEnabled")}</Text>
+          <NativeToggle
+            accessibilityLabel={translate("settings.pluginEnabled")}
+            value={enabled}
+            disabled={busy}
+            onValueChange={(next) => onAction(next ? "enable" : "disable")}
+            style={SETTINGS_FIELD_SWITCH_SLOT}
+          />
+        </View>
+        <View style={styles.pluginActions}>
+          <NativeButton title={translate("settings.pluginSync")} disabled={busy || !enabled} busy={pending === "sync"} onPress={() => { void onAction("sync"); }} />
+          <NativeButton title={translate("settings.pluginConfigure")} disabled={busy} onPress={openSource} />
+        </View>
+      </View> :
+      <View style={styles.pluginForm}>
+        <Text style={[SETTINGS_SECTION_TITLE, styles.pluginNote]}>{translate("settings.pluginConfigure")}</Text>
+        <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginSourceHint")}</Text>
+        {MODEL_LIST_SOURCE_FIELDS.map(([field, label]) => <View key={field} style={SETTINGS_FIELD_ROW_INDENTED}>
+          <Text style={SETTINGS_FIELD_LABEL}>{translate(label)}</Text>
+          <View style={SETTINGS_FIELD_CELL_WIDE}>
+            <NativeTextField
+              accessibilityLabel={translate(label)}
+              value={source[field]}
+              editable={!busy}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(text) => setSource((current) => current && { ...current, [field]: text })}
+              style={styles.input}
+            />
+          </View>
+        </View>)}
+        <View style={[styles.pluginActions, styles.pluginFormActions]}>
+          <NativeButton title={translate("status.cancel")} disabled={busy} onPress={() => setSource(undefined)} />
+          <NativeButton title={translate("common.save")} primary disabled={busy} busy={pending === "configure"} onPress={saveSource} />
+        </View>
+      </View>
+    )}
+    {error ? <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote, styles.pluginError]} accessibilityLiveRegion="polite">{error}</Text> : null}
+  </View>;
+}
+
+function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }: {
   /** Disambiguates two clients' identical labels inside one pane. */
   accessibilityPrefix?: string;
   /** The saved routes this app serves, as the designate menu lists them. */
@@ -11711,9 +11817,6 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
   designatedRoute: string;
   /** What the off direction returns to; absent when nothing is remembered. */
   designatedSelection?: UnknownRecord;
-  /** Absent for a client that keeps no model list of its own. */
-  modelList?: { enabled: boolean; onToggle: (enabled: boolean) => void | Promise<unknown> };
-  modelListHint?: string;
   busy: boolean;
   /** States a result the row could not perform where the window's strip reads it. */
   onStatus?: (message?: string) => void;
@@ -11725,7 +11828,6 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
   const savedModelCount = menuGroups.reduce((total, group) => total + group.labels.length, 0);
   const [clientActionBusy, setClientActionBusy] = useState(false);
   const [designateBusy, setDesignateBusy] = useState(false);
-  const [listBusy, setListBusy] = useState(false);
   // A controlled native switch only repaints on a *changed* value prop, so an
   // action that cannot name a saved route re-mounts it onto the configured
   // value instead of drifting from the file.
@@ -11817,20 +11919,6 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
         </View>
       </View>
     </View>
-    {modelList === undefined ? null : <ProxyScopedToggleField
-      label={translate("settings.useRouterModelList")}
-      accessibilityLabel={labelled("settings.useRouterModelList")}
-      value={modelList.enabled}
-      proxyOnly={localApiActive}
-      busy={busy || listBusy}
-      onValueChange={(enabled) => {
-        if (listBusy) return;
-        setListBusy(true);
-        return Promise.resolve(modelList.onToggle(enabled)).finally(() => setListBusy(false));
-      }}
-      hint={modelListHint}
-      translate={translate}
-    />}
   </View>;
 }
 
@@ -11942,7 +12030,7 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
   return <>{files.map(row)}</>;
 }
 
-function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, claudeClients, claudeDesktopAvailable, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeModelList, onToggleClaudeNonstreamFallback, onToggleClaudeAutoMode, onToggleClaudeAutoMemory, translate, ipc, filesToken, onOpenFile, onStatus }: {
+function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexFeature, onApplyClientSettings, onUseLocalApi, onUseSavedModel, claudeClients, claudeDesktopAvailable, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeNonstreamFallback, onToggleClaudeAutoMode, onToggleClaudeAutoMemory, translate, ipc, filesToken, onOpenFile, onStatus }: {
   /** The client the route named, when it named one (`claude-settings`). */
   initialClient?: ClientFile["client"];
   busy: boolean;
@@ -11957,8 +12045,8 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   clientProvider: string;
   clientModel: string;
   localApiActive: boolean;
-  onToggleCodexModelCatalog: (enabled: boolean) => Promise<unknown>;
   onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<unknown>;
+  onApplyClientSettings: () => Promise<void>;
   onUseLocalApi: (selection: UnknownRecord) => Promise<unknown>;
   onUseSavedModel: (selection: UnknownRecord) => Promise<unknown>;
   /** One entry per Claude app: its own switch, route, and model list. */
@@ -11967,7 +12055,6 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   claudeModels: UnknownRecord[];
   onClaudeUseLocalApi: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>;
   onClaudeUseSavedModel: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>;
-  onToggleClaudeModelList: (app: ClaudeClientApp, enabled: boolean) => Promise<unknown>;
   onToggleClaudeNonstreamFallback: (enabled: boolean) => Promise<unknown>;
   onToggleClaudeAutoMode: (enabled: boolean) => Promise<unknown>;
   onToggleClaudeAutoMemory: (enabled: boolean) => Promise<unknown>;
@@ -11981,6 +12068,8 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
 }): React.JSX.Element {
   const [files, setFiles] = useState<ClientFile[]>();
   const [error, setError] = useState<string>();
+  const [pluginInfo, setPluginInfo] = useState<Partial<Record<ModelListPluginHost, ModelListPluginInfo>>>({});
+  const [pluginPending, setPluginPending] = useState<{ host: ModelListPluginHost; operation: ModelListPluginOperation }>();
   // A phone draws the client rail as a strip above the detail it opens; the
   // selection it names is this component's state either way.
   const compactWeb = useCompactWebShell();
@@ -11988,6 +12077,66 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   // The starting entry is the route's own when it named one, so a deep link to
   // the Claude settings shows Claude rather than Codex.
   const [selectedClient, setSelectedClient] = useState<ClientFile["client"]>(initialClient ?? "codex");
+  const pluginHost = selectedClient === "codex" || selectedClient === "claude" ? selectedClient : undefined;
+  const pluginRequest = useCallback(async (host: ModelListPluginHost, operation: ModelListPluginOperation | "status", source?: ModelListPluginSource): Promise<UnknownRecord> => {
+    const result = await ipc.dispatch({ type: "model_list_plugin", payload: { host, operation, ...source } });
+    return asRecord(result.action_summary);
+  }, [ipc]);
+  const setPluginResult = useCallback((host: ModelListPluginHost, info: ModelListPluginInfo) => {
+    setPluginInfo((current) => ({ ...current, [host]: info }));
+  }, []);
+  useEffect(() => {
+    if (!pluginHost) return;
+    let active = true;
+    void pluginRequest(pluginHost, "status").then(
+      (state) => { if (active) setPluginResult(pluginHost, { state }); },
+      (reason: unknown) => { if (active) setPluginResult(pluginHost, { error: errorMessage(reason, translate) }); },
+    );
+    return () => { active = false; };
+  }, [pluginHost, pluginRequest, setPluginResult, translate]);
+  const managePlugin = async (host: ModelListPluginHost, operation: ModelListPluginOperation, source?: ModelListPluginSource): Promise<boolean> => {
+    if (pluginPending) return false;
+    setPluginPending({ host, operation });
+    try {
+      const state = await pluginRequest(host, operation, source);
+      setPluginResult(host, { state });
+      onStatus(translate("common.saved"));
+      return true;
+    } catch (reason) {
+      // Installation may have completed even if a later command failed.
+      const state = await pluginRequest(host, "status").catch(() => undefined);
+      const error = errorMessage(reason, translate);
+      setPluginResult(host, { state, error });
+      onStatus(error);
+      return false;
+    } finally {
+      setPluginPending(undefined);
+    }
+  };
+  const useApiAndOfferPlugin = async (host: ModelListPluginHost, stage: () => Promise<unknown>): Promise<boolean> => {
+    const success = await stage();
+    if (success === false) return false;
+    try {
+      // The plugin discovers its source from the saved client files. Finish
+      // the API change before letting the install write to those same files.
+      await onApplyClientSettings();
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+      return false;
+    }
+    try {
+      const state = await pluginRequest(host, "status");
+      setPluginResult(host, { state });
+      if (state.available === true && state.installed !== true && await native.showConfirmation({
+        title: translate("settings.pluginInstallTitle"),
+        message: translate("settings.pluginInstallPrompt"),
+        confirmLabel: translate("settings.pluginInstall"),
+      })) await managePlugin(host, "install");
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+    }
+    return true;
+  };
   useEffect(() => { if (initialClient) setSelectedClient(initialClient); }, [initialClient]);
   useEffect(() => {
     let active = true;
@@ -12022,19 +12171,6 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   // Finder on macOS, Explorer on Windows: the label names the platform's own
   // file manager, and the host only ever opens it at the listed path.
   const revealFileLabel = translate(Platform.OS === "windows" ? "settings.revealInExplorer" : "settings.revealInFinder");
-  // Codex's own model list is one Core switch, not a document edit: checked
-  // installs this app's public model list as Codex's own catalog, unchecked
-  // drops the managed pointer so the client falls back to its built-in list.
-  // Core owns the value and the switch only guards the request while it is in
-  // flight.
-  const [catalogBusy, setCatalogBusy] = useState(false);
-  // The answer is the switch's own: a control holds the value it was given
-  // until the write answers, so the request's promise travels back to it.
-  const toggleCatalog = (enabled: boolean): Promise<unknown> | void => {
-    if (catalogBusy) return;
-    setCatalogBusy(true);
-    return onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));
-  };
   const claudeCode = asRecord(claudeClients.claudeCode);
   const claudeDesktop = asRecord(claudeClients.claudeDesktop);
   // One Claude, two apps on one settings document.  Core generates the picker
@@ -12053,8 +12189,9 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   const forEveryClaudeApp = async (
     action: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>,
     selection: UnknownRecord,
-  ): Promise<void> => {
-    for (const { app } of claudeApps) await action(app, selection);
+  ): Promise<boolean> => {
+    for (const { app } of claudeApps) if (await action(app, selection) === false) return false;
+    return true;
   };
   // Absent, not empty: the pane reads a remembered route as "off returns here,
   // silently" and its absence as "off has to ask", so an empty record would
@@ -12062,7 +12199,6 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   // Codex opens.  Both apps remember their own; the pair answers once.
   const claudeDesignated = (claudeCode.designated_route ?? claudeDesktop.designated_route) as UnknownRecord | undefined;
   const claudeRoute = claudeDesignated ? asRecord(claudeDesignated) : undefined;
-  const claudeModelListEnabled = booleanValue(claudeCode.model_list_enabled);
   // A file this app generates only stays the user's while its own switch is
   // off: with the switch on, Core rewrites that file whenever the list it came
   // from changes, so an edit needs one explicit confirmation first.
@@ -12098,6 +12234,14 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   const codexFeatureRows = featureKeys
     .filter((feature) => !codexHandedOverSurfaces.has(feature))
     .sort();
+  const pluginCard = pluginHost ? <ModelListPluginFields
+    key={pluginHost}
+    info={pluginInfo[pluginHost]}
+    busy={pluginPending !== undefined}
+    pending={pluginPending?.host === pluginHost ? pluginPending.operation : undefined}
+    translate={translate}
+    onAction={(operation, source) => managePlugin(pluginHost, operation, source)}
+  /> : null;
   return <View style={[SETTINGS_RAIL_BODY, compactWeb && styles.compactRailBody]}>
     <SettingsRail
       rows={railRows}
@@ -12111,12 +12255,6 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
         hint={translate(selectedGroup.hintKey)}
       />
       <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_BODY} horizontal={false} showsVerticalScrollIndicator>
-        {/* A client's controls are fields of the same grid the runtime pane's
-            settings use — one left-aligned label column, one control column,
-            and the tip wrapped underneath that column — so both detail panes
-            read as one surface.  Codex and Claude draw the same three fields
-            from one component: "use this app's API" plus the saved route it
-            returns to, and the model list Core generates for that client. */}
         {selectedClient === "codex" ? <>
           <ClientBackendFields
             models={codexModels}
@@ -12124,16 +12262,14 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
             localApiActive={localApiActive}
             designatedRoute={localApiActive ? "" : codexRouteLabel}
             designatedSelection={codexRoute}
-            modelList={{ enabled: codexModelCatalogEnabled, onToggle: toggleCatalog }}
-            modelListHint={translate("codex.modelCatalogHint")}
             busy={busy}
             onStatus={onStatus}
-            onUseLocalApi={onUseLocalApi}
+            onUseLocalApi={(selection) => useApiAndOfferPlugin("codex", () => onUseLocalApi(selection))}
             onUseSavedModel={onUseSavedModel}
             translate={translate}
           />
-          {/* The opt-in aims Codex at this proxy's own ``/alpha/search``, so it
-              is a proxy-only switch beside the proxy-only model list. */}
+          {pluginCard}
+          {/* The opt-in aims Codex at this proxy's own ``/alpha/search``. */}
           <ProxyScopedToggleField
             label={translate("codex.standaloneSearch")}
             accessibilityLabel={translate("codex.standaloneSearch")}
@@ -12184,21 +12320,20 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
         {selectedClient === "claude" && error === undefined && files === undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text>
           : null}
-        {selectedClient === "claude" && files !== undefined ? <>
-          <ClientBackendFields
+        {selectedClient === "claude" && files !== undefined ? <ClientBackendFields
             models={claudeModels}
             native={native}
             localApiActive={claudeLocalApiActive}
             designatedRoute={claudeLocalApiActive || !claudeRoute ? "" : clientRouteLabel(stringValue(claudeRoute.provider), stringValue(claudeRoute.model))}
             designatedSelection={claudeRoute}
-            modelList={{ enabled: claudeModelListEnabled, onToggle: (enabled) => onToggleClaudeModelList("claudeCode", enabled) }}
-            modelListHint={translate("claude.modelListHint")}
             busy={busy}
             onStatus={onStatus}
-            onUseLocalApi={(selection) => forEveryClaudeApp(onClaudeUseLocalApi, selection)}
+            onUseLocalApi={(selection) => useApiAndOfferPlugin("claude", () => forEveryClaudeApp(onClaudeUseLocalApi, selection))}
             onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}
             translate={translate}
-          />
+          /> : null}
+        {selectedClient === "claude" ? pluginCard : null}
+        {selectedClient === "claude" && files !== undefined ? <>
           <ClientToggleField
             label={translate("claude.nonstreamFallback")}
             accessibilityLabel={translate("claude.nonstreamFallback")}
@@ -12293,6 +12428,8 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
   const [requestedBackground, setRequestedBackground] = useState<boolean>();
   const [backgroundBusy, setBackgroundBusy] = useState(false);
+  const [requestedAutoUpdate, setRequestedAutoUpdate] = useState<boolean>();
+  const autoUpdateEnabled = snapshot?.service.auto_update_enabled;
   const autoStartEnabled = snapshot?.service.auto_start_state === "enabled";
   // The switch shows Core's stored preference, plus the value the user just
   // requested until Core confirms it. A rejected dispatch must not leave the
@@ -12581,6 +12718,20 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       setBackgroundBusy(false);
     }
   };
+  const setAutoUpdate = async (enabled: boolean): Promise<void> => {
+    if (autoUpdateEnabled === undefined || requestedAutoUpdate !== undefined) return;
+    setRequestedAutoUpdate(enabled);
+    onStatus(undefined);
+    try {
+      await dispatchServiceAction(enabled ? "service.auto_update_enable" : "service.auto_update_disable");
+      onSnapshot(await ipc.snapshot());
+      onStatus(translate("common.saved"));
+    } catch (reason: unknown) {
+      onStatus(errorMessage(reason, translate));
+    } finally {
+      setRequestedAutoUpdate(undefined);
+    }
+  };
   return <PersistentScrollView style={styles.generalScroll} contentContainerStyle={SETTINGS_SECTION_LIST}>
     <View style={SETTINGS_SECTION}>
       <Text style={SETTINGS_SECTION_TITLE}>{translate("general.interface")}</Text>
@@ -12617,6 +12768,14 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
             </View>
           </View>
         </View>
+        {native.setAutoUpdateEnabled ? <ClientToggleField
+          label={translate("general.autoUpdate")}
+          accessibilityLabel={translate("general.autoUpdate")}
+          hint={translate("general.autoUpdateHint")}
+          value={requestedAutoUpdate ?? autoUpdateEnabled ?? false}
+          busy={busy || autoUpdateEnabled === undefined || requestedAutoUpdate !== undefined}
+          onValueChange={setAutoUpdate}
+        /> : null}
       </View>
     </View>
     <View style={SETTINGS_SECTION}>
@@ -13948,7 +14107,18 @@ function logClockText(parsed: Date): string {
   return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
 }
 
-function shortLogTimestamp(value: unknown): string {
+function compactLogClockText(parsed: Date, compactOn?: Date): string {
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  const date = `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}`;
+  const time = `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+  const seconds = pad(parsed.getSeconds());
+  // The task rail has room for two short stamps. Today's runs retain seconds
+  // because some tasks run more than once a minute.
+  if (compactOn) return parsed.toDateString() === compactOn.toDateString() ? `${time}:${seconds}` : `${date} ${time}`;
+  return logClockText(parsed);
+}
+
+function shortLogTimestamp(value: unknown, compactOn?: Date): string {
   const raw = stringValue(value);
   if (!raw) return "";
   const numeric = Number(raw);
@@ -13960,7 +14130,7 @@ function shortLogTimestamp(value: unknown): string {
       parsed.getUTCDate() === 1 && parsed.getUTCHours() < 3) {
     return "";
   }
-  return logClockText(parsed);
+  return compactOn ? compactLogClockText(parsed, compactOn) : logClockText(parsed);
 }
 
 function compactLogValue(value: unknown): string {
@@ -14226,6 +14396,7 @@ const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
   "upstream-client-version-rejected": "logs.routeTrace.reasonClientVersion",
   "upstream-model-unpriced": "logs.routeTrace.reasonModelUnpriced",
   "upstream-model-not-found": "logs.routeTrace.reasonModelNotFound",
+  "upstream-model-unavailable": "logs.routeTrace.reasonModelUnavailable",
   "thinking-tool-choice-refused": "logs.routeTrace.reasonThinkingToolChoice",
   "upstream-tool-history-rejected": "logs.routeTrace.reasonToolHistory",
   "encrypted-replay-refused": "logs.routeTrace.reasonEncryptedReplay",
@@ -14301,16 +14472,24 @@ function requestStatusLabel(value: string, translate: Translate, record?: Record
   if (!key) return value;
   const status = translate(key);
   if (!record) return status;
-  let reason = "";
+  const details = [status];
   if (key === "logs.aborted") {
-    reason = requestAbortedDetail(record.aborted, translate, "");
+    details.push(requestAbortedDetail(record.aborted, translate, ""));
   } else if (key === "logs.failed" || key === "logs.stuck") {
     const error = asRecord(record.error);
     const reasonCode = compactLogValue(error.reason);
     const httpStatus = compactLogValue(error.status_code);
-    reason = requestErrorReasonLabel(reasonCode === "other" ? "" : reasonCode, translate, httpStatus ? `HTTP ${httpStatus}` : "");
+    details.push(requestErrorReasonLabel(reasonCode === "other" ? "" : reasonCode, translate, httpStatus ? `HTTP ${httpStatus}` : ""));
   }
-  return reason ? `${status} · ${reason}` : status;
+  if (record.internal_attempt === "head_hedge") {
+    details.push(translate("logs.siblingDispatch"));
+  } else if (record.dispatch_mode === "fallback") {
+    details.push(translate("logs.fallbackSending"));
+  } else if (record.dispatch_mode === "recovery") {
+    details.push(translate("logs.recoverySending"));
+  }
+  if (record.parallel_attempt_active === true) details.push(translate("logs.siblingSending"));
+  return details.filter(Boolean).join(" · ");
 }
 
 function logLevelLabel(value: string, translate: Translate): string {
@@ -14472,6 +14651,7 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
     local_gateway_auth: "logs.recoveryReason.localGatewayAuth",
     timeout: "logs.recoveryReason.timeout",
     upstream_channel_refused: "logs.recoveryReason.stationChannelRefused",
+    upstream_model_unavailable: "logs.routeTrace.reasonModelUnavailable",
     unknown: "logs.recoveryReason.unknown",
   };
   return value.split(" · ").map((part) => {
@@ -14890,12 +15070,6 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const cacheWriteTokens = compactLogValue(usage.cache_write_tokens ?? value.cache_write_tokens);
   const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens, cacheWriteTokens);
   const details: string[] = [];
-  if (tab === "requests" && compactLogValue(value.internal_attempt) === "head_hedge") {
-    // A sibling dispatch is a second route asked in parallel by the same turn;
-    // the row is real (it may answer, or lose to another route), so it says
-    // which kind of attempt it was instead of borrowing the turn's words.
-    details.push(translate("logs.siblingDispatch"));
-  }
   const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
   if (abortedDetail) details.push(abortedDetail);
   const directDetail = value.error === undefined
@@ -14906,7 +15080,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
       ? routeTraceDetailLabel(directDetail, translate)
       : tab === "recovery" ? recoveryDetailLabel(directDetail, translate) : directDetail,
   );
-  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "client_surface", "upstream_surface", "stream", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments", "internal_attempt"]);
+  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "client_surface", "upstream_surface", "stream", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments", "internal_attempt", "dispatch_mode", "hedge_parent", "parallel_attempt_active"]);
   for (const [key, item] of Object.entries(value)) {
     if (used.has(key)) continue;
     const display = compactLogValue(item);
@@ -15466,8 +15640,147 @@ function routeTraceAttemptIcon(state: RouteTraceAttempt["state"]): string {
   return "•";
 }
 
-function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelect }: { requests: RouteTraceRequest[]; selectedKey: string; native: NativeLeafAdapter; translate: Translate; onSelect: (key: string) => void }): React.JSX.Element {
+type LogListKey = {
+  key?: string;
+  altKey?: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  shiftKey?: boolean;
+};
+type LogListKeyboardEvent = LogListKey & { nativeEvent?: LogListKey; preventDefault: () => void };
+
+const LOG_LIST_KEYS = ["ArrowUp", "ArrowDown", "Home", "End"] as const;
+const LOG_LIST_NATIVE_KEYS = Platform.OS === "windows"
+  ? LOG_LIST_KEYS.map((code) => ({ code, handledEventPhase: 3 }))
+  : LOG_LIST_KEYS.map((key) => ({ key }));
+const logListViewCommands = codegenNativeCommands<{ focus: (view: HostInstance) => void }>({ supportedCommands: ["focus"] });
+
+// Keep focus on the list surface so a virtualized row can leave the rendered
+// window (or a new run can arrive) without dropping keyboard navigation.
+function useLogListKeyboard(selectedKey: string | undefined, getKeys: () => string[], onSelect: (key: string) => void, reveal: (index: number) => void) {
+  const ref = useRef<View>(null);
+  const cursor = useRef(selectedKey);
+  useEffect(() => { cursor.current = selectedKey; }, [selectedKey]);
+  const select = (key: string): void => {
+    cursor.current = key;
+    onSelect(key);
+  };
+  const selectFromClick = (key: string): void => {
+    select(key);
+    const view = ref.current;
+    if (!view) return;
+    // HostInstance.focus() is gated by React Native's imperative-focus flag;
+    // dispatch RCTView's focus command directly so keyboard navigation works
+    // on every native host.
+    if (Platform.OS === "web") view.focus();
+    else logListViewCommands.focus(view);
+  };
+  const onKeyDown = (event: LogListKeyboardEvent): void => {
+    const { key, altKey, ctrlKey, metaKey, shiftKey } = event.nativeEvent ?? event;
+    if (altKey || ctrlKey || metaKey || shiftKey || !LOG_LIST_KEYS.some((name) => name === key)) return;
+    const keys = getKeys();
+    if (!keys.length) return;
+    event.preventDefault();
+    const current = keys.indexOf(cursor.current ?? "");
+    const next = key === "Home" ? 0 : key === "End" ? keys.length - 1 : current < 0 ? 0
+      : Math.max(0, Math.min(keys.length - 1, current + (key === "ArrowDown" ? 1 : -1)));
+    if (next === current) return;
+    select(keys[next]);
+    reveal(next);
+  };
+  const keyboardProps = Platform.OS === "web"
+    ? { onKeyDown, tabIndex: 0 as const }
+    : { onKeyDown, focusable: true, keyDownEvents: LOG_LIST_NATIVE_KEYS, enableFocusRing: Platform.OS === "macos" ? false : undefined };
+  return { ref, keyboardProps, select, selectFromClick };
+}
+
+function useLogListScroll() {
+  const viewport = useRef(0);
+  const offset = useRef(0);
+  return {
+    onLayout: ({ nativeEvent }: Parameters<NonNullable<ScrollViewProps["onLayout"]>>[0]) => { viewport.current = nativeEvent.layout.height; },
+    onScroll: ({ nativeEvent }: Parameters<NonNullable<ScrollViewProps["onScroll"]>>[0]) => { offset.current = nativeEvent.contentOffset.y; },
+    reveal: (top: number, height: number, scroll: (y: number) => void): void => {
+      if (viewport.current <= 0) return;
+      const y = top < offset.current ? top : Math.max(offset.current, top + height - viewport.current);
+      if (y === offset.current) return;
+      offset.current = y;
+      scroll(y);
+    },
+  };
+}
+
+function LogSidebar<Item>({ data, keyExtractor, describe, selectedKey, onSelect, onScroll, rowHeight = LOG_SIDEBAR_ROW_HEIGHT }: {
+  data: Item[];
+  keyExtractor: (item: Item) => string;
+  describe: (item: Item) => { title: string; meta?: string; detail: string; status?: string; statusStyle?: TextStyle };
+  selectedKey?: string;
+  onSelect: (key: string) => void;
+  onScroll?: () => void;
+  rowHeight?: number;
+}): React.JSX.Element {
   const [appActive, setAppActive] = useState(() => AppState.currentState === "active");
+  const listRef = useRef<FlatList<Item>>(null);
+  const scroll = useLogListScroll();
+  const keyboard = useLogListKeyboard(selectedKey, () => data.map(keyExtractor), onSelect, (index) => {
+    scroll.reveal(index * rowHeight, rowHeight, (offset) => listRef.current?.scrollToOffset({ offset, animated: false }));
+  });
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => setAppActive(state === "active"));
+    return () => subscription.remove();
+  }, []);
+  return <View ref={keyboard.ref} style={styles.logSidebar} collapsable={false} {...keyboard.keyboardProps}>
+    <FlatList
+      ref={listRef}
+      style={styles.logSidebarScroll}
+      contentContainerStyle={styles.logSidebarContent}
+      data={data}
+      keyExtractor={keyExtractor}
+      initialNumToRender={12}
+      maxToRenderPerBatch={12}
+      windowSize={7}
+      getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}
+      removeClippedSubviews={false}
+      onLayout={scroll.onLayout}
+      onScrollBeginDrag={onScroll}
+      onMomentumScrollBegin={onScroll}
+      onScroll={(event) => { scroll.onScroll(event); onScroll?.(); }}
+      scrollEventThrottle={16}
+      alwaysBounceHorizontal={false}
+      showsHorizontalScrollIndicator={false}
+      showsVerticalScrollIndicator
+      renderItem={({ item }) => {
+        const key = keyExtractor(item);
+        const isSelected = key === selectedKey;
+        const selectedTextStyle = isSelected && appActive ? styles.logSidebarSelectedText : null;
+        const { title, meta, detail, status, statusStyle } = describe(item);
+        return <Pressable
+          style={({ pressed }) => [
+            styles.logSidebarRow,
+            { height: rowHeight },
+            !isSelected && pressed && styles.logSidebarRowPressed,
+            isSelected && (appActive ? styles.logSidebarRowSelected : styles.logSidebarRowSelectedInactive),
+          ]}
+          onPress={() => keyboard.selectFromClick(key)}
+          onFocus={() => keyboard.select(key)}
+          accessibilityRole="button"
+          accessibilityLabel={[title, meta, detail, status].filter(Boolean).join(" · ")}
+          accessibilityState={{ selected: isSelected }}
+          aria-selected={isSelected}
+        >
+          <View style={styles.logSidebarHeading}>
+            <Text numberOfLines={1} style={[styles.logSidebarTitle, selectedTextStyle]}>{title}</Text>
+            {meta ? <Text style={[styles.logSidebarMeta, selectedTextStyle]}>{meta}</Text> : null}
+          </View>
+          <Text numberOfLines={1} style={[styles.logSidebarDetail, selectedTextStyle]}>{detail}</Text>
+          {status ? <Text style={[styles.logSidebarStatus, statusStyle, selectedTextStyle]}>{status}</Text> : null}
+        </Pressable>;
+      }}
+    />
+  </View>;
+}
+
+function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelect }: { requests: RouteTraceRequest[]; selectedKey: string; native: NativeLeafAdapter; translate: Translate; onSelect: (key: string) => void }): React.JSX.Element {
   const [visibleRequests, setVisibleRequests] = useState(requests);
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
   const [timelineContentWidth, setTimelineContentWidth] = useState(0);
@@ -15487,10 +15800,6 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
   const timelineScrollbarThumbOffset = timelineMaximumHorizontalOffset > 0
     ? timelineScrollbarTravel * Math.max(0, Math.min(1, timelineHorizontalOffset / timelineMaximumHorizontalOffset))
     : 0;
-  useEffect(() => {
-    const subscription = AppState.addEventListener("change", (state) => setAppActive(state === "active"));
-    return () => subscription.remove();
-  }, []);
   const deferLiveRequestRefresh = useCallback((): void => {
     scrolling.current = true;
     if (scrollIdleTimer.current !== undefined) clearTimeout(scrollIdleTimer.current);
@@ -15530,56 +15839,20 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
     });
   };
   return <View style={styles.routeTraceWorkspace}>
-    <View style={styles.routeTraceRequestPane}>
-      <FlatList
-        style={styles.routeTraceRequestScroll}
-        contentContainerStyle={styles.routeTraceRequestList}
-        data={visibleRequests}
-        keyExtractor={(request) => request.key}
-        initialNumToRender={12}
-        maxToRenderPerBatch={12}
-        windowSize={7}
-        getItemLayout={(_data, index) => ({
-          length: ROUTE_TRACE_REQUEST_ROW_HEIGHT,
-          offset: ROUTE_TRACE_REQUEST_ROW_HEIGHT * index,
-          index,
-        })}
-        removeClippedSubviews={false}
-        onScrollBeginDrag={deferLiveRequestRefresh}
-        onMomentumScrollBegin={deferLiveRequestRefresh}
-        onScroll={deferLiveRequestRefresh}
-        scrollEventThrottle={16}
-        renderItem={({ item: request }) => {
-          const isSelected = selected?.key === request.key;
-          const selectedTextStyle = isSelected && appActive ? styles.routeTraceRequestTextSelected : null;
-          const requestDescription = [request.model, request.time, request.routePath, routeTraceOutcomeLabel(request.outcome, translate, request.attempts.length)].filter(Boolean).join(" · ");
-          return <Pressable
-            key={request.key}
-            style={({ pressed }) => [
-              styles.routeTraceRequestRow,
-              !isSelected && pressed && styles.routeTraceRequestRowPressed,
-              isSelected && (appActive ? styles.routeTraceRequestRowSelected : styles.routeTraceRequestRowSelectedInactive),
-            ]}
-            onPress={() => onSelect(request.key)}
-            onFocus={() => onSelect(request.key)}
-            focusable
-            accessibilityRole="button"
-            accessibilityLabel={requestDescription}
-            accessibilityState={{ selected: isSelected }}
-          >
-            <View style={styles.routeTraceRequestHeading}>
-              <Text numberOfLines={1} style={[styles.routeTraceRequestModel, selectedTextStyle]}>{request.model || translate("common.notAvailable")}</Text>
-              <Text style={[styles.routeTraceRequestTime, selectedTextStyle]}>{request.time || translate("common.notAvailable")}</Text>
-            </View>
-            <Text numberOfLines={1} style={[styles.routeTraceRequestPath, selectedTextStyle]}>{request.routePath || translate("logs.routeTrace.noRoute")}</Text>
-            <Text style={[styles.routeTraceOutcome, request.outcome === "failed" ? styles.routeTraceOutcomeFailed : request.outcome === "fallback" ? styles.routeTraceOutcomeFallback : styles.routeTraceOutcomeDirect, selectedTextStyle]}>{routeTraceOutcomeLabel(request.outcome, translate, request.attempts.length)}</Text>
-          </Pressable>;
-        }}
-        alwaysBounceHorizontal={false}
-        showsHorizontalScrollIndicator={false}
-        showsVerticalScrollIndicator
-      />
-    </View>
+    <LogSidebar
+      data={visibleRequests}
+      keyExtractor={(request) => request.key}
+      selectedKey={selected?.key}
+      onSelect={onSelect}
+      onScroll={deferLiveRequestRefresh}
+      describe={(request) => ({
+        title: request.model || translate("common.notAvailable"),
+        meta: request.time || translate("common.notAvailable"),
+        detail: request.routePath || translate("logs.routeTrace.noRoute"),
+        status: routeTraceOutcomeLabel(request.outcome, translate, request.attempts.length),
+        statusStyle: request.outcome === "failed" ? styles.logStatusFailed : request.outcome === "fallback" ? styles.logStatusWarning : undefined,
+      })}
+    />
     <View style={styles.routeTraceDetailPane}>
       {selected ? <>
         <View style={styles.routeTraceDetailHeader}>
@@ -15670,16 +15943,140 @@ function taskIntervalText(seconds: number | null, translate: Translate): string 
   return translate("tasks.intervalSeconds", { count: seconds });
 }
 
-function TaskFact({ label, value, outcome }: { label: string; value: string; outcome?: ScheduledTaskRecord["history"][number]["outcome"] }): React.JSX.Element {
-  return <View>
+const SCHEDULED_TASK_COUNTS = ["succeeded", "failed", "skipped"] as const;
+
+function taskScheduleText(task: ScheduledTaskRecord, today: Date, translate: Translate): string {
+  const missing = translate("common.notAvailable");
+  return translate("tasks.scheduleTimes", {
+    last: shortLogTimestamp(task.history[0]?.started_at, today) || missing,
+    next: shortLogTimestamp(task.next_run_at, today) || missing,
+  });
+}
+
+function taskStateStyle(state?: ScheduledTaskRecord["state"]): TextStyle | undefined {
+  return state === "running" ? styles.scheduledTaskRunning : state === "blocked" ? styles.logStatusWarning : undefined;
+}
+
+function TaskFact({ label, value, state }: { label: string; value: string; state?: ScheduledTaskRecord["state"] }): React.JSX.Element {
+  return <View style={styles.scheduledTaskFact}>
     <Text style={styles.scheduledTaskLabel}>{label}</Text>
-    <Text style={[styles.routeTraceDetailMeta, outcome === "failed" && styles.routeTraceOutcomeFailed, outcome === "partial" && styles.routeTraceOutcomeFallback]}>{value}</Text>
+    <Text style={[styles.scheduledTaskValue, taskStateStyle(state)]}>{value}</Text>
   </View>;
 }
 
-function ScheduledTasksWorkspace({ log, loadFailed, translate, selectedKey, onSelect }: {
+function scheduledTaskRunRaw(task: ScheduledTaskRecord, run: ScheduledTaskRecord["history"][number], translate: Translate): UnknownRecord {
+  const failureNotRecorded = !run.detail && !run.issues?.length
+    && (run.outcome === "failed" || (run.outcome === "partial" && run.failed !== 0));
+  return {
+    task: {
+      id: task.id,
+      name: translate(`tasks.name.${task.id}`),
+    },
+    execution: failureNotRecorded
+      ? { ...run, detail: { note: translate("tasks.failureNotRecorded") } }
+      : run,
+  };
+}
+
+function ScheduledTaskHistory({ task, native, translate }: { task: ScheduledTaskRecord; native: NativeLeafAdapter; translate: Translate }): React.JSX.Element {
+  const { history } = task;
+  const [selectedKey, setSelectedKey] = useState<string>();
+  const lastPress = useRef<{ key: string; at: number } | undefined>(undefined);
+  const scrollRef = useRef<ScrollView>(null);
+  const rowLayouts = useRef(new Map<string, { y: number; height: number }>());
+  const scroll = useLogListScroll();
+  const title = translate("tasks.history");
+  const showCounts = history.some((run) => SCHEDULED_TASK_COUNTS.some((key) => run[key] !== undefined));
+  const runEntries = useMemo(() => {
+    const occurrences = new Map<string, number>();
+    return history.map((run) => {
+      const identity = `${run.started_at}/${run.finished_at}`;
+      const occurrence = occurrences.get(identity) ?? 0;
+      occurrences.set(identity, occurrence + 1);
+      return { run, key: `${identity}/${occurrence}` };
+    });
+  }, [history]);
+  const keyboard = useLogListKeyboard(selectedKey, () => runEntries.map((entry) => entry.key), setSelectedKey, (index) => {
+    lastPress.current = undefined;
+    const row = rowLayouts.current.get(runEntries[index].key);
+    if (row) scroll.reveal(row.y, row.height, (y) => scrollRef.current?.scrollTo({ y, animated: false }));
+  });
+  useEffect(() => {
+    const keys = new Set(runEntries.map((entry) => entry.key));
+    for (const key of rowLayouts.current.keys()) {
+      if (!keys.has(key)) rowLayouts.current.delete(key);
+    }
+  }, [runEntries]);
+  const openRun = (run: ScheduledTaskRecord["history"][number]): void => {
+    void native.showReadOnlyText({
+      title: translate("logs.originalRecord"),
+      text: JSON.stringify(scheduledTaskRunRaw(task, run, translate), null, 2),
+      closeLabel: translate("status.close"),
+      language: "json",
+      html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
+    });
+  };
+  const pressRun = (run: ScheduledTaskRecord["history"][number], key: string): void => {
+    keyboard.selectFromClick(key);
+    const now = Date.now();
+    if (lastPress.current?.key === key && now - lastPress.current.at < 360) {
+      lastPress.current = undefined;
+      openRun(run);
+    } else {
+      lastPress.current = { key, at: now };
+    }
+  };
+  return <>
+    <Text accessibilityRole="header" style={styles.scheduledTaskHistoryTitle}>{title}</Text>
+    {history.length === 0 ? <Text style={styles.scheduledTaskNoHistory}>{translate("tasks.noHistory")}</Text> : <View ref={keyboard.ref} role="table" accessibilityLabel={title} style={styles.scheduledTaskHistory} collapsable={false} {...keyboard.keyboardProps}>
+      <View role="row" style={[styles.scheduledTaskRun, styles.scheduledTaskColumnHeader]}>
+        <Text role="columnheader" style={[styles.scheduledTaskLabel, styles.scheduledTaskTimeColumn]}>{translate("tasks.startedAt")}</Text>
+        <Text role="columnheader" style={[styles.scheduledTaskLabel, styles.scheduledTaskTimeColumn]}>{translate("tasks.finishedAt")}</Text>
+        <Text role="columnheader" style={[styles.scheduledTaskLabel, styles.scheduledTaskResultColumn]}>{translate("tasks.outcome")}</Text>
+        {showCounts ? <Text role="columnheader" style={[styles.scheduledTaskLabel, styles.scheduledTaskCountsColumn]}>{translate("tasks.runCounts")}</Text> : null}
+      </View>
+      <PersistentScrollView ref={scrollRef} style={styles.scheduledTaskHistory} showsVerticalScrollIndicator onLayout={scroll.onLayout} onScroll={scroll.onScroll} scrollEventThrottle={16}>
+        {runEntries.map(({ run, key }) => {
+          const counts = SCHEDULED_TASK_COUNTS.flatMap((key) => {
+            const count = run[key];
+            return count === undefined ? [] : [translate(`tasks.total.${key}`, { count })];
+          });
+          const isSelected = key === selectedKey;
+          const selectedTextStyle = isSelected ? styles.logSidebarSelectedText : null;
+          return <View
+            key={key}
+            onLayout={({ nativeEvent }) => { rowLayouts.current.set(key, nativeEvent.layout); }}
+            role="row"
+            accessible
+            accessibilityState={{ selected: isSelected }}
+            aria-selected={isSelected}
+            accessibilityLabel={[shortLogTimestamp(run.started_at), shortLogTimestamp(run.finished_at), translate(`tasks.outcome.${run.outcome}`), ...counts].join(" · ")}
+            accessibilityActions={[{ name: "activate", label: translate("logs.originalRecord") }]}
+            onAccessibilityAction={({ nativeEvent }) => {
+              if (nativeEvent.actionName === "activate") {
+                keyboard.select(key);
+                openRun(run);
+              }
+            }}
+            onStartShouldSetResponder={() => true}
+            onResponderRelease={() => pressRun(run, key)}
+            style={[styles.scheduledTaskRun, isSelected && styles.logSidebarRowSelected]}
+          >
+            <Text role="cell" style={[styles.scheduledTaskValue, styles.scheduledTaskTimeColumn, selectedTextStyle]}>{shortLogTimestamp(run.started_at)}</Text>
+            <Text role="cell" style={[styles.scheduledTaskValue, styles.scheduledTaskTimeColumn, selectedTextStyle]}>{shortLogTimestamp(run.finished_at)}</Text>
+            <Text role="cell" style={[styles.scheduledTaskValue, styles.scheduledTaskResultColumn, run.outcome === "failed" && styles.logStatusFailed, run.outcome === "partial" && styles.logStatusWarning, run.outcome === "skipped" && styles.scheduledTaskSecondary, selectedTextStyle]}>{translate(`tasks.outcome.${run.outcome}`)}</Text>
+            {showCounts ? <Text role="cell" style={[styles.scheduledTaskValue, styles.scheduledTaskCountsColumn, styles.scheduledTaskSecondary, selectedTextStyle]}>{counts.join(" · ") || translate("common.notAvailable")}</Text> : null}
+          </View>;
+        })}
+      </PersistentScrollView>
+    </View>}
+  </>;
+}
+
+function ScheduledTasksWorkspace({ log, loadFailed, native, translate, selectedKey, onSelect }: {
   log?: LogView;
   loadFailed: boolean;
+  native: NativeLeafAdapter;
   translate: Translate;
   selectedKey: string;
   onSelect: (id: string) => void;
@@ -15692,46 +16089,31 @@ function ScheduledTasksWorkspace({ log, loadFailed, translate, selectedKey, onSe
     const message = log ? "tasks.empty" : loadFailed ? "tasks.loadFailed" : "tasks.loading";
     return <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{translate(message)}</Text></View>;
   }
-  const name = translate(`tasks.name.${selected.id}`);
+  const today = new Date();
   return <View style={styles.routeTraceWorkspace}>
-    <View style={styles.scheduledTaskList}>
-      <NativeTable
-        columns={[{ label: "", width: 210 }]}
-        rows={tasks.map((task) => ({ key: task.id, cells: [translate(`tasks.name.${task.id}`)] }))}
-        selectedKey={selected.id}
-        onSelectionChange={onSelect}
-        sourceList
-        style={styles.logTable}
-      />
-    </View>
+    <LogSidebar
+      data={tasks}
+      keyExtractor={(task) => task.id}
+      selectedKey={selected.id}
+      onSelect={onSelect}
+      rowHeight={LOG_SIDEBAR_TWO_LINE_ROW_HEIGHT}
+      describe={(task) => ({
+        title: translate(`tasks.name.${task.id}`),
+        detail: taskScheduleText(task, today, translate),
+      })}
+    />
     <View style={styles.routeTraceDetailPane}>
       <View style={styles.scheduledTaskHeader}>
-        <Text accessibilityRole="header" style={styles.routeTraceDetailTitle}>{name}</Text>
+        <Text accessibilityRole="header" style={styles.scheduledTaskTitle}>{translate(`tasks.name.${selected.id}`)}</Text>
         <View style={styles.scheduledTaskFacts}>
-          <TaskFact label={translate("tasks.status")} value={translate(`tasks.state.${selected.state}`)} />
+          <TaskFact label={translate("tasks.status")} value={translate(`tasks.state.${selected.state}`)} state={selected.state} />
           <TaskFact label={translate("tasks.interval")} value={taskIntervalText(selected.interval_seconds, translate)} />
           {selected.running_since
             ? <TaskFact label={translate("tasks.runningSince")} value={shortLogTimestamp(selected.running_since)} />
             : <TaskFact label={translate("tasks.nextRun")} value={shortLogTimestamp(selected.next_run_at) || translate("common.notAvailable")} />}
         </View>
       </View>
-      <Text accessibilityRole="header" style={styles.scheduledTaskHistoryTitle}>{translate("tasks.history")}</Text>
-      <PersistentScrollView key={selected.id} style={styles.scheduledTaskHistory} showsVerticalScrollIndicator>
-        {selected.history.length === 0 ? <Text style={styles.scheduledTaskNoHistory}>{translate("tasks.noHistory")}</Text> : selected.history.map((run) => {
-          const counts = (["succeeded", "failed", "skipped"] as const).flatMap((outcome) => {
-            const count = run[outcome];
-            return count === undefined ? [] : [translate(`tasks.total.${outcome}`, { count })];
-          });
-          return <View key={`${run.started_at}:${run.finished_at}`} style={styles.scheduledTaskRun}>
-            <View style={styles.scheduledTaskFacts}>
-              <TaskFact label={translate("tasks.startedAt")} value={shortLogTimestamp(run.started_at)} />
-              <TaskFact label={translate("tasks.finishedAt")} value={shortLogTimestamp(run.finished_at)} />
-              <TaskFact label={translate("tasks.outcome")} value={translate(`tasks.outcome.${run.outcome}`)} outcome={run.outcome} />
-            </View>
-            {counts.length > 0 ? <Text style={styles.scheduledTaskLabel}>{counts.join(" · ")}</Text> : null}
-          </View>;
-        })}
-      </PersistentScrollView>
+      <ScheduledTaskHistory key={selected.id} task={selected} native={native} translate={translate} />
     </View>
   </View>;
 }
@@ -16510,7 +16892,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       <Text numberOfLines={1} style={styles.logRangeError} accessibilityLiveRegion="polite">{onlineUsageRangeError}</Text>
       {onlineUsageRangeError === translate("logs.onlineUsageRangeInvalid") ? <Text numberOfLines={1} style={styles.logRangeErrorHint}>{translate("logs.onlineUsageRangeHint")}</Text> : null}
     </View> : null}
-    {selected === "scheduled-tasks" ? <ScheduledTasksWorkspace log={active} loadFailed={loadFailed} translate={translate} selectedKey={selectedKey} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} /> : rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
+    {selected === "scheduled-tasks" ? <ScheduledTasksWorkspace log={active} loadFailed={loadFailed} native={native} translate={translate} selectedKey={selectedKey} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} /> : rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
       : <View style={styles.logTablesLayout} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onEndReached={selected === "requests" && active?.has_older ? loadOlder : undefined} onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         if (onlineUsageWaitingForSource || onlineUsageTimePending) return;
@@ -17773,30 +18155,37 @@ const assistantFileSurfaceStyles = StyleSheet.create({
 
 const styles = StyleSheet.create({
   routeTraceWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
-  scheduledTaskList: { width: "33%", minWidth: 160, maxWidth: 224, minHeight: 0 },
-  scheduledTaskHeader: { gap: 6, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
-  scheduledTaskFacts: { flexDirection: "row", flexWrap: "wrap", columnGap: 16, rowGap: 4 },
+  scheduledTaskHeader: { gap: 10, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
+  scheduledTaskTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" },
+  scheduledTaskFacts: { flexDirection: "row", gap: 8 },
+  scheduledTaskFact: { flex: 1, minWidth: 0, gap: 2 },
   scheduledTaskLabel: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  scheduledTaskHistoryTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600", paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  scheduledTaskValue: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontVariant: ["tabular-nums"] },
+  scheduledTaskRunning: { color: systemColors.blue },
+  scheduledTaskSecondary: { color: systemColors.secondaryLabel },
+  scheduledTaskHistoryTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600", paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 10 },
   scheduledTaskHistory: { flex: 1, minHeight: 0 },
-  scheduledTaskRun: { gap: 4, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  scheduledTaskRun: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  scheduledTaskColumnHeader: { backgroundColor: systemColors.window, borderTopWidth: 1, borderTopColor: systemColors.separator },
+  scheduledTaskTimeColumn: { flex: 1.5, minWidth: 0 },
+  scheduledTaskResultColumn: { flex: 1, minWidth: 0 },
+  scheduledTaskCountsColumn: { flex: 2.2, minWidth: 0 },
   scheduledTaskNoHistory: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, padding: SETTINGS_PANE_INSET },
-  routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
-  routeTraceRequestScroll: { flex: 1, minHeight: 0 },
-  routeTraceRequestList: { flexGrow: 1 },
-  routeTraceRequestRow: { height: ROUTE_TRACE_REQUEST_ROW_HEIGHT, paddingHorizontal: 9, paddingVertical: 8, gap: 3, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
-  routeTraceRequestRowPressed: { backgroundColor: systemColors.separator },
-  routeTraceRequestRowSelected: { backgroundColor: systemColors.selectedContent, borderBottomColor: systemColors.selectedContent },
-  routeTraceRequestRowSelectedInactive: { backgroundColor: systemColors.unemphasizedSelectedContent, borderBottomColor: systemColors.unemphasizedSelectedContent },
-  routeTraceRequestTextSelected: { color: systemColors.selectedControlText },
-  routeTraceRequestHeading: { flexDirection: "row", alignItems: "center", gap: 8 },
-  routeTraceRequestModel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
-  routeTraceRequestTime: { flexShrink: 0, color: systemColors.label, fontSize: UI_TIP_FONT_SIZE },
-  routeTraceRequestPath: { color: systemColors.label, fontSize: UI_FONT_SIZE },
-  routeTraceOutcome: { alignSelf: "flex-start", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  routeTraceOutcomeDirect: { color: systemColors.label },
-  routeTraceOutcomeFallback: { color: systemColors.brown },
-  routeTraceOutcomeFailed: { color: systemColors.red },
+  logSidebar: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
+  logSidebarScroll: { flex: 1, minHeight: 0 },
+  logSidebarContent: { flexGrow: 1 },
+  logSidebarRow: { paddingHorizontal: 9, paddingVertical: 8, gap: 3, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  logSidebarRowPressed: { backgroundColor: systemColors.separator },
+  logSidebarRowSelected: { backgroundColor: systemColors.selectedContent, borderBottomColor: systemColors.selectedContent },
+  logSidebarRowSelectedInactive: { backgroundColor: systemColors.unemphasizedSelectedContent, borderBottomColor: systemColors.unemphasizedSelectedContent },
+  logSidebarSelectedText: { color: systemColors.selectedControlText },
+  logSidebarHeading: { flexDirection: "row", alignItems: "center", gap: 8 },
+  logSidebarTitle: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  logSidebarMeta: { flexShrink: 0, color: systemColors.label, fontSize: UI_TIP_FONT_SIZE },
+  logSidebarDetail: { color: systemColors.label, fontSize: UI_FONT_SIZE },
+  logSidebarStatus: { color: systemColors.label, alignSelf: "flex-start", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  logStatusWarning: { color: systemColors.brown },
+  logStatusFailed: { color: systemColors.red },
   routeTraceDetailPane: { flex: 1, minWidth: 0, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceDetailHeader: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
   routeTraceDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 },
@@ -17924,6 +18313,13 @@ const styles = StyleSheet.create({
   compactDetailBackText: { color: systemColors.link, fontSize: UI_FONT_SIZE },
   compactDetailTitle: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitleBlock: { flex: 1, minWidth: 0 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  pluginSection: { ...SETTINGS_SECTION, paddingRight: SETTINGS_FIELD_LEAD, paddingVertical: SETTINGS_FIELD_GAP, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control },
+  pluginControls: { ...SETTINGS_FIELD_ROW_INDENTED, flexWrap: "wrap", justifyContent: "space-between" },
+  pluginActions: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: SETTINGS_FIELD_GAP },
+  pluginForm: { ...SETTINGS_FIELD, gap: SETTINGS_FIELD_GAP },
+  pluginFormActions: { justifyContent: "flex-end" },
+  pluginNote: { marginLeft: SETTINGS_FIELD_LEAD },
+  pluginError: { color: systemColors.red },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   // 常规 spreads the same field grid as 运行时, 外部 and WebDAV: one field is a

@@ -890,6 +890,36 @@ class CoreOperationsTests(unittest.TestCase):
 
             self.assertTrue(override.is_file())
 
+    def test_auto_update_preference_defaults_on_and_round_trips(self) -> None:
+        """Stable desktop builds update unless the General switch disables it."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            with mock.patch.object(controller, "_health", return_value=False):
+                self.assertTrue(controller.status()["auto_update_enabled"])
+                self.assertFalse(controller.paths.auto_update_disabled.exists())
+                self.assertFalse(controller.dispatch("auto_update_disable")["auto_update_enabled"])
+                self.assertTrue(controller.paths.auto_update_disabled.is_file())
+                self.assertFalse(controller.status()["auto_update_enabled"])
+                self.assertTrue(controller.dispatch("auto_update_enable")["auto_update_enabled"])
+                self.assertFalse(controller.paths.auto_update_disabled.exists())
+                self.assertTrue(controller.dispatch("auto_update_enable")["auto_update_enabled"])
+
+    def test_default_core_dispatches_auto_update_preference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            core = CoreStore.with_default_domains(runtime_root=directory, config_path=config)
+            controller = CoreServiceController(directory)
+
+            self.assertTrue(core.snapshot()["service"]["auto_update_enabled"])
+            core.dispatch({"type": "service.auto_update_disable"})
+            self.assertFalse(core.snapshot()["service"]["auto_update_enabled"])
+            self.assertFalse(controller.status()["auto_update_enabled"])
+            core.dispatch({"type": "service.auto_update_enable"})
+            self.assertTrue(core.snapshot()["service"]["auto_update_enabled"])
+            self.assertTrue(controller.status()["auto_update_enabled"])
+
     def test_snapshot_status_reuses_recent_probe_but_health_forces_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
@@ -2217,10 +2247,15 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
                 "young_router.webdav.operations.pull_bundle"
             ) as pulled:
-                outcome = core.run_automatic_webdav_sync()
+                core.webdav_scheduler()._run()
 
             # The loop is told what happened, so it can stop asking.
-            self.assertEqual("webdav_sync_conflict", outcome)
+            task = next(row for row in core.log_view("scheduled-tasks")["log"]["records"] if row["id"] == "webdav-sync")
+            run = task["history"][0]
+            self.assertEqual("failed", run["outcome"])
+            self.assertEqual("webdav_sync_conflict", run["detail"]["code"])
+            self.assertIn("both ends changed the same content", run["detail"]["message"])
+            self.assertTrue(run["detail"]["blocked"])
             pushed.assert_not_called()
             pulled.assert_not_called()
             self.assertEqual(original, config.read_text(encoding="utf-8"))

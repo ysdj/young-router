@@ -1,7 +1,9 @@
 #import <Cocoa/Cocoa.h>
 #import <fcntl.h>
+#import <string.h>
 #import <sys/file.h>
 #import <unistd.h>
+#import "YoungRouter-Swift.h"
 
 // Keep this descriptor open for the entire process lifetime.  flock locks are
 // released by the kernel when the process exits, including after a crash.
@@ -89,6 +91,14 @@ static NSRunningApplication *YoungRouterExistingInstance(void) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
+    if (argc == 4 && strcmp(argv[1], "--install-stable-update") == 0) {
+      NSString *updateID = [NSString stringWithUTF8String:argv[2]];
+      NSString *parentPID = [NSString stringWithUTF8String:argv[3]];
+      if (updateID == nil || parentPID == nil) {
+        return EXIT_FAILURE;
+      }
+      return [YoungRouterUpdateHelper installWithID:updateID parentPID:parentPID];
+    }
     // Check every Young Router bundle before AppKit starts. Launch Services'
     // bundle-identifier rule alone is insufficient for older preview/debug
     // copies that used a different identifier.

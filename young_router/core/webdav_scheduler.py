@@ -21,7 +21,8 @@ import time
 from math import isfinite, log2
 from typing import Any, Callable, Mapping
 
-from .scheduled_tasks import WEBDAV_SYNC, ScheduledTasks
+from .protocol import is_error_code
+from .scheduled_tasks import WEBDAV_SYNC, ScheduledTasks, TaskFacts, task_exception_detail
 
 INITIAL_DELAY_SECONDS = 120.0
 """Grace period before a machine that has never synced runs its first one."""
@@ -266,14 +267,22 @@ class WebDAVSyncScheduler:
         self._due_since = None
         if self._tasks is not None:
             self._tasks.begin(WEBDAV_SYNC)
+        detail: TaskFacts = {"phase": "sync"}
         try:
             outcome = self._sync()
         except Exception as exc:
-            outcome = str(getattr(exc, "code", "") or "webdav_sync_failed")
+            code = getattr(exc, "code", None)
+            outcome = code if is_error_code(code) else "webdav_sync_failed"
+            detail = task_exception_detail(exc, phase="sync")
         self._observe(outcome)
         if self._tasks is not None:
-            result = "skipped" if outcome == UNSAVED_CODE else "failed" if self._blocked or self._failures else "succeeded"
-            self._tasks.finish(WEBDAV_SYNC, result)
+            code = outcome if is_error_code(outcome) else "ok"
+            result = "skipped" if code == UNSAVED_CODE else "succeeded" if code == "ok" else "failed"
+            self._tasks.finish(
+                WEBDAV_SYNC,
+                result,
+                detail={**detail, "code": code, "blocked": self._blocked, "consecutive_failures": self._failures},
+            )
 
     def _observe(self, outcome: object) -> None:
         """Turn one run's answer into how long the loop waits next.
