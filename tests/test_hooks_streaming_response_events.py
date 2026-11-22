@@ -3100,6 +3100,94 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
         self.assertNotIn("response.failed", types)
 
+    async def test_a_raw_reasoning_item_before_max_messages_is_retried(self) -> None:
+        """An item-only reasoning stream is output, even without summary text.
+
+        A few OpenAI-compatible relays emit ``response.reasoning_item`` and
+        raw reasoning frames while the request asks for no public summary.  A
+        following ``max_messages`` terminal is still the route's generated
+        item cap; it must take the same in-turn fallback as a public summary
+        delta instead of being remembered as an oversized replay.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        routing = importlib.import_module("young_router.proxy.routing")
+        routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
+        self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
+        calls: list = []
+
+        def raw_reasoning_then_capped():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cut"}}
+                yield {
+                    "type": "response.reasoning_item.added",
+                    "output_index": 0,
+                    "item": {"id": "rs_1", "type": "reasoning", "status": "in_progress"},
+                }
+                yield {
+                    "type": "response.reasoning_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "delta": "private reasoning",
+                }
+                yield {
+                    "type": "response.reasoning_item.done",
+                    "output_index": 0,
+                    "item": {"id": "rs_1", "type": "reasoning", "status": "incomplete"},
+                }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cut",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"id": "rs_1", "type": "reasoning", "status": "incomplete"}],
+                    },
+                }
+
+            return stream()
+
+        def answered():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return answered()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+            "reasoning": {"summary": "none"},
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-raw-reasoning-cap",
+            "client_metadata": {"thread_id": "thread-raw-reasoning-cap"},
+            "model_info": {"id": "order-0", "order": 0, "route_key": "provider / default-chat / key=primary"},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=raw_reasoning_then_capped(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(1, len(calls))
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
+
     async def test_a_heavy_cut_is_answered_by_repairing_the_request_not_the_route(
         self,
     ) -> None:

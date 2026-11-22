@@ -3229,6 +3229,40 @@ def _incomplete_terminal_capped_generated_output(
     return False
 
 
+def _responses_stream_chunk_has_generated_output(chunk: Any) -> bool:
+    """Whether a Responses frame proves the route generated an output item.
+
+    Some OpenAI-compatible relays emit reasoning as output-item lifecycle
+    events (or raw reasoning deltas) without a public summary delta.  Those
+    frames are still output from this response.  If the next frame is an
+    ``response.incomplete``/``max_messages`` terminal, treating the request as
+    an oversized replay causes the fallback path to shorten history instead of
+    continuing the current turn on another route.
+    """
+
+    dumped = _stream_chunk_dump(chunk)
+    if not isinstance(dumped, dict):
+        return False
+    chunk_type = _stream_chunk_type(dumped)
+    if chunk_type in {
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.reasoning_item.added",
+        "response.reasoning_item.done",
+    }:
+        return isinstance(dumped.get("item"), dict)
+    if chunk_type.startswith("response.reasoning_"):
+        delta = dumped.get("delta")
+        return isinstance(delta, str) and bool(delta.strip())
+    if chunk_type != "response.incomplete":
+        return False
+    response = dumped.get("response")
+    output = response.get("output") if isinstance(response, dict) else None
+    return isinstance(output, list) and any(
+        isinstance(item, dict) and bool(item.get("type")) for item in output
+    )
+
+
 def _mark_generated_output_item_cap(
     exception: Exception,
     terminal_chunk: Any,
@@ -7460,6 +7494,7 @@ async def _yield_guarded_original_stream(
     # states no outcome at all, so the empty-completion check below reads this
     # flag rather than the delivered-output one, whose thinking would waive it.
     answer_output_seen = False
+    generated_output_seen = False
     seen_output_item_ids: set[str] = set()
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]] = {}
     completed_output_items: dict[int, dict[str, Any]] = {}
@@ -7560,11 +7595,15 @@ async def _yield_guarded_original_stream(
         return name
 
     def remember(chunk: Any) -> None:
-        nonlocal saw_image_generation_activity
+        nonlocal generated_output_seen, saw_image_generation_activity
         event_tail.append(chunk)
         if len(event_tail) > _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS:
             del event_tail[0]
         completion_state.remember(chunk)
+        generated_output_seen = (
+            generated_output_seen
+            or _responses_stream_chunk_has_generated_output(chunk)
+        )
         saw_image_generation_activity = (
             saw_image_generation_activity
             or _image_generation_module._response_has_image_generation_activity(chunk)
@@ -8030,11 +8069,17 @@ async def _yield_guarded_original_stream(
                     yield completed
                     await _close_async_iterator_safely(response)
                     return
-            if visible_output_seen:
+            generated_output = bool(
+                visible_output_seen
+                or generated_output_seen
+                or _responses_stream_chunk_has_generated_output(chunk)
+            )
+            if generated_output:
                 failure = _responses_incomplete_stream_exception(
                     "terminal response event before response.completed",
                     buffer=event_tail,
                     request_data=request_data,
+                    delivered_output=generated_output,
                 )
                 if (
                     not answer_output_seen
@@ -8056,6 +8101,7 @@ async def _yield_guarded_original_stream(
                 "terminal response event before response.completed",
                 buffer=event_tail,
                 request_data=request_data,
+                delivered_output=generated_output,
             )
         undeclared_name = undeclared_tool_call_name(chunk)
         if undeclared_name is not None:
@@ -8857,6 +8903,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
     saw_responses_completed = False
     saw_visible_output = False
     saw_delivered_output = False
+    generated_output_seen = False
     stream_exhausted = True
     empty_completion_ended_stream = False
     stream_started_at = time.monotonic()
@@ -8935,6 +8982,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
             buffer.append(chunk)
             if is_responses_stream:
                 completion_state.remember(chunk)
+                generated_output_seen = (
+                    generated_output_seen
+                    or _responses_stream_chunk_has_generated_output(chunk)
+                )
             saw_visible_output = saw_visible_output or (
                 _stream_chunk_has_visible_output(chunk)
             )
@@ -8977,21 +9028,27 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         _responses_incomplete_terminal_reason(chunk)
                         in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
                     )
+                    generated_output = bool(
+                        saw_visible_output
+                        or saw_delivered_output
+                        or generated_output_seen
+                        or _responses_stream_chunk_has_generated_output(chunk)
+                    )
                     incomplete_exception = _responses_incomplete_stream_exception(
                         "terminal response event before response.completed",
                         buffer=buffer,
                         request_data=request_data,
-                        delivered_output=bool(saw_visible_output or saw_delivered_output),
+                        delivered_output=generated_output,
                     )
                     _mark_generated_output_item_cap(
                         incomplete_exception,
                         chunk,
-                        delivered=bool(saw_visible_output or saw_delivered_output),
+                        delivered=generated_output,
                     )
                     _mark_generated_output_item_cap(
                         incomplete_exception,
                         chunk,
-                        delivered=bool(saw_visible_output or saw_delivered_output),
+                        delivered=generated_output,
                     )
                     if output_limit_terminal:
                         _trace_module._request_route_trace(
