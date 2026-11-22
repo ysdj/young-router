@@ -1735,10 +1735,10 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_stage_runtime_config"), mock.patch.object(
                 controller, "_runtime_env", return_value={"LITELLM_PORT": "12390", "LITELLM_HEALTH_WAIT_SECONDS": "1"}
             ), mock.patch.dict(
-                "os.environ", {"YOUNG_ROUTER_HOST_PROFILE": "gateway", "LITELLM_PORT": "4401"}
+                "os.environ", {"YOUNG_ROUTER_HOST_PROFILE": "gateway", "LITELLM_PORT": "4401", "YOUNG_ROUTER_PROXY_BIND": "0.0.0.0"}
             ), mock.patch.object(
                 controller, "_port_available", return_value=True
-            ), mock.patch.object(controller, "_first_free_port") as stepped, mock.patch.object(
+            ) as preflight, mock.patch.object(controller, "_first_free_port") as stepped, mock.patch.object(
                 controller, "_write_owner_record"
             ), mock.patch.object(
                 controller, "_health", return_value=True
@@ -1748,6 +1748,9 @@ class CoreOperationsTests(unittest.TestCase):
                 controller.start()
             stepped.assert_not_called()
             command = popen.call_args[0][0]
+            address = "127.0.0.1" if os.name == "nt" else "0.0.0.0"
+            preflight.assert_called_once_with(4401, address)
+            self.assertEqual(address, command[command.index("--host") + 1])
             self.assertEqual("4401", command[command.index("--port") + 1])
             self.assertEqual("4401", popen.call_args[1]["env"]["LITELLM_PORT"])
 

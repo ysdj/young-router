@@ -1159,21 +1159,21 @@ class CoreServiceController:
         return None
 
     @staticmethod
-    def _port_available(port: int) -> bool:
+    def _port_available(port: int, address: str) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                probe.bind(("127.0.0.1", port))
+                probe.bind((address, port))
             except OSError:
                 return False
         return True
 
-    def _first_free_port(self, start: int) -> int:
+    def _first_free_port(self, start: int, address: str) -> int:
         """Step forward from the configured port until one can be bound."""
 
         candidate = start
         while candidate <= 65535:
-            if self._port_available(candidate):
+            if self._port_available(candidate, address):
                 return candidate
             candidate += 1
         return start
@@ -1626,6 +1626,9 @@ class CoreServiceController:
             current = self.status(force=True)
         if current["state"] == "unhealthy":
             raise RuntimeError("A managed LiteLLM service is already active")
+        from . import host_profile
+
+        proxy_bind = host_profile.proxy_bind()
         self._stage_runtime_config()
         self.reset_transient_routing_state()
         self.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1648,10 +1651,8 @@ class CoreServiceController:
         # a health probe, so landing on the next free one answers every client
         # with 502 while every status line still says "running".  There an
         # occupied port is the failure, stated before the child is spawned.
-        from . import host_profile as _host_profile
-
         configured_port = self._configured_port(environment)
-        stated_port = _host_profile.stated_port()
+        stated_port = host_profile.stated_port()
         listen_fd = self._inherited_gateway_socket()
         if listen_fd is not None:
             # The descriptor names the port; stepping forward from an occupied
@@ -1668,13 +1669,13 @@ class CoreServiceController:
             # nothing was listening on.
             port = stated_port if stated_port is not None else configured_port
         elif stated_port is not None:
-            if not self._port_available(stated_port):
+            if not self._port_available(stated_port, proxy_bind):
                 raise RuntimeError(
                     "The port this host publishes is occupied: %d" % stated_port
                 )
             port = stated_port
         else:
-            port = self._first_free_port(configured_port)
+            port = self._first_free_port(configured_port, proxy_bind)
         environment["LITELLM_PORT"] = str(port)
         if listen_fd is not None:
             # The child serves the descriptor systemd owns instead of binding a
@@ -1713,7 +1714,7 @@ class CoreServiceController:
                 "--config",
                 str(self.paths.runtime_config),
                 "--host",
-                "127.0.0.1",
+                proxy_bind,
                 "--port",
                 str(port),
                 "--workers",
@@ -1725,7 +1726,7 @@ class CoreServiceController:
                 "--config",
                 str(self.paths.runtime_config),
                 "--host",
-                "127.0.0.1",
+                proxy_bind,
                 "--port",
                 str(port),
                 "--num_workers",

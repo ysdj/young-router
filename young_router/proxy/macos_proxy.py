@@ -82,7 +82,7 @@ def _positive_workers(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the managed POSIX LiteLLM proxy")
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--host", choices=("127.0.0.1",), default="127.0.0.1")
+    parser.add_argument("--host", choices=("127.0.0.1", "0.0.0.0"), default="127.0.0.1")
     parser.add_argument("--port", required=True, type=_bounded_port)
     parser.add_argument("--workers", required=True, type=_positive_workers)
     return parser

@@ -19,6 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MacOSProxyLauncherTests(unittest.TestCase):
+    def test_parser_accepts_container_bind_address(self) -> None:
+        arguments = macos_proxy.build_parser().parse_args(
+            ["--config", "/runtime/config.yaml", "--host", "0.0.0.0", "--port", "12390", "--workers", "2"]
+        )
+        self.assertEqual("0.0.0.0", arguments.host)
+
     def test_worker_config_preserves_config_only_cli_behavior(self) -> None:
         config = macos_proxy._worker_config(Path("/private/runtime/config.yaml"))
 
@@ -36,9 +42,11 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         ), mock.patch.object(
             macos_proxy.urllib.request,
             "getproxies_macosx_sysconf",
+            create=True,
         ) as get_system_proxies, mock.patch.object(
             macos_proxy.urllib.request,
             "_get_proxy_settings",
+            create=True,
         ) as get_system_settings:
             snapshot = macos_proxy._system_proxy_snapshot()
 
@@ -53,7 +61,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         get_system_settings.assert_not_called()
 
     def test_system_proxy_snapshot_caches_macos_settings_before_fork(self) -> None:
-        with mock.patch.object(
+        with mock.patch.object(macos_proxy.sys, "platform", "darwin"), mock.patch.object(
             macos_proxy.urllib.request,
             "getproxies_environment",
             return_value={},
@@ -61,10 +69,12 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             macos_proxy.urllib.request,
             "getproxies_macosx_sysconf",
             return_value={"https": "http://system-proxy.example:8080"},
+            create=True,
         ), mock.patch.object(
             macos_proxy.urllib.request,
             "_get_proxy_settings",
             return_value={"exclude_simple": True, "exceptions": ["*.example.test"]},
+            create=True,
         ):
             snapshot = macos_proxy._system_proxy_snapshot()
 
@@ -97,6 +107,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         ), mock.patch.object(
             macos_proxy.urllib.request,
             "getproxies_macosx_sysconf",
+            create=True,
         ) as get_system_proxies:
             snapshot = macos_proxy._system_proxy_snapshot()
 

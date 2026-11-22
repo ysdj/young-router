@@ -45,6 +45,24 @@ Also included: route-trace HTML reports, online usage, and optional WebDAV confi
 
 Requirements: macOS 14+ (prebuilt Cask: Apple silicon); Windows via source build.
 
+Linux servers can run the published container image with Docker Engine and
+Compose. The image includes the same Core, proxy, WebUI, and headless Chromium
+host; it keeps configuration and runtime state in `/data` and publishes one
+local port for both `/ui` and `/v1`:
+
+```bash
+docker compose up -d
+docker compose exec young-router python -m young_router.container api-key
+docker compose exec young-router python -m young_router.container web-password
+```
+
+Open `http://127.0.0.1:12390/ui/`, use the printed Web password, and configure
+providers in the page. Put the printed API key in clients using
+`http://127.0.0.1:12390/v1`. Set `YOUNG_ROUTER_PORT` or
+`YOUNG_ROUTER_IMAGE` in the Compose environment when the host port or image tag
+needs to differ. A server deployment should put TLS and any public reverse
+proxy in front of this local port.
+
 ```bash
 brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
 ```
@@ -154,6 +172,21 @@ MIT License. See [LICENSE](./LICENSE).
 ## 安装
 
 系统要求：macOS 14+（预构建 Cask 为 Apple silicon）；Windows 需从源码构建。
+
+Linux 服务器可使用 Docker Engine 与 Compose 运行发布镜像。镜像包含同一套
+Core、代理、WebUI 和无界面 Chromium；配置与运行状态保存在 `/data`，`/ui` 与
+`/v1` 共用一个本地端口：
+
+```bash
+docker compose up -d
+docker compose exec young-router python -m young_router.container api-key
+docker compose exec young-router python -m young_router.container web-password
+```
+
+打开 `http://127.0.0.1:12390/ui/`，输入显示的 Web 密码，在页面中配置供应商；客户端
+使用显示的 API key 和 `http://127.0.0.1:12390/v1`。需要更换主机端口或镜像标签时，设置
+Compose 环境中的 `YOUNG_ROUTER_PORT` 或 `YOUNG_ROUTER_IMAGE`。服务端应在这个本地端口前配置
+TLS 与公开反向代理。
 
 ```bash
 brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router

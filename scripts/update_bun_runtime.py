@@ -70,6 +70,8 @@ def _platform_package() -> tuple[str, str]:
         return f"@oven/bun-darwin-{architecture}", "bun"
     if system == "windows" and machine in {"arm64", "aarch64", "amd64", "x86_64"}:
         return f"@oven/bun-windows-{architecture}", "bun.exe"
+    if system == "linux" and machine in {"arm64", "aarch64", "amd64", "x86_64"}:
+        return f"@oven/bun-linux-{architecture}", "bun"
     raise UpdateError(f"The Bun runtime is not staged for {platform.system()} {machine}")
 
 

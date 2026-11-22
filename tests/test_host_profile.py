@@ -12,6 +12,7 @@ document, because that is what the proxy loads.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import textwrap
 import unittest
@@ -69,6 +70,18 @@ def _document(**overrides: object) -> dict[str, object]:
 
 
 class HostProfileProjectionTests(unittest.TestCase):
+    def test_proxy_listens_on_all_interfaces_only_when_a_gateway_requests_it(self) -> None:
+        with mock.patch.dict("os.environ", {host_profile.PROXY_BIND_ENV: "0.0.0.0"}, clear=True):
+            self.assertEqual("127.0.0.1", host_profile.proxy_bind())
+        with mock.patch.dict("os.environ", {host_profile.PROFILE_ENV: "gateway"}, clear=True):
+            self.assertEqual("127.0.0.1", host_profile.proxy_bind())
+
+    @unittest.skipIf(os.name == "nt", "the container uses the POSIX launcher")
+    def test_an_unsupported_gateway_address_is_reported(self) -> None:
+        with mock.patch.dict("os.environ", {host_profile.PROFILE_ENV: "gateway", host_profile.PROXY_BIND_ENV: "typo"}):
+            with self.assertRaisesRegex(ValueError, host_profile.PROXY_BIND_ENV):
+                host_profile.proxy_bind()
+
     def test_a_loopback_provider_is_somebody_elses_port(self) -> None:
         projected = host_profile.document(_document(), "sk-host")
         self.assertEqual({"worker", "remote"}, set(projected["providers"]))

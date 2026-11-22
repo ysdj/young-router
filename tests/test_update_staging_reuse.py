@@ -688,6 +688,8 @@ class BunRuntimeStagingTests(unittest.TestCase):
             ("Darwin", "x86_64", ("@oven/bun-darwin-x64", "bun")),
             ("Windows", "AMD64", ("@oven/bun-windows-x64", "bun.exe")),
             ("Windows", "ARM64", ("@oven/bun-windows-aarch64", "bun.exe")),
+            ("Linux", "x86_64", ("@oven/bun-linux-x64", "bun")),
+            ("Linux", "aarch64", ("@oven/bun-linux-aarch64", "bun")),
         ):
             with mock.patch.object(bun_runtime.platform, "system", return_value=system), \
                  mock.patch.object(bun_runtime.platform, "machine", return_value=machine):
@@ -695,7 +697,7 @@ class BunRuntimeStagingTests(unittest.TestCase):
 
     def test_an_unsupported_host_is_refused_rather_than_guessed_at(self) -> None:
         with mock.patch.object(bun_runtime.platform, "system", return_value="Linux"), \
-             mock.patch.object(bun_runtime.platform, "machine", return_value="x86_64"):
+             mock.patch.object(bun_runtime.platform, "machine", return_value="riscv64"):
             with self.assertRaises(update_common.UpdateError):
                 bun_runtime._platform_package()
 

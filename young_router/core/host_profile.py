@@ -51,6 +51,9 @@ PROXY_KEY_ENV = "YOUNG_ROUTER_HOST_PROXY_KEY_FILE"
 #: one deployment state it differently: a unit file names ``LV_PORT`` for the
 #: launcher it starts, and the launcher hands the proxy ``LITELLM_PORT``.
 PORT_ENVS = ("LITELLM_PORT", "LV_PORT")
+PROXY_BIND_ENV = "YOUNG_ROUTER_PROXY_BIND"
+DEFAULT_PROXY_BIND = "127.0.0.1"
+PROXY_BIND_ADDRESSES = frozenset({DEFAULT_PROXY_BIND, "0.0.0.0"})
 
 #: The router's own hook is the data plane, not a desktop convenience.
 HOOK_CALLBACK = "young_router.callbacks.image_generation_routing_hook"
@@ -99,6 +102,24 @@ def stated_port() -> int | None:
         if 1 <= port <= 65535:
             return port
     return None
+
+
+def proxy_bind() -> str:
+    """The managed proxy's bind address, restricted to an explicit gateway.
+
+    Desktop hosts keep the proxy private to this machine. A gateway may opt in
+    to the container/network interface, and invalid values fail before the
+    service starts rather than widening its listener unexpectedly.
+    """
+
+    if os.name == "nt" or not active():
+        return DEFAULT_PROXY_BIND
+    configured = os.environ.get(PROXY_BIND_ENV, "").strip()
+    if not configured:
+        return DEFAULT_PROXY_BIND
+    if configured not in PROXY_BIND_ADDRESSES:
+        raise ValueError("YOUNG_ROUTER_PROXY_BIND must be 127.0.0.1 or 0.0.0.0")
+    return configured
 
 
 def reachable(base: object) -> bool:
