@@ -10,18 +10,10 @@ Upstream is a Node module and the vision fallback runs inside the Python
 LiteLLM process, so the package is not importable there.  It is therefore
 staged into the Core bundle the same way modelprint and
 ``dsh-connect-workbuddy`` are, and ``young_router/adapters/dsh_vision_worker.mjs``
-calls it through the bundled Node.js runtime.  This script resolves the npm
-``latest`` dist-tag, installs the package plus the peer closure it needs, writes
-the one stub its closure requires, and flattens the result into Core.  No
-repository lock is written: a stale chain copy is never packaged.
-
-Upstream declares ``@deepseek-ai/dsh-llm-deepseek`` as a peer, and that package
-in turn declares ``@deepseek-ai/dsh-environment`` — which is not published to
-the public registry.  Only ``environmentOf`` is reached, to read an ambient API
-key out of the launching environment, and this build has no such environment.
-``write_environment_shim`` writes that single function locally; see
-``ENVIRONMENT_SHIM_REASON`` for why the stub is written here rather than
-vendored into the repository.
+calls it through the bundled Node.js runtime. This script resolves the npm
+``latest`` dist-tag, installs its package and dependencies, and flattens the
+result into Core. The worker uses the provider lists, which do not need the
+optional DeepSeek Harness and Sharp peers.
 
 ``*_URL`` environment variables and the matching command-line options exist for
 offline/unit-test fixtures.
@@ -68,61 +60,6 @@ USER_AGENT = "Young-Router/dsh-vision-router-build"
 #: entry is verified after staging so an upstream move fails the build.
 REQUIRED_PACKAGE_FILES = ("package.json", "lib/core-primitives.js")
 
-#: Peers the staged chain functions transitively import.  They are installed
-#: without version ranges: a range resolved at build time is what
-#: ``package_metadata`` already pinned for the package itself, and a peer whose
-#: own closure is unpublished must not silently resolve to a different major.
-#: The list is the transitive closure of the three chain functions above, and
-#: ``_verify_staged_chain`` fails the build when a release needs one more, so
-#: this table is a floor rather than a guess.
-REQUIRED_PEER_PACKAGES = (
-    # dsh-vision-router's own peers.
-    "@deepseek-ai/dsh-anonymous-user-id",
-    "@deepseek-ai/dsh-llm-deepseek",
-    "@deepseek-ai/dsh-storage-domain",
-    "sharp",
-    # dsh-llm-deepseek's peers, reached through lib/sharp-runtime.js.
-    "@deepseek-ai/dsh-credentials",
-    "@deepseek-ai/dsh-invariants",
-    "@deepseek-ai/dsh-llm",
-    "@deepseek-ai/dsh-settings",
-    "@deepseek-ai/dsh-timeout",
-    # dsh-llm's peers, and the plugin framework the whole @deepseek-ai/dsh-*
-    # family declares against.
-    "@deepseek-ai/cordis",
-    "@deepseek-ai/dsh-brand",
-    "@deepseek-ai/dsh-home-paths",
-    "@deepseek-ai/dsh-storage",
-)
-
-#: The unpublished peer, and the one function the staged closure reaches.
-ENVIRONMENT_SHIM_PACKAGE = "@deepseek-ai/dsh-environment"
-ENVIRONMENT_SHIM_ENTRY = "index.js"
-ENVIRONMENT_SHIM_SOURCE = """\
-// Written by scripts/update_dsh_vision_router.py — do not edit in place.
-//
-// @deepseek-ai/dsh-llm-deepseek declares @deepseek-ai/dsh-environment as a
-// required peer, but that package is not published to the public registry, so
-// the import below cannot be resolved from npm. The staged vision chain only
-// calls environmentOf() to read an ambient API key out of the launching
-// environment; Young Router supplies every credential through its own provider
-// config and has no such ambient key, so a lookup that finds nothing is the
-// faithful answer. If a future upstream release reads anything else from this
-// module, this stub is wrong and the build must fail rather than serve a
-// silent divergence — update_dsh_vision_router.py re-checks the call site.
-export function environmentOf() {
-  return {
-    get() {
-      return undefined
-    },
-  }
-}
-"""
-ENVIRONMENT_SHIM_REASON = (
-    f"{ENVIRONMENT_SHIM_PACKAGE} is required by dsh-llm-deepseek but is not "
-    "published to the public npm registry"
-)
-
 
 def _request_bytes(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> bytes:
     return request_bytes(url, timeout=timeout, user_agent=USER_AGENT)
@@ -139,130 +76,11 @@ def _package_metadata(registry_url: str) -> tuple[str, str, dict[str, Any]]:
     )
 
 
-def _peer_specs() -> list[str]:
-    """Install the peer closure the staged chain functions import at load."""
-
-    return list(REQUIRED_PEER_PACKAGES)
-
-
-def _environment_shim_target(npm_root: Path) -> Path:
-    return npm_root / "node_modules" / ENVIRONMENT_SHIM_PACKAGE / ENVIRONMENT_SHIM_ENTRY
-
-
-def write_environment_shim(npm_root: Path) -> Path:
-    """Write the one stub the staged package closure cannot resolve from npm.
-
-    The stub is written into the temporary install tree before flattening, so
-    the Core bundle carries it exactly as it carries every other staged
-    dependency and no third-party file is ever patched in the repository.
-    """
-
-    target = _environment_shim_target(npm_root)
-    scope = target.parent
-    # pnpm only materialises a scope directory when a package occupies it, and
-    # this one is never installed because it is not published.  A package
-    # manager that *did* place a real copy here would mean the upstream
-    # closure changed and this stub must not shadow it.
-    if scope.exists() and any(scope.iterdir()):
-        raise UpdateError(
-            f"The staged {PACKAGE_NAME} install now carries a real {ENVIRONMENT_SHIM_PACKAGE}; "
-            "the published package no longer needs the local stub — remove it and re-check "
-            "ENVIRONMENT_SHIM_SOURCE"
-        )
-    scope.mkdir(parents=True, exist_ok=True)
-    target.write_text(ENVIRONMENT_SHIM_SOURCE, encoding="utf-8")
-    manifest = target.parent / "package.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "name": ENVIRONMENT_SHIM_PACKAGE,
-                "version": "0.0.0-young-router-shim",
-                "type": "module",
-                "main": ENVIRONMENT_SHIM_ENTRY,
-                "exports": {".": f"./{ENVIRONMENT_SHIM_ENTRY}"},
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return target
-
-
-def _shim_reaches_only_environment_of(npm_root: Path) -> None:
-    """Prove the staged closure still only needs ``environmentOf`` from the stub.
-
-    A future upstream release could read another export from the unpublished
-    module. Serving a stub that answers a different question would be a silent
-    divergence, so the build fails here instead.
-    """
-
-    stub_directory = npm_root / "node_modules" / ENVIRONMENT_SHIM_PACKAGE
-    offenders: set[str] = set()
-    sources = sorted(
-        path
-        for pattern in ("*.js", "*.mjs", "*.cjs")
-        for path in (npm_root / "node_modules").rglob(pattern)
-    )
-    for path in sources:
-        # The stub is the one file allowed to name the module; its package
-        # specifier spans two path elements, so it is skipped as a directory.
-        if path.is_relative_to(stub_directory):
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line in text.splitlines():
-            if ENVIRONMENT_SHIM_PACKAGE not in line:
-                continue
-            if "import" not in line and "require" not in line:
-                continue
-            for match in _imported_names(line):
-                if match != "environmentOf":
-                    offenders.add(match)
-    if offenders:
-        names = ", ".join(sorted(offenders))
-        raise UpdateError(
-            f"The staged {PACKAGE_NAME} closure imports {names} from "
-            f"{ENVIRONMENT_SHIM_PACKAGE}, which the local stub does not provide; "
-            "re-check the upstream release and update ENVIRONMENT_SHIM_SOURCE"
-        )
-
-
-def _imported_names(line: str) -> list[str]:
-    import re
-
-    names: list[str] = []
-    brace = re.search(r"import\s*\{([^}]*)\}\s*from", line)
-    if brace:
-        names.extend(
-            part.strip().split(" as ")[0].strip()
-            for part in brace.group(1).split(",")
-            if part.strip()
-        )
-    require_brace = re.search(r"\{([^{}]*)\}\s*=\s*require\s*\(", line)
-    if require_brace:
-        names.extend(
-            part.strip().split(":")[0].split(" as ")[0].strip()
-            for part in require_brace.group(1).split(",")
-            if part.strip()
-        )
-    single = re.search(r"import\s+(\w+)\s+from", line)
-    if single:
-        names.append(single.group(1))
-    require_module = re.search(r"\b(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(", line)
-    if require_module:
-        names.append(require_module.group(1))
-    namespace = re.search(r"import\s+\*\s+as\s+(\w+)\s+from", line)
-    if namespace:
-        names.append(namespace.group(1))
-    return names
-
-
 def _verify_staged_chain(npm_root: Path) -> dict[str, Any]:
     """Run the staged chain functions once with the bundled Node.js runtime.
 
-    Importing them is the only proof that the peer closure, the shim, and the
-    private entry path all resolve. The values are returned so a caller can
-    compare them with the fallback the Core keeps.
+    This exercises the private entry point the worker uses against the installed
+    dependencies.
     """
 
     import subprocess
@@ -323,23 +141,11 @@ def _find_node() -> str:
     return node
 
 
-def _staged_shim_is_present(output: Path) -> bool:
-    """Does the staged tree still carry the stub npm cannot resolve?
-
-    The stub is written into the install tree before it is flattened, so it
-    travels with the package like every other dependency.  A tree missing it
-    would fail every vision fallback at request time, so its absence sends the
-    release back through a fresh install rather than being reused.
-    """
-
-    return (output / "node_modules" / ENVIRONMENT_SHIM_PACKAGE / ENVIRONMENT_SHIM_ENTRY).is_file()
-
-
 def update(output: Path, *, registry_url: str) -> str:
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    latest, tarball_url, _version_payload = _package_metadata(registry_url)
-    integrity = release_integrity(_version_payload)
+    latest, tarball_url, version_payload = _package_metadata(registry_url)
+    integrity = release_integrity(version_payload)
     # The release was resolved above on this build; this only skips installing
     # the identical one again.  The staged chain was proved importable when it
     # was staged, and the build proves it again on the assembled bundle.
@@ -349,8 +155,7 @@ def update(output: Path, *, registry_url: str) -> str:
         version=latest,
         integrity=integrity,
         required_files=REQUIRED_PACKAGE_FILES,
-        required_peer_dirs=REQUIRED_PEER_PACKAGES,
-    ) and _staged_shim_is_present(output):
+    ):
         return latest
     manager, manager_env = find_package_manager(
         "DSH_VISION_ROUTER_PACKAGE_MANAGER_BIN", purpose=f"stage {PACKAGE_NAME}"
@@ -366,12 +171,10 @@ def update(output: Path, *, registry_url: str) -> str:
             manager_env,
             npm_root,
             package_tarball,
-            _peer_specs(),
+            (),
             package_name=PACKAGE_NAME,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
-        write_environment_shim(npm_root)
-        _shim_reaches_only_environment_of(npm_root)
         _verify_staged_chain(npm_root)
         package_version = flatten_npm_package(
             npm_root,

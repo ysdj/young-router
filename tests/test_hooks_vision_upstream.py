@@ -22,7 +22,6 @@ from young_router.adapters import dsh_vision_upstream as upstream
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "young_router" / "adapters" / "dsh_vision_worker.mjs"
-STAGER = ROOT / "scripts" / "update_dsh_vision_router.py"
 
 
 class VisionUpstreamBridgeTests(unittest.TestCase):
@@ -185,65 +184,6 @@ class VisionWorkerProtocolTests(unittest.TestCase):
         local = self._run({"backend": "local", "freeFallback": True}, package=package)
         self.assertEqual("upstream", local["source"])
         self.assertEqual([], local["providers"])
-
-
-class VisionStagingTests(unittest.TestCase):
-    """The staging step's own guards, without touching the network."""
-
-    @staticmethod
-    def _staging_module():
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "update_dsh_vision_router", STAGER
-        )
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        return module
-
-    def test_the_staged_environment_shim_only_answers_environment_of(self) -> None:
-        module = self._staging_module()
-        self.assertIn("environmentOf", module.ENVIRONMENT_SHIM_SOURCE)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            # The offending import lives in a staged dependency, not in the
-            # stub itself: the stub is the one file allowed to name the module.
-            consumer = root / "node_modules" / "@deepseek-ai" / "dsh-llm-deepseek" / "lib"
-            consumer.mkdir(parents=True)
-            (consumer / "index.js").write_text(
-                "import { environmentOf, environmentPaths } from '@deepseek-ai/dsh-environment'\n",
-                encoding="utf-8",
-            )
-            with self.assertRaises(module.UpdateError):
-                module._shim_reaches_only_environment_of(root)
-
-    def test_the_stub_itself_is_never_scanned_for_extra_imports(self) -> None:
-        module = self._staging_module()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stub = root / "node_modules" / "@deepseek-ai" / "dsh-environment"
-            stub.mkdir(parents=True)
-            (stub / "index.js").write_text(
-                "import { environmentOf } from '@deepseek-ai/dsh-environment'\n", encoding="utf-8"
-            )
-            # Only `environmentOf` is named, so this closure is still faithful.
-            module._shim_reaches_only_environment_of(root)
-
-    def test_the_staging_step_refuses_to_shadow_a_published_environment_package(self) -> None:
-        module = self._staging_module()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            scope = root / "node_modules" / "@deepseek-ai" / "dsh-environment"
-            scope.mkdir(parents=True)
-            (scope / "index.js").write_text("export const published = true\n", encoding="utf-8")
-            with self.assertRaises(module.UpdateError):
-                module.write_environment_shim(root)
-
-    def test_the_peer_closure_covers_the_published_chain_functions(self) -> None:
-        module = self._staging_module()
-        for peer in ("@deepseek-ai/dsh-llm-deepseek", "@deepseek-ai/cordis"):
-            self.assertIn(peer, module.REQUIRED_PEER_PACKAGES)
 
 
 def shutil_which_node() -> str | None:

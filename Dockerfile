@@ -12,7 +12,7 @@ COPY rn/packages/shared/src packages/shared/src
 RUN pnpm run build:web
 
 # Stage upstream workers and their dependencies on the target architecture.
-FROM node:22-bookworm-slim AS workers
+FROM node:24-bookworm-slim AS workers
 WORKDIR /src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git python3 \
