@@ -31,11 +31,10 @@ if ($WindowsArch -notin @("X64", "ARM64")) {
 # verbatim, and that spelling is ``x64`` -- so an uppercased ``X64`` looked for
 # ``windows\X64\Release`` and ``target\X64``, which a build never creates.
 $WindowsArchName = if ($WindowsArch -eq "ARM64") { "ARM64" } else { "x64" }
-$PythonTarget = if ($WindowsArch -eq "ARM64") {
-  "cpython-3.12-windows-arm64-none"
-} else {
-  "cpython-3.12-windows-x86_64-none"
-}
+# LiteLLM's required proxy wheel is only published for Windows x64. Core is
+# a separate process, so even the native ARM64 host runs the bundled x64
+# Python on Windows 11 without an extra installation.
+$PythonTarget = "cpython-3.12-windows-x86_64-none"
 if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
   $Core = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-rn-core-" + [guid]::NewGuid().ToString("N"))
 } else {
@@ -214,11 +213,11 @@ try {
       $RuntimeSeed = $PreviousRuntime
     }
   }
-  # A seed that lost its interpreter (a copy of ``bin\Lib`` and ``bin\DLLs``
-  # without ``python.exe`` is what an interrupted staging run leaves behind) is
-  # not a seed: the fallback below still produces a working runtime, and the
-  # LiteLLM step has to know that this one carries nothing to reuse.
-  $RuntimeSeedUsable = [bool]($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\python.exe")))
+  $RuntimeSeedUsable = $false
+  if ($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\python.exe"))) {
+    $SeedPlatform = & (Join-Path $RuntimeSeed "bin\python.exe") -c "import sysconfig; print(sysconfig.get_platform())"
+    $RuntimeSeedUsable = $LASTEXITCODE -eq 0 -and $SeedPlatform -eq "win-amd64"
+  }
   if ($RuntimeSeedUsable) {
     Copy-Item -Path (Join-Path $RuntimeSeed "bin\*") -Destination $RuntimeBin -Recurse -Force
   } else {
@@ -227,7 +226,7 @@ try {
       Where-Object { $_.Name -like "cpython-3.12*-windows-*" } |
       Select-Object -First 1
     if ($null -eq $PythonSource -or -not (Test-Path (Join-Path $PythonSource.FullName "python.exe"))) {
-      throw "uv did not install the expected standalone Windows $WindowsArch Python 3.12 runtime."
+      throw "uv did not install the bundled Windows x64 Python 3.12 runtime."
     }
     Copy-Item -Path (Join-Path $PythonSource.FullName "*") -Destination $RuntimeBin -Recurse -Force
   }
@@ -242,18 +241,12 @@ try {
   #   The interpreter at ... is externally managed
   #
   # ``--target`` writes the packages into that interpreter's own site-packages
-  # instead of asking it to accept an install. ARM64 needs one extra platform
-  # split: LiteLLM's normal ``proxy`` extra is installable, but its optional
-  # ``litellm-proxy-extras`` package pulls psycopg wheels that PyPI does not
-  # publish for Windows ARM64. Install the proxy extra's metadata without its
-  # dependencies, then install every base/proxy requirement except that one
-  # optional database package. The package itself is not imported by this app.
+  # instead of asking it to accept an install.
   $RuntimeSitePackages = & $RuntimePython -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
   if ($LASTEXITCODE -ne 0 -or -not $RuntimeSitePackages) {
     throw "Could not resolve the bundled Windows runtime's site-packages path."
   }
   function Remove-Stale-LiteLLM-Metadata {
-    param([string]$SitePackages = $RuntimeSitePackages)
     # ``--target`` merges into an existing directory instead of replacing it,
     # and it does not uninstall the release it is upgrading from.  A seed that
     # already carried 1.106.4 therefore ends up with both
@@ -262,64 +255,11 @@ try {
     # reads as "the update did nothing" and stops the build on the release it
     # just installed.  Only the metadata directory is removed; the new files
     # already overwrote the module tree.
-    Get-ChildItem -LiteralPath $SitePackages -Directory -Filter "litellm-*.dist-info" -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $RuntimeSitePackages -Directory -Filter "litellm-*.dist-info" -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -ne "litellm-$LiteLLMVersion.dist-info" } |
       Remove-Item -Recurse -Force
   }
   function Install-LiteLLM {
-    if ($WindowsArch -eq "ARM64") {
-      & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade --no-deps "litellm[proxy]==$LiteLLMVersion"
-      if ($LASTEXITCODE -ne 0) { throw "Could not install the LiteLLM package for Windows ARM64." }
-      $metadataFile = Get-ChildItem -LiteralPath $RuntimeBin -Recurse -File -Filter "METADATA" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Directory.Name -eq "litellm-$LiteLLMVersion.dist-info" } |
-        Select-Object -First 1
-      if ($null -eq $metadataFile) {
-        throw "Could not read LiteLLM's Windows ARM64 dependency metadata."
-      }
-      $LiteLLMRequirements = @(
-        $proxyMarker = 'extra == "proxy"'
-        foreach ($line in Get-Content -LiteralPath $metadataFile.FullName) {
-          if (-not $line.StartsWith("Requires-Dist:")) { continue }
-          $raw = $line.Substring("Requires-Dist:".Length).Trim()
-          $parts = $raw.Split(";", 2)
-          $head = $parts[0].Trim()
-          $marker = if ($parts.Count -eq 2) { $parts[1].Trim() } else { "" }
-          # ``maturin`` writes the extra marker with single quotes
-          # (``extra == 'proxy'``); the setuptools-built wheels this parse was
-          # written against used double quotes.  Match both spellings.
-          $marker = $marker.Replace("'", '"')
-          if ($head.StartsWith("litellm-proxy-extras", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-          if ($marker.Contains($proxyMarker)) {
-            # The marker itself has to go, not just a neighbouring ``and``: a
-            # requirement left as ``websockets>=15.0.1; extra == "proxy"`` is
-            # skipped by an installer that has no such extra active, which is
-            # how 1.109.0's proxy-only dependencies stopped arriving and the
-            # Core import failed on ``websockets``.
-            $marker = ($marker.Replace($proxyMarker, "") -replace '^\s*and\s+', "" -replace '\s+and\s*$', "").Trim()
-            if ($marker -eq "") { $head } else { "$head; $marker" }
-          } elseif ($marker -notmatch "extra\s*==") {
-            $raw
-          }
-        }
-      )
-      if ($LiteLLMRequirements.Count -eq 0) {
-        throw "Could not read LiteLLM's Windows ARM64 dependency set."
-      }
-      # PyPI publishes no ``win_arm64`` wheel of cryptography from 47.0.0 on
-      # (46.0.3 is the last one); 47 through 50 ship ``win_amd64`` only.  LiteLLM
-      # declares ``cryptography>=49,<51``, so the installer falls back to the
-      # sdist, which needs an ARM64 OpenSSL 3 development tree that this build
-      # does not stage -- the build stopped there instead of producing a payload.
-      # 46.0.3 is installed explicitly, and said so, because it is the newest
-      # release the platform can actually install.
-      $Arm64Override = Join-Path $Core "litellm-arm64-overrides.txt"
-      Set-Content -LiteralPath $Arm64Override -Value "cryptography==46.0.3" -Encoding ascii
-      Write-Warning "Windows ARM64 packages cryptography 46.0.3: 47.0.0 and later publish no win_arm64 wheel, and LiteLLM's declared >=49 cannot be built here without an ARM64 OpenSSL 3 tree."
-      & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade --overrides $Arm64Override @LiteLLMRequirements "fastapi==0.140.3" PyYAML
-      if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows ARM64 runtime dependencies." }
-      Remove-Stale-LiteLLM-Metadata
-      return
-    }
     & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
     if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
     Remove-Stale-LiteLLM-Metadata
@@ -532,48 +472,15 @@ print('young-router-modelprint-tables-ok')
     $instance | Stop-Process -Force -ErrorAction SilentlyContinue
   }
   if ($RunningPayload) { Start-Sleep -Milliseconds 800 }
-  # The raw-output convenience exe is the launcher this script compiles below,
-  # and it is written to the same path MSBuild puts the real host in.  Copying
-  # the release tree verbatim therefore took last build's launcher as the
-  # package's app executable: it hands off to the installed MSIX, which starts
-  # the launcher again, and the window never appears.  The sidecar the launcher
-  # build writes says which file is which.
-  $LauncherMarker = Join-Path $WindowsRelease "YoungRouter.exe.launcher"
-  $RawHostExe = Join-Path $WindowsRelease "YoungRouter.exe"
-  $RawHostIsLauncher = $false
-  if ((Test-Path -LiteralPath $LauncherMarker) -and (Test-Path -LiteralPath $RawHostExe)) {
-    $RawHostIsLauncher = (Get-Content -Raw -LiteralPath $LauncherMarker).Trim() -eq
-      (Get-FileHash -LiteralPath $RawHostExe -Algorithm SHA256).Hash
-  }
   # Core is refreshed from the staged tree and copied into the payload below,
   # so taking the release's copy here would write the whole runtime twice.
   $ReleaseCore = Join-Path $WindowsRelease "Core"
   Get-ChildItem -LiteralPath $WindowsRelease -Force |
-    Where-Object {
-      -not ($RawHostIsLauncher -and $_.Name -eq "YoungRouter.exe" -and $_.PSIsContainer -eq $false) -and
-      -not ($_.Name -eq "Core" -and $_.PSIsContainer)
-    } |
+    Where-Object { $_.Name -ne "Core" } |
     ForEach-Object {
       Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload -Recurse -Force
     }
   Remove-Item -LiteralPath (Join-Path $PackagePayload "Bundle\Bundle") -Recurse -Force -ErrorAction SilentlyContinue
-
-  # The copy above is additive, so a release that moved leaves the previous
-  # ``litellm-<old>.dist-info`` in the payload beside the new one.  Two
-  # distributions of the same name make ``importlib.metadata.version`` answer
-  # ``None`` (it happened: the payload carried 1.106.4, 1.106.6 and 1.109.0),
-  # and the next build's seed check then reads a version that is not the one
-  # installed and reinstalls the whole runtime every time.  Only the metadata
-  # directory is removed -- the module tree was already overwritten.
-  $PayloadSitePackages = Join-Path $PackagePayload "Core\runtime\bin\Lib\site-packages"
-  if (Test-Path -LiteralPath $PayloadSitePackages) {
-    Get-ChildItem -LiteralPath $PayloadSitePackages -Directory -Filter "litellm-*.dist-info" -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -ne "litellm-$LiteLLMVersion.dist-info" } |
-      ForEach-Object {
-        Write-Output "Removing stale payload metadata: $($_.Name)"
-        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-      }
-  }
 
   # The wheel fix lives in RNW source that upstream has not taken, so the shipped
   # binary has to be the prepared source-build output rather than the NuGet copy
@@ -592,42 +499,25 @@ print('young-router-modelprint-tables-ok')
     Copy-Item -LiteralPath $ReactNativeTargetDll -Destination $PackagedReactNativeDll -Force
   }
 
-  # The host project links Core from ``windows\<arch>\Release\Core`` as
-  # deployment content, and MSBuild only rewrites a deployment item whose source
-  # is newer.  That directory outlives a build -- a copy of it is the only thing
-  # a packaged run loads -- so a Core edit made after the last full solution
-  # build never reached the package: the app kept executing the previous
-  # ``young_router`` while the tests ran against the current one.  The staged
-  # source tree is copied over it here, before the payload is used, so one build
-  # always ships exactly the Core that was just tested.
-  if (Test-Path $ReleaseCore) {
-    Copy-CoreSource $CoreRoot $ReleaseCore
-    # The copy merges rather than replaces, so a release the staged tree dropped
-    # -- the previous LiteLLM metadata, for one -- would survive here and make
-    # this directory unusable as the next build's seed.  It is the seed: the next
-    # run reads its LiteLLM version to decide whether anything has to be
-    # installed at all.
-    Remove-Stale-LiteLLM-Metadata -SitePackages (Join-Path $ReleaseCore "runtime\bin\Lib\site-packages")
-    $ReleaseCoreSource = Join-Path $ReleaseCore "young_router"
-    if (Test-Path $ReleaseCoreSource) {
-      Get-ChildItem -LiteralPath $ReleaseCoreSource -Recurse -Directory -Filter "__pycache__" |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-      Get-ChildItem -LiteralPath $ReleaseCoreSource -Recurse -File -Include "*.pyc", "*.pyo" |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+  # Replace both generated copies from the staged tree. Merging leaves old
+  # Python package metadata and ARM64 extensions beside the x64 runtime.
+  $StagedCoreSource = Join-Path $CoreRoot "young_router"
+  Get-ChildItem -LiteralPath $StagedCoreSource -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+  Get-ChildItem -LiteralPath $StagedCoreSource -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
+  $PayloadCore = Join-Path $PackagePayload "Core"
+  foreach ($DestinationCore in @($ReleaseCore, $PayloadCore)) {
+    if (Test-Path -LiteralPath $DestinationCore) {
+      Remove-Item -LiteralPath $DestinationCore -Recurse -Force
     }
-    $PayloadCore = Join-Path $PackagePayload "Core"
-    New-Item -ItemType Directory -Force -Path $PayloadCore | Out-Null
-    Copy-Item -Path (Join-Path $ReleaseCore "*") -Destination $PayloadCore -Recurse -Force
+    Copy-CoreSource $CoreRoot $DestinationCore
   }
 
-  # The WinUI host links Windows App SDK and can fail before WinMain when a
-  # user double-clicks the unpackaged build-output EXE on ARM64. Keep the
-  # packaged host produced above, then replace only that convenient raw-output
-  # path with a tiny launcher that hands off to the installed MSIX.
+  # Launch the registered app from outside the Release tree so the launcher
+  # cannot overwrite the WinUI executable reused by incremental builds.
   $LauncherSource = Join-Path $AppRoot "windows\YoungRouter\YoungRouterLauncher.cpp"
-  $LauncherOutput = Join-Path $WindowsRelease "YoungRouter.exe"
+  $LauncherOutput = Join-Path (Split-Path -Parent $WindowsRelease) "YoungRouterLauncher.exe"
   if (-not (Test-Path $LauncherSource) -or -not (Test-Path (Split-Path $LauncherOutput))) {
-    throw "Windows launcher source or Release output directory is missing."
+    throw "Windows launcher source or output directory is missing."
   }
   $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
   if (-not (Test-Path $VsWhere)) {
@@ -646,9 +536,7 @@ print('young-router-modelprint-tables-ok')
     throw "Could not compile the unpackaged Windows launcher."
   }
   Remove-Item -LiteralPath $LauncherObject -Force -ErrorAction SilentlyContinue
-  Write-Output "Windows raw-output launcher: $LauncherOutput"
-  Set-Content -LiteralPath (Join-Path $WindowsRelease "YoungRouter.exe.launcher") `
-    -Value (Get-FileHash -LiteralPath $LauncherOutput -Algorithm SHA256).Hash -Encoding ascii
+  Write-Output "Windows launcher: $LauncherOutput"
 
   $BundledPython = Get-ChildItem -LiteralPath (Join-Path $AppRoot "windows") -Recurse -File -Filter "python.exe" |
     Where-Object { $_.FullName -match '[\\/]Core[\\/]runtime[\\/]bin[\\/]python\.exe$' } |

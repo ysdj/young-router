@@ -850,22 +850,24 @@ class ReactNativeReleaseTests(unittest.TestCase):
         payload is a copy of it, so a Core edit made after the last full solution
         build stayed invisible: the app kept running the previous
         ``young_router`` while every test ran against the current one.  The
-        script therefore refreshes that directory from the staged source tree and
-        copies it into the payload after the payload copy.
+        script therefore replaces both copies from the staged source tree after
+        the payload copy.
         """
 
         script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
         payload = script.index(
             'Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload'
         )
-        refresh = script.index("Copy-CoreSource $CoreRoot $ReleaseCore")
+        refresh = script.index("foreach ($DestinationCore in @($ReleaseCore, $PayloadCore))")
         self.assertLess(payload, refresh)
         self.assertIn('$ReleaseCore = Join-Path $WindowsRelease "Core"', script)
         # The refreshed tree replaces the payload's copy, and no stale bytecode
         # travels with it: a ``.pyc`` written against the previous source wins
         # over the new file on import.
-        self.assertIn('Copy-Item -Path (Join-Path $ReleaseCore "*") -Destination $PayloadCore -Recurse -Force', script)
-        refresh_block = script[refresh : script.index("# The WinUI host links Windows App SDK")]
+        refresh_block = script[
+            script.index('$StagedCoreSource = Join-Path $CoreRoot "young_router"') : script.index("$LauncherSource =")
+        ]
+        self.assertIn("Copy-CoreSource $CoreRoot $DestinationCore", refresh_block)
         self.assertIn('-Filter "__pycache__"', refresh_block)
         self.assertIn('-Include "*.pyc", "*.pyo"', refresh_block)
 
@@ -1114,10 +1116,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # checkout that only needed the install it was refusing to run.
         script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
 
-        self.assertIn(
-            '$RuntimeSeedUsable = [bool]($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\\python.exe")))',
-            script,
-        )
+        self.assertIn('if ($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\\python.exe")))', script)
+        self.assertIn('$SeedPlatform -eq "win-amd64"', script)
         self.assertNotIn("if ($RuntimeSeed) {", script)
         self.assertIn('if ($RuntimeSeedUsable) {\n    Copy-Item -Path (Join-Path $RuntimeSeed "bin\\*")', script)
         # Inside the seed branch the repair comes before the failure: a seed
@@ -1138,16 +1138,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('-Filter "litellm-*.dist-info"', script)
         self.assertIn('$_.Name -ne "litellm-$LiteLLMVersion.dist-info"', script)
         install_function = script.split("function Install-LiteLLM", 1)[1].split("\n  if ($RuntimeSeedUsable)", 1)[0]
-        self.assertEqual(install_function.count("Remove-Stale-LiteLLM-Metadata"), 2, install_function[-200:])
-        # The release Core is the next build's seed, and ``robocopy /E`` merges:
-        # a metadata directory the staged tree dropped survives there and makes
-        # the seed unusable, which is what sent every build back through the
-        # whole install.  The same rule runs on that copy.
-        self.assertIn(
-            'Remove-Stale-LiteLLM-Metadata -SitePackages (Join-Path $ReleaseCore "runtime\\bin\\Lib\\site-packages")',
-            script,
-        )
-        self.assertIn("param([string]$SitePackages = $RuntimeSitePackages)", script)
+        self.assertIn("Remove-Stale-LiteLLM-Metadata", install_function)
 
     def test_the_build_proves_the_staged_workbuddy_surface_is_still_published(self) -> None:
         # WorkBuddy ships the desktop credential format and both model
@@ -1489,17 +1480,6 @@ class ReactNativeReleaseTests(unittest.TestCase):
             build.index("RNW source-build output is missing"),
         )
         self.assertIn("Copy-Item -LiteralPath $ReactNativeTargetDll -Destination $PackagedReactNativeDll -Force", build)
-        # The raw-output convenience exe and the host share one path, and the
-        # launcher is compiled there after the payload copy: the next build then
-        # packaged the launcher as the app executable, which hands off to the
-        # installed MSIX -- which starts the launcher.  The sidecar says which
-        # file is which, and the payload copy skips it by that answer.
-        self.assertIn("YoungRouter.exe.launcher", build)
-        self.assertIn("$RawHostIsLauncher", build)
-        self.assertLess(
-            build.index("$RawHostIsLauncher = (Get-Content -Raw -LiteralPath $LauncherMarker)"),
-            build.index("Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload"),
-        )
 
     def test_the_prepared_wheel_build_can_be_carried_to_another_machine(self) -> None:
         # Only one machine can produce the wheel-patched RNW binary (a source
