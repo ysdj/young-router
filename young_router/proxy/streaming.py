@@ -4227,8 +4227,11 @@ _REPAIRED_REQUESTS: dict[str, float] = {}
 _REPAIRED_LOCK = threading.Lock()
 _REPAIRED_TTL_SECONDS = 6 * 60 * 60.0
 _REPAIRED_LIMIT = 4096
-#: Below this many replay items the cut says something about the route, not
-#: about the size of the request; those keep the sibling hop untouched.
+#: Very long replays are not always many *items*: one Codex turn can contain a
+#: few hundred items with more than a hundred reasoning records.  That shape
+#: still spends an upstream ``max_messages`` budget on the replay plus the new
+#: reasoning, so it needs the same one-time elision as a multi-thousand-item
+#: history.
 _REQUEST_REPAIR_MIN_ITEMS = 2000
 #: The repair keeps at least this many of the newest reasoning items.  The
 #: refusal ladder's 8 is enough to fit a replay under a route's cap, but a
@@ -4237,6 +4240,31 @@ _REQUEST_REPAIR_MIN_ITEMS = 2000
 #: costs ~1 KB of text (the 9,013 old items in the live 2026-11-21 repair were
 #: only 104 KB in total), so there is no reason to cut it to a fragment.
 _REQUEST_REPAIR_KEEP_REASONING = 100
+
+
+def _request_replay_is_heavy(request_data: Optional[dict]) -> bool:
+    """Whether a Responses replay is large enough to repair after an item cap.
+
+    Item count alone missed the live failure: 239 input items carried 167
+    reasoning items and 133 KB of text, then two different routes both ended
+    at ``max_messages``.  Count reasoning records as well, but keep the gate
+    above one complete capped turn so ordinary short conversations stay on
+    the sibling failover path.
+    """
+
+    if not isinstance(request_data, dict):
+        return False
+    items = request_data.get("input")
+    if not isinstance(items, list):
+        return False
+    if len(items) >= _REQUEST_REPAIR_MIN_ITEMS:
+        return True
+    reasoning_count = sum(
+        1
+        for item in items
+        if isinstance(item, dict) and item.get("type") == "reasoning"
+    )
+    return reasoning_count > _REQUEST_REPAIR_KEEP_REASONING
 
 
 def _claim_request_repair(request_kwargs: Optional[dict]) -> bool:
@@ -4284,7 +4312,7 @@ def _should_repair_heavy_replay_request(
     if not _responses_request_module._request_is_responses_api(request_data):
         return False
     items = request_data.get("input")
-    if not isinstance(items, list) or len(items) < _REQUEST_REPAIR_MIN_ITEMS:
+    if not _request_replay_is_heavy(request_data) or not isinstance(items, list):
         return False
     if _routing_module._is_upstream_unreachable_error(exception):
         return False
@@ -4327,7 +4355,7 @@ def _repair_heavy_replay_request(
     ):
         return False
     items = request_data.get("input")
-    if not isinstance(items, list) or len(items) < _REQUEST_REPAIR_MIN_ITEMS:
+    if not _request_replay_is_heavy(request_data) or not isinstance(items, list):
         return False
     if not _claim_request_repair(request_data):
         return False

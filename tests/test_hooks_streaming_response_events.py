@@ -3188,6 +3188,94 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
         self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
 
+    async def test_a_reasoning_heavy_replay_repairs_before_a_second_route_cap(
+        self,
+    ) -> None:
+        """A few hundred items can still carry too much reasoning to replay.
+
+        The previous gate only repaired histories with 2,000 items.  The live
+        interrupted turn had 239 items but 167 reasoning records; the first
+        route and its sibling both reached ``max_messages`` before the request
+        was finally returned as ``response.incomplete``.  Elide the older
+        reasoning on the first cap so the current turn does not spend its one
+        sibling hop on the same oversized body.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = importlib.import_module("young_router.proxy.streaming")
+        streaming._REPAIRED_REQUESTS.clear()
+        self.addCleanup(streaming._REPAIRED_REQUESTS.clear)
+        calls: list = []
+
+        def capped_stream():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-cap"}}
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs-new",
+                    "output_index": 0,
+                    "delta": "still thinking",
+                }
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [{"id": "rs-new", "type": "reasoning"}],
+                    },
+                }
+
+            return stream()
+
+        def answered():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return answered()
+
+        proxy_server.llm_router = FakeRouter()
+        old_reasoning = [
+            {"type": "reasoning", "id": f"rs-old-{index}", "summary": []}
+            for index in range(150)
+        ]
+        original_input = [*old_reasoning, {"type": "message", "role": "user", "content": "Continue."}]
+        request_data = {
+            "model": "default-chat",
+            "input": original_input,
+            "stream": True,
+            "reasoning": {"effort": "max", "summary": "detailed"},
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-reasoning-heavy-cap",
+            "client_metadata": {"thread_id": "thread-reasoning-heavy-cap"},
+            "model_info": {"id": "order-0", "order": 0, "route_key": "provider / default-chat / key=primary"},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=capped_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(1, len(calls))
+        self.assertLess(len(calls[0]["input"]), len(original_input))
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
+        self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
+
     async def test_a_heavy_cut_is_answered_by_repairing_the_request_not_the_route(
         self,
     ) -> None:
