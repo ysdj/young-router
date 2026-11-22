@@ -21,9 +21,11 @@ from young_router.core.domains.relay_accounts import (
     RelayHTTPClient,
     RelayTransportError,
     RelayLoginBackoffError,
+    RelayPasswordRejectedError,
     RelaySessionLimitError,
 )
 from young_router.core.protocol import validate_method_result
+from young_router.core.scheduled_tasks import RELAY_LOGIN
 from young_router.core.service import CoreError, CoreStore, RevisionConflict
 
 
@@ -2246,6 +2248,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             fake = FakeRelayHTTPClient(
                 {},
+                errors={"/api/v1/auth/me": RelayAccountsError("Relay login has expired")},
                 password_login_result={
                     "username": "account-a@example.test",
                     "cookie": "",
@@ -2667,7 +2670,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             # The station refuses the stored session: the probe answers 401,
             # which is the station speaking about the credential.
-            fake.errors["/api/v1/auth/me"] = RelayAccountsError("Relay request was rejected")
+            fake.errors["/api/v1/auth/me"] = RelayAccountsError("Relay login has expired")
             settings = root / "runtime-settings.env"
             settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
             with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
@@ -2716,7 +2719,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             root = Path(directory)
             fake = FakeRelayHTTPClient(
                 {},
-                password_login_result=RelayAccountsError("Relay login was rejected"),
+                password_login_result=RelayPasswordRejectedError("Relay login was rejected"),
             )
             relay = RelayAccountsDomain(root, http_client=fake)
             account = relay.dispatch(
@@ -2738,7 +2741,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 metadata_path=root / ".litellm-runtime" / "core-state.json",
                 domains=[relay, ProvidersModelsDomain(root / "config.yaml")],
             )
-            fake.errors["/api/v1/auth/me"] = RelayAccountsError("Relay request was rejected")
+            fake.errors["/api/v1/auth/me"] = RelayAccountsError("Relay login has expired")
             settings = root / "runtime-settings.env"
             settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
             with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
@@ -3064,40 +3067,14 @@ class RelayAccountsDomainTests(unittest.TestCase):
             core.restore_relay_session(**mount)
             self.assertEqual(settled, core.revision)
 
-    def test_a_determined_signed_out_costs_no_station_round_trip_on_the_next_mount(self) -> None:
-        """The route settles a determined 未登录 instead of re-probing it.
-
-        This is the whole point at the level the pane actually calls: the
-        station is read once, the row reads 未登录, and every later mount inside
-        the window answers from that determination without a single station
-        request — no session probe and no remembered-password renewal.  Before
-        the window covered this outcome, the first request was paid again on
-        every mount, so a row the user could already read kept re-asking a
-        station that had already answered.
-        """
-
-        responses = {
-            "/api/user/models": {"success": True, "data": ["chat-a"]},
-            "/api/token/?p=1&size=100": {
-                "success": True,
-                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
-            },
-        }
-
-        class RefusingStation(FakeRelayHTTPClient):
-            """A station that answers and refuses both the session and the password."""
-
-            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
-                self.requests.append((origin, path, dict(headers)))
-                raise RelayAccountsError("Relay session is expired")
-
-            def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
-                self.password_logins.append((origin, account_type, username, password))
-                raise RelayAccountsError("Relay username or password is invalid")
-
+    def test_a_recent_signed_out_observation_does_not_skip_the_first_login_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake = RefusingStation(responses, password_login_result=RelayAccountsError("Relay username or password is invalid"))
+            fake = FakeRelayHTTPClient(
+                {},
+                errors={"/api/user/self": RelayAccountsError("Relay login has expired")},
+                password_login_result=RelayPasswordRejectedError("Relay username or password is invalid"),
+            )
             domain = RelayAccountsDomain(root, http_client=fake)
             account_id = domain.dispatch(
                 "add",
@@ -3113,9 +3090,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 metadata_path=root / ".litellm-runtime" / "core-state.json",
                 domains=[domain, ProvidersModelsDomain(root / "config.yaml")],
             )
-            # Age the verified login past the window so the first mount is a
-            # real check rather than a reuse of the sign-in that just landed.
-            domain._accounts[0]["login_observed_at"] = "2000-01-01T00:00:00Z"
+            domain.set_login_status(account_id, "signed_out")
 
             def mount() -> tuple[str, int]:
                 before = len(fake.requests) + len(fake.password_logins)
@@ -3131,7 +3106,8 @@ class RelayAccountsDomainTests(unittest.TestCase):
             # The first check is the answer: the station is asked, and refuses.
             status, cost = mount()
             self.assertEqual("signed_out", status)
-            self.assertGreater(cost, 0)
+            self.assertEqual(2, cost)  # One profile GET and one login POST.
+            self.assertEqual("rejected", domain.snapshot()["accounts"][0]["login_failure"])
 
             # Every later mount inside the window settles on that answer and
             # pays nothing at all.
@@ -3139,6 +3115,64 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 status, cost = mount()
                 self.assertEqual("signed_out", status)
                 self.assertEqual(0, cost)
+
+    def test_background_session_check_recovers_a_determined_logout_once(self) -> None:
+        cases = (
+            (RelayAccountsError("Relay login has expired"), None, "signed_in", None, 1),
+            (None, None, "signed_in", None, 1),  # Saved password, no stored session.
+            (RelayAccountsError("Relay login has expired"), RelaySessionLimitError(), "expired", "session_limit", 1),
+            (RelayAccountsError("Relay login has expired"), RelayTransportError(), "expired", "unavailable", 1),
+            (RelayTransportError(), None, "signed_in", None, 0),
+            (RelayAccountsError("Relay request was rejected"), None, "signed_in", None, 0),
+        )
+        for read_error, login_error, status, failure, posts in cases:
+            with self.subTest(read_error=read_error, login_error=login_error), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                http = FakeRelayHTTPClient(
+                    {},
+                    errors={"/api/user/self": read_error} if read_error else {},
+                    password_login_result=login_error or {"username": "sample-user", "cookie": "session=renewed"},
+                )
+                relay = RelayAccountsDomain(root, http_client=http)
+                account_id = relay.dispatch(
+                    "add", {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"}
+                )["accounts"][0]["id"]
+                with mock.patch.object(relay_accounts, "_utc_now_iso", return_value="2000-01-01T00:00:00Z"):
+                    relay.accept_login_result(
+                        account_id, username="sample-user", cookie="session=old", password="sample-password",
+                        remember_password=True, remember_session=read_error is not None,
+                    )
+                    if read_error is None:
+                        relay.set_login_status(account_id, "signed_out")
+                relay.apply()
+                core = CoreStore(domains=[relay])
+
+                # Run the same batch the timer uses, with no settings pane open.
+                maintenance = core.relay_maintenance()
+                accounts = core._relay_maintenance_accounts()[RELAY_LOGIN]
+                self.assertEqual([account_id], accounts)
+                maintenance._run_due(RELAY_LOGIN, accounts)
+                row = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+                self.assertEqual((status, failure), (row["login_status"], row.get("login_failure")))
+                self.assertEqual(posts, len(http.password_logins))
+                # Password-only mode permits a sign-in but does not retain the
+                # session across restarts.
+                persisted_status = status if read_error is not None else "unknown"
+                self.assertEqual(persisted_status, RelayAccountsDomain(root).snapshot()["accounts"][0]["login_status"])
+                task = next(r for r in core.log_view("scheduled-tasks")["log"]["records"] if r["id"] == RELAY_LOGIN)
+                run = task["history"][0]
+                if login_error or not posts:
+                    self.assertEqual("failed", run["outcome"])
+                    self.assertEqual("restore_login" if login_error else "check_session", run["issues"][0]["phase"])
+                else:
+                    self.assertEqual("succeeded", run["outcome"])
+
+                if login_error:
+                    core.restore_relay_session(
+                        account_id=account_id, account_type="newapi", label="Relay",
+                        origin="https://relay.example.test", login_status="unknown",
+                    )
+                    self.assertEqual(1, len(http.password_logins))
 
     def test_a_fresh_login_observation_answers_the_panes_own_recheck(self) -> None:
         """One station round trip answers every check inside the window.
@@ -3602,9 +3636,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 with self.assertRaises(RelayLoginBackoffError):
                     domain.restore_saved_password(account_id)
             self.assertEqual(1, station.logins)
-            # A refused attempt is not a login observation either: the station
-            # never said this account is signed out.
-            self.assertEqual("signed_in", domain.snapshot()["accounts"][0]["login_status"])
+            # The profile proved expiry. The cap explains why renewal failed.
+            snapshot = domain.snapshot()["accounts"][0]
+            self.assertEqual("expired", snapshot["login_status"])
+            self.assertEqual("session_limit", snapshot["login_failure"])
 
             # A window of 0 asks immediately, which is what the setting means.
             domain.clear_login_refusal(account_id)
@@ -3672,7 +3707,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             # A cap is the station refusing to mint *any* session, so the form
             # must not ask again.
-            domain._note_login_refusal(account_id, capped=True)
+            domain._note_login_refusal(account_id, reason="session_limit")
             self.assertFalse(domain.login_prefill(account_id)["submit"])
             domain.clear_login_refusal(account_id)
 
@@ -3956,9 +3991,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertFalse(domain.login_check_is_recent(account_id))
             self.assertIsNone(domain.recent_login_check_answer(account_id))
 
-            # The window is still the window: a determined 未登录 leaves it and
-            # the station is asked again.
+            # A signed-out observation alone does not say recovery was tried.
             domain.set_login_status(account_id, "signed_out")
+            self.assertFalse(domain.login_check_is_recent(account_id))
+            domain._note_login_refusal(account_id)
             self.assertTrue(domain.login_check_is_recent(account_id))
             settings = root / "runtime-settings.env"
             settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
@@ -3966,14 +4002,12 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 self.assertFalse(domain.login_check_is_recent(account_id))
                 self.assertIsNone(domain.recent_login_check_answer(account_id))
 
-            # The observation is the account's state, so it survives the
-            # process that made it: a restart reads the stamp back and the
-            # window keeps answering.  What bounds it is its own age, not the
-            # lifetime of a Core.
+            # The observation survives a restart, but a refusal wait is local
+            # to the Core that attempted the sign-in.
             domain.apply()
             reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
             self.assertLess(reloaded.snapshot()["accounts"][0]["login_observed_seconds_ago"], 5.0)
-            self.assertTrue(reloaded.login_check_is_recent(account_id))
+            self.assertFalse(reloaded.login_check_is_recent(account_id))
 
             # An old observation is not a claim: the window is measured from
             # the stamp, so a stamp that has aged out asks for a real check
@@ -4243,7 +4277,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
                 def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
                     self.password_logins.append((origin, account_type, username, password))
-                    raise RelayAccountsError("Relay username or password is invalid")
+                    raise RelayPasswordRejectedError("Relay username or password is invalid")
 
             refusing = RelayAccountsDomain(root, http_client=RefusingClient({}, password_login_result=RelayAccountsError("Relay is unavailable")))
             refusing_core = CoreStore(
@@ -4396,7 +4430,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
             (
                 "login_expired",
                 {},
-                {"/api/user/models": RelayAccountsError("Relay login has expired")},
+                {
+                    "/api/user/models": RelayAccountsError("Relay login has expired"),
+                    "/api/user/self": RelayAccountsError("Relay login has expired"),
+                },
             ),
         )
         for resource_error, responses, errors in cases:
@@ -4498,7 +4535,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
                 # Only the authenticated dashboard read fails, and a fresh
                 # sign-in is exactly what a station accepts again.
-                if self.expired and path == "/api/v1/keys?page=1&page_size=100":
+                if self.expired and path in {"/api/v1/keys?page=1&page_size=100", "/api/v1/auth/me"}:
                     self.requests.append((origin, path, dict(headers)))
                     raise RelayAccountsError("Relay login has expired")
                 return super().json(origin, path, headers=headers)
@@ -4555,13 +4592,13 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
         class AlwaysExpiredClient(FakeRelayHTTPClient):
             def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
-                if path == "/api/v1/keys?page=1&page_size=100":
+                if path in {"/api/v1/keys?page=1&page_size=100", "/api/v1/auth/me"}:
                     self.requests.append((origin, path, dict(headers)))
                     raise RelayAccountsError("Relay login has expired")
                 return super().json(origin, path, headers=headers)
 
         with tempfile.TemporaryDirectory() as directory:
-            fake = AlwaysExpiredClient({}, password_login_result=RelayAccountsError("Relay username or password is invalid"))
+            fake = AlwaysExpiredClient({}, password_login_result=RelayPasswordRejectedError("Relay username or password is invalid"))
             domain = RelayAccountsDomain(directory, http_client=fake)
             account = domain.dispatch(
                 "add",

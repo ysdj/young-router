@@ -2134,7 +2134,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("document.querySelector", relay_ui)
         self.assertIn("NativeCheckbox", relay_ui)
         self.assertNotIn('title={translate("relay.importSelected")}', relay_ui)
-        self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay_ui)
         # The retired manual re-login control is gone: the quiet mount restore
         # answers the session question, so no button re-runs it.  The one
         # refresh control the pane carries is 刷新资源 — the affordance every
@@ -2520,7 +2519,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("restoreRelaySession?: (options:", platform)
         self.assertIn("native.restoreRelaySession", relay_ui)
         self.assertIn("username: account.username || undefined", relay_ui)
-        self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay_ui)
         self.assertIn("await refreshAccountResources(account, { silent: true });", relay_ui)
         self.assertNotIn('translate("relay.lastUpdated"', relay_ui)
         self.assertNotIn("accountAvatar", relay_ui)
@@ -4052,13 +4050,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         """
 
         mac_views = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        readable = mac_views.split("readablePlainText", 1)[1].split("if ((identityChanged", 1)[0]
+        readable = mac_views.split("canReadPlainText", 1)[1].split("if ((identityChanged", 1)[0]
         windows_controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         windows_plain = windows_controls.split("IsPlainTextAutoCommitField", 1)[1].split("bool IsPlainTextAutoCommitField() const", 1)[0]
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         general = ui.split("function GeneralWorkspace", 1)[1].split("function RuntimeWorkspace", 1)[0]
 
-        for source, label in ((readable, "macOS"), (windows_plain, "Windows")):
+        mac_plain = mac_views.split("- (BOOL)isPlainTextAutoCommitField", 1)[1].split("- (NSView *)accessibilityElement", 1)[0]
+        for source, label in ((mac_plain, "macOS"), (windows_plain, "Windows")):
             self.assertIn("YOUNG_ROUTER_MASTER_KEY", source, label)
             self.assertIn("YOUNG_ROUTER_WEB_PASSWORD", source, label)
         self.assertIn('target="YOUNG_ROUTER_WEB_PASSWORD"', general)

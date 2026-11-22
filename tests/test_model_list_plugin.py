@@ -70,7 +70,8 @@ def test_legacy_plugin_configuration_owns_both_targets(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("host", ["codex", "claude"])
-def test_direct_api_commits_the_client_then_syncs(tmp_path, host):
+def test_direct_api_commits_the_client_then_syncs(tmp_path, monkeypatch, host):
+    monkeypatch.setenv("LITELLM_PORT", "4000")
     home = tmp_path / "codex"
     home.mkdir()
     runtime = tmp_path / "config.yaml"
@@ -116,6 +117,9 @@ def test_direct_api_commits_the_client_then_syncs(tmp_path, host):
         sync.assert_called_once_with(host)
     assert key not in json.dumps(core.snapshot())
     assert not core.secret_descriptor(host, "direct_api_key", token)["present"]
+    descriptor = core.trusted_secret_read_descriptor(host, "direct_api_key", token)
+    assert descriptor["present"]
+    assert core.trusted_secret_value(host, "direct_api_key", token, revision=descriptor["revision"]) == key
     if host == "codex":
         content = tomllib.loads(path.read_text())
         provider = content["model_providers"][content["model_provider"]]
@@ -127,3 +131,9 @@ def test_direct_api_commits_the_client_then_syncs(tmp_path, host):
         content = json.loads(path.read_text())
         assert content["env"] == {"ANTHROPIC_BASE_URL": "https://gateway.example.test", "ANTHROPIC_API_KEY": key, "KEEP": "me"}
         assert content["model"] == "example-model"
+
+    with mock.patch.object(model_list_plugin, "sync_if_enabled") as sync:
+        core.dispatch({**action, "payload": {**payload, "key_token": "", "clear_key": True}})
+        sync.assert_called_once_with(host)
+    assert key not in path.read_text()
+    assert not core.trusted_secret_read_descriptor(host, "direct_api_key", token)["present"]

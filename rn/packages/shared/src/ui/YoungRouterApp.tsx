@@ -11758,9 +11758,8 @@ function ClientBackendFields({ client, native, localApiActive, busy, onUseLocalA
           />
         </View>
       </View>
-      <View style={SETTINGS_FIELD_HELP_SLOT}>{localApiActive
-        ? <Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("settings.useLocalApiHint")}</Text>
-        : <NativeButton title={translate("settings.directApiEdit")} link compact disabled={busy || clientActionBusy} onPress={openDirectApi} />}
+      <View style={SETTINGS_FIELD_HELP_SLOT}>
+        <NativeButton title={translate("settings.directApiEdit")} link compact disabled={busy || clientActionBusy} onPress={openDirectApi} />
       </View>
   </View>;
 }
@@ -11805,23 +11804,33 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
   const [model, setModel] = useState(() => stringValue(connection.model));
   const [catalog, setCatalog] = useState(() => stringValue(connection.model_catalog_url));
   const [apiKeyAuth, setApiKeyAuth] = useState(() => connection.auth_mode === "x-api-key");
-  const [clearKey, setClearKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
+  const [keyReady, setKeyReady] = useState(false);
+  const [keyReset, setKeyReset] = useState(0);
   const [commitRequest, setCommitRequest] = useState(0);
   const [keyToken] = useState(() => `direct-api-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const pendingSecret = useRef(0);
-  const stagedKey = useRef(false);
+  const keyEdited = useRef(false);
   const optional = translate("settings.directApiOptional");
   const auth = apiKeyAuth ? "x-api-key" : "bearer";
-  const keepKeyAvailable = connection.key_configured === true && url.trim() === connection.base_url
-    && (client === "codex" || auth === connection.auth_mode);
+
+  const resetPrefilledKey = (): void => {
+    // Only an explicit edit may carry a key to a different connection.
+    if (keyEdited.current || keyReset !== 0) return;
+    setKeyReady(false);
+    setKeyReset(1);
+  };
+  const changeURL = (next: string): void => {
+    setURL(next);
+    if (next.trim().replace(/\/+$/, "") !== stringValue(connection.base_url).replace(/\/+$/, "")) resetPrefilledKey();
+  };
 
   const save = async (withKey: boolean): Promise<void> => {
     try {
       const snapshot = await ipc.snapshot();
       await ipc.dispatch({ domain: client, type: "use_direct_api", payload: {
-        base_url: url.trim(), model: model.trim(), key_token: withKey ? keyToken : "", clear_key: clearKey,
+        base_url: url.trim(), model: model.trim(), key_token: withKey ? keyToken : "", clear_key: !withKey,
         ...(client === "codex" ? { model_catalog_url: catalog.trim() } : { auth_mode: auth }),
       } }, snapshot.revision);
       onClose();
@@ -11831,30 +11840,30 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
     }
   };
   const submit = (): void => {
-    if (saving || !url.trim()) return;
+    if (saving || !keyReady || !url.trim()) return;
     setError(undefined);
     setSaving(true);
-    if (clearKey || stagedKey.current) {
-      void save(!clearKey);
-      return;
-    }
     pendingSecret.current = commitRequest + 1;
     setCommitRequest(pendingSecret.current);
   };
   const secretChanged = ({ status, present, commitRequest: request }: SecretState): void => {
     if (status === "dirty") {
-      stagedKey.current = false;
-      setClearKey(false);
+      keyEdited.current = true;
+      setKeyReady(true);
     }
-    if (!pendingSecret.current || request !== pendingSecret.current || !["ready", "saved", "error"].includes(status)) return;
+    if (!pendingSecret.current) {
+      if (status === "ready") setKeyReady(true);
+      if (status === "error" && request === 0) setError(translate("settings.directApiKeyReadFailed"));
+      return;
+    }
+    if (request !== pendingSecret.current || (status !== "saved" && status !== "error")) return;
     pendingSecret.current = 0;
-    if (status === "error") {
-      setError(translate("settings.directApiKeyAgain"));
-      setSaving(false);
-    } else {
-      stagedKey.current = status === "saved" && present;
-      void save(stagedKey.current);
+    if (status === "saved") {
+      void save(present);
+      return;
     }
+    setError(translate("settings.directApiKeyAgain"));
+    setSaving(false);
   };
   const input = (label: string, value: string, change: (next: string) => void, required = false): React.ReactNode => <NativeFormRow label={label} required={required}>
     <NativeTextField accessibilityLabel={label} value={value} placeholder={required ? "https://" : optional} editable={!saving} autoCapitalize="none" autoCorrect={false} onChangeText={change} style={styles.input} />
@@ -11864,20 +11873,21 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
   const authChoices = [translate("settings.directApiBearer"), "x-api-key"];
   return <>
     <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_BODY}>
-      {input(translate("providers.baseUrl"), url, setURL, true)}
+      {input(translate("providers.baseUrl"), url, changeURL, true)}
       {client === "claude" ? <NativeFormRow label={authLabel}>
-        <NativePicker accessibilityLabel={authLabel} labels={authChoices} selectedValue={authChoices[apiKeyAuth ? 1 : 0]} disabled={saving} onChange={({ nativeEvent }) => setApiKeyAuth(nativeEvent.index === 1)} />
+        <NativePicker accessibilityLabel={authLabel} labels={authChoices} selectedValue={authChoices[apiKeyAuth ? 1 : 0]} disabled={saving} onChange={({ nativeEvent }) => {
+          const next = nativeEvent.index === 1;
+          if (next !== apiKeyAuth) resetPrefilledKey();
+          setApiKeyAuth(next);
+        }} />
       </NativeFormRow> : null}
       <NativeFormRow label={keyLabel}>
         <NativeSecureTextInput
           domain={client} field="direct_api_key" target={keyToken} label={keyLabel}
-          placeholder={keepKeyAvailable && !clearKey ? translate("settings.directApiKeepKey") : optional}
-          disabled={saving} commitRequest={commitRequest} onSecretState={secretChanged} style={styles.nativeSecretInput}
+          placeholder={optional} plainText disabled={saving}
+          commitRequest={commitRequest} resetRequest={keyReset} onSecretState={secretChanged} style={styles.nativeSecretInput}
         />
       </NativeFormRow>
-      {keepKeyAvailable ? <View style={SETTINGS_FIELD_HELP_SLOT}>
-        <NativeButton title={translate(clearKey ? "settings.directApiRestoreKey" : "settings.directApiClearKey")} link compact disabled={saving} onPress={() => setClearKey((current) => !current)} />
-      </View> : null}
       {input(translate("settings.directApiModel"), model, setModel)}
       {client === "codex" ? input(translate("settings.directApiCatalog"), catalog, setCatalog) : null}
     </PersistentScrollView>
@@ -11885,7 +11895,7 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
       <Text style={assistantFileSurfaceStyles.editorError} accessibilityLiveRegion="polite">{error ?? ""}</Text>
       <View style={assistantFileSurfaceStyles.editorFooterActions}>
         <NativeButton title={translate("status.cancel")} disabled={saving} onPress={onClose} />
-        <NativeButton title={translate("common.save")} primary disabled={saving || !url.trim()} busy={saving} onPress={submit} />
+        <NativeButton title={translate("common.save")} primary disabled={saving || !keyReady || !url.trim()} busy={saving} onPress={submit} />
       </View>
     </View>
   </>;
@@ -12032,6 +12042,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
   const [error, setError] = useState<string>();
   const [pluginInfo, setPluginInfo] = useState<ModelListPluginInfo>();
   const [pluginPending, setPluginPending] = useState<ModelListPluginOperation>();
+  const pluginActionVersion = useRef(0);
   // A phone draws the client rail as a strip above the detail it opens; the
   // selection it names is this component's state either way.
   const compactWeb = useCompactWebShell();
@@ -12042,14 +12053,17 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
   useEffect(() => {
     if (selectedClient !== "claude") return;
     let active = true;
+    const version = pluginActionVersion.current;
+    const current = (): boolean => active && version === pluginActionVersion.current;
     void requestClaudePlugin(ipc, "status").then(
-      (state) => { if (active) setPluginInfo({ state }); },
-      (reason: unknown) => { if (active) setPluginInfo({ error: errorMessage(reason, translate) }); },
+      (state) => { if (current()) setPluginInfo({ state }); },
+      (reason: unknown) => { if (current()) setPluginInfo((info) => ({ ...info, error: errorMessage(reason, translate) })); },
     );
     return () => { active = false; };
   }, [claudeRevision, filesToken, ipc, selectedClient, translate]);
   const managePlugin = async (operation: ModelListPluginOperation): Promise<boolean> => {
     if (pluginPending) return false;
+    pluginActionVersion.current += 1;
     setPluginPending(operation);
     try {
       const state = await requestClaudePlugin(ipc, operation);
@@ -12060,10 +12074,11 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
       // Installation may have completed even if a later command failed.
       const state = await requestClaudePlugin(ipc, "status").catch(() => undefined);
       const error = errorMessage(reason, translate);
-      setPluginInfo({ state, error });
+      setPluginInfo((current) => ({ state: state ?? current?.state, error }));
       onStatus(error);
       return false;
     } finally {
+      pluginActionVersion.current += 1;
       setPluginPending(undefined);
     }
   };
@@ -12130,11 +12145,20 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
   const useClaudeApiAndOfferPlugin = async (): Promise<boolean> => {
     // The plugin reads the saved client file and may write to it on install.
     if (!await saveLocalApi(useClaudeLocalApi)) return false;
+    const version = pluginActionVersion.current;
     try {
       const state = await requestClaudePlugin(ipc, "status");
+      if (version !== pluginActionVersion.current) return true;
       setPluginInfo({ state });
-      if (state.enabled === true) await managePlugin("sync");
-      else if (state.available === true && state.installed !== true && await native.showConfirmation({
+      if (state.enabled === true) {
+        // The API switch is independent of the plugin's interactive controls.
+        void requestClaudePlugin(ipc, "sync").then(
+          (synced) => { if (version === pluginActionVersion.current) setPluginInfo({ state: synced }); },
+          (reason: unknown) => {
+            if (version === pluginActionVersion.current) setPluginInfo((info) => ({ ...info, error: errorMessage(reason, translate) }));
+          },
+        );
+      } else if (state.available === true && state.installed !== true && await native.showConfirmation({
         title: translate("settings.pluginInstallTitle"),
         message: translate("settings.pluginInstallPrompt"),
         confirmLabel: translate("settings.pluginInstall"),

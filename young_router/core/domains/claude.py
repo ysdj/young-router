@@ -2894,6 +2894,21 @@ class ClaudeSettingsDomain:
         return bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY"))
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
+        if field == "direct_api_key" and target:
+            # The form is available in both modes. In local mode show the
+            # router key that would be written when the user switches away;
+            # otherwise read the active direct client credential.
+            if self.code_uses_local_api():
+                try:
+                    return _shared_api.endpoint(self.runtime_config_path)[1]
+                except Exception:
+                    return ""
+            if self._desktop is not None and not self.desktop_uses_local_api():
+                try:
+                    return self._desktop.secret_value("desktop_gateway_api_key")
+                except ClaudeDesktopConfigError:
+                    pass
+            return self.trusted_secret_value("deployment_token")
         if target is not None:
             raise ClaudeSettingsError("The requested secret field is unavailable")
         if field == "desktop_gateway_api_key":
@@ -2907,7 +2922,7 @@ class ClaudeSettingsDomain:
             raise ClaudeSettingsError("The requested secret field is unavailable")
         env = _mapping(self._draft.get("env", {}), "env")
         value = env.get("ANTHROPIC_AUTH_TOKEN")
-        if not isinstance(value, str):
+        if not isinstance(value, str) or not value:
             value = env.get("ANTHROPIC_API_KEY")
         if not isinstance(value, str):
             return ""

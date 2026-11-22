@@ -86,6 +86,11 @@ class OneDerivedValueOneProducerTests(unittest.TestCase):
             ROOT / "young_router/core/scheduled_tasks.py",
             r"Date\.parse\((?:run|execution)\.(?:started_at|finished_at)\)",
         ),
+        Producer(
+            "an automatic relay login failure's displayed explanation",
+            UI_DIR / "RelayAccountManager.tsx",
+            r"translate\((?:LOGIN_FAILURE_MESSAGES\[|[\"']relay\.autoSignIn(?:Rejected|SessionLimit|Unavailable))",
+        ),
     )
 
     def test_no_ui_surface_recomputes_a_derived_name(self) -> None:

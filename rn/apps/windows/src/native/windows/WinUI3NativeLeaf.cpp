@@ -3277,7 +3277,7 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
   if (route == L"webdav-settings") return Localized("routeWebDavSettings", L"WebDAV Sync Settings");
   if (route == L"codex-api-settings" || route == L"claude-api-settings")
-    return Localized("routeDirectApiSettings", L"Direct API Settings");
+    return Localized("routeDirectApiSettings", L"Edit API");
   // Settings panes share one window, so its title is the app name while the
   // sidebar selection names the active pane (System Settings style).
   return Localized("appTitle", L"Young Router");

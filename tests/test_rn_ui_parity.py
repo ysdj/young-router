@@ -4494,6 +4494,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'client === "codex" ? "codex-api-settings" : "claude-api-settings"',
             'client={directApiClient}',
             'field="direct_api_key" target={keyToken}',
+            'title={translate("settings.directApiEdit")}',
+            'placeholder={optional} plainText disabled={saving}',
             'domain: client, type: "use_direct_api"',
         ):
             self.assert_ui_has(marker)
@@ -4603,7 +4605,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "<NativeToggle",
             "value={localApiActive}",
             'const label = translate("settings.useLocalApi");',
-            'translate("settings.useLocalApiHint")',
+            'title={translate("settings.directApiEdit")}',
             "disabled={busy || clientActionBusy}",
             "onValueChange={toggleLocalApi}",
             'localApiActive={codexUsesLocalApi}',
@@ -8073,8 +8075,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "void beginAddLogin();",
             "const loginAccount = async (account: AddedRelayAccount): Promise<boolean> => {",
             "native.relayLogin({",
-            "markLoginFailure(account.id, true);",
-            "const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {",
+            "const restoreSavedSession = async (account: RelayAccount): Promise<void> => {",
             "native.restoreRelaySession({",
         ):
             self.assertIn(marker, relay)
@@ -8084,11 +8085,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # just landed); the pane's mount read stays implicit so 分组管理 can join
         # it instead of paying for the same station round trip twice.
         self.assertIn("await refreshAccountResources({ id: account.id }, { silent: true, force: true });", relay)
-        # A ready key read is the later proof of the same session the mount
-        # probe may have failed to renew: it clears 未登录 and keeps 已登录.
-        self.assertIn('if (status === "ready") {', relay)
-        self.assertIn("markLoginFailure(target.id, false);", relay)
-        self.assertIn("markLocalSignedIn(target.id, true);", relay)
+        # Reads and sign-ins share Core's projection. A local verdict could
+        # hide a newer observation received from background maintenance.
+        self.assertNotIn("markLoginFailure", relay)
+        self.assertNotIn("markLocalSignedIn", relay)
         # Removal asks before it removes, on the host's own decision panel, and
         # stages the dependency policy before the native erase; a failed erase
         # persists a retry tombstone.
@@ -8098,56 +8098,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await commit("account.delete", { id: account.id, dependency_policy: "detach" });', removal)
         self.assertIn("await native.clearRelayCredentials(account.id);", removal)
         self.assertIn('await commit("credential_cleanup_confirm", { id: account.id, kind: "credentials" });', removal)
-        # Quietly restore sessions once per account when the panel mounts; a
-        # restore that fails leaves the account signed out and never opens the
-        # login page on its own (去登录 / + ask for it).  The quiet resource
-        # refresh still runs: a locally known key is local data, and Core reads
-        # the station through a remembered session when it has one.  The probe
-        # is a station round trip, so it reports in the resources lane: every
-        # mount re-checks a saved session, and re-entering the pane must not
-        # paint a verified account as 登录中 while that check runs.
-        self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay)
-        self.assertIn("attemptedAccounts.current.add(account.id);", relay)
-        self.assertNotIn("if (!(await restoreSavedSession(account))) return;", relay)
-        self.assertIn("await restoreSavedSession(account);", relay)
+        # The mount effect quietly checks Core and then reads resources. Its
+        # dependency is an observation, not each newly delivered array.
+        self.assertIn("if (!fresh) await restoreSavedSession(account);", relay)
         self.assertIn("await refreshAccountResources(account, { silent: true });", relay)
-        self.assertNotIn("const canAutoLogin =", relay)
-        # ...and a login the runtime's re-check window still covers skips the
-        # probe entirely: entering the pane twice within the window must not
-        # re-authenticate or re-read a station whose observation is seconds old.
-        # The short-circuit covers a determined 未登录 as well as 已登录 — a login
-        # that has been answered is settled, not a question to ask again.  The
-        # word alone is not the test, the observation is: an account created but
-        # never checked carries 未登录 with no stamp, and that is exactly what a
-        # mount must probe.  An expired login is left out on purpose, because
-        # re-authenticating is how such an account recovers.
-        self.assertIn("const observed = account.loginObservedSecondsAgo;", relay)
-        self.assertIn('const settled = (account.loginStatus === "signed_in" || account.loginStatus === "signed_out")', relay)
-        self.assertIn("&& observed !== null;", relay)
-        self.assertIn("&& observed < sessionRecheckSeconds;", relay)
-        self.assertNotIn('const fresh = account.loginStatus === "signed_in"', relay)
-        # The probe runs for a session the window no longer covers, and its
-        # answer is what decides whether the account is released back to
-        # unattempted: a refused round trip observed nothing, so leaving the id
-        # attempted suppressed the mount check for the life of the panel.
-        self.assertIn("if (!fresh && active) answered = await restoreSavedSession(account);", relay)
-        self.assertIn("if (!answered) attemptedAccounts.current.delete(account.id);", relay)
-        # The mount pass belongs to a change in the facts it reads, not to a
-        # render: it ends by refreshing the account, that refresh publishes a
-        # snapshot, and the rebuilt account array used to restart the pass on
-        # its own result -- probe → refresh → snapshot → probe, with the rows
-        # repainting 检测中 forever.  A station that answers nothing is asked
-        # again only after the re-check window, so the retry that a transient
-        # timeout needs cannot become a spin.
-        self.assertIn("const mountProbeKey = stationAccounts", relay)
-        self.assertIn("}, [busy, sessionRecheckSeconds, mountProbeKey]);", relay)
         self.assertNotIn("}, [busy, sessionRecheckSeconds, stationAccounts]);", relay)
-        self.assertIn("const probeAttemptedAt = useRef(new Map<string, number>());", relay)
-        self.assertIn("probeAttemptedAt.current.set(account.id, Date.now());", relay)
-        self.assertIn("const cooling = lastAttempt !== undefined && Date.now() - lastAttempt < cooldownMs;", relay)
-        self.assertIn("const cooldownMs = Math.max(1, typeof sessionRecheckSeconds", relay)
-        self.assertIn("let active = true;", relay)
-        self.assertIn("return () => { active = false; };", relay)
         self.assertIn("sessionRecheckSeconds?: number;", relay)
         self.assertIn("export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | undefined {", relay)
         self.assertIn("sessionRecheckSeconds={relaySessionRecheckSeconds(snapshotForCleanups)}", self.ui)
@@ -8167,9 +8122,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # only asks what the session on hand is worth. 去登录 only appears while
         # signed out and is never disabled; 刷新资源 and 分组管理 are the controls
         # that act on a session, so they appear only once the row reads 已登录.
-        self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "checking_login" | "signing_in" | "signed_out" => {', relay)
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
-        self.assertIn('if (effectiveLoginStatus(account) === "signed_in") return "signed_in";', relay)
+        self.assertIn('if (account.loginStatus === "signed_in") return "signed_in";', relay)
         self.assertIn('if (loading[account.id]?.checking) return "checking_login";', relay)
         self.assertIn('return "signed_out";', relay)
         # 未登录 is a conclusion, not a placeholder: the mount check is a station
@@ -8182,7 +8136,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # must be able to interrupt the check rather than sit it out.
         self.assertIn('updateLoading(account.id, "checking", true);', relay)
         self.assertIn('updateLoading(account.id, "checking", false);', relay)
-        probe_lanes = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {", 1)[1].split("const loginAccount", 1)[0]
+        probe_lanes = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<void> => {", 1)[1].split("const loginAccount", 1)[0]
         self.assertNotIn('"session"', probe_lanes)
         self.assertNotIn('updateLoading(account.id, "resources"', probe_lanes)
         self.assertIn('type AccountLoading = { session: boolean; checking: boolean; resources: boolean };', relay)
@@ -8205,22 +8159,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('startSigningIn(account.id);', relay)
         self.assertNotIn('updateLoading(account.id, "session", false);', relay)
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
-        # 去登录 is the escape hatch from the wait itself: a row that states
-        # 未登录 carries it, so the user can skip the station round trip the
-        # mount check would otherwise make them sit through.  It is withheld
-        # while the row already reads 登录中 — the pane's own sign-in, or the
-        # mount check still fetching its answer — because a login already being
-        # settled has no second sign-in to offer, and a button beside that word
-        # read as "your attempt did not start".  A sign-in that lands while a
-        # check was in flight stays authoritative: the check's answer is about
-        # the session the sign-in replaced, so it is discarded by the pane's
-        # sign-in count.
-        self.assertIn('const signInCounts = useRef<Record<string, number>>({});', relay)
-        self.assertIn('signInCounts.current[accountID] = (signInCounts.current[accountID] ?? 0) + 1;', relay)
-        self.assertIn('const checkEpoch = signInCounts.current[account.id] ?? 0;', relay)
-        self.assertIn('if ((signInCounts.current[account.id] ?? 0) !== checkEpoch) return false;', relay)
-        self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
-        self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
+        self.assertIn('const canSignIn = selectedLoginState === "signed_out" || selectedLoginState === "unknown";', relay)
+        self.assertIn('{canSignIn ? <NativeButton title={translate("relay.goLogin")}', relay)
         # 登录中 owns no sign-in button at all, whether the wait is the pane's
         # own session lane or the mount check's.
         self.assertNotIn('selectedLoginState !== "signed_in" && !loading[selected.id]?.session ? <NativeButton title={translate("relay.goLogin")}', relay)
@@ -8254,11 +8194,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # answers a probe with nothing at all when it could not reach the
         # station, and the pane keeps what it already knew instead of painting
         # 未登录 and retiring a session the user still holds.
-        probe = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {", 1)[1].split("const loginAccount", 1)[0]
-        self.assertIn("if (!result) return false;", probe)
-        self.assertIn('const signedIn = result.loginStatus === "signed_in";', probe)
-        self.assertNotIn('const signedIn = result?.loginStatus === "signed_in";', relay)
-        self.assertNotIn("markLocalSignedIn(account.id, false);\n      return false;", probe)
+        self.assertIn("await refreshAccounts();", probe_lanes)
         self.assertIn('"relay.status.signing_in": "登录中"', self.zh)
         self.assertIn('"relay.status.signing_in": "Signing in"', self.en)
         # The mount check is not a sign-in, so the row says 检测中 while it runs

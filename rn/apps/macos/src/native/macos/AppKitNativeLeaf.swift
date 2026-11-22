@@ -288,7 +288,7 @@ private enum NativeRelayOriginPolicy {
         "routeRuntimeSettings": "Runtime",
         "routeDataManagement": "Data Management", "routeLogs": "Tasks & Logs",
         "routeWebDavSettings": "WebDAV Sync Settings",
-        "routeDirectApiSettings": "Direct API Settings",
+        "routeDirectApiSettings": "Edit API",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
         "modelChooserProvider": "Provider", "modelChooserKey": "Key", "modelChooserSearch": "Search models",
         "modelChooserAll": "All", "modelChooserSelectAllVisible": "Select all visible models",
@@ -3068,7 +3068,7 @@ private enum NativeRelayOriginPolicy {
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
         case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")
-        case "codex-api-settings", "claude-api-settings": return localized("routeDirectApiSettings", fallback: "Direct API Settings")
+        case "codex-api-settings", "claude-api-settings": return localized("routeDirectApiSettings", fallback: "Edit API")
         default: return nil
         }
     }

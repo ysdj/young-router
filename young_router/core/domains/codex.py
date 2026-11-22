@@ -1292,9 +1292,11 @@ class CodexSettingsDomain:
             structured if isinstance(structured, Mapping) else {}
         )
 
+    def _direct_api_provider_id(self, structured: Mapping[str, Any], uses_local_api: bool) -> str:
+        return DIRECT_API_PROVIDER_ID if uses_local_api else str(structured.get("model_provider") or "openai")
+
     def _direct_api_settings(self, structured: Mapping[str, Any], uses_local_api: bool) -> dict[str, Any]:
-        selected = structured.get("model_provider")
-        provider_id = DIRECT_API_PROVIDER_ID if uses_local_api else selected
+        provider_id = self._direct_api_provider_id(structured, uses_local_api)
         provider = next((row for row in structured.get("providers", []) if row.get("id") == provider_id), {})
         base_url = structured.get("openai_base_url") if provider_id == "openai" else provider.get("base_url")
         return {
@@ -1543,6 +1545,18 @@ class CodexSettingsDomain:
         return isinstance(structured, Mapping) and bool(structured.get("api_key"))
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
+        if field == "direct_api_key" and target:
+            from .. import codex_config
+
+            structured = self._draft.get("structured") or {}
+            provider_id = self._direct_api_provider_id(structured, self.uses_local_api())
+            provider = codex_config._provider_mapping(self._draft.get("config_text", ""), provider_id)
+            env_key = provider.get("env_key")
+            if isinstance(env_key, str) and env_key:
+                return os.environ.get(env_key, "")
+            if provider_id == "openai" or provider.get("requires_openai_auth") is True:
+                return os.environ.get("OPENAI_API_KEY") or structured.get("api_key", "")
+            return str(provider.get("experimental_bearer_token") or "")
         if field != "api_key" or target is not None:
             raise DomainError("The requested secret field is unavailable")
         structured = self._draft.get("structured", {})

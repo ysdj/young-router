@@ -2553,12 +2553,6 @@ class BrowserModelChooserTests(unittest.TestCase):
         self.assertNotIn('login_status: "signed_out"', silent_restore)
         self.assertIn('const loginStatus: "signed_in" | "signed_out" | "expired" = answered;', leaf)
         self.assertIn("loginStatus,\n          username:", leaf)
-        # The no-answer cases name the two codes they are: a station never
-        # reached, and a station that would not mint a session for this check.
-        restore = leaf.split("restoreRelaySession: async (options) => {", 1)[1].split("openRelayLogs:", 1)[0]
-        self.assertIn("relay_restore_unavailable", restore)
-        self.assertIn("relay_login_session_limit", restore)
-        self.assertIn("relay_login_backoff", restore)
 
     def test_the_words_come_from_the_apps_localization(self) -> None:
         leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")

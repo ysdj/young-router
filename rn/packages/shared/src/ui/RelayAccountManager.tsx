@@ -16,6 +16,11 @@ export { providedKeyName } from "./providedKeyName";
 
 type UnknownRecord = Record<string, unknown>;
 type Translate = (key: string, values?: Record<string, string | number>) => string;
+const LOGIN_FAILURE_MESSAGES = {
+  rejected: "relay.autoSignInRejected",
+  session_limit: "relay.autoSignInSessionLimit",
+  unavailable: "relay.autoSignInUnavailable",
+} as const;
 export type RelayType = "newapi" | "sub2api";
 type RemoteDeletePolicy = "delete_models" | "detach_disabled" | "detach_only";
 export type RelayGroup = {
@@ -47,6 +52,7 @@ export type RelayAccount = {
   stationName: string;
   username: string;
   loginStatus: string;
+  loginFailure?: keyof typeof LOGIN_FAILURE_MESSAGES;
   /**
    * How long ago Core's login observation for this account was made, or null
    * when it cannot say.  The pane compares it with the station's re-check
@@ -171,6 +177,7 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
     if (!type || !id) return [];
     const origin = text(item.origin) || text(item.base_url) || text(item.url);
     const stationID = text(item.station_id) || text(item.group_id) || text(item.relay_id);
+    const failure = item.login_failure;
     return [{
       id,
       type,
@@ -180,6 +187,7 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
       stationName: text(item.station_name) || text(item.station_label),
       username: text(item.username),
       loginStatus: text(item.login_status) || "unknown",
+      loginFailure: failure === "rejected" || failure === "session_limit" || failure === "unavailable" ? failure : undefined,
       loginObservedSecondsAgo: typeof item.login_observed_seconds_ago === "number" && Number.isFinite(item.login_observed_seconds_ago) ? item.login_observed_seconds_ago : null,
       rememberPassword: item.remember_password === true,
       passwordSaved: item.password_saved === true,
@@ -659,8 +667,6 @@ export function StationAccountsPanel({
   const [loading, setLoading] = useState<Record<string, AccountLoading>>({});
   const loadingRef = useRef(loading);
   loadingRef.current = loading;
-  const [localSignedIn, setLocalSignedIn] = useState<Set<string>>(() => new Set());
-  const [loginFailure, setLoginFailure] = useState<Set<string>>(() => new Set());
   // The account whose sign-in this pane started, while that wait is in flight.
   // The session lane is cleared against *this* id, so the lane and the account
   // it belongs to can never drift apart.
@@ -678,12 +684,6 @@ export function StationAccountsPanel({
   // Which account action is running: the button that started one keeps its own
   // inline spinner instead of graying out.
   const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove" | "refresh">();
-  // How many sign-ins this pane has started for each account.  A session check
-  // that began before the newest one is asking about a session the pane has
-  // already replaced: 去登录 stays offered while a check runs, so its answer can
-  // land after the sign-in the user made instead — and recording that stale
-  // 未登录 retires a login that just succeeded.
-  const signInCounts = useRef<Record<string, number>>({});
   // What a sign-in may save is asked by the native login flow after the
   // webview login succeeds; adding an account goes straight to sign-in.
   const beginAddLogin = async (): Promise<void> => {
@@ -718,38 +718,14 @@ export function StationAccountsPanel({
   const publish = (message: string): void => {
     onStatus?.(message);
   };
-  const effectiveLoginStatus = (account: RelayAccount): "signed_in" | "signed_out" | "expired" | "unknown" => {
-    if (loginFailure.has(account.id)) return "expired";
-    if (localSignedIn.has(account.id)) return "signed_in";
-    if (account.loginStatus === "signed_in" || account.loginStatus === "signed_out" || account.loginStatus === "expired") return account.loginStatus;
-    return "unknown";
-  };
-  // The status column and both account actions read this one state: 已登录,
-  // 登录中 while a sign-in this pane started is still being settled
-  // (``session``), 检测中 while the mount check is asking the station what the
-  // session on hand is worth (``checking``), and 未登录 for every other case
-  // (signed out, expired, and an account no answer has covered yet).
-  //
-  // The two waits say different things.  A sign-in is the station minting a
-  // session, so it reads 登录中; a check spends that session on one probe and
-  // may answer 已登录 or 未登录 from it, so it reads 检测中 -- the word the row
-  // shows while the answer is still unknown, and never 登录中, which would
-  // claim a sign-in that nobody started.
-  //
-  // 未登录 is a conclusion, and only an answer may state it: the mount check is
-  // a station round trip whose network timeout is long enough that a row painted
-  // 未登录 while it ran read as "sign in again", which is what sent users into a
-  // second, pointless sign-in while the first session was still being verified.
-  // A row the pane already knows is signed in keeps 已登录 through a check that
-  // is about to agree with it, so re-entering the pane never flickers a verified
-  // account through 检测中; only the pane's own sign-in outranks that, because
-  // the facts beside the row must not read 已登录 before they belong to the
-  // account that just signed in.
-  const relayLoginState = (account: RelayAccount): "signed_in" | "checking_login" | "signing_in" | "signed_out" => {
+  // The pane owns only progress for actions it started. Core owns the result,
+  // including the distinction between a definite logout and an untested row.
+  const relayLoginState = (account: RelayAccount): "signed_in" | "checking_login" | "signing_in" | "signed_out" | "unknown" => {
     if (loading[account.id]?.session) return "signing_in";
-    if (effectiveLoginStatus(account) === "signed_in") return "signed_in";
+    if (account.loginStatus === "signed_in") return "signed_in";
     if (loading[account.id]?.checking) return "checking_login";
-    return "signed_out";
+    if (account.loginStatus === "expired" || (account.loginStatus === "signed_out" && account.loginObservedSecondsAgo !== null)) return "signed_out";
+    return "unknown";
   };
   // The session lane is set on the way in to a sign-in, never cleared in a
   // `finally`: 去登录 hands the wait to a browser window the native host owns,
@@ -764,12 +740,6 @@ export function StationAccountsPanel({
   const startSigningIn = (accountID: string): void => {
     clearPendingLogin();
     pendingLoginRef.current = accountID;
-    signInCounts.current[accountID] = (signInCounts.current[accountID] ?? 0) + 1;
-    // The sign-in replaces whatever the mount check was asking about, so it
-    // releases that lane too: the check's answer is discarded by the count
-    // above, and a lane left up would make the key-list read this sign-in forces
-    // look like a read already in progress and skip it.
-    updateLoading(accountID, "checking", false);
     updateLoading(accountID, "session", true);
   };
   // One account can hold the pane's sign-in at a time, so the lane's owner is
@@ -799,33 +769,6 @@ export function StationAccountsPanel({
     if (selected && selected.id === selectedID) return;
     setSelectedID(selected?.id);
   }, [selected, selectedID]);
-  useEffect(() => {
-    const ids = new Set(stationAccounts.map((account) => account.id));
-    setLocalSignedIn((current) => {
-      const next = new Set([...current].filter((id) => ids.has(id)));
-      return next.size === current.size ? current : next;
-    });
-    setLoginFailure((current) => {
-      const next = new Set([...current].filter((id) => ids.has(id)));
-      return next.size === current.size ? current : next;
-    });
-  }, [stationAccounts]);
-  const markLoginFailure = (accountID: string, failed: boolean): void => {
-    setLoginFailure((current) => {
-      const next = new Set(current);
-      if (failed) next.add(accountID);
-      else next.delete(accountID);
-      return next;
-    });
-  };
-  const markLocalSignedIn = (accountID: string, signedIn: boolean): void => {
-    setLocalSignedIn((current) => {
-      const next = new Set(current);
-      if (signedIn) next.add(accountID);
-      else next.delete(accountID);
-      return next;
-    });
-  };
   const refreshAccountResources = async (target: ResourceRefreshTarget, options: { silent?: boolean; force?: boolean } = {}): Promise<"ready" | "unavailable"> => {
     const { silent = false, force = false } = options;
     if (loadingRef.current[target.id]?.resources) {
@@ -835,15 +778,6 @@ export function StationAccountsPanel({
     if (!silent) onStatus?.(undefined);
     try {
       const status = await refreshResources(target.id, { force });
-      // The station answered this account's key question.  That is the same
-      // session the mount probe just questioned, so a probe that failed marks
-      // the row 未登录 beside a key list the account has plainly read.  A ready
-      // read is the later, stronger answer: it clears the probe's failure and
-      // keeps the row 已登录 through the next restart.
-      if (status === "ready") {
-        markLoginFailure(target.id, false);
-        markLocalSignedIn(target.id, true);
-      }
       // A checked 自动分组 is the user's standing instruction to keep one key per
       // group, and this read is the station saying whether it still does.  The
       // pane already draws that key list as the aligned layout, so a key whose
@@ -876,50 +810,21 @@ export function StationAccountsPanel({
       updateLoading(target.id, "resources", false);
     }
   };
-  const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {
-    // The mount check reports in a lane of its own.  It is a statement about the
-    // login, so the row states a wait while it runs — 检测中, never 未登录, which
-    // is the answer this check is still fetching, and never 登录中, because this
-    // check signs nothing in — and it stays out of the session lane, because
-    // that lane is the pane's own sign-in: a window the host holds over this one
-    // until it closes, while this check is a wait 去登录 may interrupt instead
-    // of one the user has to sit out.
+  const restoreSavedSession = async (account: RelayAccount): Promise<void> => {
     updateLoading(account.id, "checking", true);
-    const checkEpoch = signInCounts.current[account.id] ?? 0;
     try {
-      const result = await native.restoreRelaySession({
+      await native.restoreRelaySession({
         accountId: account.id,
         type: account.type,
         label: account.label,
         origin: account.origin,
         username: account.username || undefined,
       });
-      // No answer at all is not a signed-out answer: the host reports one only
-      // when it could not reach the station (a timeout, a dropped connection),
-      // which says nothing about the login.  The pane keeps what it knows —
-      // treating an absent answer as 未登录 is what turned a momentary network
-      // failure into a login the user then had to redo by hand.
-      if (!result) return false;
-      // A sign-in started while this check was in flight owns the row now, and
-      // this answer is about the session that sign-in replaced.
-      if ((signInCounts.current[account.id] ?? 0) !== checkEpoch) return false;
-      const signedIn = result.loginStatus === "signed_in";
-      // The lane is released with the answer, in the same batch that records
-      // it: the row states what the station said from here on, instead of
-      // reading 登录中 through the refresh that follows.
-      updateLoading(account.id, "checking", false);
-      markLoginFailure(account.id, !signedIn);
-      markLocalSignedIn(account.id, signedIn);
-      try {
-        await refreshAccounts();
-      } catch {
-        // The native session result is authoritative.
-      }
-      return signedIn;
+      // Core owns the observation. A local override would still be on screen
+      // after a background check or sync supplied a newer answer.
+      await refreshAccounts();
     } catch {
-      // Same boundary as an absent answer: a refused round trip observed
-      // nothing, so the pane's login state is left exactly as it was.
-      return false;
+      // The published account state remains authoritative.
     } finally {
       updateLoading(account.id, "checking", false);
     }
@@ -946,15 +851,7 @@ export function StationAccountsPanel({
         rememberPassword: account.rememberPassword,
         autoGrouping: account.autoGrouping,
       });
-      if (!result) {
-        // A cancelled or failed sign-in only surfaces as the stale brown
-        // account row; no login-status copy appears in the status line.
-        markLoginFailure(account.id, true);
-        markLocalSignedIn(account.id, false);
-        return false;
-      }
-      markLoginFailure(account.id, false);
-      markLocalSignedIn(account.id, true);
+      if (!result) return false;
       const username = text(result.username).trim();
       if (username && username !== account.username) {
         try {
@@ -972,8 +869,6 @@ export function StationAccountsPanel({
       await refreshAccountResources({ id: account.id }, { silent: true, force: true });
       return true;
     } catch {
-      markLoginFailure(account.id, true);
-      markLocalSignedIn(account.id, false);
       return false;
     } finally {
       // The lane is released with the account's settled facts already in hand,
@@ -983,87 +878,40 @@ export function StationAccountsPanel({
       setFormBusy(false);
     }
   };
-  // Restore saved sessions quietly once per account per panel mount. This
-  // mirrors the old workspace behaviour: selecting a provider must surface
-  // fresh login state and resources without a manual refresh click.  A restore
-  // that fails never opens the login page on its own: the account reads 未登录
-  // once the check has answered, and keeps its cached keys until the user
-  // presses 去登录 (or +).
-  //
-  // The mount is not a reason to re-authenticate: Core answers with the
-  // observation it already has while that observation is inside the station's
-  // re-check window (运行时 adjusts it), so stepping into the pane and back
-  // within the window costs no station round trip and never repaints the login
-  // state.  Only a session the window no longer covers is probed again.
-  const attemptedAccounts = useRef(new Set<string>());
-  // When each account was last probed, so a station that answers nothing is
-  // asked once per re-check window instead of once per render.  The pass below
-  // ends by refreshing the account, that refresh publishes a snapshot, and a
-  // fresh snapshot hands this panel a rebuilt `stationAccounts` array -- an
-  // array in the dependency list therefore restarted the pass on its own
-  // result: probe → refresh → snapshot → probe, with the rows repainting
-  // 检测中 and 余额 forever.  The pass belongs to a change in the facts it
-  // reads, so the dependency is that change spelled as a value.
-  const probeAttemptedAt = useRef(new Map<string, number>());
+  // Check on entry, and again if the observed state becomes recoverable while
+  // the panel is open. Resource snapshots and the clock do not start new work.
+  const checkedAccounts = useRef(new Map<string, boolean>());
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const mountProbeKey = stationAccounts
-    .map((account) => `${account.id}:${account.loginStatus}:${account.loginObservedSecondsAgo ?? "-"}`)
+    .map((account) => `${account.id}:${account.loginStatus}:${account.loginObservedSecondsAgo !== null}:${account.passwordSaved}`)
     .join("\u001f");
   useEffect(() => {
     if (busy) return;
-    // A probe that settles after this panel has been replaced must not write
-    // its state into the row set the replacement is rendering: the station
-    // editor is keyed by station, so switching stations swaps this panel out
-    // while an unbounded station round trip may still be running.
-    let active = true;
-    const cooldownMs = Math.max(1, typeof sessionRecheckSeconds === "number" && sessionRecheckSeconds > 0 ? sessionRecheckSeconds : 60) * 1000;
     for (const account of accountsRef.current) {
-      const lastAttempt = probeAttemptedAt.current.get(account.id);
-      // The window is the same one Core answers from: asking again inside it
-      // cannot learn anything the answer it just gave did not say.
-      const cooling = lastAttempt !== undefined && Date.now() - lastAttempt < cooldownMs;
-      if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id) || cooling) continue;
-      attemptedAccounts.current.add(account.id);
-      probeAttemptedAt.current.set(account.id, Date.now());
       const observed = account.loginObservedSecondsAgo;
-      // A determined answer is settled, not a question to ask again: 已登录 and
-      // 未登录 both stay put until their observation leaves the window, so
-      // re-entering the pane never re-probes a login that was just answered.
-      // 未登录 with no observation is the placeholder an account carries before
-      // any check ever ran, and that one is exactly what a mount is for.  An
-      // expired login is left out on purpose: it is the station rejecting its
-      // own session, and re-authenticating is how the account comes back
-      // without the user's help.
-      const settled = (account.loginStatus === "signed_in" || account.loginStatus === "signed_out")
-        && observed !== null;
-      const fresh = settled
+      const recoveryNeeded = account.passwordSaved && observed !== null
+        && (account.loginStatus === "signed_out" || account.loginStatus === "expired");
+      const checked = checkedAccounts.current.get(account.id);
+      if (checked !== undefined && (checked || !recoveryNeeded)) continue;
+      if (isAccountLoading(account.id)) continue;
+      checkedAccounts.current.set(account.id, recoveryNeeded);
+      // A recent 未登录 with a password still has work for Core to do. Core
+      // probes any saved session and decides whether another POST is needed.
+      const fresh = (account.loginStatus === "signed_in" || (account.loginStatus === "signed_out" && !recoveryNeeded))
+        && observed !== null
         && typeof sessionRecheckSeconds === "number"
         && sessionRecheckSeconds > 0
         && observed < sessionRecheckSeconds;
       void (async () => {
-        // Opening the station is the probe: restore the login, then refresh the
-        // key list.  The refresh runs even when the session check failed — a
-        // locally known key is local data, and Core still reads the station
-        // through an explicitly remembered session when it has one.  A session
-        // the window already covers skips the probe entirely, and the pane goes
-        // straight to the key list it actually came to show.
-        //
-        // A refused round trip observed nothing, so the account is released
-        // back to unattempted: one transient station timeout used to suppress
-        // the mount check for the life of the panel, leaving 未登录 + 去登录 on
-        // an account whose login was never actually questioned.
-        let answered = fresh;
-        if (!fresh && active) answered = await restoreSavedSession(account);
-        if (!active) return;
-        if (!answered) attemptedAccounts.current.delete(account.id);
-        await refreshAccountResources(account, { silent: true });
-        // Releasing the id lets the next pass ask again; the timestamp above is
-        // what keeps "next pass" from meaning "next render", so a transient
-        // station timeout still recovers once the window passes instead of
-        // suppressing the check for the life of the panel or spinning.
+        if (!fresh) await restoreSavedSession(account);
+        if (mounted.current) await refreshAccountResources(account, { silent: true });
       })();
     }
-    return () => { active = false; };
-  }, [busy, sessionRecheckSeconds, mountProbeKey]);
+  }, [busy, loading, sessionRecheckSeconds, mountProbeKey]);
   // The add flow never reserves an account slot. The webview login runs
   // first (its own modal window over the workspace); Core creates the account
   // shell only when sign-in actually succeeds (pending_account), so a
@@ -1132,7 +980,7 @@ export function StationAccountsPanel({
   };
   const loginSelected = async (): Promise<void> => {
     if (!selected) return;
-    if (effectiveLoginStatus(selected) === "signed_in") return;
+    if (selected.loginStatus === "signed_in") return;
     if (pendingAction === "login") return;
     const account = selected;
     await runPendingAction("login", () => loginAccount(account));
@@ -1569,7 +1417,8 @@ export function StationAccountsPanel({
       setGroupManagerOpen(false);
     }
   };
-  const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";
+  const selectedLoginState = selected ? relayLoginState(selected) : "unknown";
+  const canSignIn = selectedLoginState === "signed_out" || selectedLoginState === "unknown";
   const accountRows = stationAccounts.map((account) => ({
     key: account.id,
     cells: [
@@ -1609,7 +1458,7 @@ export function StationAccountsPanel({
   );
   // A stale login turns the whole row brown until the next successful probe.
   const alertAccountRows = stationAccounts
-    .filter((account) => effectiveLoginStatus(account) === "expired")
+    .filter((account) => account.loginStatus === "expired" || account.loginFailure)
     .map((account) => account.id);
   const retryCleanup = async (cleanup: PendingCredentialCleanup): Promise<void> => {
     if (pendingAction === "cleanup") return;
@@ -1685,16 +1534,16 @@ export function StationAccountsPanel({
           titleWidth="tight"
           onPress={openDashboard}
         />
-        {/* 去登录 is offered by a row that states 未登录, and only by one: a row
-            already carrying a wait — 登录中 for the pane's own sign-in, 检测中
-            while the mount check fetches its answer — has no second sign-in to
-            hand the user, and a button beside that word reads as "your attempt
-            did not start".  A check that settles to 未登录 brings the button
-            back; a verified account never needed it. */}
-        {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
+        {/* Offer manual sign-in after the current check or sign-in settles. */}
+        {canSignIn ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact accessibilityLabel={native.showGroupManager ? translate("relay.groupManager") : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
+      {canSignIn && selected.loginFailure ? <Text style={styles.cleanupText} accessibilityLiveRegion="polite">
+        {translate(LOGIN_FAILURE_MESSAGES[selected.loginFailure])}
+      </Text> : selectedLoginState === "signed_out" && !selected.passwordSaved ? <Text style={styles.cleanupText}>
+        {translate("relay.autoSignInNoPassword")}
+      </Text> : null}
     </View> : null}
   </View>;
 }

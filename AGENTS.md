@@ -6,6 +6,7 @@
 
 - 项目名是 `young-router`，Python 包是 `young_router`。`core/` 负责 IPC、域和持久化，`proxy/` 负责 LiteLLM 数据面，`adapters/` 负责 staged worker，`config/` 和 `webdav/` 负责文档与同步，`rn/packages/shared` 是共享 UI、路由、i18n 和类型化 IPC，`rn/apps/{macos,windows,web}` 只放平台叶子，`scripts/` 负责构建发布，`tests/` 放测试。根目录的 `sitecustomize.py` 由构建复制到 Core 根目录，不能漏掉。
 - 一个功能只拥有一套共享 UI 和一个 Core 域；不要增加第二套存储、配置写入器、应用外壳或旧启动路径。React 只保存视图状态，不直接写配置、启动 proxy、访问任意路径或持有原始密钥；版本化编辑器正文是唯一例外。
+- 工作树可能同时包含多个任务的改动。每个任务只修改自己负责的文件和行为；发现其他任务的未提交改动时，保留它们，不覆盖、不回退、不顺手整理。若同一文件混有不同任务的改动，只做带精确上下文的最小补丁，并在验证时分别说明各自范围。
 - IPC 的 schema、校验器、类型化客户端、两个 host bridge 和聚焦测试一起修改。每个 host 都传 Core 私有的 `--metadata` 路径。
 - 生成的模型目录和客户端 catalog 不手改；目录字段必须由实际装载的客户端二进制和 Core 使用的 registry 共同验证，`model_catalog_json` 不能指向不存在的文件。
 - 公开模型名是大小写敏感的身份。导入入口统一使用 `public_names` 归一化并保留上游 id；读取、分组、重命名、删除、fallback、catalog 和上下文索引都使用同一份名字，不在消费者侧重新推导或做不区分大小写的匹配。

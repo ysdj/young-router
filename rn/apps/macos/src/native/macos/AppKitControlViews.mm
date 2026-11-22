@@ -5008,6 +5008,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
   return LiteLLMAppKitBusySpinnerComponentView.class;
 }
 
+static BOOL IsDirectApiKey(NSString *domain, NSString *field, NSString *target)
+{
+  return target.length > 0 && [field isEqualToString:@"direct_api_key"] &&
+      ([domain isEqualToString:@"codex"] || [domain isEqualToString:@"claude"]);
+}
 
 @interface LiteLLMAppKitSecureTextInputComponentView () <NSTextFieldDelegate, NSTextViewDelegate, RCTLiteLLMAppKitSecureTextInputViewProtocol>
 - (NSView *)activeControl;
@@ -5133,8 +5138,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
   const BOOL isMultiline = newViewProps.multiline;
   NSView *activeControl = isMultiline ? _scrollView : (newViewProps.plainText ? _plainField : _field);
   const BOOL activeControlChanged = _host.control != activeControl;
-  const BOOL visibleChanged = _readablePlainText != (newViewProps.plainText && (newViewProps.autoCommit || newViewProps.disabled));
-  _readablePlainText = newViewProps.plainText && (newViewProps.autoCommit || newViewProps.disabled);
+  const BOOL directApi = newViewProps.plainText && IsDirectApiKey(domain, field, target);
+  const BOOL canReadPlainText = directApi || (newViewProps.plainText && (newViewProps.autoCommit || newViewProps.disabled));
+  const BOOL visibleChanged = _readablePlainText != canReadPlainText;
+  _readablePlainText = canReadPlainText;
   const BOOL resetReadable = newViewProps.resetRequest != oldViewProps.resetRequest &&
       newViewProps.resetRequest != _lastResetRequest;
   if (_host.control != activeControl) {
@@ -5182,6 +5189,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
     // The pane uses a reset to re-read a value that changed underneath it, so
     // the remembered copy goes with it.
     LiteLLMForgetPlainText(_domain, _secretField, _target);
+    if (directApi) _generation += 1;
     _synchronizingField = YES;
     _field.stringValue = @"";
     _plainField.stringValue = @"";
@@ -5195,22 +5203,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
       newViewProps.commitRequest != _lastCommitRequest) {
     [self stageCurrentSecretForRequest:newViewProps.commitRequest];
   }
-  const BOOL readablePlainText = !isMultiline && newViewProps.plainText && newViewProps.autoCommit && (
-      ([domain isEqualToString:@"providers_models"] || [domain isEqualToString:@"relay_accounts"]) ?
-          [field isEqualToString:@"api_key"] && target.length > 0 :
-      ([domain isEqualToString:@"codex"] && [field isEqualToString:@"api_key"] && target.length == 0) ||
-      ([domain isEqualToString:@"claude"] &&
-       ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
-       target.length == 0) ||
-      ([domain isEqualToString:@"runtime"] && [field isEqualToString:@"setting"] &&
-       ([target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"] ||
-        // The General pane's proxy key, the one credential a window draws in
-        // the clear so it can be copied into a client.
-        [target isEqualToString:@"YOUNG_ROUTER_MASTER_KEY"] ||
-        // The browser page's key, drawn for the same reason: it is read out
-        // loud or pasted into another browser, and dots cannot be copied.
-        [target isEqualToString:@"YOUNG_ROUTER_WEB_PASSWORD"])));
-  if ((identityChanged || activeControlChanged || visibleChanged || resetReadable) && readablePlainText) {
+  const BOOL readablePlainText = !isMultiline && canReadPlainText;
+  // A direct API URL/auth change intentionally clears the editable key. Core
+  // still holds the old connection until Save, so reading here would put the
+  // old key straight back into the field.
+  if ((identityChanged || activeControlChanged || visibleChanged || resetReadable) && readablePlainText &&
+      !(directApi && resetReadable)) {
     [self loadPlainTextSecretForGeneration:_generation];
   }
   [_host setNeedsLayout:YES];
@@ -5228,9 +5226,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
 - (void)stageCurrentSecretForRequest:(NSInteger)commitRequest
 {
   if (_stageInFlight) return;
-  NSString *value = [[self activeText] copy];
-  const BOOL allowEmptyValue = [self isPlainTextAutoCommitField];
-  if (value.length == 0 && !allowEmptyValue) {
+  const BOOL directApi = _plainText && IsDirectApiKey(_domain, _secretField, _target);
+  NSString *value = [(directApi ? (_plainField.currentEditor.string ?: [self activeText]) : [self activeText]) copy];
+  const BOOL rememberPlainText = [self isPlainTextAutoCommitField];
+  const BOOL preservePlainText = rememberPlainText || directApi;
+  if (value.length == 0 && !preservePlainText) {
     _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
     [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
     return;
@@ -5255,7 +5255,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
   NSString *target = [_target copy];
   [self.window makeFirstResponder:nil];
   NSString *secret = value;
-  const BOOL preservePlainText = [self isPlainTextAutoCommitField];
   if (!preservePlainText) {
     _synchronizingField = YES;
     _field.stringValue = @"";
@@ -5288,7 +5287,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
       strongSelf->_lastSyncedPlainText = [secret copy];
       // What the user staged is what this field now holds, so the next read
       // shows it instead of the value it replaced.
-      LiteLLMRememberPlainText(domain, field, target, secret);
+      if (rememberPlainText) LiteLLMRememberPlainText(domain, field, target, secret);
     }
     [strongSelf emitRevision:revision.integerValue present:present.boolValue status:@"saved" error:@"" commitRequest:strongSelf->_lastCommitRequest];
   }];
@@ -5353,7 +5352,7 @@ static const NSTimeInterval kPlainTextSecretReadRetrySeconds = 0.5;
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"read_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
-    LiteLLMRememberPlainText(domain, field, target, value);
+    if (!IsDirectApiKey(domain, field, target)) LiteLLMRememberPlainText(domain, field, target, value);
     strongSelf->_synchronizingField = YES;
     [strongSelf setActiveText:value];
     strongSelf->_lastSyncedPlainText = [value copy];

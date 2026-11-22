@@ -747,6 +747,11 @@ struct SecureTextInputComponentView
     return Props() && IsPlainTextAutoCommitField(*Props());
   }
 
+  bool IsDirectApiPlainTextField() const noexcept {
+    return Props() && Props()->plainText.value_or(false) && !Props()->target.empty() &&
+        Props()->field == "direct_api_key" && (Props()->domain == "codex" || Props()->domain == "claude");
+  }
+
   bool IsMultiline() const noexcept {
     return Props() && Props()->multiline.value_or(false);
   }
@@ -824,7 +829,9 @@ struct SecureTextInputComponentView
         old_props->plainText != props.plainText || old_props->autoCommit != props.autoCommit;
     const bool multiline_changed = !old_props || old_props->multiline != props.multiline;
     const bool reset_identity = identity_changed || plain_key_mode_changed || multiline_changed;
-    const bool should_load_plaintext = reset_identity && IsPlainTextAutoCommitField(props);
+    const bool direct_api = props.plainText.value_or(false) && !props.target.empty() &&
+        props.field == "direct_api_key" && (props.domain == "codex" || props.domain == "claude");
+    bool should_load_plaintext = reset_identity && (IsPlainTextAutoCommitField(props) || direct_api);
     const bool placeholder_changed = !old_props || old_props->placeholder != props.placeholder;
     const bool plain_text_changed = !old_props || old_props->plainText != props.plainText;
     const bool label_changed = !old_props || old_props->label != props.label;
@@ -871,15 +878,23 @@ struct SecureTextInputComponentView
     const int32_t reset_request = props.resetRequest.value_or(0);
     if ((!old_props || old_props->resetRequest != props.resetRequest) && reset_request != last_reset_request_) {
       last_reset_request_ = reset_request;
+      if (direct_api && loading_) {
+        lifecycle_->generation.fetch_add(1, std::memory_order_acq_rel);
+        loading_ = false;
+        SetInputEnabled(Enabled(props.disabled));
+      }
       ClearInputs();
       dirty_ = false;
       if (!lifecycle_->staging.load(std::memory_order_acquire)) {
         EmitState(last_revision_, last_present_, "ready", "", last_commit_request_);
       }
+      // A direct API URL/auth change intentionally clears the editable key;
+      // Core still holds the old connection until Save, so do not load it back.
+      if (direct_api) should_load_plaintext = false;
     }
     const int32_t commit_request = props.commitRequest.value_or(0);
     if ((!old_props || old_props->commitRequest != props.commitRequest) && commit_request != last_commit_request_) {
-      StageForRequest(commit_request, false);
+      StageForRequest(commit_request, direct_api);
     }
     if (should_load_plaintext) {
       LoadPlainTextSecret();
@@ -889,7 +904,7 @@ struct SecureTextInputComponentView
   void MarkDirty() noexcept {
     if (syncing_ || !lifecycle_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
     try {
-      if (InputValue().empty() && !IsPlainTextAutoCommitField()) return;
+      if (InputValue().empty() && !IsPlainTextAutoCommitField() && !IsDirectApiPlainTextField()) return;
       dirty_ = true;
       EmitState(last_revision_, last_present_, "dirty", "", last_commit_request_);
     } catch (...) {
@@ -942,7 +957,7 @@ struct SecureTextInputComponentView
     } catch (...) {
       secret.reset();
     }
-    const bool preserve_input = IsPlainTextAutoCommitField();
+    const bool preserve_input = IsPlainTextAutoCommitField() || IsDirectApiPlainTextField();
     if (!preserve_input) {
       ClearInputs();
     }
@@ -1007,7 +1022,7 @@ struct SecureTextInputComponentView
   }
 
   void LoadPlainTextSecret() noexcept {
-    if (!IsPlainTextAutoCommitField() || !lifecycle_ || !dispatcher_ || !Props()) return;
+    if ((!IsPlainTextAutoCommitField() && !IsDirectApiPlainTextField()) || !lifecycle_ || !dispatcher_ || !Props()) return;
     const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
     const bool disabled = Props()->disabled.value_or(false);
     const auto domain = active_domain_;
@@ -1018,6 +1033,7 @@ struct SecureTextInputComponentView
     auto weak_self = get_weak();
     loading_ = true;
     SetInputEnabled(false);
+    if (IsDirectApiPlainTextField()) EmitState(last_revision_, false, "loading", "", last_commit_request_);
     try {
       std::thread([lifecycle, dispatcher, weak_self, generation, disabled, domain, field, target] {
         auto value = YoungRouter::CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
@@ -1044,7 +1060,7 @@ struct SecureTextInputComponentView
       uint64_t generation,
       bool disabled,
       std::optional<std::string> value) noexcept {
-    if (!Current(generation) || !IsPlainTextAutoCommitField()) return;
+    if (!Current(generation) || (!IsPlainTextAutoCommitField() && !IsDirectApiPlainTextField())) return;
     loading_ = false;
     auto display_value = value.value_or("");
     SetInput(ToHString(display_value));

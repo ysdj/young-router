@@ -1398,11 +1398,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
           username: String(result.username ?? options.username ?? ""),
         };
       } catch {
-        // No answer at all, for the same reason a native probe reports none: an
-        // unreachable station (``relay_restore_unavailable``) says nothing about
-        // the session, and a station that refused to mint one
-        // (``relay_login_session_limit``, ``relay_login_backoff``) answered a
-        // question this check did not ask.  The pane keeps what it knew.
+        // A failed check leaves the published account observation alone.
         return undefined;
       }
     },

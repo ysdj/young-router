@@ -240,6 +240,10 @@ class RelayLoginBackoffError(RelayLoginRefusedError):
         super().__init__(message)
 
 
+class RelayPasswordRejectedError(RelayAccountsError):
+    """The station answered the login request and did not accept the credential."""
+
+
 def _runtime_root(value: Path | str | None) -> Path:
     if value is not None:
         return Path(value).expanduser()
@@ -798,6 +802,10 @@ def _reloaded_account(raw: Mapping[str, Any]) -> dict[str, Any]:
     return account
 
 
+def _has_saved_password(account: Mapping[str, Any]) -> bool:
+    return bool(account.get("remember_password") and account.get("username") and account.get("password"))
+
+
 def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": str(account.get("id", "")),
@@ -812,7 +820,7 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
         # the password: 仅记住登录态, the answer the post-login prompt offers.
         "remember_session": account.get("remember_session") is not False,
         "auto_grouping": account.get("auto_grouping") is True,
-        "password_saved": bool(account.get("password")),
+        "password_saved": _has_saved_password(account),
         "balance": _balance(account.get("balance")),
         # A background or manual read can leave a displayed balance whose
         # freshness has expired or been invalidated by a failed read.
@@ -1018,10 +1026,10 @@ def _raise_login_refusal(exc: urllib.error.HTTPError) -> None:
     if code == "AUTH_SESSION_LIMIT":
         raise RelaySessionLimitError() from None
     if code in {"AUTH_2FA_REQUIRED", "AUTH_TOTP_REQUIRED"}:
-        raise RelayAccountsError("Relay login requires verification") from None
+        raise RelayPasswordRejectedError("Relay login requires verification") from None
     if exc.code in {401, 403}:
-        raise RelayAccountsError("Relay username or password is invalid") from None
-    raise RelayAccountsError("Relay login was rejected") from None
+        raise RelayPasswordRejectedError("Relay username or password is invalid") from None
+    raise RelayAccountsError("Relay returned an unsuccessful login response") from None
 
 
 # What a New API fork writes when the session it was shown is not accepted.
@@ -1381,11 +1389,16 @@ class RelayHTTPClient:
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RelayAccountsError("Relay returned an invalid response") from None
+        if isinstance(payload, Mapping):
+            if payload.get("code") == "AUTH_SESSION_LIMIT":
+                raise RelaySessionLimitError()
+            if payload.get("success") is False:
+                raise RelayPasswordRejectedError("Relay login was rejected")
         data = _json_data(payload)
         if not isinstance(data, Mapping):
             raise RelayAccountsError("Relay login was rejected")
         if data.get("require_2fa") is True or data.get("requires_2fa") is True:
-            raise RelayAccountsError("Relay login requires verification")
+            raise RelayPasswordRejectedError("Relay login requires verification")
         user = data.get("user") if isinstance(data.get("user"), Mapping) else {}
         accepted_username = next(
             (
@@ -1547,10 +1560,8 @@ class RelayAccountsDomain:
         # what ran out.  Process-local on purpose: a restart is a new reason to
         # ask.  See ``_renew_remembered_session``.
         self._login_refusals: dict[str, float] = {}
-        # Which of those refusals were the station's concurrent-session cap.
-        # A cap outlives the one-minute wait a rejected password is held for, so
-        # the two are recorded apart and read back with their own windows.
-        self._capped_refusals: dict[str, bool] = {}
+        # Safe outcomes of actual POSTs, also used to select the retry window.
+        self._login_failures: dict[str, str] = {}
         # A native browser-session erase can fail after account deletion. Keep
         # only an opaque tombstone so the UI can retry after a restart.
         self._pending_credential_cleanups: list[dict[str, str]] = []
@@ -1946,6 +1957,9 @@ class RelayAccountsDomain:
             public = _public_account(account)
             station_id = str(account.get("station_id", ""))
             account_id = str(account.get("id", ""))
+            failure = self._login_failures.get(account_id)
+            if failure and _has_saved_password(account) and account["login_status"] != "signed_in":
+                public["login_failure"] = failure
             account_operations = [
                 operation for operation in self._pending_operations if operation.get("account_id") == account_id
             ]
@@ -4219,7 +4233,9 @@ class RelayAccountsDomain:
 
         index = self._index(account_id)
         account = self._accounts[index]
-        if status == "signed_out" and self._has_session_credentials(account):
+        if (status == "signed_out" and self._has_session_credentials(account)) or (
+            account["login_status"] == status and account["login_observed_at"]
+        ):
             return _public_account(account)
         return self.set_login_status(account_id, status)
 
@@ -4255,29 +4271,17 @@ class RelayAccountsDomain:
         headers = self._session_headers(secrets, user_id=account.get("user_id"), station_type=account.get("type"))
         path = self._session_profile_path(account["type"])
         try:
-            payload = self._http.json(account["origin"], path, headers=headers)
-        except RelayTransportError:
-            # The station was never reached, so this is not an answer about the
-            # session.  Letting it fall into the ``None`` below reports "no
-            # usable session", and the caller then records 未登录 for a login
-            # that was never actually rejected.
-            raise
+            profile = self._read_session_profile(account["origin"], path, headers)
         except RelayAccountsError as exc:
-            # A session-only account has no password restore that can settle
-            # the refusal, so record it here instead of returning the old
-            # signed-in state on its next check. A remembered-password account
-            # leaves that transition to its sign-in attempt; other response
-            # errors say nothing about the session itself.
-            if not account["remember_password"] and "expired" in str(exc).lower():
+            if "expired" not in str(exc).lower():
+                raise
+            # The station rejected this session even if the next sign-in is
+            # inconclusive. Keep an existing negative observation as-is.
+            if account["login_status"] not in {"signed_out", "expired"} or not account["login_observed_at"]:
                 self.set_login_status(account_id, "expired")
             return None
-        profile = _json_data(payload)
-        if not isinstance(profile, Mapping):
-            # An unreadable body is not an answer about the session, so it must
-            # not retire one -- a caller that turns this into 未登录 then signs
-            # in again over a session the station never refused.
-            raise RelayAccountsError("Relay returned an invalid response")
         self._session_secrets[account_id] = secrets
+        self.clear_login_refusal(account_id)
         account["login_status"] = "signed_in"
         account["login_observed_at"] = _utc_now_iso()
         account["last_updated_at"] = account["login_observed_at"]
@@ -4325,17 +4329,7 @@ class RelayAccountsDomain:
 
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
-        password = account.get("password", "")
-        username = account.get("username", "")
-        login = getattr(self._http, "password_login", None)
-        if (
-            not account.get("remember_password")
-            or not isinstance(password, str)
-            or not password
-            or not isinstance(username, str)
-            or not username
-            or not callable(login)
-        ):
+        if not _has_saved_password(account):
             # Nothing to sign in with.  No request is sent: a form filled with an
             # empty password can only be answered as a rejected credential, and
             # the app would then hold that station-side rejection for an account
@@ -4347,53 +4341,37 @@ class RelayAccountsDomain:
             # state travels, share) an answer nobody had asked for.  The row
             # keeps the placeholder it already carries.
             return _public_account(account)
-        remaining = self._login_refusal_remaining(account_id)
-        if remaining > 0:
-            raise RelayLoginBackoffError(remaining)
         if not force and self._has_session_credentials(account):
             # A credential the station still accepts needs no replacement, and
             # probing it mints nothing.
-            try:
-                restored = self.restore_saved_session(account_id)
-            except RelayTransportError:
-                raise
-            except Exception:
-                restored = None
-            if isinstance(restored, Mapping) and restored.get("login_status") == "signed_in":
-                self.clear_login_refusal(account_id)
+            restored = self.restore_saved_session(account_id)
+            if restored is not None:
                 return restored
+        remaining = self._login_refusal_remaining(account_id)
+        if remaining > 0:
+            raise RelayLoginBackoffError(remaining)
         try:
-            result = login(account["origin"], account["type"], username, password)
-        except RelayTransportError:
-            # The station was never reached, so nothing was refused and there is
-            # nothing to wait out.
-            raise
+            result = self._http.password_login(account["origin"], account["type"], account["username"], account["password"])
         except RelaySessionLimitError:
             # The station will not mint another session because this account
             # already holds as many as the site allows.  That refusal is not
             # about the password and cannot be waited out on a short window: it
             # lasts exactly as long as the sessions filling the cap, so the wait
-            # it starts is the cap's own (see
-            # ``_relay_login_backoff_seconds_for``).
-            self._note_login_refusal(account_id, capped=True)
+            # it starts is the cap's own.
+            self._note_login_refusal(account_id, reason="session_limit")
             raise
-        except RelayLoginRefusedError:
-            # The station answered and would not mint a session.  Waiting before
-            # the next attempt is what stops a capped account from being asked
-            # once per pane entry.
+        except RelayPasswordRejectedError:
             self._note_login_refusal(account_id)
+            self.set_login_status(account_id, "signed_out")
             raise
-        except Exception:
-            # Any other rejection (a remembered password the station no longer
-            # accepts, a locked account) is answered the same way: repeat the
-            # attempt after the wait rather than on every entry.  A user who
-            # fixes the credential signs in through the account pane, which
-            # clears the wait.
-            self._note_login_refusal(account_id)
+        except RelayAccountsError:
+            # A POST that timed out may have reached the station. Hold the
+            # next attempt just as for a refusal, without inventing a verdict.
+            self._note_login_refusal(account_id, reason="unavailable")
             raise
         if not isinstance(result, Mapping):
-            self._note_login_refusal(account_id)
-            raise RelayAccountsError("Relay login was rejected")
+            self._note_login_refusal(account_id, reason="unavailable")
+            raise RelayAccountsError("Relay returned an invalid login result")
         return self.accept_login_result(
             account_id,
             username=str(result.get("username", "")),
@@ -4457,7 +4435,7 @@ class RelayAccountsDomain:
         # A cap is the station saying it will not mint *any* session for this
         # account right now.  The password was never the question; a form post
         # would ask the same refused question once more.
-        if self._capped_refusals.get(str(account_id)):
+        if self._login_failures.get(str(account_id)) == "session_limit" and self._login_refusal_remaining(account_id):
             return False
         if account.get("login_status") not in {"signed_out", "expired"}:
             return False
@@ -4674,6 +4652,7 @@ class RelayAccountsDomain:
         # so locally known keys keep loading and stay usable while the account
         # reads signed out or expired.  Only a real resource read may replace,
         # empty, or downgrade that list.
+        self._invalidate_balance_observation(account)
         self._accounts[index] = _private_account(account)
         self._session_secrets.pop(account_id, None)
         self._persist()
@@ -4723,11 +4702,10 @@ class RelayAccountsDomain:
         checks inside the window:
 
         * ``signed_in`` -- a session this Core verified and still holds.
-        * ``signed_out`` -- a login this Core determined from the station's own
-          refusal, or from having no credential left to try.  The account
-          created but never checked carries the same word with no observation
-          stamp, and that placeholder answers nothing: it is the one 未登录 the
-          pane has never actually established.
+        * ``signed_out`` -- a recent observation with no password to try, or
+          after a login attempt this Core is still waiting to retry. A stored
+          signed-out observation alone does not establish that the password
+          was tried here.
 
         ``expired`` is deliberately excluded.  It is the station rejecting its
         own session, and re-authenticating with the remembered password is how
@@ -4750,10 +4728,9 @@ class RelayAccountsDomain:
         status = account.get("login_status")
         if status not in {"signed_in", "signed_out"}:
             return None
-        # A verified login still needs the credential that proved it, so a
-        # session Core can no longer use is asked about again.  A determined
-        # 未登录 needs nothing: having no usable session is what it states.
         if status == "signed_in" and not self._has_session_credentials(account):
+            return None
+        if status == "signed_out" and _has_saved_password(account) and not self._login_refusal_remaining(account_id):
             return None
         age = _observed_seconds_ago(account.get("login_observed_at"))
         if age is None or age >= window:
@@ -4810,11 +4787,21 @@ class RelayAccountsDomain:
         return bool(self._session_headers(account.get("session")))
 
     def maintenance_account_ids(self, *, grouping: bool) -> list[str]:
+        if grouping:
+            return [
+                account["id"] for account in self._accounts
+                if account["auto_grouping"] and account["login_status"] == "signed_in"
+                and self._has_session_credentials(account)
+            ]
         return [
             account["id"] for account in self._accounts
-            if self._has_session_credentials(account)
-            and (not grouping or (account["auto_grouping"] and account["login_status"] == "signed_in"))
+            if self._has_session_credentials(account) or self._can_recover_without_session(account)
         ]
+
+    def _can_recover_without_session(self, account: Mapping[str, Any]) -> bool:
+        return _has_saved_password(account) and bool(account["login_observed_at"]) and (
+            account["login_status"] in {"signed_out", "expired"}
+        )
 
     def mark_group_poll_operations(self) -> None:
         """Mark the batch just staged by a timer on an otherwise clean draft."""
@@ -4837,51 +4824,79 @@ class RelayAccountsDomain:
     def _session_profile_path(kind: str) -> str:
         return "/api/user/self" if kind == "newapi" else "/api/v1/auth/me"
 
+    def _read_session_profile(self, origin: str, path: str, headers: Mapping[str, str]) -> Mapping[str, Any]:
+        payload = self._http.json(origin, path, headers=headers)
+        profile = _json_data(payload)
+        if not isinstance(profile, Mapping) or not profile or (
+            isinstance(payload, Mapping)
+            and (payload.get("success") is False or type(payload.get("code")) is int and payload["code"] != 0)
+        ):
+            raise RelayAccountsError("Relay returned an invalid session profile")
+        return profile
+
     def poll_session(
         self, account_id: str, *, io_gate: Callable[[], AbstractContextManager[None]],
         cancelled: Callable[[], bool],
     ) -> tuple[TaskResult, bool]:
-        """Check the session Core already holds without attempting a sign-in."""
+        """Check the saved session and try one recovery when it is refused."""
 
         account = next((row for row in self._accounts if row["id"] == account_id), None)
-        if account is None or not self._has_session_credentials(account):
+        if account is None:
+            return TaskResult("skipped"), False
+        has_session = self._has_session_credentials(account)
+        if not has_session and not self._can_recover_without_session(account):
             return TaskResult("skipped"), False
         if self.recent_login_check_answer(account_id) is not None:
             return TaskResult("skipped"), False
         origin, kind = account["origin"], account["type"]
         observed_at = account["login_observed_at"]
         baseline = self._baseline_bytes
-        headers = self._headers(account)
-        try:
-            with io_gate():
-                payload = self._http.json(origin, self._session_profile_path(kind), headers=headers)
-        except RelayAccountsError as error:
-            if "expired" not in str(error).lower():
-                return TaskResult("failed", task_exception_detail(error, phase="check_session")), False
-            status = "expired"
-        else:
-            profile = _json_data(payload)
-            if not isinstance(profile, Mapping) or not profile or (
-                isinstance(payload, Mapping) and payload.get("success") is False
-            ):
-                return TaskResult("failed", {"phase": "check_session", "message": "Relay returned an invalid session profile"}), False
-            status = "signed_in"
+        headers = self._headers(account) if has_session else {}
+        status = account["login_status"]
+        if has_session:
+            try:
+                with io_gate():
+                    self._read_session_profile(origin, self._session_profile_path(kind), headers)
+            except RelayAccountsError as error:
+                if "expired" not in str(error).lower():
+                    return TaskResult("failed", task_exception_detail(error, phase="check_session")), False
+                status = "expired"
+            else:
+                status = "signed_in"
 
         current = next((row for row in self._accounts if row["id"] == account_id), None)
         if cancelled() or current is not account or (
             current["origin"] != origin or current["type"] != kind
             or current["login_observed_at"] != observed_at
-            or not self._has_session_credentials(current) or self._headers(current) != headers
+            or (has_session and self._headers(current) != headers)
             or self._baseline_bytes != baseline or self._read_storage_bytes() != baseline
         ):
             return TaskResult("skipped"), False
-        observed_at = _utc_now_iso()
         # Persist only the observation on the saved identity. A background
         # check can finish while this account has other edits in a draft.
         document = json.loads(baseline) if baseline else {}
         saved = next((row for row in document.get("accounts", ()) if row["id"] == account_id), None)
         if saved is None or any(saved.get(key) != current[key] for key in ("origin", "type", "username")):
             return TaskResult("skipped"), False
+        outcome = TaskResult("succeeded")
+        if status != "signed_in" and _has_saved_password(current) and not self._has_staged_changes():
+            try:
+                # We already checked the session. Hold the account lane during
+                # the POST so a pane or resource read cannot sign in alongside it.
+                self.restore_saved_password(account_id, force=True)
+            except RelayLoginBackoffError:
+                outcome = TaskResult("skipped")
+            except RelayPasswordRejectedError as error:
+                return TaskResult("failed", task_exception_detail(error, phase="restore_login")), True
+            except RelayAccountsError as error:
+                outcome = TaskResult("failed", task_exception_detail(error, phase="restore_login"))
+            else:
+                return outcome, True
+        if not has_session:
+            if outcome.outcome == "failed":
+                return outcome, True
+            return TaskResult("skipped"), False
+        observed_at = _utc_now_iso()
         saved.update(login_status=status, login_observed_at=observed_at)
         if status == "expired":
             saved["balance_observed_at"] = ""
@@ -4890,8 +4905,10 @@ class RelayAccountsDomain:
         current.update(login_status=status, login_observed_at=observed_at)
         if status == "expired":
             self._invalidate_balance_observation(current)
+        else:
+            self.clear_login_refusal(account_id)
         self.revision += 1
-        return TaskResult("succeeded"), True
+        return outcome, True
 
     def _headers(self, account: Mapping[str, Any]) -> dict[str, str]:
         """Resolve dashboard headers for one station read or write.
@@ -5622,25 +5639,22 @@ class RelayAccountsDomain:
         # The wait the refusal itself started is kept beside it: a cap is not a
         # rejected password, and reading the short window for both is what let a
         # capped account be asked once a minute forever.
-        window = self._session_limit_refusal_seconds() if self._capped_refusals.get(str(account_id)) \
+        window = self._session_limit_refusal_seconds() if self._login_failures.get(str(account_id)) == "session_limit" \
             else self._login_refusal_seconds()
         remaining = window - (time.monotonic() - float(stamped))
         return remaining if remaining > 0 else 0.0
 
-    def _note_login_refusal(self, account_id: str, *, capped: bool = False) -> None:
+    def _note_login_refusal(self, account_id: str, *, reason: str = "rejected") -> None:
         """Start this account's wait, so the next entry does not re-ask."""
 
         self._login_refusals[str(account_id)] = time.monotonic()
-        if capped:
-            self._capped_refusals[str(account_id)] = True
-        else:
-            self._capped_refusals.pop(str(account_id), None)
+        self._login_failures[str(account_id)] = reason
 
     def clear_login_refusal(self, account_id: str) -> None:
         """Forget a refusal because the login itself succeeded."""
 
         self._login_refusals.pop(str(account_id), None)
-        self._capped_refusals.pop(str(account_id), None)
+        self._login_failures.pop(str(account_id), None)
 
     def _renew_remembered_session(self, account_id: str) -> bool:
         """Make one station session usable again, probing before signing in.
@@ -5671,43 +5685,19 @@ class RelayAccountsDomain:
         # been replaced (or the station's session restored) since.  A transport
         # failure propagates -- it is not an answer about the session.
         if self._has_session_credentials(account):
-            try:
-                restored = self.restore_saved_session(account_id)
-            except RelayTransportError:
-                raise
-            except Exception:
-                restored = None
-            if isinstance(restored, Mapping) and restored.get("login_status") == "signed_in":
-                self.clear_login_refusal(account_id)
+            restored = self.restore_saved_session(account_id)
+            if restored is not None:
                 return True
         # The credential was refused, or there is none to ask with.  Only now is
         # a sign-in considered, and only when the last refusal has been waited
         # out: that is what keeps a capped account from being asked once per
         # pane entry, which is how the cap is reached in the first place.
-        if not account.get("remember_password"):
+        if not _has_saved_password(account):
             return False
-        if not account.get("password") or not account.get("username"):
-            return False
-        try:
-            # The probe above is this credential's answer, so the sign-in does
-            # not repeat it.
-            restored = self.restore_saved_password(account_id, force=True)
-        except RelayTransportError:
-            raise
-        except RelaySessionLimitError:
-            # The station refused to mint a session.  Report the refusal rather
-            # than a login state the station never stated; the wait it started
-            # is what keeps the next entry from asking again.
-            raise
-        except RelayLoginRefusedError:
-            # Still inside the wait a previous refusal started.
-            raise
-        except Exception:
-            # A station that rejects the remembered password leaves the expired
-            # observation in place; the caller reports the read it could not
-            # make.
-            return False
-        return isinstance(restored, Mapping) and restored.get("login_status") == "signed_in"
+        # The probe above is this credential's answer, so the sign-in does
+        # not repeat it.
+        restored = self.restore_saved_password(account_id, force=True)
+        return restored["login_status"] == "signed_in"
 
     def _with_renewed_session(self, account_id: str, read: Callable[[], Any]) -> Any:
         """Run one authenticated station read, renewing the session once.
@@ -5780,23 +5770,19 @@ class RelayAccountsDomain:
             only_resources=only_resources,
             for_grouping=for_grouping,
         )
-        if for_grouping or result.get("resource_error") != "login_expired":
+        if for_grouping:
             return result
+        account = self._accounts[self._index(account_id)]
+        needs_recovery = result.get("resource_error") == "login_expired" or (
+            not self._has_session_credentials(account) and self._can_recover_without_session(account)
+        )
+        if not needs_recovery:
+            return _public_account(self._accounts[self._index(account_id)])
         try:
             renewed = self._renew_remembered_session(account_id)
-        except RelayTransportError:
-            # The station was never reached, so nothing about the session was
-            # learned.  The read reports the failure it already has instead of
-            # turning one dropped connection into a raised error for a caller
-            # that asked for the account's resources.
-            return result
-        except (RelaySessionLimitError, RelayLoginRefusedError):
-            # The station refused to mint another session -- the account is at
-            # its concurrent-session cap, or a previous refusal is still being
-            # waited out.  That is a reason the user can act on, not a crash:
-            # the read keeps its last verified keys and reports the login it
-            # actually observed, and the wait the refusal started is what stops
-            # the next entry from asking again.
+        except RelayAccountsError:
+            # An inconclusive profile or a refused login leaves the last
+            # verified keys and the original resource error in place.
             return result
         if renewed:
             result = self._refresh_resources_once(
@@ -6004,6 +5990,7 @@ class RelayAccountsDomain:
         # account is signed in even when the separate balance/profile read
         # failed.  Marking it only from the balance read left the pane saying
         # 未登录 beside a key list the same session had just read.
+        self.clear_login_refusal(account_id)
         account["login_status"] = "signed_in"
         account["login_observed_at"] = _utc_now_iso()
         account["resource_status"] = "ready"

@@ -3854,9 +3854,6 @@ class CoreStore:
         # the value this lease is later presented for.
         revision = self._revision
         adapter = self._domains.get(name)
-        if field_name == "direct_api_key" and adapter is not None:
-            return {"domain": name, "field": field_name, "target": target_value,
-                    "revision": revision, "present": False}, ""
         reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
         if not callable(reader):
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
@@ -5041,14 +5038,12 @@ class CoreStore:
         with self._domain_scope("relay_accounts"):
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
-            status_setter = getattr(relay, "set_login_status", None) if relay is not None else None
             session_restorer = getattr(relay, "restore_saved_session", None) if relay is not None else None
             password_restorer = getattr(relay, "restore_saved_password", None) if relay is not None else None
             status_settler = getattr(relay, "settle_login_status", None) if relay is not None else None
             recent_login_answer = getattr(relay, "recent_login_check_answer", None) if relay is not None else None
             if (
                 not callable(accepter)
-                or not callable(status_setter)
                 or not callable(session_restorer)
                 or not callable(password_restorer)
                 or not callable(status_settler)
@@ -5075,84 +5070,7 @@ class CoreStore:
             ):
                 raise CoreError("relay_restore_failed", "Relay account does not match the saved site")
             try:
-                if login_status == "unknown":
-                    # The page host has no station probe of its own -- it cannot
-                    # read another origin's cookie -- so it states *no
-                    # observation*, and Core resolves one.  Treating that
-                    # request as the host's own ``signed_out`` was the one
-                    # determination nobody made: an account with no remembered
-                    # password was recorded 未登录 without the station ever being
-                    # asked, and (since a login state now travels) that invented
-                    # answer was then synced to every other machine.
-                    # A login this Core already determined inside its re-check
-                    # window answers the check with that observation: an entry
-                    # made moments after a sign-in (or after a refusal) must not
-                    # spend a station round trip -- nor, on a refused account,
-                    # a second password attempt -- repeating the same answer.
-                    public = recent_login_answer(str(account_id))
-                    unreachable = False
-                    from .domains.relay_accounts import (
-                        RelayAccountsError,
-                        RelayLoginRefusedError,
-                        RelaySessionLimitError,
-                        RelayTransportError,
-                    )
-
-                    try:
-                        public = public if public is not None else session_restorer(str(account_id))
-                    except RelayTransportError:
-                        unreachable = True
-                    except Exception:
-                        public = None
-                    if public is None and not unreachable:
-                        # The station refused the stored session, and this
-                        # account remembers the password it was signed in with.
-                        # Signing in here -- once, bounded by the refusal
-                        # window below -- is what makes a saved login come back
-                        # on its own instead of waiting for someone to press
-                        # 去登录 on an account whose password this app holds.
-                        # The attempt only follows a *refused* session: a
-                        # station that could not be reached raises above and
-                        # signs nothing in, because an unanswerable probe is
-                        # not the station saying no.
-                        try:
-                            public = password_restorer(str(account_id))
-                        except RelayTransportError:
-                            unreachable = True
-                        except RelaySessionLimitError:
-                            # The cap, not the password: the station will not
-                            # mint another session.  Record nothing and let the
-                            # cap's own wait keep the next entry from asking.
-                            public = None
-                        except RelayLoginRefusedError:
-                            # Still inside the wait a previous refusal started.
-                            public = None
-                        except RelayAccountsError:
-                            # The station answered the sign-in and refused it
-                            # (a password it no longer accepts, a login that
-                            # needs verification).  That is a determined
-                            # answer about the login, so it is recorded as one
-                            # -- the retry window above (``_note_login_refusal``)
-                            # is what makes it the *only* attempt per window.
-                            public = status_setter(str(account_id), "signed_out")
-                        except Exception:
-                            # Anything else observed nothing about the login:
-                            # the account keeps the state it held.
-                            public = None
-                    if public is None:
-                        # Nothing was determined: answer with the state this
-                        # Core already holds rather than stamping a new one.
-                        public = next(
-                            (
-                                item
-                                for item in accounts
-                                if isinstance(item, Mapping) and item.get("id") == account_id
-                            ),
-                            None,
-                        )
-                    if public is None:
-                        raise CoreError("relay_restore_failed", "Relay account is unavailable")
-                elif login_status == "signed_in":
+                if login_status == "signed_in":
                     public = accepter(
                         str(account_id),
                         username=str(username),
@@ -5162,89 +5080,36 @@ class CoreStore:
                         user_id=user_id,
                         preserve_resources=True,
                     )
-                elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
-                    # A login this Core already determined inside its re-check
-                    # window answers the check with that observation, so the
-                    # site is not asked to re-authenticate -- or to re-refuse --
-                    # a login it answered moments ago.  Re-entering the pane
-                    # inside the window therefore costs no station round trip,
-                    # and a determined 未登录 stays 未登录 instead of being
-                    # re-probed on every mount.
-                    public = recent_login_answer(str(account_id))
-                    # Whether the station was ever reached.  The host's
-                    # ``signed_out`` is an unauthenticated probe, so it may only
-                    # be recorded once a read actually arrived somewhere: a
-                    # dropped connection or a timeout is not the station saying
-                    # no, and recording it as one is what retired a session the
-                    # user still held after a momentary network failure.
-                    # ``RelayTransportError`` is raised exactly by a read that
-                    # never reached an answer.
-                    unreachable = False
-                    # The station answered and refused the sign-in itself,
-                    # because the account already holds as many concurrent
-                    # sessions as the site allows.  The remembered password is
-                    # not what was rejected, so recording 未登录 here would state
-                    # a login the station never stated and would bury the one
-                    # reason the user can act on.  The observation is left as it
-                    # was and the caller names the refusal.
-                    refused: CoreError | None = None
-                    if public is None:
-                        from .domains.relay_accounts import (
-                            RelayLoginRefusedError,
-                            RelaySessionLimitError,
-                            RelayTransportError,
-                        )
+                elif login_status == "unknown" or (
+                    login_status in {"signed_out", "expired"} and matching.get("password_saved") is True
+                ):
+                    from .domains.relay_accounts import RelayAccountsError
 
-                        # A stored credential is asked whether it still works
-                        # before any sign-in is attempted -- for ``expired``
-                        # exactly as for ``signed_out``.  The ``expired`` branch
-                        # used to go straight to the remembered password, so a
-                        # cookie that still worked was thrown away and every entry
-                        # made the station mint another session; an account at the
-                        # site's session cap then could not sign in at all, from a
-                        # password nobody had changed.  Probing costs one
-                        # authenticated read and mints nothing, so a working
-                        # cookie is simply reused and the count never grows.
+                    public = recent_login_answer(str(account_id))
+                    if public is None:
                         try:
                             public = session_restorer(str(account_id))
-                        except RelayTransportError:
-                            unreachable = True
-                        except Exception:
-                            public = None
-                        if public is None and not unreachable:
-                            try:
-                                # The probe above already answered for this
-                                # credential, so the sign-in is reached with
-                                # that answer in hand rather than repeating it.
-                                public = password_restorer(str(account_id), force=True)
-                            except RelayTransportError:
-                                unreachable = True
-                            except RelaySessionLimitError:
-                                refused = CoreError(
-                                    "relay_login_session_limit",
-                                    "The station refused a new session, so the login was left unchanged",
-                                )
-                            except RelayLoginRefusedError:
-                                refused = CoreError(
-                                    "relay_login_backoff",
-                                    "A recent sign-in was refused, so this one was not attempted yet",
-                                )
-                            except Exception:
-                                public = status_setter(str(account_id), str(login_status))
-                        # ``expired`` is the station's own rejection of its
-                        # session, so it is recorded whether or not the renewal
-                        # above reached the site; only the host's signed-out
-                        # guess is dropped, and the caller is told the check did
-                        # not happen instead of being given a login state.
-                        if unreachable and login_status == "signed_out":
-                            raise CoreError(
-                                "relay_restore_unavailable",
-                                "The station could not be reached, so the login was not re-checked",
-                            )
-                        if refused is not None and public is None:
-                            raise refused
-                    if public is None:
-                        public = status_settler(str(account_id), str(login_status))
+                        except RelayAccountsError:
+                            # A probe that learned nothing cannot authorize a
+                            # password POST. Only an explicit host expiry may
+                            # replace the observation already stored in Core.
+                            if login_status == "signed_out":
+                                raise CoreError(
+                                    "relay_restore_unavailable",
+                                    "The saved session could not be verified",
+                                ) from None
+                            public = status_settler(str(account_id), "expired") if login_status == "expired" else matching
+                        else:
+                            if public is None:
+                                if login_status in {"signed_out", "expired"}:
+                                    status_settler(str(account_id), str(login_status))
+                                if matching.get("password_saved") is True:
+                                    try:
+                                        password_restorer(str(account_id), force=True)
+                                    except RelayAccountsError:
+                                        # The projection reports the POST's outcome.
+                                        # A backoff leaves the previous outcome in place.
+                                        pass
                 elif login_status in {"signed_out", "expired"}:
                     # A host observation of an account that holds no session,
                     # and every explicit ``expired``, are recorded as they are;
@@ -5253,6 +5118,9 @@ class CoreStore:
                     public = status_settler(str(account_id), str(login_status))
                 else:
                     raise CoreError("relay_restore_failed", "Relay login status is invalid")
+                updated = self._adapter_snapshot("relay_accounts")
+                if public is None:
+                    public = next(item for item in updated["accounts"] if item["id"] == account_id)
                 self._record_relay_transient_update(
                     was_dirty=relay_was_dirty,
                     prior_baseline=relay_prior_baseline,
@@ -5265,7 +5133,7 @@ class CoreStore:
                 # nothing to say, and answered 更改未生效 over a write that had
                 # landed.  A check that did change something still advances it.
                 if relay_was_dirty or (
-                    _relay_projection_without_the_clock(self._adapter_snapshot("relay_accounts"))
+                    _relay_projection_without_the_clock(updated)
                     != _relay_projection_without_the_clock(current)
                 ):
                     self._advance_revision()
