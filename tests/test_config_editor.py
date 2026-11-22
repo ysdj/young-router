@@ -82,6 +82,29 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertNotIn(marker, str(context.exception))
 
+    def test_deleting_a_route_from_a_document_with_model_list_first(self) -> None:
+        path = self.write_config("""
+            model_list:
+              - model_name: remove-me
+                litellm_params: {model: openai/first, api_key: fixture-key}
+                model_info: {id: deadbeef, provider: primary}
+              - model_name: keep-me
+                litellm_params: {model: openai/second, api_key: fixture-key}
+                model_info: {id: cafe1234, provider: primary}
+            providers:
+              primary:
+                api_base: https://example.test/v1
+                api_keys: [{name: default, value: fixture-key}]
+            """)
+        providers = config_load.load_config(path)["providers"]
+        del providers[0]["models"][0]
+
+        config_api.save_config(providers, path)
+
+        reloaded = config_schema.load_yaml_text(path.read_text(encoding="utf-8"), path)
+        self.assertEqual(["keep-me"], [row["model_name"] for row in reloaded["model_list"]])
+        self.assertEqual("fixture-key", reloaded["model_list"][0]["litellm_params"]["api_key"])
+
     def test_load_rejects_exponential_alias_expansion_without_leaking_source(self) -> None:
         marker = "sk-alias-bomb-leak-marker"
         aliases = ", ".join(["*previous"] * 10)

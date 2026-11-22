@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import hashlib
 import json
@@ -14,7 +15,7 @@ from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.persistence import atomic_write_json
-from young_router.core.service import CoreStore
+from young_router.core.service import CoreStore, MemoryDomain
 
 
 class RollbackWriteTests(unittest.TestCase):
@@ -45,6 +46,44 @@ class RollbackWriteTests(unittest.TestCase):
 
 
 class CoreServiceReloadTests(unittest.TestCase):
+    def test_provider_delete_commits_while_client_catalog_is_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(2) as pool:
+            config = Path(directory) / "config.yaml"
+            config.write_text(textwrap.dedent("""\
+                providers:
+                  primary:
+                    api_base: https://example.test/v1
+                    api_keys:
+                      - name: default
+                        value: fixture-key
+                model_list:
+                  - model_name: public-chat
+                    litellm_params: {model: openai/upstream, api_key: fixture-key}
+                    model_info: {id: deadbeef, provider: primary}
+                """), encoding="utf-8")
+            entered, release = threading.Event(), threading.Event()
+
+            class SlowCatalog(MemoryDomain):
+                def refresh_model_catalog(self) -> None:
+                    entered.set()
+                    release.wait(5)
+
+            core = CoreStore(domains=[ProvidersModelsDomain(config), SlowCatalog("codex", {})])
+
+            def delete_provider() -> dict:
+                staged = core.dispatch({"domain": "providers_models", "type": "provider.delete", "payload": {"provider_id": "primary"}})
+                return core.apply("providers_models", revision=staged["revision"])
+
+            refreshing = pool.submit(core.refresh_client_model_lists, refresh_contexts=False, include_claude=False)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(pool.submit(delete_provider).result(2)["applied"])
+                self.assertIn("model_list: []", config.read_text(encoding="utf-8"))
+                self.assertFalse(refreshing.done())
+            finally:
+                release.set()
+            self.assertEqual("succeeded", refreshing.result(2)[0])
+
     def test_provider_apply_reloads_service_after_source_config_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.yaml"
@@ -296,6 +335,9 @@ class CoreServiceReloadTests(unittest.TestCase):
             ), mock.patch(
                 "young_router.core.model_catalog.load_native_catalog",
                 return_value=[],
+            ), mock.patch(
+                "young_router.core.model_list_plugin.target_initialized",
+                return_value=False,
             ):
                 providers = ProvidersModelsDomain(config_path)
                 codex = CodexSettingsDomain(config_path, codex_home=codex_home)
@@ -329,9 +371,9 @@ class CoreServiceReloadTests(unittest.TestCase):
                 self.assertTrue(core.wait_for_service_reload(5.0))
                 # Endpoint-backed repairs require two fresh observations so a
                 # transient post-reload worker view cannot rewrite the client's
-                # model list. The apply's forced refresh is the first; the next
-                # snapshot with a fresh probe completes the pair.
-                codex._catalog_source_checked_at = 0.0
+                # model list. The reload's forced refresh is the first; the
+                # client-list worker supplies the next observation.
+                core.refresh_client_model_lists(refresh_contexts=False, include_claude=False)
                 catalog_state = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             catalog = json.loads(
@@ -1088,11 +1130,11 @@ class WebDAVPullReloadTests(unittest.TestCase):
     def _pull(self, core: CoreStore, remote_document: str) -> None:
         """Install ``remote_document`` the way a pull does, and return."""
 
-        def install(_client: object, _settings: object, config_path: Path, *_args: object, **_kwargs: object) -> None:
-            config_path.write_text(textwrap.dedent(remote_document).lstrip(), encoding="utf-8")
+        from young_router.webdav import core as webdav_core
 
-        with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-            "young_router.webdav.operations.pull_bundle", side_effect=install
+        bundle = webdav_core.bundle_from_files({"config.yaml": textwrap.dedent(remote_document).lstrip().encode()})
+        with mock.patch.object(webdav_core.WebDAVClient, "get", return_value=bundle), mock.patch(
+            "young_router.webdav.operations.publish_remote_digests", return_value=True
         ):
             core.dispatch(
                 {"domain": "webdav", "type": "pull", "payload": {"sections": ["providers_models", "relay_accounts"]}},
@@ -1250,26 +1292,13 @@ class WebDAVPullReloadTests(unittest.TestCase):
             # without being told a direction.
             baseline = webdav_core.local_snapshot(config_path).manifest
             webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), baseline, "sync")
-            remote_manifest = json.loads(json.dumps(baseline))
-            for entry in remote_manifest["files"]:
-                if entry.get("path") == "config.yaml":
-                    entry["sha256"] = "0" * 64
-
             remote = textwrap.dedent(self.CONFIG.replace("openai/old-chat", "openai/arrived-chat")).lstrip()
-
-            def install(_client: object, _settings: object, config_path: Path, *_args: object, **_kwargs: object) -> None:
-                config_path.write_text(remote, encoding="utf-8")
+            bundle = webdav_core.bundle_from_files({"config.yaml": remote.encode()})
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot",
-                return_value=webdav_core.SyncSnapshot(
-                    remote_manifest,
-                    {
-                        entry["path"]: entry.get("sha256") if entry.get("present") else None
-                        for entry in remote_manifest["files"]
-                    },
-                ),
-            ), mock.patch("young_router.webdav.operations.pull_bundle", side_effect=install):
+                return_value=webdav_core.bundle_snapshot(*webdav_core.read_config_bundle(bundle)),
+            ), mock.patch("young_router.webdav.operations.publish_remote_digests", return_value=True):
                 core.run_automatic_webdav_sync()
 
             self.assertTrue(core.wait_for_service_reload(5.0))

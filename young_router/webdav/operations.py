@@ -284,14 +284,22 @@ def push_bundle(
     state_path: pathlib.Path | None = None,
     action: str = "push",
 ) -> tuple[int, dict[str, Any]]:
-    remote_bundle_url = bundle_url(settings)
     bundle_data, snapshot = create_bundle(config_path)
+    upload_bundle(client, settings, bundle_data, snapshot)
+    if state_path is not None:
+        save_sync_state(state_path, settings, snapshot, action)
+    return len(bundle_data), snapshot.manifest or {}
+
+
+def upload_bundle(client: WebDAVClient, settings: Settings, bundle_data: bytes, snapshot: SyncSnapshot) -> None:
+    """Publish an already captured bundle without touching local files."""
+
     manifest = snapshot.manifest or {}
     manifest_data = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
     digest_data = build_digest_record(manifest, snapshot.digests or {})
 
     client.try_mkcol(collection_url(settings))
-    client.put(remote_bundle_url, bundle_data, "application/json; charset=utf-8")
+    client.put(bundle_url(settings), bundle_data, "application/json; charset=utf-8")
     try:
         client.put(manifest_url(settings), manifest_data, "application/json; charset=utf-8")
     except WebDAVHTTPError as exc:
@@ -305,9 +313,6 @@ def push_bundle(
         except WebDAVHTTPError as exc:
             if exc.code not in {403, 404, 405, 409, 500, 502, 503, 504}:
                 raise
-    if state_path is not None:
-        save_sync_state(state_path, settings, snapshot, action)
-    return len(bundle_data), manifest
 
 
 def pull_bundle(

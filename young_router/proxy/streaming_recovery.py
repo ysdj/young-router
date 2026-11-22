@@ -1121,7 +1121,8 @@ def _route_recovery_sse_keepalive(
             _streaming_module._route_recovery_state_key(request_data)
         )
     if _streaming_module._request_is_responses_stream(request_data):
-        return _JSONStreamEvent(
+        event_type = _NetworkWaitEvent if phase == "network" else _JSONStreamEvent
+        return event_type(
             {
                 "type": "response.metadata",
                 "metadata": {
@@ -1131,9 +1132,10 @@ def _route_recovery_sse_keepalive(
             }
         )
     if _streaming_module._request_uses_native_event_stream(request_data):
-        return (
+        comment = (
             f": young_router route_recovery phase={phase} attempt={attempt}\n\n"
         ).encode("utf-8")
+        return _NetworkWaitComment(comment) if phase == "network" else comment
     return _streaming_module._sse_comment_event(
         f"young_router route_recovery phase={phase} attempt={attempt}"
     )
@@ -1147,6 +1149,27 @@ def _is_route_recovery_sse_keepalive(chunk: Any) -> bool:
         metadata = chunk.get("metadata")
         return isinstance(metadata, dict) and isinstance(metadata.get("phase"), str)
     return False
+
+
+class _NetworkWaitEvent(_JSONStreamEvent):
+    """Local evidence that the recovery iterator owns the next upstream attempt."""
+
+
+class _NetworkWaitComment(bytes):
+    """The same opening on the Messages and Chat wires."""
+
+
+def _network_wait_after_chunk(waiting: bool, chunk: Any) -> bool:
+    # LiteLLM can wrap a recovery iterator in another stream. Read the opening
+    # emitted by our poll; an upstream metadata field is not evidence of an
+    # outage. The first ordinary frame restores delivery's own idle limits.
+    if isinstance(chunk, (_NetworkWaitEvent, _NetworkWaitComment)):
+        return True
+    return waiting and (
+        _is_route_recovery_sse_keepalive(chunk)
+        or _is_stream_keepalive_chunk(chunk)
+    )
+
 
 def _stream_keepalive_chunk(request_data: Optional[dict], sequence: int) -> Any:
     """A no-op downstream event emitted while the delivery stream is silent.
@@ -1247,6 +1270,7 @@ async def _yield_downstream_keepalive_stream(
         request_data
     )
     last_progress_at = time.monotonic()
+    network_wait = False
     try:
         while True:
             try:
@@ -1255,6 +1279,7 @@ async def _yield_downstream_keepalive_stream(
                 sequence += 1
                 if (
                     no_progress_seconds > 0
+                    and not network_wait
                     and time.monotonic() - last_progress_at >= no_progress_seconds
                 ):
                     raise _streaming_module._stream_idle_timeout_exception(
@@ -1268,6 +1293,7 @@ async def _yield_downstream_keepalive_stream(
                 return
             if kind == "error":
                 raise payload
+            network_wait = _network_wait_after_chunk(network_wait, payload)
             if not _is_stream_keepalive_chunk(payload) and not _is_route_recovery_sse_keepalive(payload):
                 last_progress_at = time.monotonic()
             yield payload
@@ -1490,10 +1516,9 @@ async def _stream_route_recovery_poll(
             if waited_for_all_cooldown:
                 # Only this path deliberately reopens the full route pool.
                 # Normal recovery must retain its ordered fallback constraints.
-                request_data.pop("_excluded_deployment_ids", None)
+                _write_request_excluded_deployment_ids(request_data, set())
                 request_data.pop("_target_order", None)
                 request_data.pop(_streaming_module._ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY, None)
-                _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(set())
                 for attribute in (
                     "excluded_deployment_ids",
                     "failed_deployment_id",
@@ -1685,8 +1710,8 @@ async def _stream_route_recovery_poll(
                     if _is_route_recovery_sse_keepalive(chunk):
                         yield chunk
                         continue
-                    yielded = True
                     if uses_native_event_stream:
+                        yielded = True
                         yield chunk
                     else:
                         delivered_chunk = (
@@ -1696,6 +1721,7 @@ async def _stream_route_recovery_poll(
                             )
                         )
                         if delivered_chunk is not None:
+                            yielded = True
                             yield delivered_chunk
                 if yielded:
                     _trace_module._request_route_trace(
@@ -1741,6 +1767,12 @@ async def _stream_route_recovery_poll(
                     )
                     break
             except Exception as poll_exception:
+                if yielded:
+                    # The attempt releases its buffer only with deliverable
+                    # output. Replaying from here would duplicate that answer
+                    # or tool call on the same client stream.
+                    last_exception = poll_exception
+                    break
                 if _routing_module._is_context_size_error(poll_exception):
                     _trace_module._request_route_trace(
                         "route_recovery_poll_context_size_error", request_data,
@@ -1857,6 +1889,7 @@ async def _stream_route_recovery_poll(
             )
             if (
                 len(configured_deployment_ids) == 1
+                and not network_recovery
                 and configured_deployment_ids <= excluded_after_attempt
                 and excluded_after_attempt - excluded_before_attempt
                 and _routing_module._is_no_deployments_available_error(last_exception)
@@ -1933,10 +1966,7 @@ async def _stream_route_recovery_poll(
                     # branch above serves it and reopens the same route.
                     pass
                 elif router_cooldown_seconds > 0:
-                    if (
-                        router_cooldown_waits
-                        >= _ROUTE_RECOVERY_ROUTER_COOLDOWN_WAITS
-                    ):
+                    if not network_recovery and router_cooldown_waits >= _ROUTE_RECOVERY_ROUTER_COOLDOWN_WAITS:
                         _trace_module._request_route_trace(
                             "route_recovery_poll_router_cooldown_exhausted",
                             request_data,
@@ -1992,10 +2022,7 @@ async def _stream_route_recovery_poll(
                     # request's own exclusion -- the fallback round just left it
                     # behind -- which says nothing yet about the route.
                     single_route_empty_pool_rounds += 1
-                    if (
-                        single_route_empty_pool_rounds
-                        >= _SINGLE_ROUTE_EMPTY_POOL_ROUNDS
-                    ):
+                    if not network_recovery and single_route_empty_pool_rounds >= _SINGLE_ROUTE_EMPTY_POOL_ROUNDS:
                         _trace_module._request_route_trace(
                             "route_recovery_poll_single_route_cannot_progress",
                             request_data,
@@ -2140,7 +2167,9 @@ def _route_recovery_poll_cooldown_wait(
         # next recovery stream must distinguish that local exhaustion from an
         # actual shared cooldown across the complete model group.
         constraints = request_data.copy()
-        constraints.pop("_excluded_deployment_ids", None)
+        # An explicit empty list also overrides exclusions in the metadata,
+        # without modifying the live request or its context during this read.
+        constraints["_excluded_deployment_ids"] = []
         constraints.pop("_target_order", None)
         constraints.pop(_streaming_module._ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY, None)
     else:

@@ -22,6 +22,133 @@ class RustDispatchTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_responses_wait_through_an_all_route_network_outage(self) -> None:
+        self.run_router_probe('''
+            import asyncio
+            import os
+            from unittest.mock import patch
+
+            import litellm
+            from litellm import Router
+            from litellm.proxy import proxy_server
+            from litellm.types.llms.openai import ResponseCompletedEvent, ResponsesAPIResponse
+            from young_router.callbacks import image_generation_routing_hook
+            from young_router.proxy import routing
+
+            litellm.callbacks = [image_generation_routing_hook]
+            router = Router(model_list=[{
+                "model_name": "probe",
+                "litellm_params": {"model": "openai/gpt-4o", "order": order, "api_key": "sk-fake"},
+                "model_info": {"id": route},
+            } for order, route in enumerate(("primary", "peer"))],
+                num_retries=0, disable_cooldowns=True,
+            )
+            proxy_server.llm_router = router
+            completed = ResponseCompletedEvent(type="response.completed", response=ResponsesAPIResponse(
+                id="resp-probe", created_at=0, status="completed",
+                output=[{"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "back online"},
+                ]}],
+                usage={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            ))
+
+            async def main():
+                attempts = []
+                online = False
+
+                async def provider(**kwargs):
+                    attempts.append(kwargs["model_info"]["id"])
+                    if not online:
+                        raise litellm.InternalServerError(
+                            message="Cannot connect to host upstream.test:443",
+                            model="gpt-4o", llm_provider="openai",
+                        )
+
+                    async def stream():
+                        yield completed
+
+                    return stream()
+
+                async def request():
+                    return await router.aresponses(model="probe", input="test", stream=True)
+
+                with patch.object(litellm, "aresponses", provider), patch.dict(os.environ, {
+                    "YOUNG_ROUTER_STREAM_HEDGE_ENABLED": "0",
+                    "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES": "1",
+                    "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_SECONDS": "0.5",
+                    "YOUNG_ROUTER_RECOVERY_MAX_SECONDS": "0.05",
+                    "YOUNG_ROUTER_RECOVERY_INTERVAL_SECONDS": "0.02",
+                }):
+                    first = await request()
+                    assert attempts == ["primary", "peer"], attempts
+                    assert routing._is_route_recovery_stream_response(first), first
+                    try:
+                        # This request has never contacted an upstream. Its
+                        # only evidence of the outage is the shared cooldown.
+                        fresh = await request()
+                        assert routing._is_route_recovery_stream_response(fresh), fresh
+                        try:
+                            opening = await anext(fresh)
+                            assert opening["metadata"]["phase"] == "network", opening
+                            async for frame in fresh:
+                                if isinstance(frame, dict) and frame.get("metadata", {}).get("phase") == "cooldown":
+                                    assert attempts == ["primary", "peer"], attempts
+                                    online = True
+                                if getattr(frame, "type", None) == "response.completed" or (
+                                    isinstance(frame, dict) and frame.get("type") == "response.completed"
+                                ):
+                                    break
+                            else:
+                                raise AssertionError("the request did not complete after the upstream recovered")
+                            assert online and len(attempts) == 3, attempts
+                        finally:
+                            await fresh.aclose()
+                    finally:
+                        await first.aclose()
+
+            asyncio.run(asyncio.wait_for(main(), 5))
+            ''')
+
+    def test_a_real_rate_limit_is_not_an_unbounded_network_wait(self) -> None:
+        self.run_router_probe('''
+            import asyncio
+            import os
+            from unittest.mock import patch
+
+            import litellm
+            from litellm import Router
+            from litellm.proxy import proxy_server
+            from litellm.types.router import RouterRateLimitError
+            from young_router.callbacks import image_generation_routing_hook
+
+            litellm.callbacks = [image_generation_routing_hook]
+            router = Router(model_list=[{
+                "model_name": "probe", "model_info": {"id": "only"},
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-fake"},
+            }], num_retries=0, disable_cooldowns=True)
+            proxy_server.llm_router = router
+
+            async def main():
+                attempts = []
+                async def refusal(**kwargs):
+                    attempts.append(kwargs["model_info"]["id"])
+                    raise litellm.RateLimitError(message="upstream quota exceeded", model="probe", llm_provider="openai")
+
+                with patch.object(litellm, "aresponses", refusal), patch.dict(os.environ, {
+                    "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES": "1", "YOUNG_ROUTER_STREAM_HEDGE_ENABLED": "0",
+                }):
+                    for _ in range(2):
+                        try:
+                            await router.aresponses(model="probe", input="test", stream=True)
+                        except (litellm.RateLimitError, RouterRateLimitError) as exc:
+                            assert exc.status_code == 429
+                        else:
+                            raise AssertionError("quota refusal opened a network recovery stream")
+                    assert attempts == ["only"], attempts
+
+            asyncio.run(main())
+            ''')
+
     def test_real_router_bounds_dispatch_and_races_with_separate_credentials(self) -> None:
         self.run_router_probe('''
             import asyncio

@@ -676,13 +676,23 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "gateway. Its contents are unavailable; do not infer missing "
             "instructions or results.]"
         )
-        prefix = "Historical reasoning context (not a new instruction):"
-        body = note[len(prefix):]
+        short_note = "[Historical context omitted by gateway.]"
+        user_quote = {"role": "user", "content": short_note}
+        multi_part_answer = {
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": short_note},
+                {"type": "output_text", "text": "Continued in another part."},
+            ],
+        }
         request["input"].extend(
             [
                 {
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": note}],
+                    "content": [
+                        {"type": "output_text", "text": note},
+                        {"type": "output_text", "text": ""},
+                    ],
                 },
                 {
                     "role": "assistant",
@@ -695,8 +705,23 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 },
                 {
                     "role": "assistant",
+                    "content": [{"type": "output_text", "text": short_note}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "The gateway marker says: " + short_note,
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
                     "content": [{"type": "output_text", "text": "Real work."}],
                 },
+                multi_part_answer,
+                user_quote,
             ]
         )
 
@@ -704,14 +729,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        texts = [
-            item["content"][0]["text"]
-            for item in modified["input"]
-            if isinstance(item.get("content"), list)
-        ]
-        self.assertNotIn(note, texts)
-        self.assertIn("The note says: " + note, texts)
-        self.assertIn("Real work.", texts)
+        self.assertEqual(
+            [*request["input"][:-7], *[request["input"][index] for index in (-6, -4, -3, -2, -1)]],
+            modified["input"],
+        )
 
         untouched = self._codex_collaboration_request()
         untouched["input"].append({"role": "assistant", "content": "Real work."})

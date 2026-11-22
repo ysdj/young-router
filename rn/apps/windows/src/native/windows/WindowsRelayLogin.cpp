@@ -393,17 +393,6 @@ struct StoredSession {
   std::string user_id;
 };
 
-std::string EncodeSession(StoredSession const& session) {
-  json::JsonObject object;
-  object.SetNamedValue(L"accountType", json::JsonValue::CreateStringValue(Utf8ToWide(session.account_type)));
-  object.SetNamedValue(L"origin", json::JsonValue::CreateStringValue(Utf8ToWide(session.origin)));
-  object.SetNamedValue(L"cookie", json::JsonValue::CreateStringValue(Utf8ToWide(session.cookie)));
-  object.SetNamedValue(L"accessToken", json::JsonValue::CreateStringValue(Utf8ToWide(session.access_token)));
-  object.SetNamedValue(L"refreshToken", json::JsonValue::CreateStringValue(Utf8ToWide(session.refresh_token)));
-  object.SetNamedValue(L"userID", json::JsonValue::CreateStringValue(Utf8ToWide(session.user_id)));
-  return WideToUtf8(object.Stringify().c_str());
-}
-
 // A station states its own account id in several shapes; the ``New-Api-User``
 // header only ever accepts a plain decimal id (a fork parses it with
 // ``strconv.Atoi``), so anything else is treated as no id at all rather than
@@ -455,20 +444,17 @@ std::string SessionUserID(json::IJsonValue const& root) {
 }
 
 std::optional<StoredSession> ReadSession(WindowsRelayLoginOptions const& options) {
-  auto raw = ReadChunkedCredential(options.account_id, L"session");
+  auto raw = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "session", options.account_id);
   if (!raw || raw->size() > kMaxSessionBytes) return std::nullopt;
   try {
     auto object = json::JsonObject::Parse(Utf8ToWide(*raw));
-    // A session written before the account id was stored has five fields; the
-    // id is then absent instead of invalid.
-    if (object.Size() != 5 && object.Size() != 6) return std::nullopt;
     StoredSession session{
-        WideToUtf8(object.GetNamedString(L"accountType", L"").c_str()),
+        WideToUtf8(object.GetNamedString(L"type", L"").c_str()),
         WideToUtf8(object.GetNamedString(L"origin", L"").c_str()),
         WideToUtf8(object.GetNamedString(L"cookie", L"").c_str()),
-        WideToUtf8(object.GetNamedString(L"accessToken", L"").c_str()),
-        WideToUtf8(object.GetNamedString(L"refreshToken", L"").c_str()),
-        NumericUserID(WideToUtf8(object.GetNamedString(L"userID", L"").c_str())),
+        WideToUtf8(object.GetNamedString(L"access_token", L"").c_str()),
+        WideToUtf8(object.GetNamedString(L"refresh_token", L"").c_str()),
+        NumericUserID(WideToUtf8(object.GetNamedString(L"user_id", L"").c_str())),
     };
     if (session.account_type != options.account_type || session.origin != options.origin ||
         session.cookie.size() > 32768 || session.access_token.size() > 32768 ||
@@ -647,43 +633,13 @@ constexpr wchar_t kRelayBrowserUserAgent[] =
     L"Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
 constexpr wchar_t kRelayBrowserAcceptLanguage[] = L"zh-CN,zh;q=0.9,en;q=0.8";
 
-// Whether a 2xx envelope states that the session it was shown is dead.
-// Mirrors Core's ``_payload_refuses_session`` and the macOS probe's helper:
-// only an envelope that explicitly denies success *and* names the login is a
-// refusal.  An envelope that fails for another reason (a missing permission,
-// an unknown route) says nothing about the session.
-bool PayloadRefusesSession(json::JsonValue const& root) {
-  try {
-    if (root.ValueType() != json::JsonValueType::Object) return false;
-    auto object = root.GetObject();
-    if (object.GetNamedValue(L"success").GetBoolean()) return false;
-    constexpr wchar_t const* markers[] = {
-        L"未登录", L"登录已过期", L"未登錄", L"登錄已過期",
-        L"not logged in", L"login has expired", L"login expired",
-        L"session expired", L"invalid session", L"please log in",
-        L"please sign in", L"unauthorized", L"authentication required"};
-    for (auto const* key : {L"message", L"error", L"msg"}) {
-      try {
-        auto message = WideToUtf8(object.GetNamedValue(key).GetString().c_str());
-        for (auto& ch : message) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        for (auto const* marker : markers) {
-          if (message.find(WideToUtf8(marker)) != std::string::npos) return true;
-        }
-      } catch (...) {}
-    }
-  } catch (...) {}
-  return false;
-}
-
 std::optional<EndpointProbeResult> ProbeEndpoint(
     WindowsRelayLoginOptions const& options,
     ParsedOrigin const& origin,
     std::string const& cookie_header,
     std::optional<std::string> const& captured_access,
     std::optional<std::string> const& captured_refresh,
-    std::optional<std::string> const& captured_user_id = std::nullopt,
-    bool* confirmed_authentication_rejection = nullptr) {
-  if (confirmed_authentication_rejection) *confirmed_authentication_rejection = false;
+    std::optional<std::string> const& captured_user_id) {
   if (cookie_header.find_first_of("\r\n") != std::string::npos ||
       (captured_access && captured_access->find_first_of("\r\n") != std::string::npos)) return std::nullopt;
   auto session = WinHttpHandle(WinHttpOpen(
@@ -703,27 +659,20 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
   // family from whichever probe answers when the caller did not name one; the
   // New-Api-User header follows it too.
   struct ProbeStep {
-    std::wstring method;
     std::wstring suffix;
     char const* family;
   };
-  std::vector<ProbeStep> probes = options.account_type == "sub2api"
-      ? std::vector<ProbeStep>{{L"GET", L"api/v1/auth/me", "sub2api"}}
-      : std::vector<ProbeStep>{{L"GET", L"api/user/self", "newapi"},
-                               {L"POST", L"api/user/auth/refresh", "newapi"},
-                               {L"GET", L"api/v1/auth/me", "sub2api"}};
-  bool saw_authentication_rejection = false;
-  bool saw_non_authentication_failure = false;
+  std::vector<ProbeStep> probes;
+  if (options.account_type != "sub2api") probes.push_back({L"api/user/self", "newapi"});
+  if (options.account_type != "newapi") probes.push_back({L"api/v1/auth/me", "sub2api"});
   for (auto const& step : probes) {
-    auto const& method = step.method;
     auto const& suffix = step.suffix;
     auto path = base_path + L"/" + suffix;
     DWORD flags = _wcsicmp(origin.uri.SchemeName().c_str(), L"https") == 0 ? WINHTTP_FLAG_SECURE : 0;
     auto request = WinHttpHandle(WinHttpOpenRequest(
-        connection.get(), method.c_str(), path.c_str(), nullptr, WINHTTP_NO_REFERER,
+        connection.get(), L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
     if (!request) {
-      saw_non_authentication_failure = true;
       continue;
     }
     DWORD no_redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
@@ -752,7 +701,6 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.get(), nullptr)) {
-      saw_non_authentication_failure = true;
       continue;
     }
     DWORD status = 0;
@@ -760,15 +708,9 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX) ||
         status == 0) {
-      saw_non_authentication_failure = true;
-      continue;
-    }
-    if (status == 401 || status == 403) {
-      saw_authentication_rejection = true;
       continue;
     }
     if (status < 200 || status >= 300) {
-      saw_non_authentication_failure = true;
       continue;
     }
     std::string body;
@@ -796,7 +738,6 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
       body.resize(offset + read);
     }
     if (!body_complete || body.empty()) {
-      saw_non_authentication_failure = true;
       continue;
     }
     try {
@@ -809,21 +750,26 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
       // had just refused -- one more minted session per pane entry, until the
       // account's cap refused even a correct password.  Core and the macOS
       // probe classify the same envelope the same way.
-      if (PayloadRefusesSession(root)) {
-        saw_authentication_rejection = true;
-        continue;
+      auto profile = root.GetObject();
+      if (!profile.GetNamedBoolean(L"success", true)) continue;
+      if (profile.HasKey(L"code")) {
+        auto code = profile.GetNamedValue(L"code");
+        if (!((code.ValueType() == json::JsonValueType::Number && code.GetNumber() == 0) ||
+              (code.ValueType() == json::JsonValueType::String && code.GetString() == L"0"))) continue;
       }
       auto username = FirstJsonString(root, {
           {L"data", L"username"}, {L"data", L"email"},
           {L"data", L"user", L"username"}, {L"data", L"user", L"email"},
-          {L"email"}, {L"username"}}).value_or(options.username.value_or(""));
+          {L"email"}, {L"username"}});
+      auto detected_user_id = SessionUserID(root);
+      if (!username && detected_user_id.empty()) continue;
+      auto accepted_username = username.value_or(options.username.value_or(""));
       auto access = FirstJsonString(root, {{L"data", L"access_token"}, {L"access_token"}});
       auto refresh = FirstJsonString(root, {{L"data", L"refresh_token"}, {L"refresh_token"}});
       if (!access) access = captured_access;
       if (!refresh) refresh = captured_refresh;
       // The answer names the account the session belongs to; that value is what
       // the header must carry, so it is preferred over an older capture.
-      auto detected_user_id = SessionUserID(root);
       if (detected_user_id.empty() && captured_user_id) detected_user_id = *captured_user_id;
       auto cookies = ParseCookieHeader(cookie_header);
       DWORD index = 0;
@@ -846,9 +792,8 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
         }
       }
       auto accepted_cookie = CookieHeader(cookies);
-      if (username.empty() || username.size() > 320 || accepted_cookie.size() > 32768 ||
+      if (accepted_username.empty() || accepted_username.size() > 320 || accepted_cookie.size() > 32768 ||
           (accepted_cookie.empty() && (!access || access->empty()))) {
-        saw_non_authentication_failure = true;
         continue;
       }
       // A braced initializer fills members in declaration order, so the family
@@ -856,17 +801,12 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
       // this list as "id then family" stored the id as the session's account type,
       // which ReadSession then rejected against its own account -- so every mount
       // re-probed with no session and the pane read 未登录 after a restart.
-      return EndpointProbeResult{std::move(username), std::move(accepted_cookie), std::move(access),
+      return EndpointProbeResult{std::move(accepted_username), std::move(accepted_cookie), std::move(access),
                                  std::move(refresh), std::string(step.family),
                                  std::move(detected_user_id),
                                  FirstJsonNumber(root, {{L"data", L"quota"}, {L"quota"}})};
     } catch (...) {
-      saw_non_authentication_failure = true;
     }
-  }
-  if (confirmed_authentication_rejection &&
-      saw_authentication_rejection && !saw_non_authentication_failure) {
-    *confirmed_authentication_rejection = true;
   }
   return std::nullopt;
 }
@@ -987,16 +927,6 @@ struct LoginState {
   std::atomic_bool finished{false};
   std::atomic_bool canceled{false};
   std::atomic_bool checking{false};
-  bool auto_probe_pending = false;
-  bool did_auto_submit_saved_password = false;
-  // Whether this attempt has shown the station refusing a credential.  Only
-  // that answer justifies replacing the session on hand with a sign-in.
-  bool attempt_saw_refusal = false;
-  // Whether this presentation may submit the remembered password at all.  It is
-  // opened by having no session to preserve, or by a station's refusal of the
-  // one it had, and it stays closed afterwards: each submission is one more
-  // session against the account's cap.
-  bool login_submit_authorized = false;
   bool dialog_closed_during_commit = false;
   std::shared_ptr<RelayLoginAttempt> active_attempt;
 };
@@ -1090,11 +1020,6 @@ void ShowLoginDialog(std::shared_ptr<LoginState> const& state) {
   }
 }
 
-// Declared ahead of ``ProbeLogin``: the failure paths of a check are what
-// decide whether the remembered password may be submitted, and that decision
-// belongs to the same flow.
-winrt::fire_and_forget SubmitSavedPassword(std::shared_ptr<LoginState> state);
-
 winrt::fire_and_forget ProbeLogin(
     std::shared_ptr<LoginState> state,
     std::shared_ptr<RelayLoginAttempt> attempt) {
@@ -1164,29 +1089,9 @@ winrt::fire_and_forget ProbeLogin(
     }
     co_await winrt::resume_background();
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
-    bool confirmed_authentication_rejection = false;
-    auto verified = ProbeEndpoint(state->options, state->origin, cookie_header, access_token, refresh_token, user_id,
-                                  &confirmed_authentication_rejection);
+    auto verified = ProbeEndpoint(state->options, state->origin, cookie_header, access_token, refresh_token, user_id);
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
-    if (!verified) {
-      // Only a refusal the station actually stated opens the way to a sign-in.
-      // A station this app could not reach, or one that answered a shape this
-      // probe cannot read, says nothing about the session on hand -- the same
-      // rule Core applies to its own check.  The window is left for the user
-      // instead of spending a session to answer a question nobody asked.
-      if (confirmed_authentication_rejection) {
-        state->attempt_saw_refusal = true;
-        // A refused session is exactly what the remembered password is for,
-        // so this is also what opens the way to submitting it.
-        state->login_submit_authorized = true;
-      }
-      throw winrt::hresult_error(E_ACCESSDENIED);
-    }
-    StoredSession session{verified->family.empty() ? state->options.account_type : verified->family,
-                          state->options.origin, verified->cookie,
-                          verified->access_token.value_or(""), verified->refresh_token.value_or(""),
-                          verified->user_id};
-    auto session_text = EncodeSession(session);
+    if (!verified) throw winrt::hresult_error(E_ACCESSDENIED);
     if (!attempt->BeginCommit()) co_return;
     dispatcher.TryEnqueue([state, attempt] {
       if (state->finished.load()) return;
@@ -1225,24 +1130,9 @@ winrt::fire_and_forget ProbeLogin(
         co_await winrt::resume_background();
       }
     }
-    auto prior_session = ReadChunkedCredential(state->options.account_id, L"session");
-    auto prior_password = ReadChunkedCredential(state->options.account_id, L"password");
-    bool credentials_saved = WriteChunkedCredential(state->options.account_id, L"session", session_text);
-    if (credentials_saved) {
-      if (remember_password && password && !password->empty()) {
-        credentials_saved = WriteChunkedCredential(state->options.account_id, L"password", EncodePassword(state->options, *password));
-      } else {
-        credentials_saved = ClearChunkedCredential(state->options.account_id, L"password");
-      }
-    }
-    if (!credentials_saved) {
-      WriteChunkedCredential(state->options.account_id, L"session", prior_session);
-      WriteChunkedCredential(state->options.account_id, L"password", prior_password);
-    }
-    // AcceptRelayLogin is transactional in Core: a missing response is a
-    // definitive failed import, so restore the native side to the same prior
-    // state. A visible window close cannot cancel this synchronous boundary.
-    auto accepted = credentials_saved ? CoreIPCBridge::Shared().AcceptRelayLogin(
+    // Core is the durable session boundary. Saving the password for manual
+    // Windows prefill cannot decide whether the login succeeded.
+    auto accepted = CoreIPCBridge::Shared().AcceptRelayLogin(
         state->options.account_id,
         verified->family.empty() ? state->options.account_type : verified->family,
         state->options.label,
@@ -1254,12 +1144,13 @@ winrt::fire_and_forget ProbeLogin(
         state->options.station_id, state->options.station_name,
         state->options.station_type, state->options.station_origin,
         remember_password, auto_grouping ? std::optional<bool>(true) : std::nullopt,
-        state->options.pending_account) : std::nullopt;
-    // Once Core accepted the login, preserve the matching native credentials
-    // even if the user closed the dialog while that synchronous IPC call ran.
-    if (credentials_saved && !accepted) {
-      WriteChunkedCredential(state->options.account_id, L"session", prior_session);
-      WriteChunkedCredential(state->options.account_id, L"password", prior_password);
+        state->options.pending_account);
+    if (accepted) {
+      if (remember_password && password && !password->empty()) {
+        WriteChunkedCredential(state->options.account_id, L"password", EncodePassword(state->options, *password));
+      } else {
+        ClearChunkedCredential(state->options.account_id, L"password");
+      }
     }
     auto completed_result = accepted
         ? std::optional<WindowsRelayLoginResult>(WindowsRelayLoginResult{accepted->revision, accepted->username})
@@ -1275,14 +1166,6 @@ winrt::fire_and_forget ProbeLogin(
           return;
         }
         ShowLoginDialog(state);
-        // No session on hand survived, and the station said so itself.  Only
-        // now is the remembered password submitted, and only once per
-        // presentation.
-        if (state->attempt_saw_refusal && state->restored_password &&
-            !state->restored_password->empty() && !state->did_auto_submit_saved_password) {
-          SubmitSavedPassword(state);
-          return;
-        }
         state->check.IsEnabled(true);
         state->cancel.IsEnabled(true);
         state->status.Text(Text(state->options,
@@ -1323,13 +1206,6 @@ winrt::fire_and_forget ProbeLogin(
         return;
       }
       ShowLoginDialog(state);
-      // No session on hand survived, and the station said so itself.  Only now
-      // is the remembered password submitted, and only once per presentation.
-      if (state->attempt_saw_refusal && state->restored_password &&
-          !state->restored_password->empty() && !state->did_auto_submit_saved_password) {
-        SubmitSavedPassword(state);
-        return;
-      }
       state->check.IsEnabled(true);
       state->cancel.IsEnabled(true);
       state->status.Text(Text(state->options,
@@ -1351,56 +1227,18 @@ void StartLoginCheck(std::shared_ptr<LoginState> const& state) {
   auto attempt = std::make_shared<RelayLoginAttempt>();
   state->active_attempt = attempt;
   state->dialog_closed_during_commit = false;
-  // Every check starts from "the station has refused nothing yet": only an
-  // answer this attempt receives may justify a sign-in.
-  state->attempt_saw_refusal = false;
   ProbeLogin(state, std::move(attempt));
-}
-
-// Submit the remembered password, because the station refused everything else.
-//
-// This is the only place the Windows flow asks a station to mint a session of
-// its own, and it runs only after ``ProbeLogin`` showed that neither the
-// restored session nor the page's own session is usable.  A station caps an
-// account's concurrent sessions, so each submission is one attempt against
-// that cap; submitting before the credential on hand was actually refused is
-// what turned every window open into another session until the account was
-// signed out everywhere.
-winrt::fire_and_forget SubmitSavedPassword(std::shared_ptr<LoginState> state) {
-  if (!state || state->canceled.load() || state->finished.load() ||
-      !state->login_submit_authorized ||
-      !state->restored_password || state->restored_password->empty() ||
-      state->did_auto_submit_saved_password) co_return;
-  state->did_auto_submit_saved_password = true;
-  std::wstring script = LR"JS((() => {
-    const user = document.querySelector('input[type=email],input[type=text],input:not([type]),input[name=email],input[name=username],input[autocomplete=username],input[placeholder*="用户名"],input[placeholder*="email" i]');
-    const password = document.querySelector('input[type=password],input[autocomplete=current-password]');
-    if (!user || !password || !user.value || !password.value) return false;
-    const form = password.form;
-    const submit = form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])')
-      ?? Array.from(document.querySelectorAll('button')).find(node => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
-    if (submit instanceof HTMLElement) submit.click();
-    else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
-    return true;
-  })())JS";
-  bool submitted = false;
-  try {
-    submitted = co_await state->webview.ExecuteScriptAsync(script) == L"true";
-  } catch (...) {}
-  if (!submitted && !state->finished.load()) {
-    // A form that is gone or incomplete did not submit: the station was still
-    // not asked anything, so a later check may try again.
-    state->did_auto_submit_saved_password = false;
-    co_return;
-  }
-  if (state->canceled.load() || state->finished.load()) co_return;
-  try {
-    state->status.Text(Text(state->options, L"Waiting for sign-in...", L"等待完成登录..."));
-  } catch (...) {}
 }
 
 winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
   try {
+    if (!state->options.pending_account) {
+      auto dispatcher = state->dialog.DispatcherQueue();
+      co_await winrt::resume_background();
+      state->restored_session = ReadSession(state->options);
+      co_await DispatcherQueueAwaiter{dispatcher};
+      if (state->canceled.load()) co_return;
+    }
     auto folder = WebViewDataFolder();
     if (folder.empty()) throw winrt::hresult_error(E_FAIL);
     web::CoreWebView2EnvironmentOptions environment_options;
@@ -1450,14 +1288,6 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
         cookie.IsSecure(_wcsicmp(state->origin.uri.SchemeName().c_str(), L"https") == 0);
         manager.AddOrUpdateCookie(cookie);
       }
-      state->auto_probe_pending = true;
-      // A presentation holding a session asks it first; only a refusal of that
-      // session may replace it with a sign-in.
-      state->login_submit_authorized = false;
-    } else {
-      // Nothing is on hand to preserve, so the remembered password is the only
-      // way in and filling it is the sign-in the user asked for.
-      state->login_submit_authorized = state->restored_password && !state->restored_password->empty();
     }
     // The page inside the station, as the relay domain states it: a family's
     // paths are one table for every host that opens a station page, and a copy
@@ -1500,7 +1330,6 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   state->options = input_options;
   state->options.origin = origin->value;
   state->origin = *origin;
-  state->restored_session = ReadSession(state->options);
   state->restored_password = ReadPassword(state->options);
 
   xaml::Window dialog;
@@ -1551,7 +1380,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   controls::Button cancel;
   cancel.FontSize(kUIFontSize);
   state->cancel = cancel;
-  cancel.Content(winrt::box_value(Text(state->options, L"Cancel", L"取消")));
+  cancel.Content(winrt::box_value(Text(state->options, L"Stop signing in", L"停止登录")));
   actions.Children().Append(check);
   actions.Children().Append(cancel);
   header.Children().Append(actions);
@@ -1624,34 +1453,13 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
       if (agreement) (agreement.closest('label,li,form,section') || agreement).scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
       return hasCredentials;
     })())JS";
-    // Filling the form is all this pass does.  Submitting it is the one action
-    // that asks the station to mint a session, and a station caps how many an
-    // account may hold at once -- so only a station's own refusal of the
-    // credential on hand (see ``StartLoginCheck``) opens the way to
-    // ``SubmitSavedPassword``.  A page that still shows its sign-in form is not
-    // that refusal: a station that just accepted this browser's session may not
-    // have left the sign-in route yet, and a restored session that still works
-    // renders exactly the same form while its cookies are being installed.
-    // Submitting on that evidence is what minted one session per window open
-    // until the account was locked out.
+    // Core owns automatic sign-in. The browser only fills the manual form.
     auto after = [current, script = std::move(script)]() mutable -> winrt::fire_and_forget {
-      std::wstring result;
       try {
-        result = co_await current->webview.ExecuteScriptAsync(script);
+        co_await current->webview.ExecuteScriptAsync(script);
       } catch (...) {}
       if (current->canceled.load() || current->finished.load()) co_return;
       current->check.IsEnabled(true);
-      // With nothing on hand to preserve, this form *is* the sign-in the user
-      // asked for, so the filled password is submitted once.  A presentation
-      // holding a session submits only after that session was refused.
-      if (result == L"true" && current->login_submit_authorized) {
-        SubmitSavedPassword(current);
-        co_return;
-      }
-      if (current->auto_probe_pending) {
-        current->auto_probe_pending = false;
-        StartLoginCheck(current);
-      }
     };
     after();
   });
@@ -1721,51 +1529,10 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
       (input_options.username && input_options.username->size() > 320)) return std::nullopt;
   auto origin = ParseOrigin(input_options.origin);
   if (!origin) return std::nullopt;
-  WindowsRelayLoginOptions options = input_options;
-  options.origin = origin->value;
-  auto stored = ReadSession(options);
-  if (!stored) {
-    auto accepted = CoreIPCBridge::Shared().RestoreRelaySession(
-        options.account_id, options.account_type, options.label, options.origin,
-        "signed_out", std::nullopt, std::nullopt, std::nullopt, std::nullopt);
-    if (!accepted) return std::nullopt;
-    return WindowsRelaySessionRestoreResult{
-        accepted->revision, accepted->login_status, accepted->username};
-  }
-  bool confirmed_authentication_rejection = false;
-  auto verified = ProbeEndpoint(
-      options, *origin, stored->cookie,
-      stored->access_token.empty() ? std::nullopt : std::optional<std::string>(stored->access_token),
-      stored->refresh_token.empty() ? std::nullopt : std::optional<std::string>(stored->refresh_token),
-      stored->user_id.empty() ? std::nullopt : std::optional<std::string>(stored->user_id),
-      &confirmed_authentication_rejection);
-  // An unreachable relay is not evidence that the account logged out. Keep
-  // its Core status unknown until a later successful validation occurs.
-  if (!verified) {
-    if (!confirmed_authentication_rejection) return std::nullopt;
-    auto accepted = CoreIPCBridge::Shared().RestoreRelaySession(
-        options.account_id, options.account_type, options.label, options.origin,
-        "expired", std::nullopt, std::nullopt, std::nullopt, std::nullopt);
-    if (!accepted) return std::nullopt;
-    return WindowsRelaySessionRestoreResult{
-        accepted->revision, accepted->login_status, accepted->username};
-  }
   auto accepted = CoreIPCBridge::Shared().RestoreRelaySession(
-      options.account_id, options.account_type, options.label, options.origin,
-      "signed_in", verified->username,
-      verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
-      verified->access_token, verified->refresh_token,
-      verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id),
-      verified->quota);
+      input_options.account_id, input_options.account_type, input_options.label, origin->value,
+      "unknown", input_options.username, std::nullopt, std::nullopt, std::nullopt);
   if (!accepted) return std::nullopt;
-  // The probe merges the answer's Set-Cookie and may have rotated the tokens.
-  // The next restore reads this store and the sign-in browser plants it, so
-  // both must see the session the station just accepted instead of the one it
-  // replaced.
-  StoredSession refreshed{stored->account_type, options.origin, verified->cookie,
-                          verified->access_token.value_or(""), verified->refresh_token.value_or(""),
-                          verified->user_id};
-  WriteChunkedCredential(options.account_id, L"session", EncodeSession(refreshed));
   return WindowsRelaySessionRestoreResult{
       accepted->revision, accepted->login_status, accepted->username};
 }

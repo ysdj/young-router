@@ -36,7 +36,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ..config.load import load_config
-from .domains.relay_accounts import _payload_refuses_session
+from .domains.relay_accounts import (
+    RelayAccountsError, RelaySessionRejectedError, _payload_refuses_session, _reject_relay_response,
+)
 from young_router.api_base import isolated_http_opener, service_root
 from young_router.browser_identity import browser_request_headers
 
@@ -972,9 +974,12 @@ def _fetch_json_with_headers(
             status = int(getattr(response, "status", None) or response.getcode())
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
+        try:
+            _reject_relay_response(exc)
+        except RelaySessionRejectedError:
             return "refused", None
-        return "unsupported", None
+        except RelayAccountsError:
+            return "unsupported", None
     except (socket.timeout, TimeoutError):
         return "timeout", None
     except (urllib.error.URLError, OSError):
@@ -1457,6 +1462,7 @@ def fetch_target(
     *,
     page: int = 1,
     rows_per_page: int | None = None,
+    standalone: bool = True,
 ) -> tuple[str, list[dict[str, Any]], str, int, int]:
     """Read one page of the account's history through its dashboard session.
 
@@ -1491,7 +1497,9 @@ def fetch_target(
         # routinely outlives the pane, and asking the station to replace a
         # working token costs a session each time — which is exactly what a
         # station with a concurrent-session cap makes expensive.
-        headers = _session_headers_for(target, timeout)
+        # When called by Core, it alone may rotate the saved session. A page
+        # read only reports rejection and reruns after Core saves the result.
+        headers = _session_headers_for(target, timeout) if standalone else dict(target.session_headers)
         if not headers:
             # Neither the stored token nor an exchange produced one, so this
             # login really is spent.  The caller may be able to renew it; it is
@@ -1500,7 +1508,7 @@ def fetch_target(
         ledger, refused, station_total, applied_rows = _sub2api_ledger_rows(
             headers, target.origin, timeout, page=page, rows_per_page=rows_per_page
         )
-        if refused:
+        if refused and standalone:
             # The station refused the token it was given.  One renewal is tried,
             # and only one: a station that refuses two tokens in a row is not
             # answering a rotation, and repeating the exchange would be the
@@ -1626,6 +1634,7 @@ def _fetch_target_safely(
     *,
     page: int = 1,
     rows_per_page: int | None = None,
+    standalone: bool = True,
 ) -> tuple[str, list[dict[str, Any]], str, int, int]:
     try:
         return fetch_target(
@@ -1634,6 +1643,7 @@ def _fetch_target_safely(
             fallback_timestamp,
             page=page,
             rows_per_page=rows_per_page,
+            standalone=standalone,
         )
     except Exception:
         # A malformed third-party response must not prevent other configured
@@ -1709,20 +1719,17 @@ def collect(
     if not targets:
         return [], USAGE_REASON_NO_CREDENTIAL, 0, 0
 
-    read = _read_targets(targets, timeout, page=page, rows_per_page=rows_per_page)
+    standalone = not callable(relogin)
+    read = _read_targets(targets, timeout, page=page, rows_per_page=rows_per_page, standalone=standalone)
     if read.expired_login and callable(relogin):
         # The login is spent, and a remembered password can replace it.  The
         # renewals run first and the read repeats, so a relay that signs itself
         # back in never appears to the user as an expired login at all.
         renewed = False
-        for target in targets:
-            if target.account_id and _renew_login(relogin, target.account_id):
+        for account_id in read.expired_account_ids:
+            if _renew_login(relogin, account_id):
                 renewed = True
         if renewed:
-            # The station has new material, so the cached tokens for these
-            # accounts are spent by definition.
-            for target in targets:
-                _forget_token(target.account_id)
             try:
                 targets = [
                     t
@@ -1731,7 +1738,7 @@ def collect(
                 ]
             except UsageConfigError:
                 targets = []
-            read = _read_targets(targets, timeout, page=page, rows_per_page=rows_per_page)
+            read = _read_targets(targets, timeout, page=page, rows_per_page=rows_per_page, standalone=False)
     if not read.readable:
         # A relay whose dashboard login the station no longer accepts is not a
         # relay that installs no feed: signing in again is the fix, so the pane
@@ -1774,6 +1781,7 @@ class _TargetRead:
     # The page size the feed actually applied, which is what the pager counts
     # from: a feed that caps its own page answered 100 rows for a request of 300.
     page_rows: int
+    expired_account_ids: tuple[str, ...] = ()
 
 
 def _read_targets(
@@ -1782,6 +1790,7 @@ def _read_targets(
     *,
     page: int = 1,
     rows_per_page: int | None = None,
+    standalone: bool = True,
 ) -> _TargetRead:
     """Read one page from every target and fold the answers into one result."""
 
@@ -1798,6 +1807,7 @@ def _read_targets(
                 observed_at,
                 page=page,
                 rows_per_page=rows_per_page,
+                standalone=standalone,
             )
             for target in targets
         ]
@@ -1807,13 +1817,16 @@ def _read_targets(
     readable = False
     answered_empty = False
     expired_login = False
+    expired_accounts: dict[str, None] = {}
     total = 0
     page_rows = 0
-    for source, rows, reason, station_total, applied_rows in results:
+    for target, (source, rows, reason, station_total, applied_rows) in zip(targets, results, strict=True):
         if applied_rows > 0:
             page_rows = applied_rows
         if reason == USAGE_REASON_LOGIN_EXPIRED:
             expired_login = True
+            if target.account_id:
+                expired_accounts[target.account_id] = None
         # One selected relay answers for one page, so its own total is the
         # count the pager needs.  Several accounts of one station are several
         # lists, and their totals add up.
@@ -1828,7 +1841,7 @@ def _read_targets(
             # that installs no feed, and the pane says which.
             answered_empty = True
         records.extend(rows)
-    return _TargetRead(records, readable, answered_empty, expired_login, total, page_rows)
+    return _TargetRead(records, readable, answered_empty, expired_login, total, page_rows, tuple(expired_accounts))
 
 
 def render(

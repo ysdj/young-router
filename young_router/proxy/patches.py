@@ -2486,6 +2486,7 @@ def _install_rust_dispatch_patch() -> None:
     from litellm.router_rust import core as rust_router
     from litellm.router_rust.core import RustCore, _Driver
     from litellm.types.llms.openai import ResponseCompletedEvent
+    from litellm.types.router import RouterRateLimitError
 
     original_drive = RustCore._drive
     if getattr(original_drive, _RUST_DISPATCH_PATCH_ATTR, False):
@@ -2626,13 +2627,44 @@ def _install_rust_dispatch_patch() -> None:
         marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         try:
             dispatch = original_drive(self, plan, request, *args, **kwargs)
-            if plan.host_op in {"aresponses", "acompletion"} and request.get("stream") is True:
-                routed_request = {**request, "call_type": plan.host_op}
-                response = await _streaming_module._await_upstream_dispatch_with_head_hedge(
-                    dispatch, routed_request, per_attempt_budget=True
+            routed_request = {**request, "call_type": plan.host_op}
+            try:
+                if plan.host_op in {"aresponses", "acompletion"} and request.get("stream") is True:
+                    response = await _streaming_module._await_upstream_dispatch_with_head_hedge(
+                        dispatch, routed_request, per_attempt_budget=True
+                    )
+                else:
+                    response = await dispatch
+            except Exception as exc:
+                # The driver has already exhausted its retries and peers. Only
+                # the client-facing dispatch owns recovery; an internal round
+                # or losing hedge must report its failure to its caller.
+                if (
+                    _streaming_module._is_head_hedge_attempt(routed_request)
+                    or _responses_request_module._request_already_attempted_streaming_error_fallback(routed_request)
+                    or _request_is_external_web_search_internal_call(routed_request)
+                    or not _routing_module._should_return_route_recovery_stream(exc, routed_request)
+                ):
+                    raise
+                routed_request["_route_recovery_ignore_local_constraints"] = True
+                if isinstance(exc, RouterRateLimitError):
+                    # A fresh request can hit only the shared cooldown, with
+                    # no connect exception left in this worker's call stack.
+                    wait = _streaming_module._route_recovery_poll_cooldown_wait(
+                        routed_request, ignore_constraints=True,
+                    )
+                    if wait and any(
+                        row.get("network_failure") is True
+                        for row in wait["cooldown_deployments"]
+                    ):
+                        setattr(exc, _routing_module._NETWORK_CONNECTIVITY_MARKER_ATTR, True)
+                if not _routing_module._is_network_recovery_exception(exc):
+                    raise
+                _trace_module._request_route_trace(
+                    "route_recovery_stream_returned", routed_request,
+                    exception=_routing_module._trace_exception(exc),
                 )
-            else:
-                response = await dispatch
+                return _routing_module._route_recovery_stream_response(routed_request, exc)
             marker = _routing_module._selected_deployment_marker_from_response(response)
             if marker is None:
                 marker = selected_box.get("marker")

@@ -19,8 +19,14 @@ type Translate = (key: string, values?: Record<string, string | number>) => stri
 const LOGIN_FAILURE_MESSAGES = {
   rejected: "relay.autoSignInRejected",
   session_limit: "relay.autoSignInSessionLimit",
+  session_unconfirmed: "relay.autoSignInSessionUnconfirmed",
   unavailable: "relay.autoSignInUnavailable",
 } as const;
+
+function isLoginFailure(value: unknown): value is keyof typeof LOGIN_FAILURE_MESSAGES {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(LOGIN_FAILURE_MESSAGES, value);
+}
+
 export type RelayType = "newapi" | "sub2api";
 type RemoteDeletePolicy = "delete_models" | "detach_disabled" | "detach_only";
 export type RelayGroup = {
@@ -187,7 +193,7 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
       stationName: text(item.station_name) || text(item.station_label),
       username: text(item.username),
       loginStatus: text(item.login_status) || "unknown",
-      loginFailure: failure === "rejected" || failure === "session_limit" || failure === "unavailable" ? failure : undefined,
+      loginFailure: isLoginFailure(failure) ? failure : undefined,
       loginObservedSecondsAgo: typeof item.login_observed_seconds_ago === "number" && Number.isFinite(item.login_observed_seconds_ago) ? item.login_observed_seconds_ago : null,
       rememberPassword: item.remember_password === true,
       passwordSaved: item.password_saved === true,
@@ -575,7 +581,7 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
             </View>
           </View>
         </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={translate("relay.apiKeyCreate")} primary disabled={disabled || !name.trim()} onPress={() => onCreate({ name: name.trim(), groupID: groupID || undefined, enabled })} /></View></View>
+        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.close")} compact disabled={disabled} onPress={onClose} /><NativeButton title={translate("relay.apiKeyCreate")} primary disabled={disabled || !name.trim()} onPress={() => onCreate({ name: name.trim(), groupID: groupID || undefined, enabled })} /></View></View>
       </View>
     </View>
   </RelayDialogLayer>;

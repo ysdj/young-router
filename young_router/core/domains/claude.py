@@ -2261,6 +2261,67 @@ class ClaudeSettingsDomain:
         base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, Mapping) else None
         return self._names_local_api(base_url)
 
+    def _adopt_local_api(self, data: Mapping[str, Any]) -> None:
+        """Point one Claude client at this app's own proxy and adopt its key.
+
+        Claude Code names its gateway in ``env``; Claude Desktop names it in its
+        third-party inference profile.  Both store the Messages root, which
+        carries no ``/v1``: each appends ``/v1/messages`` itself.  One staging
+        path for both entries that name this endpoint -- the pane's switch and
+        the Edit API form saved on the proxy's own address -- so the route, the
+        key and the picker this app generates stay one decision.
+        """
+
+        client = _claude_client(data)
+        base_url, key = _shared_api.endpoint(self.runtime_config_path)
+        # The endpoint just adopted *is* this app's proxy, whatever this
+        # domain resolved at construction: a checkout with no installed
+        # config resolved nothing, and both `uses_local_api` answers would
+        # then contradict the document that was just written.
+        self._local_api_base_url = base_url
+        base_url = anthropic_base_url(base_url)
+        if client == "claudeDesktop":
+            if self._desktop is None:
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            try:
+                self._desktop.patch(
+                    {"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": base_url}
+                )
+                self._desktop.stage_secret("desktop_gateway_api_key", key)
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return
+        candidate = copy.deepcopy(self._draft)
+        env = _mapping(candidate.get("env", {}), "env")
+        env["ANTHROPIC_BASE_URL"] = base_url
+        # ``ANTHROPIC_AUTH_TOKEN`` is the bearer form a gateway states; an
+        # ``ANTHROPIC_API_KEY`` left beside it is the old direct route's
+        # credential and would be sent as a second identity.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env["ANTHROPIC_AUTH_TOKEN"] = key
+        # The route is named the way this app publishes it, not by its
+        # public name: a gateway id has no catalogue entry in the client, so
+        # a session launched with the public name reports the client's 200k
+        # default and drops the effort ladder (see ``_code_published_id``).
+        # Only while the picker is this app's list is there a row to name,
+        # so a client on the proxy with its own catalogue is left as it is.
+        named = self.code_model_list_enabled()
+        model = str(data.get("model") or "").strip()
+        if model:
+            env["ANTHROPIC_MODEL"] = self._code_published_id(model) if named else model
+            candidate["model"] = env["ANTHROPIC_MODEL"]
+        elif isinstance(env.get("ANTHROPIC_MODEL"), str):
+            if named:
+                env["ANTHROPIC_MODEL"] = self._code_published_id(env["ANTHROPIC_MODEL"])
+            candidate["model"] = env["ANTHROPIC_MODEL"]
+        candidate["env"] = env
+        errors = validate_settings(candidate)
+        if errors:
+            raise ClaudeSettingsError(errors[0])
+        self._draft = candidate
+        self._revision += 1
+
     def code_nonstream_fallback_enabled(self) -> bool:
         """True when Claude Code is told not to re-send a failed stream whole."""
 
@@ -2555,7 +2616,11 @@ class ClaudeSettingsDomain:
         settings = self._safe_projection(self._draft)
         uses_local_api = self.code_uses_local_api()
         env = self._code_env()
-        direct_api = {} if uses_local_api else {
+        # The Edit API form edits one connection and shows whichever one Claude
+        # Code runs.  With this app's API switched on that turns out to be the
+        # proxy itself; answering an empty object instead left every field
+        # blank beside a switch that said the client was connected.
+        direct_api = {
             "base_url": settings["gateway_url"],
             "model": settings.get("model"),
             "key_configured": settings["token_configured"],
@@ -2648,6 +2713,14 @@ class ClaudeSettingsDomain:
             from ..model_list_plugin import target_initialized
 
             base_url = anthropic_base_url(data["base_url"])
+            if self._names_local_api(base_url):
+                # The form edits one connection, and saving this app's own
+                # proxy back is that connection: the local route owns its
+                # endpoint, its master key and the picker this app generates.
+                # Writing the same endpoint as a hand-managed gateway would
+                # drop the picker while the pane's switch still read "on".
+                self._adopt_local_api(data)
+                return self.snapshot()
             key, model, auth = data["api_key"], data["model"], data["auth_mode"]
             candidate = copy.deepcopy(self._draft)
             env = _mapping(candidate.get("env", {}), "env")
@@ -2684,60 +2757,7 @@ class ClaudeSettingsDomain:
             self._revision += 1
             return self.snapshot()
         if name in {"use_local_api", "uselocalapi"}:
-            # Point one Claude client at this app's own proxy and adopt its
-            # master key.  Claude Code names its gateway in ``env``; Claude
-            # Desktop names it in its third-party inference profile.  Both
-            # store the Messages root, which carries no ``/v1``: each appends
-            # ``/v1/messages`` itself.
-            client = _claude_client(data)
-            base_url, key = _shared_api.endpoint(self.runtime_config_path)
-            # The endpoint just adopted *is* this app's proxy, whatever this
-            # domain resolved at construction: a checkout with no installed
-            # config resolved nothing, and both `uses_local_api` answers would
-            # then contradict the document that was just written.
-            self._local_api_base_url = base_url
-            base_url = anthropic_base_url(base_url)
-            if client == "claudeDesktop":
-                if self._desktop is None:
-                    raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
-                try:
-                    self._desktop.patch(
-                        {"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": base_url}
-                    )
-                    self._desktop.stage_secret("desktop_gateway_api_key", key)
-                except ClaudeDesktopConfigError as exc:
-                    raise ClaudeSettingsError(str(exc)) from None
-                self._revision += 1
-                return self.snapshot()
-            candidate = copy.deepcopy(self._draft)
-            env = _mapping(candidate.get("env", {}), "env")
-            env["ANTHROPIC_BASE_URL"] = base_url
-            # ``ANTHROPIC_AUTH_TOKEN`` is the bearer form a gateway states; an
-            # ``ANTHROPIC_API_KEY`` left beside it is the old direct route's
-            # credential and would be sent as a second identity.
-            env.pop("ANTHROPIC_API_KEY", None)
-            env["ANTHROPIC_AUTH_TOKEN"] = key
-            # The route is named the way this app publishes it, not by its
-            # public name: a gateway id has no catalogue entry in the client, so
-            # a session launched with the public name reports the client's 200k
-            # default and drops the effort ladder (see ``_code_published_id``).
-            # Only while the picker is this app's list is there a row to name,
-            # so a client on the proxy with its own catalogue is left as it is.
-            named = self.code_model_list_enabled()
-            model = str(data.get("model") or "").strip()
-            if model:
-                env["ANTHROPIC_MODEL"] = self._code_published_id(model) if named else model
-                candidate["model"] = env["ANTHROPIC_MODEL"]
-            elif isinstance(env.get("ANTHROPIC_MODEL"), str):
-                if named:
-                    env["ANTHROPIC_MODEL"] = self._code_published_id(env["ANTHROPIC_MODEL"])
-                candidate["model"] = env["ANTHROPIC_MODEL"]
-            candidate["env"] = env
-            errors = validate_settings(candidate)
-            if errors:
-                raise ClaudeSettingsError(errors[0])
-            self._draft = candidate
-            self._revision += 1
+            self._adopt_local_api(data)
             return self.snapshot()
         if name in {"desktop_models_patch", "desktopmodelspatch"}:
             # The Desktop list as an explicit value rather than a switch.  Older

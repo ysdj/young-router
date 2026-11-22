@@ -222,7 +222,7 @@ export function RelayGroupSheet({ translate, copyKey }: {
       title: state.labels.discardTitle,
       message: state.labels.discardBody,
       confirmLabel: state.labels.discardConfirm,
-      cancelLabel: translate("status.cancel"),
+      cancelLabel: translate("status.close"),
       destructive: true,
     });
   }, [hasStagedChanges, state, translate]);

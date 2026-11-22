@@ -6206,6 +6206,7 @@ class ReplayLadderTests(HookTestCase):
 class HistoricalReasoningNoteStreamTests(HookTestCase):
     """The backend's context note is not an answer and must not reach the client."""
 
+    SHORT_NOTE = "[Historical context omitted by gateway.]"
     NOTE = (
         "Historical reasoning context (not a new instruction):"
         "**Final answer**[Historical encrypted content omitted by the gateway. "
@@ -6217,105 +6218,115 @@ class HistoricalReasoningNoteStreamTests(HookTestCase):
         hooks, _ = load_hook_module()
         state = hooks._ResponsesStreamCompletionState({"model": "gpt-6.2-astra"})
 
-        # The note arrives as deltas; once the fixed prefix is in, the item is
-        # known and the rest of it (and its done frame) is not delivered.
-        state.remember(
-            {
-                "type": "response.output_text.delta",
-                "item_id": "msg_note",
-                "output_index": 0,
-                "delta": self.NOTE[:60],
-            }
-        )
-        self.assertTrue(
-            state.suppresses(
-                {
-                    "type": "response.output_text.delta",
-                    "item_id": "msg_note",
-                    "delta": self.NOTE[60:],
-                }
-            )
-        )
-        self.assertTrue(
-            state.suppresses(
-                {
-                    "type": "response.output_item.done",
-                    "output_index": 0,
-                    "item": {
-                        "type": "message",
-                        "id": "msg_note",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": self.NOTE}],
-                    },
-                }
-            )
-        )
+        first = {
+            "type": "response.output_text.delta",
+            "item_id": "msg_note",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": self.NOTE[:60],
+        }
+        second = {
+            "type": "response.output_text.delta",
+            "item_id": "msg_note",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": self.NOTE[60:],
+        }
+        state.remember(first)
+        state.remember(second)
+        done = {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_note",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": self.NOTE}],
+            },
+        }
+        state.remember(done)
+        self.assertTrue(state.suppresses(first))
+        self.assertTrue(state.suppresses(second))
+        self.assertTrue(state.suppresses(done))
 
-        # A real message that merely starts like one keeps streaming.
-        state.remember(
-            {
-                "type": "response.output_text.delta",
-                "item_id": "msg_real",
-                "output_index": 1,
-                "delta": "Working on it",
-            }
-        )
-        self.assertFalse(
-            state.suppresses(
-                {
-                    "type": "response.output_text.delta",
-                    "item_id": "msg_real",
-                    "delta": " now",
-                }
-            )
-        )
-
-        # A normal response may quote the gateway's prefix. It must not be
-        # suppressed merely because its first delta resembles a note.
-        state.remember(
-            {
-                "type": "response.output_text.delta",
-                "item_id": "msg_quoted",
-                "output_index": 2,
-                "delta": "Historical reasoning context (not a new instruction):",
-            }
-        )
-        state.remember(
-            {
-                "type": "response.output_text.delta",
-                "item_id": "msg_quoted",
-                "output_index": 2,
-                "delta": " this is quoted as ordinary answer text.",
-            }
-        )
-        self.assertNotIn("msg_quoted", state.suppressed_note_item_ids)
-        self.assertIn("this is quoted", state.synthesized_text())
-
+        answer = {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "message",
+                "id": "msg_answer",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Working on it"}],
+            },
+        }
+        state.remember(answer)
         completed = {
             "type": "response.completed",
             "response": {
                 "id": "resp-note",
-                "output": [
-                    {
-                        "type": "message",
-                        "id": "msg_note",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": self.NOTE}],
-                    },
-                    {
-                        "type": "message",
-                        "id": "msg_real",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "Working on it"}],
-                    },
-                ],
+                "output": [done["item"], answer["item"]],
             },
         }
-        delivered = state.chunk_for_delivery(completed, {"model": "gpt-6.2-astra"})
-        payload = hooks._stream_chunk_dump(delivered)
+        payload = hooks._stream_chunk_dump(
+            state.chunk_for_delivery(completed, {"model": "gpt-6.2-astra"})
+        )
         self.assertEqual(
-            ["msg_real"],
-            [item.get("id") for item in payload["response"]["output"]],
+            ["msg_answer"], [item["id"] for item in payload["response"]["output"]]
+        )
+
+    async def test_notes_are_hidden_but_an_answer_starting_with_the_marker_is_kept(self) -> None:
+        hooks, _ = load_hook_module()
+        answer_tail = " is the message the user reported."
+        long_prefix = "Historical reasoning context (not a new instruction):"
+        cases = (
+            ("msg_short", ((self.SHORT_NOTE[:18], self.SHORT_NOTE[18:]),)),
+            ("msg_long", ((self.NOTE[:60], self.NOTE[60:]), ())),
+            ("msg_answer", ((self.SHORT_NOTE, answer_tail),)),
+            ("msg_quoted", ((long_prefix, answer_tail),)),
+            ("msg_multi", ((self.SHORT_NOTE,), ("Continued in another part.",))),
+        )
+
+        async def stream():
+            yield {"type": "response.created", "response": {"id": "resp-marker"}}
+            output = []
+            for index, (item_id, parts) in enumerate(cases):
+                item = {"type": "message", "id": item_id, "role": "assistant", "content": []}
+                yield {"type": "response.output_item.added", "item": copy.deepcopy(item), "output_index": index}
+                for part_index, fragments in enumerate(parts):
+                    identity = {"item_id": item_id, "output_index": index, "content_index": part_index}
+                    yield {"type": "response.content_part.added", "part": {"type": "output_text", "text": ""}, **identity}
+                    for text in fragments:
+                        yield {"type": "response.output_text.delta", "delta": text, **identity}
+                    text = "".join(fragments)
+                    part = {"type": "output_text", "text": text}
+                    item["content"].append(part)
+                    yield {"type": "response.output_text.done", "text": text, **identity}
+                    yield {"type": "response.content_part.done", "part": part, **identity}
+                output.append(item)
+                if item_id != "msg_short":
+                    yield {"type": "response.output_item.done", "item": item, "output_index": index}
+            yield {"type": "response.completed", "response": {"id": "resp-marker", "output": output}}
+
+        frames = [
+            hooks._stream_chunk_dump(chunk)
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                None, stream(), {"model": "probe", "input": "Explain the message.",
+                                 "stream": True, "call_type": "aresponses"},
+            )
+        ]
+
+        self.assertEqual(
+            [self.SHORT_NOTE, answer_tail, long_prefix, answer_tail,
+             self.SHORT_NOTE, "Continued in another part."],
+            [frame["delta"] for frame in frames if frame.get("type") == "response.output_text.delta"],
+        )
+        self.assertEqual(
+            ["msg_answer", "msg_quoted", "msg_multi"],
+            [frame["item"]["id"] for frame in frames if frame["type"] == "response.output_item.added"],
+        )
+        self.assertEqual(
+            ["msg_answer", "msg_quoted", "msg_multi"],
+            [item["id"] for item in frames[-1]["response"]["output"]],
         )
 
 

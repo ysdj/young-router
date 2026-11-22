@@ -1681,11 +1681,9 @@ class BrowserRelaySignInTests(unittest.TestCase):
         -- so every later poll skipped it and the window waited forever.
         """
 
-        from young_router.core.domains.relay_accounts import RelayTransportError
-
         entry = self._jar_entry()
         answers: list[object] = [
-            RelayTransportError(),
+            RelayAccountsError("Relay returned an invalid session profile"),
             {"username": "window-user", "cookie": "session=jar", "user_id": "7"},
         ]
         asked: list[str] = []
@@ -1715,14 +1713,14 @@ class BrowserRelaySignInTests(unittest.TestCase):
         self.assertEqual(2, len(asked))
 
     def test_a_jar_the_station_refused_is_not_offered_twice(self) -> None:
-        from young_router.core.domains.relay_accounts import RelayAccountsError
+        from young_router.core.domains.relay_accounts import RelaySessionRejectedError
 
         entry = self._jar_entry()
         asked: list[str] = []
 
         def refuse(**arguments: str) -> object:
             asked.append(arguments["cookie"])
-            raise RelayAccountsError("Relay session is not signed in")
+            raise RelaySessionRejectedError()
 
         with mock.patch.object(relay_browser, "cookie_header", return_value="session=jar"), mock.patch.object(
             self.relay, "verify_browser_session", refuse
@@ -1760,9 +1758,8 @@ class BrowserRelaySignInTests(unittest.TestCase):
         The two native hosts type the remembered username and password into
         the station's form.  A page host cannot hand its browser a WebKit
         credential store, so Core types into the browser it opened instead:
-        the page never receives the secret.  The post is one attempt, made only
-        when the station's own last answer says this account holds no usable
-        session -- the same authorization the native flows apply.
+        the page never receives the secret. The station form is for manual
+        submission, even if the account needs to sign in.
         """
 
         status, answer = self._post(self._body())
@@ -1796,7 +1793,7 @@ class BrowserRelaySignInTests(unittest.TestCase):
         # The account's own username wins over the empty one the caller sent.
         self.assertEqual("person@example.test", kwargs["username"])
         self.assertEqual("replace-page-password", kwargs["password"])
-        self.assertTrue(kwargs["submit"])
+        self.assertEqual({"username", "password"}, set(kwargs))
         self.assertEqual("person@example.test", self.core._browser_logins[answered["login_id"]]["username"])
 
     def test_a_pending_account_has_nothing_to_fill(self) -> None:
@@ -1820,7 +1817,7 @@ class BrowserRelaySignInTests(unittest.TestCase):
         _args, kwargs = prefill.call_args
         self.assertEqual("", kwargs["username"])
         self.assertEqual("", kwargs["password"])
-        self.assertFalse(kwargs["submit"])
+        self.assertEqual({"username", "password"}, set(kwargs))
 
 
 
@@ -1936,9 +1933,9 @@ class MirrorTests(unittest.TestCase):
         self.assertIn('if not header and not token:', jar)
         self.assertNotIn('if not header:\n            return None', jar)
         domain = (Path(__file__).resolve().parents[1] / "young_router/core/domains/relay_accounts.py").read_text(encoding="utf-8")
-        verify = domain.split("def verify_browser_session", 1)[1].split("payload = self._http.json", 1)[0]
+        verify = domain.split("def verify_browser_session", 1)[1].split("def set_login_status", 1)[0]
         self.assertIn('_text(cookie, "Relay cookie", limit=32768, required=False)', verify)
-        self.assertIn("if cookie_value:\n            headers[\"Cookie\"] = cookie_value", verify)
+        self.assertIn('{"cookie": cookie_value, "access_token": token_value}', verify)
 
     def test_a_page_that_goes_away_ends_its_sign_in(self) -> None:
         """Closing or reloading the page must not leave a browser running.
@@ -2079,8 +2076,7 @@ class RelayBrowserPrefillTests(unittest.TestCase):
     The page host's sign-in window is a real browser on a throwaway profile,
     so it starts with no saved credential in it.  Core holds the account's own
     copy, and types it into the page over the same DevTools channel it reads
-    the session with — the secret never crosses to the page, and the form is
-    posted once only when RelayAccountsDomain.login_prefill authorized it.
+    the session with. Only the person may submit this form.
     """
 
     def test_the_values_are_json_encoded_into_the_page(self) -> None:
@@ -2088,7 +2084,7 @@ class RelayBrowserPrefillTests(unittest.TestCase):
 
         def evaluate(port: int, origin: str, expression: str, *, timeout: float = 5.0) -> str:
             seen.append(expression)
-            return "submitted"
+            return "filled"
 
         with mock.patch.object(relay_browser, "_evaluate_page", side_effect=evaluate):
             outcome = relay_browser.prefill_login_form(
@@ -2096,56 +2092,46 @@ class RelayBrowserPrefillTests(unittest.TestCase):
                 "https://relay.example.test",
                 username='a"b@example.test',
                 password="p\\w'd",
-                submit=True,
             )
 
-        self.assertEqual("submitted", outcome)
+        self.assertEqual("filled", outcome)
         expression = seen[0]
         # A quote or a backslash in the password must not end the literal, so
         # both are JSON-encoded rather than concatenated.
         self.assertIn('set(user, "a\\"b@example.test")', expression)
         self.assertIn('set(password, "p\\\\w\u0027d")', expression)
-        self.assertIn("if (!true)", expression)
         # A field the person already typed into is never overwritten.
         self.assertIn("if (!node || !value || node.value) return;", expression)
 
-    def test_nothing_is_posted_without_authorization(self) -> None:
+    def test_the_browser_form_never_submits_itself(self) -> None:
         seen: list[str] = []
         with mock.patch.object(relay_browser, "_evaluate_page", side_effect=lambda *args, **kwargs: seen.append(args[2]) or "filled"):
             self.assertEqual(
                 "filled",
-                relay_browser.prefill_login_form(1, "https://relay.example.test", username="u", password="p", submit=False),
+                relay_browser.prefill_login_form(1, "https://relay.example.test", username="u", password="p"),
             )
-        self.assertIn("if (!false)", seen[0])
+        self.assertNotIn(".click()", seen[0])
+        self.assertNotIn("requestSubmit", seen[0])
 
     def test_a_page_that_cannot_be_asked_answers_nothing(self) -> None:
         with mock.patch.object(relay_browser, "_evaluate_page", side_effect=RuntimeError("no page")):
             self.assertEqual(
                 "",
-                relay_browser.prefill_login_form(1, "https://relay.example.test", username="u", password="p", submit=True),
+                relay_browser.prefill_login_form(1, "https://relay.example.test", username="u", password="p"),
             )
 
-    def test_the_form_is_posted_once_and_then_left_alone(self) -> None:
+    def test_prefill_waits_for_the_fields_and_stops_when_filled(self) -> None:
         browser = mock.Mock(closed=False, port=1, origin="https://relay.example.test")
-        outcomes = iter(["none", "partial", "filled", "submitted", "submitted"])
+        outcomes = iter(["none", "partial", "filled"])
         with mock.patch.object(relay_browser, "prefill_login_form", side_effect=lambda *a, **k: next(outcomes)) as form, \
              mock.patch.object(relay_browser.time, "sleep", return_value=None):
-            relay_browser._prefill_loop(browser, "u", "p", True)
-        # The page had no form, then a form nobody had typed into, then it was
-        # posted: one submission, and nothing after it.
-        self.assertEqual(4, form.call_count)
-
-    def test_a_filled_form_is_final_when_this_window_may_not_post_it(self) -> None:
-        browser = mock.Mock(closed=False, port=1, origin="https://relay.example.test")
-        with mock.patch.object(relay_browser, "prefill_login_form", return_value="filled") as form, \
-             mock.patch.object(relay_browser.time, "sleep", return_value=None):
-            relay_browser._prefill_loop(browser, "u", "p", False)
-        self.assertEqual(1, form.call_count)
+            relay_browser._prefill_loop(browser, "u", "p")
+        self.assertEqual(3, form.call_count)
 
     def test_nothing_is_typed_when_nothing_is_kept(self) -> None:
         browser = mock.Mock()
         with mock.patch.object(relay_browser.threading, "Thread") as thread:
-            relay_browser.start_prefill(browser, username="", password="", submit=False)
+            relay_browser.start_prefill(browser, username="", password="")
         thread.assert_not_called()
 
 

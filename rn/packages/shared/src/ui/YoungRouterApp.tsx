@@ -85,7 +85,7 @@ type UnknownRecord = Record<string, unknown>;
  * a clock (see ``useChosenValue``).
  */
 type Dispatch = (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<boolean>;
-type ApplyProbedSurface = (providerId: string, modelId: string, surface: ProbeSurfaceName, options?: { confirmRecommendation?: boolean }) => Promise<boolean>;
+type ApplyProbedSurface = (providerId: string, modelId: string, surface: ProbeSurfaceName, inputs: string, isCurrent: () => boolean, options?: { confirmRecommendation?: boolean }) => Promise<boolean>;
 type NativeSecretClear = (options: {
   domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
   field: string;
@@ -395,11 +395,26 @@ function providerService(provider: UnknownRecord | undefined): ServiceID | undef
  */
 const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
 
-/** How tall the WebDAV child may become, and the least it is ever sized to. */
-const WEBDAV_WINDOW_MIN_HEIGHT = 380;
-const WEBDAV_WINDOW_MAX_HEIGHT = 760;
-/** What the footer and the window's own edges add to the measured form. */
-const WEBDAV_WINDOW_CHROME_HEIGHT = 58;
+/** One child form's width; its height is the body it draws (see CHILD_SURFACE_*). */
+const DIRECT_API_WINDOW_WIDTH = 540;
+/**
+ * The Edit API form's own additions to its measured body: the child-surface
+ * footer (46 pt, its buttons centred) and nothing else, because the window's
+ * content area is exactly the body above that footer.  Measured in the running
+ * app: 274 pt of rows plus 46 pt of footer is the 320 pt the window takes.
+ */
+const DIRECT_API_WINDOW_CHROME_HEIGHT = 46;
+/**
+ * How tall a child form may become, and the least it is ever sized to.
+ *
+ * A child form is its body plus its footer: the window takes the height the
+ * body reports instead of a fixed one, which is what leaves no band of empty
+ * window above the buttons (the WebDAV form and the Edit API form both).
+ */
+const CHILD_SURFACE_MIN_HEIGHT = 300;
+const CHILD_SURFACE_MAX_HEIGHT = 760;
+/** What the WebDAV form's footer and the window's own edges add to its body. */
+const CHILD_SURFACE_CHROME_HEIGHT = 58;
 
 /**
  * How long 退出登录 gives the pane to commit before leaving anyway.
@@ -1790,6 +1805,9 @@ const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([
   "providers_fetch_models",
   "fetch_models",
   "provider_fetch_relay_resource_models",
+  "account_detect_type",
+  "detect_type",
+  "resources_refresh",
   "provider_select_relay_station",
   "provider_auth_start",
   "provider_auth_cancel",
@@ -1809,8 +1827,38 @@ const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([
   "logs_previous_page",
 ]);
 
+/**
+ * Destructive route actions must not wait behind a probe's follow-up apply.
+ * A probe can finish with a recommended protocol and enqueue a staged patch
+ * before the user presses the route's delete button; serializing the delete
+ * behind that patch made a route look undeletable until the probe's strict
+ * apply completed (or timed out).  Core still serializes the actual draft
+ * mutation and rebases it by the stable route id.
+ */
+const PRIORITY_MUTATION_ACTIONS: ReadonlySet<string> = new Set([
+  "model_delete",
+  "public_model_delete",
+  "model_discard_added",
+  "provider_delete",
+  "service_provider_delete",
+]);
+
+const READ_BACKED_MUTATIONS: ReadonlySet<string> = new Set([
+  "model_import_service_catalog",
+  "model_import_catalog",
+  "resources_import",
+]);
+
 function isNonStagingAction(type: string): boolean {
   return NON_STAGING_ACTIONS.has(type.replace(/[.-]/g, "_").toLowerCase());
+}
+
+function isPriorityMutationAction(type: string): boolean {
+  return PRIORITY_MUTATION_ACTIONS.has(type.replace(/[.-]/g, "_").toLowerCase());
+}
+
+function isReadBackedMutation(type: string): boolean {
+  return READ_BACKED_MUTATIONS.has(type.replace(/[.-]/g, "_").toLowerCase());
 }
 
 /**
@@ -1837,7 +1885,7 @@ function isRevisionRetryableAction(type: string): boolean {
   const normalized = type.replace(/[.-]/g, "_").toLowerCase();
   // A live projection is not a staged edit: it carries no absolute value a
   // later revision could invalidate, so it rebases like the editor actions do.
-  if (TRANSIENT_READ_ACTIONS.has(normalized)) return true;
+  if (NON_STAGING_ACTIONS.has(normalized) || PRIORITY_MUTATION_ACTIONS.has(normalized)) return true;
   // A log view action is the same kind of absolute value: which text this tab
   // filters by, whether it is paused, how many lines it shows.  A keystroke
   // burst can put several of them in flight at once, and the ones that lost the
@@ -2229,7 +2277,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       serviceRunningOnPort: translate("service.runningOnPort", { port: "{port}" }),
       serviceUnhealthy: translate("service.unhealthy"), serviceStopped: translate("service.stopped"),
       serviceUnknown: translate("service.unknown"),
-      cancel: translate("status.cancel"), set: translate("common.set"), clear: translate("common.clear"), stage: translate("common.stageRaw"), find: translate("common.find"),
+      cancel: translate("status.close"), set: translate("common.set"), clear: translate("common.clear"), stage: translate("common.stageRaw"), find: translate("common.find"),
       findNext: translate("common.findNext"), edit: translate("common.edit"), undo: translate("common.undo"),
       redo: translate("common.redo"), cut: translate("common.cut"), copy: translate("common.copy"),
       paste: translate("common.paste"), selectAll: translate("common.selectAll"), settings: translate("status.settings"),
@@ -3184,7 +3232,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // succeeded answers the next implicit caller from its own result.
   const relayRefreshInFlight = useRef(new Map<string, Promise<"ready" | "unavailable">>());
   const relayRefreshFresh = useRef(new Map<string, { at: number; status: "ready" | "unavailable" }>());
-  const probedSurfaceApplyQueue = useRef<Promise<void>>(Promise.resolve());
   const importPlanToken = useRef<string | undefined>(undefined);
   // The token the provider wizard staged its key value under, reported by the
   // wizard itself, so closing that surface can drop exactly what it staged.
@@ -3211,9 +3258,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
    * slow save.  The fallback is also the honest statement of what the plan is --
    * the same facts, taken out of the whole projection.
    */
-  const readCommitPlan = async (): Promise<StagedPlan> => {
+  const readCommitPlan = async (requested = APPLY_PLAN_DOMAINS): Promise<StagedPlan> => {
       try {
-        return await ipc.staged(APPLY_PLAN_DOMAINS);
+        return await ipc.staged(requested);
       } catch (reason: unknown) {
         const code = stringValue(asRecord(reason).code);
         if (code !== "unsupported_method" && code !== "invalid_domain" && code !== "domain_unavailable") throw reason;
@@ -3489,6 +3536,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     // The action is in flight from here: until a snapshot answers it, the state
     // this window holds is not the state Core holds (see `paneHasNothingToWrite`).
     dispatchGeneration.current += 1;
+    const priorityMutation = isPriorityMutationAction(type);
     const issue = async (): Promise<IpcResults["dispatch"]> => {
       if (revision.current === undefined) await refresh();
       const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };
@@ -3508,42 +3556,56 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;
           if (attempt + 1 >= DISPATCH_ATTEMPTS) throw reason;
           await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+          if (priorityMutation && actionDomain === "providers_models") {
+            revision.current = (await readCommitPlan(["providers_models"])).revision;
+            continue;
+          }
           const current = await ipc.snapshot();
           revision.current = current.revision;
           latestSnapshot.current = current;
           onSnapshot(current);
         }
       }
-      revision.current = staged.revision;
+      revision.current = Math.max(revision.current ?? staged.revision, staged.revision);
       return staged;
     };
     // A read that stages nothing must not hold — or be held by — the queue of
     // edits: a relay refresh, a model fetch, and an authorization poll all
     // wait on an external service, and the user's next edit belongs in front
-    // of them, not behind them.  Everything else keeps the buffered order.
-    const unbuffered = isNonStagingAction(type);
-    const queued = unbuffered
+    // of them, not behind them.  Destructive route actions use the same fast
+    // lane so a route can be removed as a probe finishes its follow-up
+    // apply.  Everything else keeps the buffered order.
+    const unbuffered = isNonStagingAction(type) || isReadBackedMutation(type);
+    const pending = dispatchQueue.current;
+    const queued = unbuffered || priorityMutation
       ? issue()
-      : dispatchQueue.current.catch(() => undefined).then(issue);
-    if (!unbuffered) dispatchQueue.current = queued.then(() => undefined, () => undefined);
+      : pending.then(issue);
+    if (!unbuffered) {
+      const settled = queued.then(() => undefined, () => undefined);
+      dispatchQueue.current = priorityMutation ? Promise.all([pending, settled]).then(() => undefined) : settled;
+    }
     return queued;
   };
   // The General pane's service actions share the buffered queue, the live route
   // revision, and that one rebase, so they never fail because another surface
   // advanced the shared revision first.
   const enqueueServiceDispatch = (type: string, payload: UnknownRecord = {}): Promise<IpcResults["dispatch"]> => enqueueDispatch(type, payload, null);
-  const dispatch: Dispatch = (type, payload = {}, targetDomain = domain) => runOutcome(async () => {
-    const staged = await enqueueDispatch(type, payload, targetDomain);
-    if (targetDomain === "codex" || targetDomain === "claude") {
-      setSettingsRawReloadToken((current) => current + 1);
+  const dispatch: Dispatch = async (type, payload = {}, targetDomain = domain) => {
+    const providerDeletion = targetDomain === "providers_models" && isPriorityMutationAction(type);
+    const staged = await runOutcome(async () => {
+      const result = await enqueueDispatch(type, payload, targetDomain);
+      if (targetDomain === "codex" || targetDomain === "claude") {
+        setSettingsRawReloadToken((current) => current + 1);
+      }
+      return result;
+    }, null, true, !providerDeletion);
+    if (staged === undefined) return false;
+    if (providerDeletion) {
+      // Save before any snapshot fallback, which can ask the proxy for status.
+      await applyOutcome({ providerDeletion: true });
     }
-    return staged;
-  // Text inputs no longer call this path per keystroke: usePendingTextField
-  // keeps their draft local and only reaches dispatch on blur/submit or the
-  // shell's auto-apply flush.
-  // Refresh each committed action so toggles and pickers also project their
-  // new Core state immediately instead of waiting for the disk watcher.
-  }, null, true).then((staged) => staged !== undefined);
+    return true;
+  };
   const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined> => {
     // Keep a stable, narrowed domain for the asynchronous outcome projection.
     // `targetDomain` is optional on the public helper because most callers use
@@ -3579,7 +3641,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
         onSnapshot(outcome);
       }
       return staged;
-    }, null, keepControlsEnabled, false);
+    }, null, keepControlsEnabled || isNonStagingAction(type) || isReadBackedMutation(type), false);
     return succeeded ? outcome : undefined;
   };
   const addOfficialAccount = async (kind: ServiceProviderKind, name?: string): Promise<string> => {
@@ -3817,18 +3879,21 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // moving revision through every retry and reports the save it just made as
   // 更改未生效.  A second caller joins the write already in flight.
   const applyInFlight = useRef<Promise<ApplyOutcome> | undefined>(undefined);
-  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<ApplyOutcome> => {
+  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; providerDeletion?: boolean }): Promise<ApplyOutcome> => {
     // The data-management pane owns no single domain: an import stages several
     // package sections at once, so its Apply writes every dirty one.
     if ((!settingsRoute && !domain && route !== "data-management") || domain === "logs") return Promise.resolve(undefined);
     const running = applyInFlight.current;
-    if (running) return running;
+    if (running && !options?.providerDeletion) return running;
+    const stagedDomains = options?.providerDeletion
+      ? (plan: { drafts: CoreSnapshot["drafts"] }): ConfigDomain[] => plan.drafts.providers_models?.dirty ? ["providers_models"] : []
+      : stagedDomainsForRoute;
+    const readPlan = () => readCommitPlan(options?.providerDeletion ? ["providers_models"] : APPLY_PLAN_DOMAINS);
     const started = runOutcome<ApplyOutcome>(async () => {
-      await flushPendingFields();
-      // Inline relay edits stage through the shared dispatch queue when their
-      // fields lose focus. Wait for that queue before taking the apply
-      // snapshot so the immediate apply writes the newest value.
-      await dispatchQueue.current;
+      if (!options?.providerDeletion) {
+        await flushPendingFields();
+        await dispatchQueue.current;
+      }
       // The plan, not the projection.  An Apply needs the head revision, which
       // domains carry a staged draft, and whether an external edit stands in
       // front of one of them; reading the whole snapshot for those facts cost
@@ -3836,9 +3901,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // link pays in seconds while the same edit on a loopback host is instant.
       // The state this Apply produces reaches the pane through the patch Core
       // publishes for it, not through this read.
-      const plan = await readCommitPlan();
+      const plan = await readPlan();
       revision.current = plan.revision;
-      const domains = stagedDomainsForRoute(plan);
+      const domains = stagedDomains(plan);
       if (domains.length === 0) return { cancelled: true, empty: true };
       // This child action owns the same draft the shell's debounce would write.
       if (options?.quiet) autoAppliedKey.current = stagedApplyKey(domains, plan.revision);
@@ -3880,8 +3945,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           // A rebase asks the same three questions as the first attempt, so it
           // reads the same plan rather than the projection: the head moved, and
           // that is all this branch is about.
-          const current = await readCommitPlan();
-          const currentDomains = stagedDomainsForRoute(current);
+          const current = await readPlan();
+          const currentDomains = stagedDomains(current);
           const sameDomains = currentDomains.length === domains.length
             && domains.every((name) => currentDomains.includes(name));
           const sameDiskState = domains.every((name) => (
@@ -3917,9 +3982,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
             // was racing can land on the last attempt and its own event can
             // arrive after the reply that lost the revision.  A draft that is
             // no longer staged is the outcome the user asked for.
-            const settled = await readCommitPlan();
+            const settled = await readPlan();
             revision.current = settled.revision;
-            if (stagedDomainsForRoute(settled).length === 0) {
+            if (stagedDomains(settled).length === 0) {
               result = { revision: settled.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
               break;
             }
@@ -3936,7 +4001,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
             throw reason;
           }
           await settleBeforeRetry(attempt);
-          nextRevision = (await readCommitPlan()).revision;
+          nextRevision = (await readPlan()).revision;
           revision.current = nextRevision;
         }
       }
@@ -3956,7 +4021,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     }, options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet ? (failure) => ({ failure }) : undefined).finally(() => {
       if (applyInFlight.current === started) applyInFlight.current = undefined;
     });
-    applyInFlight.current = started;
+    if (!options?.providerDeletion) applyInFlight.current = started;
     return started;
   };
   const apply = async (options?: { silent?: boolean; message?: string }): Promise<void> => {
@@ -4228,23 +4293,25 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // The detail window writes behind its own 保存并关闭, so the outcome belongs
   // to its footer; this only answers whether the panel may close.
   const saveWebDavDetails = (patch: UnknownRecord): Promise<boolean> => writeWebDavSettings(patch).then((applied) => applied !== undefined);
-  const applyProbedSurface: ApplyProbedSurface = (providerId, modelId, nextSurface, options) => {
-    let applied = false;
-    const queued = probedSurfaceApplyQueue.current.catch(() => undefined).then(async () => {
-      const before = await ipc.snapshot();
-      revision.current = before.revision;
-      onSnapshot(before);
-      const currentModel = providerModelByEditorId(before, providerId, modelId);
-      if (!currentModel) {
-        const unavailable: Error & { code?: string } = new Error("The selected model is unavailable");
-        unavailable.code = "model_unavailable";
-        throw unavailable;
-      }
+  const applyProbedSurface: ApplyProbedSurface = async (providerId, modelId, nextSurface, inputs, isCurrent, options) => {
+    const matchingModel = (state: CoreSnapshot): UnknownRecord | undefined => {
+      if (!isCurrent()) return undefined;
+      const provider = snapshotProviderRecords(state).find((entry) => editorIdentifier(entry) === providerId);
+      const row = providerModelByEditorId(state, providerId, modelId);
+      if (!provider || !row) return undefined;
+      const model = modelRecord(row);
+      return probeInputFingerprint(stringValue(provider.endpoint, stringValue(provider.api_base)).trim(), upstreamModelLabel(model), model) === inputs
+        && asRecord(model.probe).recommended_surface === nextSurface ? model : undefined;
+    };
+    try {
+      const before = await refresh();
+      const currentModel = matchingModel(before);
+      if (!currentModel) return false;
       const currentSurface = stringValue(currentModel.upstream_url_surface, "openai/responses");
       const protocolMode = stringValue(currentModel.upstream_protocol_mode, "fallback") === "fixed"
         ? translate("providers.protocolModeFixed")
         : translate("providers.protocolModeFallback");
-      if (currentSurface === nextSurface) return;
+      if (currentSurface === nextSurface) return false;
       const diskChanged = before.disk.providers_models?.changed === true;
       let confirmed = true;
       if (options?.confirmRecommendation !== false) {
@@ -4268,49 +4335,28 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           confirmLabel: translate("settings.keepDraft"),
         });
       }
-      if (!confirmed) return;
-      await enqueueDispatch("model.patch", {
-        provider_id: providerId,
-        model_id: modelId,
-        changes: {
-          upstream_url_surface: nextSurface,
-        },
-      }, "providers_models");
-      const staged = await ipc.snapshot();
-      revision.current = staged.revision;
-      onSnapshot(staged);
-      const confirmations = staged.disk.providers_models?.changed ? ["overwrite_external_providers_models"] : undefined;
-      const applyStagedSurface = (nextRevision: number): Promise<IpcResults["apply"]> => (
-        ipc.apply("providers_models", nextRevision, confirmations)
-      );
-      let result: IpcResults["apply"];
+      if (!confirmed) return false;
+      const current = await refresh();
+      if (!matchingModel(current)
+        || current.disk.providers_models?.generation !== before.disk.providers_models?.generation) return false;
       try {
-        result = await applyStagedSurface(staged.revision);
+        // A recommendation is conditional on the exact route just checked.
+        // A concurrent edit wins; don't rebase this patch onto it.
+        const staged = await ipc.dispatch({ domain: "providers_models", type: "model.patch", payload: {
+          provider_id: providerId, model_id: modelId, changes: { upstream_url_surface: nextSurface },
+        } }, current.revision);
+        revision.current = Math.max(revision.current ?? staged.revision, staged.revision);
       } catch (reason: unknown) {
-        if (!isRevisionConflict(reason)) throw reason;
-        // The staged surface edit above dirties the draft, so this pane's own
-        // immediate Apply can commit it (and advance Core's shared revision)
-        // before this apply is accepted. Rebase once on the authoritative
-        // snapshot; a still-staged draft means the surface was not committed
-        // yet, and a clean one already has this exact surface applied.
-        const current = await ipc.snapshot();
-        revision.current = current.revision;
-        latestSnapshot.current = current;
-        onSnapshot(current);
-        result = current.drafts.providers_models?.dirty === true
-          ? await applyStagedSurface(current.revision)
-          : { revision: current.revision, applied: true, status: "applied", domains: ["providers_models"], completed_operations: 0, pending_operations: 0, issues: [] };
+        if (isRevisionConflict(reason)) return false;
+        throw reason;
       }
-      revision.current = result.revision;
+      if (diskChanged) setKeptDiskGeneration((generations) => ({ ...generations, providers_models: current.disk.providers_models?.generation }));
       await refresh();
-      setResult(translate("common.saved"));
-      applied = true;
-    });
-    probedSurfaceApplyQueue.current = queued.then(() => undefined, () => undefined);
-    return queued.then(() => applied).catch((reason: unknown) => {
+      return true;
+    } catch (reason: unknown) {
       setResult(errorMessage(reason, translate));
       return false;
-    });
+    }
   };
   // The provider wizard reports the token its staged key is filed under, so
   // every dismissal path of that surface can drop what it staged: a wizard the
@@ -4505,17 +4551,13 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
  const providerWizardRelayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
   const detectRelayType = useCallback(async (origin: string): Promise<RelayType | undefined> => {
     const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
-    revision.current = staged.revision;
     // The answer belongs to this dispatch.  The snapshot slot it also lands in
     // is shared with every other relay action, and the pane's own account
     // refresh can replace it before this call reads it -- measured on lv as
     // 无法识别中转站类别 for a station whose /api/status had just answered.
     const direct = asRecord(staged.action_summary).detected_type;
-    if (direct === "newapi" || direct === "sub2api") return direct;
-    const next = await refresh();
-    const detected = asRecord(next.action_summaries?.relay_accounts).detected_type;
-    return detected === "newapi" || detected === "sub2api" ? detected : undefined;
-  }, [enqueueDispatch, refresh]);
+    return direct === "newapi" || direct === "sub2api" ? direct : undefined;
+  }, [enqueueDispatch]);
   const refreshRelayResources = useCallback(async (accountId: string, options?: { force?: boolean }): Promise<"ready" | "unavailable"> => {
     // Only a caller that must not see stale facts — a sign-in that just landed
     // — passes ``force``: it always pays for a station round trip, while an
@@ -4537,7 +4579,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
         forced ? { account_id: accountId, force: true } : { account_id: accountId },
         "relay_accounts",
       );
-      revision.current = staged.revision;
       // The refresh reports its own projection as the action summary; the
       // dispatch result itself only carries the revision and that summary.
       const status = asRecord(staged.action_summary).resource_status === "ready" ? "ready" : "unavailable";
@@ -4548,7 +4589,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     try {
       return await pending;
     } finally {
-      relayRefreshInFlight.current.delete(accountId);
+      if (relayRefreshInFlight.current.get(accountId) === pending) relayRefreshInFlight.current.delete(accountId);
     }
   }, [enqueueDispatch]);
   const relayApiKeyActions = useMemo<RelayApiKeyActions>(() => ({
@@ -4642,7 +4683,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   }, [route]);
 
   if (directApiClient) return <View style={[styles.windowSurface, styles.childRouteContent]}>
-    <DirectApiSettings key={directApiClient} client={directApiClient} ipc={ipc} translate={translate} onClose={closeRoute} />
+    <DirectApiSettings key={directApiClient} client={directApiClient} native={native} ipc={ipc} translate={translate} onClose={closeRoute} />
   </View>;
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
@@ -6914,7 +6955,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           <Text numberOfLines={1} style={styles.providerWizardHint}>{relayLoginStation || translate("common.notAvailable")}</Text>
           <Text style={styles.providerWizardHint}>{translate("relay.signInWindowHint")}</Text>
           <View style={styles.providerWizardAuthRow}>
-            <NativeButton title={translate("status.cancel")} compact onPress={cancelRelaySignIn} />
+            <NativeButton title={translate("relay.officialProviderCancel")} compact onPress={cancelRelaySignIn} />
           </View>
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
@@ -7679,21 +7720,22 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // The probe is over the moment its answer is in hand: the button reports
     // this question's progress, so it stands down here instead of staying
     // disabled through the write the answer goes on to ask for.
-    if (probeSequences.current.get(key) !== sequence) {
+    const isCurrent = () => probeSequences.current.get(key) === sequence;
+    if (!isCurrent()) {
       // A newer press owns this route: its answer is the one that counts, and
       // this run's result is stale by definition.
       return;
     }
     probingModelKeys.current.delete(key);
     setProbeActivityRevision((value) => value + 1);
+    if (asRecord(result).status === "cancelled") return;
     setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));
     setDroppedProbeResults((current) => withoutRecordEntry(current, key));
     try {
-      onSnapshot(await ipc.snapshot());
       const nextSurface = stringValue(result.recommended_surface);
       if (result.ok && isProbeSurface(nextSurface)) {
-        const applied = await applyProbedSurface(targetProviderId, targetModelId, nextSurface, options);
-        if (applied) {
+        const staged = await applyProbedSurface(targetProviderId, targetModelId, nextSurface, inputs, isCurrent, options);
+        if (staged && isCurrent()) {
           // The recommended surface is the probe's own write, not an edit the
           // user made.  Re-key the finding on the route that write produced,
           // or the press that just measured it would hide its own answer (a
@@ -7713,6 +7755,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             setProbeResults((current) => current[key] ? { ...current, [key]: { inputs: nextInputs, result } } : current);
           }
         }
+      } else {
+        onSnapshot(await ipc.snapshot());
       }
     } catch (reason: unknown) {
       onStatus(errorMessage(reason, translate));
@@ -8460,7 +8504,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         message: translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length }),
         confirmLabel: translate("common.delete"),
         destructive: true,
-      }).then((confirmed) => confirmed ? dispatch("public.model_delete", { public_model: selectedGroup.name }).then(() => { setSelectedPublicModel(undefined); setSelectedRoute(""); }) : undefined));
+      }).then(async (confirmed) => {
+        if (confirmed && await dispatch("public.model_delete", { public_model: selectedGroup.name })) {
+          setSelectedPublicModel(undefined);
+          setSelectedRoute("");
+        }
+      }));
       return;
     }
     if (!activeRoute) return;
@@ -8472,7 +8521,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       message: translate("providers.deleteRouteMessage", { provider: providerDisplayName(activeRoute.provider), upstream, model: activeRoute.publicModel }),
       confirmLabel: translate("common.delete"),
       destructive: true,
-    }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID }).then(() => setSelectedRoute("")) : undefined));
+    }).then(async (confirmed) => {
+      if (confirmed && await dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID })) setSelectedRoute("");
+    }));
   };
   const confirmDeleteProvider = (): void => {
     if (!provider) return;
@@ -8873,7 +8924,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         <ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} onPress={onOpenWizard} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
-        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
+        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
           {/* Measured on a wrapper of the table rather than on the pane: React
               Native for Web observes an `onLayout` node once, when it mounts,
               and the routes pane reuses the node the provider pane drew — the
@@ -8899,11 +8950,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </View>
       </View> : <View style={styles.providerWorkspace}>
         <View style={[styles.providerModelColumns, compactWeb && styles.providerModelColumnsCompact]}>
-          <TablePane style={[styles.providerListPane, compactWeb && styles.providerListPaneCompact]} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
+          <TablePane style={[styles.providerListPane, compactWeb && styles.providerListPaneCompact]} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteProvider} /> : null}</>}>
             <ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
-            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
+            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); if (compactWeb) setCompactDetail(true); }} style={styles.modelTable} /></View>
               {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) chooseFetchKey(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
@@ -11643,7 +11694,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
       <View style={assistantFileSurfaceStyles.editorFooterActions}>
         {confirmingDiscard
           ? <>
-            <ActionButton title={translate("status.cancel")} disabled={saving} onPress={() => setConfirmingDiscard(false)} />
+            <ActionButton title={translate("settings.keepEditing")} disabled={saving} onPress={() => setConfirmingDiscard(false)} />
             <ActionButton primary danger title={translate("common.discard")} disabled={saving} onPress={discardConfirmed} />
           </>
           : <>
@@ -11759,13 +11810,14 @@ function ClientBackendFields({ client, native, localApiActive, busy, onUseLocalA
         </View>
       </View>
       <View style={SETTINGS_FIELD_HELP_SLOT}>
-        <NativeButton title={translate("settings.directApiEdit")} link compact disabled={busy || clientActionBusy} onPress={openDirectApi} />
+        <NativeButton title={translate("settings.directApiEdit")} disabled={busy || clientActionBusy} onPress={openDirectApi} style={SETTINGS_FIELD_SLOT_ACTION} />
       </View>
   </View>;
 }
 
 type DirectApiSettingsProps = {
   client: DirectApiClient;
+  native: NativeLeafAdapter;
   ipc: IpcClient;
   translate: Translate;
   onClose: () => void;
@@ -11791,15 +11843,17 @@ function DirectApiSettings(props: DirectApiSettingsProps): React.JSX.Element {
     <View style={assistantFileSurfaceStyles.editorLoading}>
       <Text style={assistantFileSurfaceStyles.filesStatus}>{error ?? translate("common.loading")}</Text>
     </View>
-    <View style={assistantFileSurfaceStyles.editorFooter}>
-      <View style={assistantFileSurfaceStyles.editorFooterActions}>
-        <NativeButton title={translate("status.cancel")} onPress={onClose} />
+    <View style={styles.childSurfaceFooter}>
+      <View style={styles.childSurfaceFooterSpacer} />
+      <View style={styles.childSurfaceFooterActions}>
+        <NativeButton title={translate("status.close")} onPress={onClose} />
       </View>
     </View>
   </>;
 }
 
-function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectApiSettingsProps & { connection: UnknownRecord }): React.JSX.Element {
+function DirectApiForm({ client, connection, native, ipc, translate, onClose }: DirectApiSettingsProps & { connection: UnknownRecord }): React.JSX.Element {
+  const route: AppRoute = client === "codex" ? "codex-api-settings" : "claude-api-settings";
   const [url, setURL] = useState(() => stringValue(connection.base_url));
   const [model, setModel] = useState(() => stringValue(connection.model));
   const [catalog, setCatalog] = useState(() => stringValue(connection.model_catalog_url));
@@ -11810,6 +11864,18 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
   const [keyReset, setKeyReset] = useState(0);
   const [commitRequest, setCommitRequest] = useState(0);
   const [keyToken] = useState(() => `direct-api-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  // The form is not the window: the four rows it holds are the whole dialog,
+  // and a fixed window left a third of it empty above the footer.  The body
+  // reports its own height and the window takes it, within a floor and a
+  // ceiling so a long error line cannot turn this into a sheet.
+  const fittedHeight = useRef(0);
+  const fitWindowHeight = (contentHeight: number): void => {
+    if (!Number.isFinite(contentHeight) || contentHeight <= 0) return;
+    const wanted = Math.round(Math.min(CHILD_SURFACE_MAX_HEIGHT, Math.max(CHILD_SURFACE_MIN_HEIGHT, contentHeight + DIRECT_API_WINDOW_CHROME_HEIGHT)));
+    if (Math.abs(wanted - fittedHeight.current) < 4) return;
+    fittedHeight.current = wanted;
+    void native.window.setContentSize?.(route, DIRECT_API_WINDOW_WIDTH, wanted);
+  };
   const pendingSecret = useRef(0);
   const keyEdited = useRef(false);
   const optional = translate("settings.directApiOptional");
@@ -11872,7 +11938,7 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
   const authLabel = translate("settings.directApiAuth");
   const authChoices = [translate("settings.directApiBearer"), "x-api-key"];
   return <>
-    <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_BODY}>
+    <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_CONTENT} onContentSizeChange={(_width, height) => fitWindowHeight(height)}>
       {input(translate("providers.baseUrl"), url, changeURL, true)}
       {client === "claude" ? <NativeFormRow label={authLabel}>
         <NativePicker accessibilityLabel={authLabel} labels={authChoices} selectedValue={authChoices[apiKeyAuth ? 1 : 0]} disabled={saving} onChange={({ nativeEvent }) => {
@@ -11891,11 +11957,11 @@ function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectAp
       {input(translate("settings.directApiModel"), model, setModel)}
       {client === "codex" ? input(translate("settings.directApiCatalog"), catalog, setCatalog) : null}
     </PersistentScrollView>
-    <View style={assistantFileSurfaceStyles.editorFooter}>
-      <Text style={assistantFileSurfaceStyles.editorError} accessibilityLiveRegion="polite">{error ?? ""}</Text>
-      <View style={assistantFileSurfaceStyles.editorFooterActions}>
-        <NativeButton title={translate("status.cancel")} disabled={saving} onPress={onClose} />
-        <NativeButton title={translate("common.save")} primary disabled={saving || !keyReady || !url.trim()} busy={saving} onPress={submit} />
+    <View style={styles.childSurfaceFooter}>
+      {error === undefined ? <View style={styles.childSurfaceFooterSpacer} /> : <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{error}</Text>}
+      <View style={styles.childSurfaceFooterActions}>
+        <NativeButton title={translate("status.close")} disabled={saving} onPress={onClose} />
+        <NativeButton title={translate("status.saveAndClose")} primary disabled={saving || !keyReady || !url.trim()} busy={saving} onPress={submit} />
       </View>
     </View>
   </>;
@@ -13721,7 +13787,7 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
   useEffect(() => {
     if (!comparing) return undefined;
     onSetContentSize(900, 620);
-    return () => onSetContentSize(600, fittedHeight.current || WEBDAV_WINDOW_MIN_HEIGHT);
+    return () => onSetContentSize(600, fittedHeight.current || CHILD_SURFACE_MIN_HEIGHT);
   }, [comparing]);
   // The form is not the window: a six-field page in a 470 pt window left a
   // third of the child empty under the last row.  The content reports its own
@@ -13730,7 +13796,7 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
   const fittedHeight = useRef(0);
   const fitWindowHeight = (contentHeight: number): void => {
     if (comparing || !Number.isFinite(contentHeight) || contentHeight <= 0) return;
-    const wanted = Math.round(Math.min(WEBDAV_WINDOW_MAX_HEIGHT, Math.max(WEBDAV_WINDOW_MIN_HEIGHT, contentHeight + WEBDAV_WINDOW_CHROME_HEIGHT)));
+    const wanted = Math.round(Math.min(CHILD_SURFACE_MAX_HEIGHT, Math.max(CHILD_SURFACE_MIN_HEIGHT, contentHeight + CHILD_SURFACE_CHROME_HEIGHT)));
     if (Math.abs(wanted - fittedHeight.current) < 4) return;
     fittedHeight.current = wanted;
     onSetContentSize(600, wanted);
@@ -16792,7 +16858,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     }
     void prompt({
       title: translate("logs.onlineUsageRangePrompt"), value: onlineUsageRangeText,
-      confirmLabel: translate("logs.onlineUsageApplyRange"), cancelLabel: translate("status.cancel"),
+      confirmLabel: translate("logs.onlineUsageApplyRange"), cancelLabel: translate("status.close"),
     }).then((value) => {
       if (value === null) return;
       setOnlineUsageRangeText(value);
@@ -17990,6 +18056,12 @@ const SETTINGS_FIELD_HELP_TEXT: TextStyle = { color: systemColors.secondaryLabel
  * action button on the same grid: an inset switch reads as a broken column.
  */
 const SETTINGS_FIELD_SWITCH_SLOT: ViewStyle = { width: 44, minWidth: 44, height: 24, alignSelf: "flex-start" };
+/**
+ * A button that stands in a field's help slot.  The slot spans the row so its
+ * hint can wrap; a button spread across that width would read as a second
+ * field, so it keeps its own intrinsic width and starts at the control column.
+ */
+const SETTINGS_FIELD_SLOT_ACTION: ViewStyle = { alignSelf: "flex-start" };
 /** A settings pane that puts a rail beside its detail: the rail, a gutter, the detail. */
 const SETTINGS_RAIL_BODY: ViewStyle = { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 };
 /** A labelled row whose value is not available: the same label in secondary ink. */

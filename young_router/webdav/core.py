@@ -535,7 +535,7 @@ def _atomic_write(path: pathlib.Path, data: bytes) -> None:
 #: The fields that are the account's login rather than a reading of it.  They
 #: travel together: a status is only true of the session that proved it, and
 #: the station's own account id belongs to that session.
-LOGIN_FIELDS = ("login_status", "login_observed_at", "session", "user_id")
+LOGIN_FIELDS = ("login_status", "login_observed_at", "session", "user_id", "auto_login_unconfirmed")
 
 
 def _stamp(value: object) -> float | None:
@@ -983,6 +983,7 @@ def sync_targets(config_path: pathlib.Path) -> list[tuple[str, pathlib.Path, boo
 #: writes can show up as a conflict, never as an edit silently dropped.
 RELAY_OBSERVATION_FIELDS = frozenset(
     {
+        "auto_login_unconfirmed",
         "balance",
         "balance_observed_at",
         "groups",
@@ -993,6 +994,7 @@ RELAY_OBSERVATION_FIELDS = frozenset(
         "resource_status",
         "resources",
         "session",
+        "session_limit_at",
         "station_resource_names",
         "user_id",
     }
@@ -1805,7 +1807,16 @@ def create_bundle(config_path: pathlib.Path) -> tuple[bytes, SyncSnapshot]:
     the reading side rejects as a tampered file.
     """
 
-    manifest, digests, contents = _sync_snapshot(config_path)
+    snapshot = local_snapshot(config_path)
+    return encode_bundle(snapshot), snapshot
+
+
+def encode_bundle(snapshot: SyncSnapshot) -> bytes:
+    """Encode the same captured files the sync plan compared."""
+
+    manifest, contents = snapshot.manifest, snapshot.files
+    if manifest is None or contents is None:
+        raise SyncError("The WebDAV sync bundle has no files")
     files: list[dict[str, Any]] = []
     for file_info in manifest["files"]:
         entry = dict(file_info)
@@ -1818,10 +1829,7 @@ def create_bundle(config_path: pathlib.Path) -> tuple[bytes, SyncSnapshot]:
         "format": CONFIG_BUNDLE_FORMAT,
         "files": files,
     }
-    return (
-        json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
-        SyncSnapshot(manifest, digests, contents),
-    )
+    return json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
 
 
 def bundle_from_files(contents: dict[str, bytes]) -> bytes:
@@ -2036,6 +2044,15 @@ def read_config_bundle_file(path: pathlib.Path) -> tuple[dict[str, Any], dict[st
 
 def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, Any]:
     manifest, files = read_config_bundle(bundle_data)
+    return install_snapshot(bundle_snapshot(manifest, files), config_path)
+
+
+def install_snapshot(snapshot: SyncSnapshot, config_path: pathlib.Path) -> dict[str, Any]:
+    """Install a bundle whose documents were already decoded and validated."""
+
+    manifest, files = snapshot.manifest, snapshot.files
+    if manifest is None or files is None:
+        raise SyncError("The WebDAV sync bundle has no files")
     if "config.yaml" not in files:
         raise SyncError("WebDAV sync bundle is missing config.yaml")
 
@@ -2088,7 +2105,6 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
             target_path.unlink()
             removed.append(str(target_path))
 
-    snapshot = bundle_snapshot(manifest, files)
     return {
         "manifest": manifest,
         # What the remote side holds, in the terms the next sync compares by.

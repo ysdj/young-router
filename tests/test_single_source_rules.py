@@ -89,7 +89,7 @@ class OneDerivedValueOneProducerTests(unittest.TestCase):
         Producer(
             "an automatic relay login failure's displayed explanation",
             UI_DIR / "RelayAccountManager.tsx",
-            r"translate\((?:LOGIN_FAILURE_MESSAGES\[|[\"']relay\.autoSignIn(?:Rejected|SessionLimit|Unavailable))",
+            r"translate\((?:LOGIN_FAILURE_MESSAGES\[|[\"']relay\.autoSignIn(?:Rejected|SessionLimit|SessionUnconfirmed|Unavailable))",
         ),
     )
 

@@ -1235,13 +1235,17 @@ class CodexSettingsDomain:
         except Exception:
             self._local_api_base_url = None
 
+    def _names_local_api(self, configured: object) -> bool:
+        """Whether one endpoint is this app's own proxy."""
+
+        base_url = self._local_api_base_url
+        if not base_url or not isinstance(configured, str) or not configured.strip():
+            return False
+        return configured.strip().rstrip("/") == base_url.rstrip("/")
+
     def uses_local_api(self) -> bool:
         """True when the selected Codex provider already points at this proxy."""
 
-        base_url = self._local_api_base_url
-        if not base_url:
-            return False
-        expected = base_url.rstrip("/")
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
         direct = str(structured.get("model_provider") or "").strip()
@@ -1255,7 +1259,7 @@ class CodexSettingsDomain:
             for item in providers:
                 if isinstance(item, Mapping) and str(item.get("id") or "").strip() == direct:
                     candidates.append(str(item.get("base_url") or ""))
-        return any(candidate.rstrip("/") == expected for candidate in candidates if candidate)
+        return any(self._names_local_api(candidate) for candidate in candidates if candidate)
 
     def standalone_search_enabled(self) -> bool:
         """Whether the selected provider opts into Codex's own web search.
@@ -1292,18 +1296,34 @@ class CodexSettingsDomain:
             structured if isinstance(structured, Mapping) else {}
         )
 
-    def _direct_api_provider_id(self, structured: Mapping[str, Any], uses_local_api: bool) -> str:
-        return DIRECT_API_PROVIDER_ID if uses_local_api else str(structured.get("model_provider") or "openai")
-
     def _direct_api_settings(self, structured: Mapping[str, Any], uses_local_api: bool) -> dict[str, Any]:
-        provider_id = self._direct_api_provider_id(structured, uses_local_api)
-        provider = next((row for row in structured.get("providers", []) if row.get("id") == provider_id), {})
-        base_url = structured.get("openai_base_url") if provider_id == "openai" else provider.get("base_url")
+        """The connection the client is on, as the Edit API form prefills it.
+
+        The form edits one connection and shows whichever one the client runs.
+        With this app's API switched on the selected provider *is* the proxy,
+        so reading only the form's own direct row left every field empty beside
+        a switch that said the client was connected, and the dialog could not
+        round-trip what it showed.
+        """
+
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        provider = next(
+            (
+                row
+                for row in structured.get("providers") or []
+                if isinstance(row, Mapping) and str(row.get("id") or "").strip() == active
+            ),
+            {},
+        )
         return {
-            "base_url": public_direct_api_url(base_url),
+            "base_url": public_direct_api_url(self._active_provider_endpoint(structured, active)),
             "model_catalog_url": public_direct_api_url(provider.get("model_catalog_url")),
-            "model": "" if uses_local_api else structured.get("model"),
-            "key_configured": provider_id == DIRECT_API_PROVIDER_ID and provider.get("auth_mode") == "bearer",
+            "model": structured.get("model") or "",
+            # A client on the proxy carries this app's master key in Codex's own
+            # auth document; a direct row carries a bearer token of its own.
+            "key_configured": bool(structured.get("api_key"))
+            if uses_local_api
+            else active == DIRECT_API_PROVIDER_ID and provider.get("auth_mode") == "bearer",
         }
 
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
@@ -1423,37 +1443,40 @@ class CodexSettingsDomain:
                     patch = {"litellm_model": data.get("selection")}
                 self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"use_local_api", "uselocalapi"}:
-            patch = self._local_api_patch()
-            patch.update(self._surface_sync_patch())
-            config_text = _remove_legacy_computer_mcp(config_text)
-            model = str(data.get("model") or "").strip()
-            if model:
-                patch["model"] = model
-            self._draft = self._sync(config_text, auth_text, patch)
+            self._draft = self._adopt_local_api(config_text, auth_text, data)
         elif name == "use_direct_api":
             from .. import codex_config
 
             base_url = data["base_url"].rstrip("/")
-            catalog_url = data.get("model_catalog_url")
-            path = ("model_providers", DIRECT_API_PROVIDER_ID)
-            current = codex_config._provider_mapping(config_text, DIRECT_API_PROVIDER_ID)
-            key = data.get("api_key")
-            old_url = current.get("base_url")
-            if not key and not data.get("clear_key") and isinstance(old_url, str) and old_url.rstrip("/") == base_url:
-                key = current.get("experimental_bearer_token")
-            for field, value in {
-                "name": "Direct API",
-                "base_url": base_url,
-                "wire_api": "responses",
-                "model_catalog_url": catalog_url,
-                "experimental_bearer_token": key,
-            }.items():
-                config_text = (codex_config.set_table_value(config_text, path, field, value)
-                               if value else codex_config.remove_table_value(config_text, path, field))
-            patch = {"model_provider": DIRECT_API_PROVIDER_ID, "model": data.get("model") or None}
-            if self._catalog_pointer_is_managed(self._draft):
-                patch["model_catalog_json"] = None
-            self._draft = self._sync(config_text, auth_text, patch)
+            if self._names_local_api(base_url):
+                # The form edits one connection, and saving this app's own
+                # proxy back is that connection: the local route owns its
+                # endpoint, its master key, the managed model list and the
+                # search opt-in.  Writing a look-alike direct provider here
+                # dropped the last two while the pane's switch still read
+                # "on", so the same endpoint took a different route.
+                self._draft = self._adopt_local_api(config_text, auth_text, data)
+            else:
+                catalog_url = data.get("model_catalog_url")
+                path = ("model_providers", DIRECT_API_PROVIDER_ID)
+                current = codex_config._provider_mapping(config_text, DIRECT_API_PROVIDER_ID)
+                key = data.get("api_key")
+                old_url = current.get("base_url")
+                if not key and not data.get("clear_key") and isinstance(old_url, str) and old_url.rstrip("/") == base_url:
+                    key = current.get("experimental_bearer_token")
+                for field, value in {
+                    "name": "Direct API",
+                    "base_url": base_url,
+                    "wire_api": "responses",
+                    "model_catalog_url": catalog_url,
+                    "experimental_bearer_token": key,
+                }.items():
+                    config_text = (codex_config.set_table_value(config_text, path, field, value)
+                                   if value else codex_config.remove_table_value(config_text, path, field))
+                patch = {"model_provider": DIRECT_API_PROVIDER_ID, "model": data.get("model") or None}
+                if self._catalog_pointer_is_managed(self._draft):
+                    patch["model_catalog_json"] = None
+                self._draft = self._sync(config_text, auth_text, patch)
         elif name == "codex_feature_set":
             feature = data.get("feature")
             enabled_value = data.get("enabled")
@@ -1549,7 +1572,19 @@ class CodexSettingsDomain:
             from .. import codex_config
 
             structured = self._draft.get("structured") or {}
-            provider_id = self._direct_api_provider_id(structured, self.uses_local_api())
+            if self.uses_local_api():
+                # The form is available in both modes.  On this app's own
+                # route the client's credential is the router key, which is
+                # what re-saving that same endpoint keeps writing; reading the
+                # environment here would answer with whatever OPENAI_API_KEY
+                # the app happened to be started with.
+                from ._shared import local_proxy_endpoint
+
+                try:
+                    return local_proxy_endpoint(self.runtime_config_path)[1]
+                except Exception:
+                    return ""
+            provider_id = str(structured.get("model_provider") or "openai").strip() or "openai"
             provider = codex_config._provider_mapping(self._draft.get("config_text", ""), provider_id)
             env_key = provider.get("env_key")
             if isinstance(env_key, str) and env_key:
@@ -1893,6 +1928,25 @@ class CodexSettingsDomain:
             # them.
             patch["web_search"] = "live"
         return patch
+
+    def _adopt_local_api(
+        self, config_text: str, auth_text: str, data: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Stage this app's proxy as the client's backend, keeping its model.
+
+        One staging path for both entries that name it: the pane's switch and
+        the Edit API form saved on the proxy's own endpoint.  The route, its
+        master key, the model list and the search opt-in are one decision, so
+        a second writer would only be able to fall out of step with this one.
+        """
+
+        patch = self._local_api_patch()
+        patch.update(self._surface_sync_patch())
+        config_text = _remove_legacy_computer_mcp(config_text)
+        model = str(data.get("model") or "").strip()
+        if model:
+            patch["model"] = model
+        return self._sync(config_text, auth_text, patch)
 
     def _surface_sync_patch(
         self,

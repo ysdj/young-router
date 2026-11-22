@@ -3,13 +3,17 @@ from __future__ import annotations
 import copy
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import yaml
+
 from young_router.core.domains.providers_models import ProvidersModelsDomain
-from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError
+from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError, RelaySessionRejectedError
 from young_router.core.service import CoreError, CoreStore, _relay_binding_projection
 
 
@@ -761,7 +765,7 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
                 if self.expired:
                     # The station rejects the stored dashboard session, exactly
                     # as it does once that session ages out.
-                    raise RelayAccountsError("Relay login has expired")
+                    raise RelaySessionRejectedError()
                 if path == "/api/v1/keys?page=1&page_size=100":
                     return {
                         "code": 0,
@@ -2093,6 +2097,107 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
             )
             written = (root / "config.yaml").read_text(encoding="utf-8")
             self.assertIn("Primary (禁蒸馏)", written)
+
+    def test_a_station_rename_keeps_key_labels_unique(self) -> None:
+        """A relay rename cannot make the provider document unloadable.
+
+        The station's display name is authoritative for its linked slot, but a
+        provider may already have an independent key with that label.  Keeping
+        both labels verbatim makes the config dumper reject the whole Apply;
+        the linked slot gets the normal deterministic suffix instead.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-a")
+            core.apply("providers_models", revision=core.revision)
+
+            provider = providers._draft["providers"][0]
+            provider["api_keys"].append(
+                {
+                    "id": "provider-slot-independent",
+                    "name": "Primary (禁蒸馏)",
+                    "value": "sk-independent",
+                    "source": {"kind": "independent"},
+                }
+            )
+            providers._sync_primary_api_key(provider, providers._provider_api_keys(provider))
+
+            http.resource_name = "Primary (禁蒸馏)"
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.set_enabled",
+                    "payload": {
+                        "account_id": relay.snapshot()["accounts"][0]["id"],
+                        "resource_id": "newapi-7",
+                        "enabled": True,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            result = core.apply("relay_accounts", revision=core.revision)
+
+            self.assertEqual("applied", result["status"])
+            reloaded = ProvidersModelsDomain(root / "config.yaml").snapshot()["providers"][0]
+            self.assertEqual(["Primary (禁蒸馏)-2", "Primary (禁蒸馏)"], [key["name"] for key in reloaded["key_states"]])
+            self.assertEqual(reloaded["key_states"][0]["id"], reloaded["models"][0]["provider_key_id"])
+            self.assertTrue(providers.validate()["valid"])
+
+    def test_route_delete_saves_and_projects_while_relay_key_update_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(2) as pool:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            resource_id = "newapi-7"
+            core.apply("providers_models", revision=core.revision)
+            core.apply("relay_accounts", revision=core.revision)
+            provider = providers.snapshot()["providers"][0]
+            self.assertEqual(1, len(provider["models"]))
+            core.dispatch({"domain": "relay_accounts", "type": "api_key.update", "payload": {
+                "account_id": account_id, "resource_id": resource_id, "name": "Renamed",
+            }})
+            entered, release = threading.Event(), threading.Event()
+
+            original_put = http.put
+
+            def update(*args, **kwargs):
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return original_put(*args, **kwargs)
+
+            def delete_route():
+                staged = core.dispatch({"domain": "providers_models", "type": "model.delete", "payload": {
+                    "provider_id": provider["editor_id"], "model_id": provider["models"][0]["editor_id"],
+                }})
+                return core.apply("providers_models", revision=staged["revision"])
+
+            with patch.object(http, "put", side_effect=update):
+                pending = pool.submit(core.apply, "relay_accounts", revision=core.revision)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(pool.submit(delete_route).result(2)["applied"])
+                    self.assertFalse(pending.done())
+                    self.assertEqual([], yaml.safe_load((root / "config.yaml").read_text())["model_list"])
+                    self.assertFalse(any(
+                        row["models"] for row in core.snapshot()["domains"]["providers_models"]["providers"]
+                    ))
+                finally:
+                    release.set()
+                self.assertEqual("partial", pending.result(2)["status"])
+
+            self.assertTrue(core.apply("relay_accounts", revision=core.revision)["applied"])
+            self.assertEqual([], yaml.safe_load((root / "config.yaml").read_text())["model_list"])
+            self.assertEqual([("PUT", "/api/token/")], [call for call in http.calls if call[0] == "PUT"])
 
     def test_alignment_retires_the_linked_slot_of_a_key_it_deletes(self) -> None:
         """The keys 自动分组 retires take their linked slots and routes with them.

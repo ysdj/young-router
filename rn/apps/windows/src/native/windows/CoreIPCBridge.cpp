@@ -741,11 +741,11 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
     std::optional<std::string> const& user_id,
     std::optional<double> const& quota) {
   bool signed_in = login_status == "signed_in";
-  bool terminal_status = login_status == "signed_out" || login_status == "expired";
+  bool check_status = login_status == "unknown" || login_status == "signed_out" || login_status == "expired";
   if (account_id.empty() || account_id.size() > 96 ||
       (account_type != "newapi" && account_type != "sub2api") ||
       label.empty() || label.size() > 160 || origin.empty() || origin.size() > 2048 ||
-      !signed_in && !terminal_status ||
+      (!signed_in && !check_status) ||
       (username && username->size() > 320) ||
       (cookie && cookie->size() > 32768) ||
       (access_token && access_token->size() > 32768) ||
@@ -783,7 +783,7 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
     }
     auto body = WideToUtf8(payload.Stringify().c_str());
     if (body.size() > 96 * 1024) return std::nullopt;
-    auto result = HostRequest(L"host/relay/restore", body, false);
+    auto result = HostRequest(L"host/relay/restore", body, false, 60000);
     if (!result || result->status != 200 || result->body.empty()) return std::nullopt;
     auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result->body));
     if (response.Size() != 4 || !response.HasKey(L"protocol_version") ||

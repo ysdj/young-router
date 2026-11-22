@@ -6,8 +6,9 @@ import copy
 import hashlib
 from pathlib import Path
 import stat
+from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Callable
 
 from ..persistence import PersistenceError, atomic_write_json, atomic_write_text
 from ..security import REDACTED, safe_exception_message
@@ -73,6 +74,10 @@ class WebDAVSettingsDomain:
     """Staged WebDAV settings using the existing WebDAV core client."""
 
     name = "webdav"
+    # Core lends this domain's single writer lane only around the remote
+    # collection probes.  The probe's result and status file remain serialized
+    # with WebDAV edits after the network call returns.
+    _io_gate: Callable[[], AbstractContextManager[None]] = staticmethod(nullcontext)
     #: The documents this domain can show for a side-by-side comparison.
     review_documents = tuple(REVIEW_DOCUMENTS)
 
@@ -109,6 +114,9 @@ class WebDAVSettingsDomain:
         self._sync_state_cache_identity: object = object()
         self.revision = 0
         self.reload()
+
+    def bind_io_gate(self, gate: Callable[[], AbstractContextManager[None]]) -> None:
+        self._io_gate = gate
 
     @staticmethod
     def _settings_raw(settings: object) -> dict[str, Any]:
@@ -565,13 +573,15 @@ class WebDAVSettingsDomain:
             # what left a folder on the server after every probe, and at a
             # read-only mount point that folder cannot even be deleted again.
             try:
-                access = client.collection_access()
+                with self._io_gate():
+                    access = client.collection_access()
             except webdav_core.WebDAVHTTPError as exc:
                 if exc.code not in {403, 405, 501}:
                     raise
                 access = "unknown"
             try:
-                client.head(webdav_core.bundle_url(settings))
+                with self._io_gate():
+                    client.head(webdav_core.bundle_url(settings))
             except webdav_core.WebDAVHTTPError as exc:
                 if exc.code not in webdav_core.BUNDLE_MISSING_STATUS:
                     raise

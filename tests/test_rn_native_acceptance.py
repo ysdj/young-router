@@ -2213,32 +2213,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("rememberPassword: Bool?,", mac_leaf)
         self.assertIn("let capturedPassword = self.capturedPassword", mac_leaf)
         self.assertIn("password: rememberPassword == true ? capturedPassword : nil", mac_leaf)
-        # A remembered account has both fields filled from what the app already
-        # knows, but the submission is a separate, authorized step: it asks the
-        # station to mint a session, so it runs only after the station refused
-        # the session on hand (or when there was none to preserve).  Submitting
-        # on a rendered form alone is what minted one session per pane entry
-        # until the account was refused its own sign-in.
+        # Native presentations fill the manual form. Core owns automatic login.
         prefill = mac_leaf.split("private func prefillLoginWhenReady()", 1)[1].split("private func scheduleLoginPrefill", 1)[0]
         self.assertIn("field: \"password\"", mac_leaf)
         self.assertIn("const password = document.querySelector('input[type=password], input[autocomplete=current-password]');", prefill)
         self.assertIn("set(password, \\(safePassword));", prefill)
         self.assertNotIn("requestSubmit", prefill)
-        submit = mac_leaf.split("private func submitSavedPassword()", 1)[1].split("private func jsonLiteral", 1)[0]
-        self.assertIn("requestSubmit", submit)
-        # The only evidence that may open that submission is the station's own
-        # refusal of the credential it was shown.
-        self.assertIn("private var attemptSawRefusal = false", mac_leaf)
-        self.assertIn("private var loginSubmitAuthorized = false", mac_leaf)
-        self.assertIn("loginSubmitAuthorized = restoredSession == nil", mac_leaf)
-        check = mac_leaf.split("private func probe(index: Int", 1)[1].split("private func persistVerifiedLogin", 1)[0]
-        self.assertIn("if refused { self.attemptSawRefusal = true }", check)
-        self.assertIn("if attemptSawRefusal, restoredPassword?.isEmpty == false {", check)
-        self.assertIn("loginSubmitAuthorized = true", check)
+        self.assertNotIn("submitSavedPassword", mac_leaf)
         self.assertIn("private var restoredPassword: String?", mac_leaf)
-        self.assertIn("private var didAutoSubmitSavedPassword = false", mac_leaf)
         self.assertIn("private func restoreRememberedPassword()", mac_leaf)
-        self.assertIn("didAutoSubmitSavedPassword = false", mac_leaf)
         # A station that draws its shell first and its form later is not ready
         # when the document commits, so the fill is a bounded probe that keeps
         # asking rather than a single delayed pass.
@@ -2372,14 +2355,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ProfileName(ProfileName(state->options.account_id))", windows_relay)
         self.assertIn("CredWriteW", windows_relay)
         self.assertIn("ProbeEndpoint(state->options", windows_relay)
-        # The saved password is submitted only after the station refused the
-        # session on hand, so a station cap is never asked for a second session
-        # on evidence that is not a refusal.
-        self.assertIn("SubmitSavedPassword", windows_relay)
-        self.assertIn("attempt_saw_refusal", windows_relay)
-        self.assertIn("login_submit_authorized", windows_relay)
-        self.assertNotIn("auto_submit_saved_password_pending", windows_relay)
-        self.assertIn("did_auto_submit_saved_password", windows_relay)
+        self.assertNotIn("SubmitSavedPassword", windows_relay)
         self.assertIn("localStorage.getItem('user')", windows_relay)
         # A token the page minted on this navigation wins; the restored
         # session only fills what the page left empty.
@@ -2388,7 +2364,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("userInput.focus({ preventScroll: true })", windows_relay)
         self.assertIn("bool UseChinese(WindowsRelayLoginOptions const& options)", windows_relay)
         self.assertIn('options.language == "zh-Hans"', windows_relay)
-        self.assertIn('auto prior_password = ReadChunkedCredential(state->options.account_id, L"password");', windows_relay)
         self.assertIn('host == L"localhost"', windows_relay)
         # The sign-in window lands on the form Core names for this family, not
         # on the origin: a sub2api station answers `/` with a marketing home.
@@ -2402,7 +2377,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("const RememberPasswordChoice remember_choice = ShowRememberPasswordPrompt(state);", windows_relay)
         self.assertIn("auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
         self.assertIn("std::map<std::string, std::string> ParseCookieHeader(std::string const& header);", windows_relay)
-        self.assertIn("if (credentials_saved && !accepted)", windows_relay)
+        self.assertIn("if (accepted) {", windows_relay)
+        self.assertIn("Core is the durable session boundary", windows_relay)
         self.assertIn("class RelayLoginAttempt", windows_relay)
         self.assertIn("bool BeginCommit()", windows_relay)
         self.assertIn("CancellationOutcome RequestCancellation()", windows_relay)
@@ -2410,9 +2386,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (!attempt->BeginCommit()) co_return;", windows_relay)
         self.assertIn("current->dialog_closed_during_commit = true;", windows_relay)
         self.assertNotIn("credentials_saved && (state->canceled.load() || state->finished.load())", windows_relay)
-        self.assertIn("bool* confirmed_authentication_rejection = nullptr", windows_relay)
-        self.assertIn("saw_authentication_rejection && !saw_non_authentication_failure", windows_relay)
-        self.assertIn("if (!confirmed_authentication_rejection) return std::nullopt;", windows_relay)
         self.assertIn("accepted_cookie.empty() && (!access || access->empty())", windows_relay)
         self.assertIn('auto const ui_language = language.value_or("system")', windows_module)
         self.assertIn('HostRequest(L"host/relay/login"', windows_core)
@@ -2498,7 +2471,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("@objc(openRelayDashboard:resolver:rejecter:)", mac_module)
         self.assertIn("self.leaf.openRelayDashboard(", mac_module)
 
-    def test_relay_session_restore_is_native_only_and_does_not_import_provider_models(self) -> None:
+    def test_relay_session_restore_is_owned_by_core_and_does_not_import_provider_models(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
@@ -2545,10 +2518,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("@objc(restoreRelaySession:resolver:rejecter:)", mac_module)
         self.assertIn("restoreRelaySession:(NSDictionary *)options", mac_bridge)
         self.assertIn("func restoreRelaySession(", mac_leaf)
-        self.assertIn("presetUsername: username?.trimmingCharacters(in: .whitespacesAndNewlines)", mac_leaf)
-        self.assertIn("NativeRelaySessionProbe.verify", mac_leaf)
-        self.assertIn("sawAuthenticationRejection && !sawNonAuthenticationFailure", mac_leaf)
-        self.assertIn("NativeRelaySessionMemoryStore.writeSession(refreshedSession, accountID: accountID)", mac_leaf)
+        self.assertIn('loginStatus: "unknown"', mac_leaf)
+        self.assertNotIn("NativeRelaySessionProbe.verify", mac_leaf)
         # The online-usage tab reads through Core's own log-format reader and
         # draws its rows in this window's table: it never opens the station's
         # dashboard in a child browser, so a dropdown selection is what scopes
@@ -2572,20 +2543,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RestoreWindowsRelaySession(", windows_relay)
         self.assertIn('HostRequest(L"host/relay/restore"', windows_core)
         self.assertIn('"/ipc/host/relay/restore"', core_ipc)
-        # The probe that proves a remembered session already read the account's
-        # profile, and Core's balance is that profile divided by the site's own
-        # display unit.  Both hosts therefore carry the quota they saw into the
-        # restore, which is what turns one authenticated read into both answers
-        # instead of two; a host that omits it still works, one read later.
-        self.assertIn("quota: probe.quota", mac_leaf)
-        self.assertIn('payload["quota"] = quota', mac_core)
-        self.assertIn('FirstJsonNumber(root, {{L"data", L"quota"}, {L"quota"}})', windows_relay)
-        self.assertIn("verified->quota", windows_relay)
-        self.assertIn('payload.SetNamedValue(L"quota"', windows_core)
+        self.assertIn('"unknown", input_options.username', windows_relay)
         self.assertIn('"refresh_token", "user_id", "quota"', core_ipc)
-        # Core accepts that quota at the boundary and drops it: the balance is
-        # the profile API's answer on the refresh behind the restore, because the
-        # page's number and the API's disagreed live.
+        # Core reads its own profile and balance; host quota is ignored.
         self.assertNotIn("quota=quota,", core_ipc)
         # A braced initializer fills members in declaration order, so the family
         # a probe answered as comes before the station's own account id.  Read as

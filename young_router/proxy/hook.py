@@ -967,6 +967,9 @@ class YoungRouterHook(CustomLogger):
                 if sanitized_chunk is None:
                     continue
                 chunk = sanitized_chunk
+                if _streaming_module._is_route_recovery_sse_keepalive(chunk):
+                    yield chunk
+                    continue
                 chunk_exception = _streaming_module._stream_chunk_priority_error_exception(chunk)
                 if chunk_exception is not None:
                     async for fallback_chunk in _streaming_module._yield_streaming_error_fallback_or_raise(

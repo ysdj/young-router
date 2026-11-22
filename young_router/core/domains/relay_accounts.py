@@ -11,6 +11,7 @@ import copy
 from contextlib import AbstractContextManager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from http.client import HTTPException
 from http.cookies import CookieError, SimpleCookie
 import hashlib
 import json
@@ -38,6 +39,8 @@ from ..security import safe_exception_message
 
 DOMAIN_NAME = "relay_accounts"
 ACCOUNT_TYPES = ("newapi", "sub2api")
+_LOGIN_CHECK_FIELDS = ("login_status", "login_observed_at", "session_limit_at", "auto_login_unconfirmed")
+_VERIFIED_LOGIN_FIELDS = (*_LOGIN_CHECK_FIELDS, "username", "user_id", "session", "last_updated_at")
 # The page each station family serves one surface at, relative to the station's
 # own origin.  This is a property of the family, so it lives here and nowhere
 # else: every host that shows a station page reads the table from this domain
@@ -170,6 +173,24 @@ class RelayTransportError(RelayAccountsError):
 
     def __init__(self) -> None:
         super().__init__("Relay is unavailable")
+
+
+class RelaySessionRejectedError(RelayAccountsError):
+    """The station explicitly rejected the session presented to it."""
+
+    def __init__(self) -> None:
+        super().__init__("Relay login has expired")
+
+
+class _RelayReadSuperseded(RelayAccountsError):
+    """The selected account or session changed during a remote read."""
+
+    def __init__(self) -> None:
+        super().__init__("Relay account changed while the request was running")
+
+
+class RelayLoginSaveError(RelayAccountsError):
+    """The session was accepted, but its local write did not complete."""
 
 
 class RelayResourceRemoved(RelayAccountsError):
@@ -731,6 +752,8 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         # a resource read records its own time there, and a failed one must not
         # renew a login observation it never made.
         "login_observed_at": _updated_at(raw.get("login_observed_at")),
+        "session_limit_at": _updated_at(raw.get("session_limit_at")),
+        "auto_login_unconfirmed": raw.get("auto_login_unconfirmed") is True,
         # The station's own account id, which a New API fork requires as the
         # ``New-Api-User`` header beside the session cookie.  It is the id the
         # station itself reported, so it always belongs to the session that
@@ -851,6 +874,8 @@ def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     # was never in doubt.  The stamp is the moment, and the window still bounds
     # it: an old one asks for a real check, a recent one settles it.
     stored["login_observed_at"] = _updated_at(account.get("login_observed_at"))
+    stored["session_limit_at"] = _updated_at(account.get("session_limit_at"))
+    stored["auto_login_unconfirmed"] = account.get("auto_login_unconfirmed") is True
     stored["password"] = str(account.get("password", ""))
     stored["session"] = copy.deepcopy(account.get("session", {}))
     stored["remember_session"] = account.get("remember_session") is not False
@@ -1033,10 +1058,7 @@ def _raise_login_refusal(exc: urllib.error.HTTPError) -> None:
 
 
 # What a New API fork writes when the session it was shown is not accepted.
-# The same refusal also arrives as an HTTP 401/403, and which one a deployment
-# answers varies by route and by fork -- the body is the shape that used to be
-# read as "this probe learned nothing", which sent one more sign-in per pane
-# entry until the account hit the site's concurrent-session cap.
+# A station can also state this refusal in the response body.
 _SESSION_REFUSAL_MARKERS = (
     "未登录",
     "登录已过期",
@@ -1047,6 +1069,10 @@ _SESSION_REFUSAL_MARKERS = (
     "login expired",
     "session expired",
     "invalid session",
+    "invalid refresh token",
+    "refresh token expired",
+    "刷新令牌无效",
+    "刷新令牌已过期",
     "please log in",
     "please sign in",
     "unauthorized",
@@ -1057,16 +1083,13 @@ _SESSION_REFUSAL_MARKERS = (
 def _payload_refuses_session(payload: object) -> bool:
     """Whether an answered read states that the session it carried is dead.
 
-    New API forks refuse an expired or not-yet-accepted session in two shapes:
-    an HTTP 401/403, *or* a plain 200 whose envelope says ``success: false``
-    with a message such as ``未登录或登录已过期``.  Only a body that actually says
-    so qualifies: an envelope that denies success for some other reason (a
-    missing permission, an unknown route) says nothing about the session, and
-    reading every ``success: false`` as a dead login would retire sessions over
-    errors the user can act on.
+    A generic permission error says nothing about the session. The station
+    must both report failure and name the authentication problem.
     """
 
-    if not isinstance(payload, Mapping) or payload.get("success") is not False:
+    if not isinstance(payload, Mapping) or _rejects_account_header(payload) or not (
+        payload.get("success") is False or payload.get("code") in (401, 403, "401", "403")
+    ):
         return False
     message = " ".join(
         value.strip().lower()
@@ -1074,6 +1097,50 @@ def _payload_refuses_session(payload: object) -> bool:
         if isinstance((value := payload.get(key)), str) and value.strip()
     )
     return any(marker in message for marker in _SESSION_REFUSAL_MARKERS)
+
+
+def _rejects_account_header(payload: Mapping[str, Any]) -> bool:
+    return any(
+        "new-api-user" in value.lower()
+        for key in ("message", "error", "msg")
+        if isinstance((value := payload.get(key)), str)
+    )
+
+
+def _reject_relay_response(error: urllib.error.HTTPError) -> None:
+    payload = None
+    if error.code in {400, 401, 403}:
+        try:
+            body = error.read(MAX_RESPONSE_BYTES + 1)
+            payload = json.loads(body) if body else {}
+        except (ValueError, OSError, HTTPException):
+            pass
+    # A missing identity header is a request problem. A bare 403 can be a WAF
+    # or ACL, so only an explicit authentication response can replace a login.
+    if isinstance(payload, Mapping):
+        if _rejects_account_header(payload):
+            raise RelayAccountsError("Relay rejected the account header") from None
+        if error.code == 401 or _payload_refuses_session(payload):
+            raise RelaySessionRejectedError() from None
+    raise RelayAccountsError("Relay request was rejected") from None
+
+
+def _session_payload_succeeded(payload: object) -> bool:
+    return isinstance(payload, Mapping) and (
+        payload.get("success") is not False and payload.get("code", 0) in (0, "0")
+    )
+
+
+def _response_cookie_values(headers: Iterable[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for header in headers:
+        parsed = SimpleCookie()
+        try:
+            parsed.load(header)
+        except CookieError:
+            continue
+        values.update((name, morsel.value) for name, morsel in parsed.items())
+    return values
 
 
 def _json_data(payload: object) -> object:
@@ -1228,6 +1295,7 @@ class RelayHTTPClient:
         headers: Mapping[str, str],
         method: str,
         body: Mapping[str, Any] | None = None,
+        set_cookies: list[str] | None = None,
     ) -> object:
         if method not in {"GET", "POST", "PUT", "DELETE"}:
             raise RelayAccountsError("Relay request method is invalid")
@@ -1241,6 +1309,7 @@ class RelayHTTPClient:
                     method=method,
                     body=body,
                     timeout=timeout,
+                    set_cookies=set_cookies,
                 )
             except RelayTransportError:
                 # The station never answered. A read is safe to send again, and
@@ -1275,6 +1344,7 @@ class RelayHTTPClient:
         method: str,
         body: Mapping[str, Any] | None,
         timeout: float,
+        set_cookies: list[str] | None,
     ) -> object:
         url = _relay_endpoint(origin, path)
         request_body = None
@@ -1292,10 +1362,10 @@ class RelayHTTPClient:
             with self._opener.open(request, timeout=timeout) as response:  # type: ignore[attr-defined]
                 status = getattr(response, "status", response.getcode())
                 body = response.read(MAX_RESPONSE_BYTES + 1)
+                if set_cookies is not None:
+                    set_cookies.extend(response.headers.get_all("Set-Cookie") or ())
         except urllib.error.HTTPError as exc:
-            if exc.code in {401, 403}:
-                raise RelayAccountsError("Relay login has expired") from None
-            raise RelayAccountsError("Relay request was rejected") from None
+            _reject_relay_response(exc)
         except Exception:
             raise RelayTransportError() from None
         if not isinstance(status, int) or status < 200 or status >= 300 or len(body) > MAX_RESPONSE_BYTES:
@@ -1305,13 +1375,7 @@ class RelayHTTPClient:
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RelayAccountsError("Relay returned an invalid response") from None
         if _payload_refuses_session(payload):
-            # Same answer as the 401/403 above, and it has to land here rather
-            # than in the session probe alone: every authenticated read -- the
-            # balance, the key page, the group catalog -- passes through this
-            # one place, and a refusal only the probe recognized let the
-            # balance read stamp 已登录 onto a session the station had just
-            # refused in the body, while the key read signed in again over it.
-            raise RelayAccountsError("Relay login has expired") from None
+            raise RelaySessionRejectedError()
         return payload
 
     def json(self, origin: str, path: str, *, headers: Mapping[str, str]) -> object:
@@ -1339,6 +1403,50 @@ class RelayHTTPClient:
 
     def delete(self, origin: str, path: str, *, headers: Mapping[str, str]) -> object:
         return self._request_json(origin, path, headers=headers, method="DELETE")
+
+    def refresh_newapi_session(
+        self, origin: str, *, headers: Mapping[str, str], session: Mapping[str, str],
+    ) -> dict[str, str] | None:
+        """Exchange the dashboard refresh cookie without posting a password."""
+
+        cookies = _response_cookie_values((session.get("cookie", ""),))
+        if not cookies.get("new_api_refresh"):
+            return None
+        # The rejected access token is not part of the refresh credential.
+        refresh_headers = {key: value for key, value in headers.items() if key != "Authorization"}
+        set_cookies: list[str] = []
+        payload = self._request_json(
+            origin, "/api/user/auth/refresh", headers=refresh_headers, method="POST", set_cookies=set_cookies,
+        )
+        data = _json_data(payload)
+        token = data.get("access_token") if isinstance(data, Mapping) else None
+        if not isinstance(token, str) or not token.strip() or not _session_payload_succeeded(payload):
+            raise RelayAccountsError("Relay returned an invalid session refresh")
+        cookies.update(_response_cookie_values(set_cookies))
+        return {
+            **session,
+            "access_token": token.strip(),
+            "cookie": "; ".join(f"{key}={value}" for key, value in sorted(cookies.items()) if value),
+        }
+
+    def refresh_sub2api_session(self, origin: str, *, session: Mapping[str, str]) -> dict[str, str] | None:
+        refresh_token = session.get("refresh_token")
+        if not refresh_token:
+            return None
+        payload = self.post(
+            origin, "/api/v1/auth/refresh", headers={"X-User-UI-Request": "1"},
+            body={"refresh_token": refresh_token},
+        )
+        data = _json_data(payload)
+        token = data.get("access_token") if isinstance(data, Mapping) else None
+        if not _session_payload_succeeded(payload) or not isinstance(token, str) or not token.strip():
+            raise RelayAccountsError("Relay returned an invalid session refresh")
+        rotated = data.get("refresh_token")
+        return {
+            **session,
+            "access_token": token.strip(),
+            "refresh_token": rotated.strip() if isinstance(rotated, str) and rotated.strip() else refresh_token,
+        }
 
     def password_login(
         self,
@@ -1421,18 +1529,7 @@ class RelayHTTPClient:
                 station_user_id = _station_user_id(reported_id)
         access_token = data.get("access_token")
         refresh_token = data.get("refresh_token")
-        cookie_values: dict[str, str] = {}
-        for header in set_cookie_headers:
-            parsed = SimpleCookie()
-            try:
-                parsed.load(header)
-            except CookieError:
-                # The stdlib parser is stricter than a browser, and its error
-                # is not one this domain may raise: a header it rejects loses
-                # only its own cookies, not a sign-in the station accepted.
-                continue
-            for name, morsel in parsed.items():
-                cookie_values[name] = morsel.value
+        cookie_values = _response_cookie_values(set_cookie_headers)
         cookie = "; ".join(f"{name}={value}" for name, value in sorted(cookie_values.items()))
         result = {
             "username": accepted_username,
@@ -1514,6 +1611,14 @@ def _is_sub2api_keys(status: int, payload: Mapping[str, Any] | None) -> bool:
 
 class RelayAccountsDomain:
     name = DOMAIN_NAME
+    _io_gate = staticmethod(nullcontext)
+    _session_write_gate = staticmethod(nullcontext)
+
+    def bind_io_gate(self, gate: Callable[[], AbstractContextManager[None]]) -> None:
+        self._io_gate = gate
+
+    def bind_session_write_gate(self, gate: Callable[[], AbstractContextManager[None]]) -> None:
+        self._session_write_gate = gate
 
     def __init__(
         self,
@@ -1533,6 +1638,7 @@ class RelayAccountsDomain:
         # The active copy stays process-local. An explicitly remembered login
         # also has a durable private copy beside the plaintext password.
         self._session_secrets: dict[str, dict[str, str]] = {}
+        self._pending_login_saves: dict[str, tuple[tuple[str, ...], bool]] = {}
         # A password a person typed into the station's own page (the page host
         # has no webview to read it from, so Core watches the browser it opened).
         # It is held only between the verified sign-in and the post-login
@@ -1557,8 +1663,8 @@ class RelayAccountsDomain:
         # sign-in is the station's answer about this moment, and asking again a
         # second later cannot change it -- while each attempt asks the station
         # to mint another session, on an account whose session count is exactly
-        # what ran out.  Process-local on purpose: a restart is a new reason to
-        # ask.  See ``_renew_remembered_session``.
+        # what ran out. Transient failures are process-local; the station's
+        # session-cap refusal also goes on the account and survives restart.
         self._login_refusals: dict[str, float] = {}
         # Safe outcomes of actual POSTs, also used to select the retry window.
         self._login_failures: dict[str, str] = {}
@@ -1577,6 +1683,7 @@ class RelayAccountsDomain:
         # and metadata refresh may update the same in-memory state, but never
         # smuggle a draft change across the persistence boundary.
         self._pending_operations: list[dict[str, Any]] = []
+        self._sending_operation: dict[str, Any] | None = None
         # Keep the pre-toggle resource state only while an automatic-grouping
         # toggle is still part of the unapplied draft. Turning it off before
         # Apply must undo the local alignment preview; after Apply the baseline
@@ -1746,6 +1853,56 @@ class RelayAccountsDomain:
         except PersistenceError as exc:
             raise RelayAccountsError(safe_exception_message(exc)) from None
 
+    def _persist_login_fields(
+        self, account: Mapping[str, Any], fields: tuple[str, ...], *, new_account: bool = False,
+    ) -> None:
+        # A verified login updates the saved identity even during a CRUD draft.
+        # Write just its authentication fields, never the draft's station or keys.
+        if not self._has_staged_changes():
+            self._persist()
+            return
+        document = json.loads(self._baseline_bytes) if self._baseline_bytes else {
+            "version": 3, "accounts": [], "stations": [],
+        }
+        saved = next((row for row in document["accounts"] if row["id"] == account["id"]), None)
+        if saved is not None and any(saved.get(key) != account[key] for key in ("origin", "type")):
+            return  # An edited site still belongs to its unapplied draft.
+        if saved is None and not new_account:
+            return  # A manually added draft is persisted by its own Apply.
+        if self._read_storage_bytes() != self._baseline_bytes:
+            raise RelayAccountsError("Relay account storage changed; reload before saving the sign-in")
+        stored = _stored_account(account)
+        if saved is None:
+            station_id = account["station_id"]
+            saved_station = next((row for row in document["stations"] if row["id"] == station_id), None)
+            if saved_station is None:
+                document["stations"].append(copy.deepcopy(self._stations[self._station_index(station_id)]))
+            elif any(saved_station.get(key) != account[key] for key in ("type", "origin")):
+                raise RelayAccountsError("Apply the edited relay station before saving its new account")
+            document["accounts"].append(stored)
+        else:
+            saved.update((key, stored[key]) for key in fields)
+        try:
+            self._store.write(document)
+            self._baseline_bytes = self._read_storage_bytes()
+        except PersistenceError as exc:
+            raise RelayAccountsError(safe_exception_message(exc)) from None
+
+    def _save_verified_login(self, account: Mapping[str, Any], fields: tuple[str, ...], *, new_account: bool = False) -> None:
+        account_id = account["id"]
+        if pending := self._pending_login_saves.get(account_id):
+            fields = tuple(dict.fromkeys((*pending[0], *fields)))
+            new_account = new_account or pending[1]
+        try:
+            self._persist_login_fields(account, fields, new_account=new_account)
+        except RelayAccountsError as exc:
+            self._pending_login_saves[account_id] = (fields, new_account)
+            raise RelayLoginSaveError(str(exc)) from None
+        except Exception as exc:
+            self._pending_login_saves[account_id] = (fields, new_account)
+            raise RelayLoginSaveError(safe_exception_message(exc)) from None
+        self._pending_login_saves.pop(account_id, None)
+
     def transaction_checkpoint(self) -> dict[str, Any]:
         """Capture only mutable relay state; the HTTP client stays shared."""
 
@@ -1818,6 +1975,23 @@ class RelayAccountsDomain:
         self._baseline_bytes = baseline_bytes
         self.revision = revision
 
+    def restore_apply_transaction(self, checkpoint: Mapping[str, Any]) -> None:
+        # Apply can renew a session while resolving a linked key. Its rollback
+        # restores settings, but must not put a spent session back on disk.
+        prior = {account["id"]: account for account in checkpoint["accounts"]}
+        renewed = {
+            account["id"]: account for account in self._accounts
+            if (old := prior.get(account["id"])) is not None
+            and all(old[key] == account[key] for key in ("origin", "type"))
+            and account["session"] and any(old[key] != account[key] for key in ("session", "auto_login_unconfirmed"))
+        }
+        self.restore_transaction(checkpoint)
+        for account_id, session_owner in renewed.items():
+            account = self._accounts[self._index(account_id)]
+            account.update((key, copy.deepcopy(session_owner[key])) for key in _VERIFIED_LOGIN_FIELDS)
+            self._session_secrets[account_id] = copy.deepcopy(account["session"])
+            self._save_verified_login(account, _VERIFIED_LOGIN_FIELDS)
+
     def _index(self, value: object) -> int:
         account_id = _account_id(value)
         for index, account in enumerate(self._accounts):
@@ -1870,6 +2044,8 @@ class RelayAccountsDomain:
         next_account["login_status"] = "signed_out"
         next_account["password"] = ""
         next_account["session"] = {}
+        next_account["session_limit_at"] = ""
+        next_account["auto_login_unconfirmed"] = False
         # The account id names a user on the old host: keeping it would send a
         # header that host never issued.
         next_account["user_id"] = ""
@@ -1957,7 +2133,13 @@ class RelayAccountsDomain:
             public = _public_account(account)
             station_id = str(account.get("station_id", ""))
             account_id = str(account.get("id", ""))
+            if account_id in self._pending_login_saves:
+                public.update(login_status="unknown", login_observed_seconds_ago=None)
             failure = self._login_failures.get(account_id)
+            if not failure and account["session_limit_at"] and self._login_refusal_remaining(account_id):
+                failure = "session_limit"
+            if not failure and account["auto_login_unconfirmed"] and account["login_status"] == "expired":
+                failure = "session_unconfirmed"
             if failure and _has_saved_password(account) and account["login_status"] != "signed_in":
                 public["login_failure"] = failure
             account_operations = [
@@ -2250,6 +2432,7 @@ class RelayAccountsDomain:
         # credential. Reusing an account id from another file must never reuse
         # the previous file's browser session or API-key cache.
         self._session_secrets = {}
+        self._pending_login_saves.clear()
         self._balance_observations.clear()
         self._resource_secret_cache = {}
         return migrated
@@ -2497,6 +2680,9 @@ class RelayAccountsDomain:
         return operation
 
     def _pending_for_resource(self, account_id: str, resource_id: str) -> list[dict[str, Any]]:
+        sending = self._sending_operation
+        if sending is not None and (sending.get("account_id"), sending.get("resource_id")) == (account_id, resource_id):
+            raise RelayAccountsError("This relay API key already has an operation in progress")
         return [
             operation
             for operation in self._pending_operations
@@ -3054,8 +3240,6 @@ class RelayAccountsDomain:
                 current["remember_password"] = data["remember_password"] is True
                 if not current["remember_password"]:
                     current["password"] = ""
-                    current["session"] = {}
-                    self._session_secrets.pop(current["id"], None)
             self._accounts[index] = _private_account(current)
             self._draft_staged = True
             details = {"kind": "account_update", "account_id": current["id"]}
@@ -3468,6 +3652,8 @@ class RelayAccountsDomain:
         creates = [operation for operation in candidates if operation.get("kind") == "api_key_create"]
         others = [operation for operation in candidates if operation.get("kind") != "api_key_create"]
         for operation in [*creates, *others]:
+            if not self._operation_is_current(operation, state="staged"):
+                continue
             account_result = self._operation_account(operation)
             account_id = str(operation.get("account_id", ""))
             resource_id = str(operation.get("resource_id", ""))
@@ -3476,6 +3662,7 @@ class RelayAccountsDomain:
                 self._mark_operation_uncertain(operation)
                 continue
             _, account = account_result
+            self._sending_operation = operation
             try:
                 if operation.get("kind") == "api_key_create":
                     # A previously reconciled create has a stable resource
@@ -3491,12 +3678,15 @@ class RelayAccountsDomain:
                     self._execute_existing_operation(account, operation)
             except Exception:
                 issues.append(self._apply_issue("remote_operation_failed", account_id=account_id, resource_id=resource_id))
-                self._mark_operation_uncertain(operation)
+                if self._operation_is_current(operation):
+                    self._mark_operation_uncertain(operation)
                 continue
+            finally:
+                self._sending_operation = None
             completed += 1
         if phase == "non_destructive":
             for operation in creates:
-                if operation.get("state") != "remote_applied":
+                if not self._operation_is_current(operation, state="remote_applied"):
                     continue
                 account_result = self._operation_account(operation)
                 account_id = str(operation.get("account_id", ""))
@@ -3507,6 +3697,8 @@ class RelayAccountsDomain:
                 _, account = account_result
                 try:
                     self._refresh_resources_for_apply(account_id)
+                    if not self._operation_is_current(operation, state="remote_applied"):
+                        continue
                     account_result = self._operation_account(operation)
                     if account_result is None or not self._reconcile_created_resource(account_result[1], operation):
                         self._update_pending_operation(
@@ -3517,22 +3709,29 @@ class RelayAccountsDomain:
                         issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
                         continue
                     account = account_result[1]
-                    if self._apply_create_metadata(account, operation):
-                        # The metadata write just changed this key (its name, group,
-                        # or enabled flag), so the key list read before it no longer
-                        # describes the account: a later pass must read again.
-                        self._mark_account_written(account_id)
+                    self._sending_operation = operation
+                    try:
+                        if self._apply_create_metadata(account, operation):
+                            self._mark_account_written(account_id)
+                    finally:
+                        self._sending_operation = None
                     self._update_pending_operation(operation, state="remote_applied", error="")
                     self._persist_journal()
                 except Exception:
                     issues.append(self._apply_issue("remote_operation_failed", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
-                    self._mark_operation_uncertain(operation)
+                    if self._operation_is_current(operation):
+                        self._mark_operation_uncertain(operation)
         return {
             "status": "partial" if issues else "applied",
             "completed_operations": completed,
             "pending_operations": len(self._pending_operations),
             "issues": issues,
         }
+
+    def _operation_is_current(self, operation: Mapping[str, Any], *, state: str | None = None) -> bool:
+        return (state is None or operation.get("state") == state) and any(
+            entry is operation for entry in self._pending_operations
+        )
 
     def _reconcile_created_resource(self, account: Mapping[str, Any], operation: dict[str, Any]) -> bool:
         resources = account.get("resources", [])
@@ -3917,6 +4116,8 @@ class RelayAccountsDomain:
                 expires_at = str(int((time.time() + 3600) * 1000))
             return json.dumps(
                 {
+                    "origin": account["origin"],
+                    "type": account["type"],
                     "username": str(account.get("username") or ""),
                     "user_id": user_id,
                     "expires_at": expires_at,
@@ -4008,17 +4209,9 @@ class RelayAccountsDomain:
         # why a station that had just been signed in could not be found on disk
         # at all).
         #
-        # The user's own relay CRUD — adding, editing, or removing a station,
-        # account, or key in the panes — is the draft that waits for Apply, and
-        # it still goes through ``_new_pending_operation`` / ``_draft_staged``.
-        # This method is never how such an edit is created.
-        #
-        # ``_persist`` keeps its own gate: with no staged draft the sign-in is
-        # written, and while the panes hold an unrelated draft the write is
-        # deferred exactly as it is for every other non-CRUD transition, so a
-        # draft never reaches disk on a login's account.
+        # Accept the credentials and save the new account together. Writing
+        # this empty shell first would leave it behind after a failed sign-in.
         self._last_action = {"kind": "account_add", "account_id": checked_id, "station_id": station["id"]}
-        self._persist()
         self.revision += 1
         return _public_account(account)
 
@@ -4069,6 +4262,8 @@ class RelayAccountsDomain:
         remember_session: bool | None = None,
         auto_grouping: bool | None = None,
         preserve_resources: bool = False,
+        new_account: bool = False,
+        auto_login_unconfirmed: bool = False,
     ) -> dict[str, Any]:
         """Trusted native/browser boundary for one completed login.
 
@@ -4135,6 +4330,7 @@ class RelayAccountsDomain:
             {
                 "username": username_value,
                 "login_status": "signed_in",
+                "auto_login_unconfirmed": auto_login_unconfirmed,
                 # The login itself was just proven, which is the fact the pane's
                 # re-check window measures.
                 "login_observed_at": observed_at,
@@ -4168,12 +4364,15 @@ class RelayAccountsDomain:
         # out is answered: the wait only ever meant "this app is not asking
         # again yet", and there is nothing left to ask.
         self.clear_login_refusal(account_id)
-        # The sign-in and the session it proved persist here.  ``_persist``
-        # applies its own gate, so a login that lands while the panes hold an
-        # unrelated draft defers its write with every other non-CRUD transition
-        # instead of forcing that draft onto disk.
-        self._persist()
         self.revision += 1
+        fields = _VERIFIED_LOGIN_FIELDS
+        if remember_password is not None or password and account["remember_password"]:
+            fields += ("remember_password", "password")
+        if remember_session is not None:
+            fields += ("remember_session",)
+        if auto_grouping is not None:
+            fields += ("auto_grouping",)
+        self._save_verified_login(self._accounts[index], fields, new_account=new_account)
         return _public_account(self._accounts[index])
 
     def store_rotated_refresh_token(self, account_id: str, refresh_token: str) -> None:
@@ -4253,9 +4452,10 @@ class RelayAccountsDomain:
 
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
-        session = account.get("session", {})
-        if not account.get("remember_session") or not isinstance(session, Mapping):
-            return None
+        if account_id in self._pending_login_saves:
+            self._save_verified_login(account, ())
+            return _public_account(account)
+        session = self._session_secrets.get(account_id) or account["session"]
         secrets = {
             key: value
             for key in ("cookie", "access_token", "refresh_token")
@@ -4272,21 +4472,16 @@ class RelayAccountsDomain:
         path = self._session_profile_path(account["type"])
         try:
             profile = self._read_session_profile(account["origin"], path, headers)
-        except RelayAccountsError as exc:
-            if "expired" not in str(exc).lower():
-                raise
-            # The station rejected this session even if the next sign-in is
-            # inconclusive. Keep an existing negative observation as-is.
+        except RelaySessionRejectedError:
+            if renewed := self._refresh_rejected_session(account, secrets, headers):
+                return renewed
             if account["login_status"] not in {"signed_out", "expired"} or not account["login_observed_at"]:
                 self.set_login_status(account_id, "expired")
             return None
         self._session_secrets[account_id] = secrets
-        self.clear_login_refusal(account_id)
         account["login_status"] = "signed_in"
         account["login_observed_at"] = _utc_now_iso()
         account["last_updated_at"] = account["login_observed_at"]
-        account["resource_status"] = "idle"
-        account["resource_error"] = "none"
         # The profile this probe just read *is* the balance read.  Settling both
         # in one write is what lets the pane state 已登录 and the money beside it
         # at the same moment; the refresh that follows is then a key list rather
@@ -4300,53 +4495,50 @@ class RelayAccountsDomain:
         else:
             self._record_balance(account, (balance, account["login_observed_at"]))
         self._accounts[index] = _private_account(account)
-        self._persist()
+        self._confirm_session(account_id)
+        self._persist_login_fields(self._accounts[index], _LOGIN_CHECK_FIELDS)
         self.revision += 1
         return _public_account(self._accounts[index])
 
-    def restore_saved_password(self, account_id: str, *, force: bool = False) -> dict[str, Any]:
-        """Attempt a non-UI login from an explicitly remembered password.
+    def _refresh_rejected_session(
+        self, account: Mapping[str, Any], session: Mapping[str, str], headers: Mapping[str, str],
+    ) -> dict[str, Any] | None:
+        try:
+            if account["type"] == "newapi":
+                refresh = getattr(self._http, "refresh_newapi_session", None)
+                renewed = refresh(account["origin"], headers=headers, session=session) if callable(refresh) else None
+            else:
+                refresh = getattr(self._http, "refresh_sub2api_session", None)
+                renewed = refresh(account["origin"], session=session) if callable(refresh) else None
+        except RelaySessionRejectedError:
+            return None
+        if renewed is None:
+            return None
+        return self.accept_login_result(
+            account["id"], username=account["username"], **renewed, preserve_resources=True,
+            auto_login_unconfirmed=account["auto_login_unconfirmed"],
+        )
 
-        This is the one place in Core that asks a station to mint a session, so
-        it is also the one place the post-refusal wait has to be enforced: every
-        caller — the pane's restore, a renewal that already probed its cookie,
-        and an Apply's own read — passes through here, and a throttle anywhere
-        else would leave a path that still asks once per entry.  Asking again is
-        exactly what an account at the site's session cap must not do.
+    def restore_saved_password(self, account_id: str) -> dict[str, Any]:
+        """Recover through Core's current session before considering a password POST."""
 
-        The stored session is therefore *asked* first, for the same reason
-        :meth:`_renew_remembered_session` asks before it renews: a sign-in is the
-        one-way step, and a cookie that still works makes it unnecessary.  Every
-        automatic caller reaches a sign-in only after its own session probe
-        failed, but the pane's explicit 去登录 does not, and neither does a
-        restart whose stored session is still valid -- both used to ask the
-        station to mint another session while a perfectly usable one sat on
-        disk, which is how an account reaches the site's concurrent-session cap
-        without the user touching anything.  ``force`` states that the probe was
-        already answered by the caller (its credential changed, or the station
-        refused it) so it is not repeated here.
-        """
-
-        index = self._index(account_id)
-        account = copy.deepcopy(self._accounts[index])
-        if not _has_saved_password(account):
-            # Nothing to sign in with.  No request is sent: a form filled with an
-            # empty password can only be answered as a rejected credential, and
-            # the app would then hold that station-side rejection for an account
-            # whose real state is simply "nothing remembered" -- at the cost of
-            # one more login attempt on an account that was never going to sign
-            # in.  Nothing is *recorded* either: an account holding no
-            # credential is not the station saying 未登录, and stamping it as one
-            # let a machine that had never signed in state (and, once a login
-            # state travels, share) an answer nobody had asked for.  The row
-            # keeps the placeholder it already carries.
-            return _public_account(account)
-        if not force and self._has_session_credentials(account):
-            # A credential the station still accepts needs no replacement, and
-            # probing it mints nothing.
-            restored = self.restore_saved_session(account_id)
-            if restored is not None:
+        # The usage reader calls from outside its own lane. It must use the
+        # same writer as a pane or maintenance before checking and renewing.
+        with self._session_write_gate():
+            if restored := self.restore_saved_session(account_id):
                 return restored
+            return self._submit_saved_password(account_id)
+
+    def _submit_saved_password(self, account_id: str) -> dict[str, Any]:
+        # Core holds the relay writer from rejection (or confirmed absence)
+        # through this POST and the session write.
+        account = self._accounts[self._index(account_id)]
+        if not self._can_recover_without_session(account):
+            return _public_account(account)
+        if account["auto_login_unconfirmed"]:
+            # A successful password POST followed by a rejected session is
+            # still the same recovery. Only a proven session can end it.
+            raise RelayLoginRefusedError("Relay has not accepted the session from the previous automatic sign-in")
         remaining = self._login_refusal_remaining(account_id)
         if remaining > 0:
             raise RelayLoginBackoffError(remaining)
@@ -4374,74 +4566,26 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay returned an invalid login result")
         return self.accept_login_result(
             account_id,
-            username=str(result.get("username", "")),
+            username=str(result.get("username") or account["username"]),
             cookie=str(result.get("cookie", "")),
             access_token=str(result.get("access_token", "")),
             refresh_token=str(result.get("refresh_token", "")),
             user_id=result.get("user_id", ""),
             preserve_resources=True,
+            auto_login_unconfirmed=True,
         )
 
-    def login_prefill(self, account_id: str) -> dict[str, Any]:
-        """What a station's sign-in form may be filled with, and whether it may
-        be posted.
+    def login_prefill(self, account_id: str, *, account_type: object, origin: object) -> dict[str, Any]:
+        """Fill the saved site's own form for manual submission."""
 
-        Both native hosts fill the station's own form from this app's copy of
-        the account, and the page host's browser login does the same: the
-        username always, the remembered password when the account chose to keep
-        one.  The secret never crosses to the page — Core types it into the
-        browser it opened, through the same DevTools channel it reads the
-        session with.
-
-        Posting that form is a different question, and gets a different answer.
-        A sign-in is one more session against the account's cap, so the form is
-        submitted only for an account the station *answered* about inside the
-        re-check window and left without a usable session: ``signed_out`` (which
-        this domain records only while nothing usable is held) or ``expired``
-        (the station rejecting its own session).  Everything else answers False
-        and leaves the button to the person: a station that was never reached, a
-        row no check has covered, and an account the station is holding at its
-        concurrent-session cap (the one wait that is about sessions rather than
-        about the password, so a form post would ask the same refused question).
-
-        A refused password is deliberately *not* a reason to withhold the post.
-        That refusal is this app's own HTTP form; the station's page may need a
-        captcha, a challenge, or a field Core's client does not send, and the
-        person opening the window is asking for that one attempt.  It is one
-        attempt per window, not per check -- the loop in
-        :func:`relay_browser.start_prefill` posts at most once.
-        """
-
-        index = self._index(account_id)
-        account = self._accounts[index]
-        username = account.get("username", "")
-        password = account.get("password", "")
-        if not isinstance(username, str):
-            username = ""
-        if account.get("remember_password") is not True or not isinstance(password, str):
-            password = ""
+        account = self._accounts[self._index(account_id)]
+        if account["origin"] != _origin(origin) or account["type"] != account_type:
+            raise RelayAccountsError("Relay account does not match the saved site")
         return {
-            "username": username,
-            "password": password,
-            "submit": bool(password) and self._saved_password_may_be_replayed(account_id, account),
-            # Whether the account already keeps its password: the sign-in
-            # surface asks the post-login question exactly when it does not.
-            "remember_password": account.get("remember_password") is True,
+            "username": account["username"],
+            "password": account["password"],
+            "remember_password": account["remember_password"],
         }
-
-    def _saved_password_may_be_replayed(self, account_id: str, account: Mapping[str, Any]) -> bool:
-        """Whether the station's own last answer authorizes a sign-in now."""
-
-        # A cap is the station saying it will not mint *any* session for this
-        # account right now.  The password was never the question; a form post
-        # would ask the same refused question once more.
-        if self._login_failures.get(str(account_id)) == "session_limit" and self._login_refusal_remaining(account_id):
-            return False
-        if account.get("login_status") not in {"signed_out", "expired"}:
-            return False
-        window = self._session_recheck_seconds()
-        observed = _observed_seconds_ago(account.get("login_observed_at"))
-        return observed is not None and window > 0 and observed < window
 
     def capture_password(self, account_id: str, value: object) -> None:
         """Hold a password a person typed into the station's own form.
@@ -4493,7 +4637,7 @@ class RelayAccountsDomain:
             account["password"] = ""
         account["last_updated_at"] = _utc_now_iso()
         self._accounts[index] = _private_account(account)
-        self._persist()
+        self._save_verified_login(self._accounts[index], ("remember_password", "password", "last_updated_at"))
         self.revision += 1
         return _public_account(self._accounts[index])
 
@@ -4504,6 +4648,7 @@ class RelayAccountsDomain:
         username: str,
         password: str,
         remember_password: bool | None = None,
+        new_account: bool = False,
     ) -> dict[str, Any]:
         """Mint one session from a password a person typed into a host.
 
@@ -4529,6 +4674,9 @@ class RelayAccountsDomain:
         login = getattr(self._http, "password_login", None)
         username_value = _text(username, "Relay username", limit=320)
         password_value = _text(password, "Relay password", limit=4096)
+        if account_id in self._pending_login_saves and _username_key(username_value) == _username_key(account["username"]):
+            self._save_verified_login(account, ())
+            return _public_account(account)
         if not callable(login):
             raise RelayAccountsError("Relay login result is incomplete")
         # The station, not this app, says whether the account is accepted: a
@@ -4547,6 +4695,7 @@ class RelayAccountsDomain:
             password=password_value,
             user_id=result.get("user_id", ""),
             remember_password=remember_password,
+            new_account=new_account,
         )
 
     def verify_browser_session(
@@ -4556,6 +4705,7 @@ class RelayAccountsDomain:
         account_type: object,
         cookie: object,
         access_token: object = "",
+        refresh_token: object = "",
         user_id: object = "",
     ) -> dict[str, str]:
         """Ask the station whether the cookie a real browser holds is a login.
@@ -4587,18 +4737,12 @@ class RelayAccountsDomain:
         cookie_value = _text(cookie, "Relay cookie", limit=32768, required=False)
         token_value = _text(access_token, "Relay access token", limit=32768, required=False)
         station_user_id = _station_user_id(user_id)
-        path = "/api/user/self" if type_value == "newapi" else "/api/v1/auth/me"
-        headers: dict[str, str] = {}
-        if cookie_value:
-            headers["Cookie"] = cookie_value
-        if token_value:
-            headers["Authorization"] = f"Bearer {token_value}"
-        if station_user_id and type_value == "newapi":
-            headers["New-Api-User"] = station_user_id
-        payload = self._http.json(origin_value, path, headers=headers)
-        profile = _json_data(payload)
-        if not isinstance(profile, Mapping):
-            raise RelayAccountsError("Relay returned an invalid response")
+        headers = self._session_headers(
+            {"cookie": cookie_value, "access_token": token_value}, user_id=station_user_id, station_type=type_value,
+        )
+        if not headers:
+            raise RelayAccountsError("Relay login result is incomplete")
+        profile = self._read_session_profile(origin_value, self._session_profile_path(type_value), headers)
         user = profile.get("user") if isinstance(profile.get("user"), Mapping) else profile
         username = next(
             (
@@ -4619,6 +4763,7 @@ class RelayAccountsDomain:
             "user_id": station_user_id,
             "access_token": token_value,
             "cookie": cookie_value,
+            "refresh_token": _text(refresh_token, "Relay refresh token", limit=32768, required=False),
         }
 
     def set_login_status(self, account_id: str, status: str) -> dict[str, Any]:
@@ -4725,6 +4870,8 @@ class RelayAccountsDomain:
             return None
         index = self._index(account_id)
         account = self._accounts[index]
+        if account_id in self._pending_login_saves:
+            return None
         status = account.get("login_status")
         if status not in {"signed_in", "signed_out"}:
             return None
@@ -4827,9 +4974,14 @@ class RelayAccountsDomain:
     def _read_session_profile(self, origin: str, path: str, headers: Mapping[str, str]) -> Mapping[str, Any]:
         payload = self._http.json(origin, path, headers=headers)
         profile = _json_data(payload)
-        if not isinstance(profile, Mapping) or not profile or (
-            isinstance(payload, Mapping)
-            and (payload.get("success") is False or type(payload.get("code")) is int and payload["code"] != 0)
+        if not _session_payload_succeeded(payload) or not isinstance(profile, Mapping):
+            raise RelayAccountsError("Relay returned an invalid session profile")
+        user = profile.get("user")
+        identity = user if isinstance(user, Mapping) else profile
+        if not (
+            _station_user_id(identity.get("id"))
+            or any(isinstance(identity.get(key), str) and identity[key].strip() for key in ("username", "email", "display_name"))
+            or any(_balance(profile.get(key)) is not None for key in ("quota", "balance"))
         ):
             raise RelayAccountsError("Relay returned an invalid session profile")
         return profile
@@ -4843,6 +4995,12 @@ class RelayAccountsDomain:
         account = next((row for row in self._accounts if row["id"] == account_id), None)
         if account is None:
             return TaskResult("skipped"), False
+        if account_id in self._pending_login_saves:
+            try:
+                self._save_verified_login(account, ())
+            except RelayLoginSaveError as error:
+                return TaskResult("failed", task_exception_detail(error, phase="save_session")), False
+            return TaskResult("succeeded"), True
         has_session = self._has_session_credentials(account)
         if not has_session and not self._can_recover_without_session(account):
             return TaskResult("skipped"), False
@@ -4857,10 +5015,10 @@ class RelayAccountsDomain:
             try:
                 with io_gate():
                     self._read_session_profile(origin, self._session_profile_path(kind), headers)
-            except RelayAccountsError as error:
-                if "expired" not in str(error).lower():
-                    return TaskResult("failed", task_exception_detail(error, phase="check_session")), False
+            except RelaySessionRejectedError:
                 status = "expired"
+            except RelayAccountsError as error:
+                return TaskResult("failed", task_exception_detail(error, phase="check_session")), False
             else:
                 status = "signed_in"
 
@@ -4878,14 +5036,22 @@ class RelayAccountsDomain:
         saved = next((row for row in document.get("accounts", ()) if row["id"] == account_id), None)
         if saved is None or any(saved.get(key) != current[key] for key in ("origin", "type", "username")):
             return TaskResult("skipped"), False
-        outcome = TaskResult("succeeded")
-        if status != "signed_in" and _has_saved_password(current) and not self._has_staged_changes():
+        if has_session and status == "expired":
             try:
-                # We already checked the session. Hold the account lane during
-                # the POST so a pane or resource read cannot sign in alongside it.
-                self.restore_saved_password(account_id, force=True)
+                if self._refresh_rejected_session(current, self._session_secrets.get(account_id) or current["session"], headers):
+                    return TaskResult("succeeded"), True
+            except RelayAccountsError as error:
+                return TaskResult("failed", task_exception_detail(error, phase="refresh_session")), False
+        outcome = TaskResult("succeeded")
+        if status != "signed_in" and _has_saved_password(current):
+            if status == "expired" and current["login_status"] not in {"signed_out", "expired"}:
+                current.update(login_status="expired", login_observed_at=_utc_now_iso())
+            try:
+                self._submit_saved_password(account_id)
             except RelayLoginBackoffError:
                 outcome = TaskResult("skipped")
+            except RelayLoginSaveError as error:
+                return TaskResult("failed", task_exception_detail(error, phase="save_session")), True
             except RelayPasswordRejectedError as error:
                 return TaskResult("failed", task_exception_detail(error, phase="restore_login")), True
             except RelayAccountsError as error:
@@ -4897,16 +5063,12 @@ class RelayAccountsDomain:
                 return outcome, True
             return TaskResult("skipped"), False
         observed_at = _utc_now_iso()
-        saved.update(login_status=status, login_observed_at=observed_at)
-        if status == "expired":
-            saved["balance_observed_at"] = ""
-        self._store.write(document)
-        self._baseline_bytes = self._read_storage_bytes()
         current.update(login_status=status, login_observed_at=observed_at)
         if status == "expired":
             self._invalidate_balance_observation(current)
         else:
-            self.clear_login_refusal(account_id)
+            self._confirm_session(account_id)
+        self._persist_login_fields(current, (*_LOGIN_CHECK_FIELDS, "balance_observed_at"))
         self.revision += 1
         return outcome, True
 
@@ -4997,7 +5159,7 @@ class RelayAccountsDomain:
         # not cross the ordinary Core snapshot boundary.
         return "configured" if isinstance(value, str) and value.strip() else ""
 
-    def _newapi_key_values(self, account: Mapping[str, Any], token_ids: Sequence[object]) -> dict[int, str]:
+    def _newapi_key_values(self, account: Mapping[str, Any], token_ids: Sequence[object], headers: Mapping[str, str]) -> dict[int, str]:
         """Read the key values one New API key list leaves empty.
 
         New API's token list reports each key identity with its own redaction
@@ -5005,21 +5167,18 @@ class RelayAccountsDomain:
         key this Core has never read comes from the key's own endpoint — the
         one read whose result the cache above later answers every caller from.
 
-        Only the keys that are still unknown are asked for, and they are asked
-        for together: a station with ten unread keys costs one wait rather than
-        ten, and a key whose value is already in hand costs nothing at all.
+        Read the selected keys together and leave the results with this round.
         """
 
-        missing = [
-            token_id
-            for token_id in token_ids
-            if type(token_id) is int
-            and not self._resource_secret_cache.get(
-                self._resource_cache_key(account["id"], f"newapi-{token_id}")
-            )
-        ]
+        # Use the same account snapshot as the token listing. Carry each
+        # already-read value into the returned rows, since the commit rebuilds
+        # the cache from those rows.
+        known = account.get("resource_keys", {})
+        values = {token_id: known[f"newapi-{token_id}"] for token_id in token_ids
+                  if type(token_id) is int and known.get(f"newapi-{token_id}")}
+        missing = {token_id for token_id in token_ids if type(token_id) is int} - values.keys()
         if not missing:
-            return {}
+            return values
 
         def read(token_id: int) -> tuple[int, str]:
             try:
@@ -5027,7 +5186,7 @@ class RelayAccountsDomain:
                     self._http.post(
                         account["origin"],
                         f"/api/token/{token_id}/key",
-                        headers=self._headers(account),
+                        headers=headers,
                     )
                 )
             except Exception:
@@ -5040,14 +5199,13 @@ class RelayAccountsDomain:
             value = key.strip()
             return token_id, value if value.startswith("sk-") else f"sk-{value}"
 
-        values: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=min(RESOURCE_REFRESH_MAX_WORKERS, len(missing))) as executor:
             for token_id, value in executor.map(read, missing):
                 if value:
                     values[token_id] = value
         return values
 
-    def _newapi_group_models(self, account: Mapping[str, Any], group_id: str) -> list[str] | None:
+    def _newapi_group_models(self, account: Mapping[str, Any], group_id: str, headers: Mapping[str, str]) -> list[str] | None:
         """Return the models one New API group actually serves.
 
         The bare ``/api/user/models`` answer is a *union* over every group the
@@ -5079,7 +5237,7 @@ class RelayAccountsDomain:
             payload = self._http.json(
                 account["origin"],
                 f"/api/user/models?group={urllib.parse.quote(group_id, safe='')}",
-                headers=self._headers(account),
+                headers=headers,
             )
         except Exception:
             # An older or slimmer fork that rejects the parameter keeps the
@@ -5094,6 +5252,7 @@ class RelayAccountsDomain:
     def _newapi_resources(
         self,
         account: Mapping[str, Any],
+        headers: Mapping[str, str] | None = None,
         *,
         keys_only: bool = False,
         only_resources: frozenset[str] | None = None,
@@ -5107,7 +5266,8 @@ class RelayAccountsDomain:
         whether it exists.
         """
 
-        headers = self._headers(account)
+        headers = dict(headers or self._headers(account))
+        values: dict[int, str] = {}
         if keys_only:
             tokens = _json_data(
                 self._http.json(
@@ -5176,20 +5336,14 @@ class RelayAccountsDomain:
                     self._newapi_key_values,
                     account,
                     value_ids,
+                    headers,
                 )
                 for group_id, group_models in zip(
                     list(groups),
-                    executor.map(lambda value: self._newapi_group_models(account, value), list(groups)),
+                    executor.map(lambda value: self._newapi_group_models(account, value, headers), list(groups)),
                 ):
                     groups[group_id] = group_models
                 values = values_future.result()
-            if values:
-                # The value a key list leaves empty is the same credential the
-                # station's own key endpoint serves, so a later listing, sync,
-                # or Apply resolves it from here instead of paying for the read
-                # again.
-                for token_id, value in values.items():
-                    self._remember_resource_key(account, f"newapi-{token_id}", value)
         # What each key reported last time, so a group read that learned nothing
         # keeps that key's own catalog instead of widening it to the union.
         previous_models: dict[str, list[str]] = {}
@@ -5219,16 +5373,14 @@ class RelayAccountsDomain:
             # (``/v1/models``) answered none.
             group_list = groups.get(group_id) if group_id else None
             stored_list = previous_models.get(resource_id)
+            catalog_fresh = False
             for candidate in (group_list, stored_list, models):
                 if candidate is not None:
                     resource_models = list(candidate)
                     # Only the group read is this key's own fresh answer; the
                     # stored list and the account-wide union are not, and a
                     # resolution seeing one must ask the key itself.
-                    if candidate is group_list:
-                        self._fresh_catalogs.setdefault(str(account.get("id", "")), set()).add(
-                            str(resource_id)
-                        )
+                    catalog_fresh = candidate is group_list
                     break
             else:
                 resource_models = []
@@ -5243,6 +5395,8 @@ class RelayAccountsDomain:
                     "group_id": group_id,
                     "group_name": group_id,
                     "_token_id": token_id,
+                    "_key": values.get(token_id, ""),
+                    "_catalog_fresh": catalog_fresh,
                 }
             )
         return resources
@@ -5250,6 +5404,7 @@ class RelayAccountsDomain:
     def _sub2api_resources(
         self,
         account: Mapping[str, Any],
+        headers: Mapping[str, str] | None = None,
         *,
         for_apply: bool = False,
         keys_only: bool = False,
@@ -5269,7 +5424,7 @@ class RelayAccountsDomain:
         what made a model add wait.
         """
 
-        headers = self._headers(account)
+        headers = dict(headers or self._headers(account))
         if keys_only:
             keys = _json_data(
                 self._http.json(
@@ -5323,8 +5478,7 @@ class RelayAccountsDomain:
             group_id = _group_id(item.get("group_id"))
             group = item.get("group")
             group_name = _resource_name(group.get("name"), group_id) if isinstance(group, Mapping) and group_id else group_id
-            normalized_key = self._remember_resource_key(account, resource_id, key)
-            key_items.append((index, normalized_key, enabled, resource_id, name, group_id, group_name))
+            key_items.append((index, key.strip(), enabled, resource_id, name, group_id, group_name))
 
         gateway_models: dict[int, list[str]] = {}
         # Each group's models come from the channel page above.  A key whose
@@ -5392,6 +5546,7 @@ class RelayAccountsDomain:
             # nothing for reported the deployment's whole catalog — 分组管理
             # listed models that 获取模型 on the same key could not fetch, and a
             # linked route was offered a model its key refuses.
+            catalog_fresh = False
             for candidate in (
                 group_list,
                 gateway_list,
@@ -5403,10 +5558,7 @@ class RelayAccountsDomain:
                     # both answers from this read; a stored list is not, and a
                     # resolution that sees it must ask the key itself rather
                     # than trust a catalog nobody just confirmed.
-                    if candidate is group_list or candidate is gateway_list:
-                        self._fresh_catalogs.setdefault(str(account.get("id", "")), set()).add(
-                            str(resource_id)
-                        )
+                    catalog_fresh = candidate is group_list or candidate is gateway_list
                     break
             else:
                 resource_models = []
@@ -5421,13 +5573,15 @@ class RelayAccountsDomain:
                     "group_id": group_id,
                     "group_name": group_name,
                     "_key": key.strip(),
+                    "_catalog_fresh": catalog_fresh,
                 }
             )
         return resources
 
-    def _newapi_groups(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _newapi_groups(self, account: Mapping[str, Any], headers: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+        headers = dict(headers or self._headers(account))
         payload = _json_data(
-            self._http.json(account["origin"], "/api/user/self/groups", headers=self._headers(account))
+            self._http.json(account["origin"], "/api/user/self/groups", headers=headers)
         )
         if not isinstance(payload, Mapping):
             raise RelayAccountsError("Relay API groups are invalid")
@@ -5440,8 +5594,8 @@ class RelayAccountsDomain:
             for name, value in payload.items()
         ])
 
-    def _sub2api_groups(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
-        headers = self._headers(account)
+    def _sub2api_groups(self, account: Mapping[str, Any], headers: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+        headers = dict(headers or self._headers(account))
         with ThreadPoolExecutor(max_workers=2) as executor:
             groups_future = executor.submit(
                 self._http.json,
@@ -5633,28 +5787,42 @@ class RelayAccountsDomain:
     def _login_refusal_remaining(self, account_id: str) -> float:
         """Seconds left of this account's post-refusal wait, or ``0``."""
 
-        stamped = self._login_refusals.get(str(account_id))
-        if not isinstance(stamped, (int, float)) or isinstance(stamped, bool):
-            return 0.0
+        account = self._accounts[self._index(account_id)]
+        stamped = self._login_refusals.get(account_id)
+        if stamped is None:
+            elapsed = _observed_seconds_ago(account["session_limit_at"])
+            if elapsed is None:
+                return 0.0
+            reason = "session_limit"
+        else:
+            elapsed = time.monotonic() - stamped
+            reason = self._login_failures.get(account_id)
         # The wait the refusal itself started is kept beside it: a cap is not a
         # rejected password, and reading the short window for both is what let a
         # capped account be asked once a minute forever.
-        window = self._session_limit_refusal_seconds() if self._login_failures.get(str(account_id)) == "session_limit" \
-            else self._login_refusal_seconds()
-        remaining = window - (time.monotonic() - float(stamped))
-        return remaining if remaining > 0 else 0.0
+        window = self._session_limit_refusal_seconds() if reason == "session_limit" else 0.0
+        return max(0.0, (window or self._login_refusal_seconds()) - elapsed)
 
     def _note_login_refusal(self, account_id: str, *, reason: str = "rejected") -> None:
         """Start this account's wait, so the next entry does not re-ask."""
 
         self._login_refusals[str(account_id)] = time.monotonic()
         self._login_failures[str(account_id)] = reason
+        if reason == "session_limit":
+            account = self._accounts[self._index(account_id)]
+            account["session_limit_at"] = _utc_now_iso()
+            self._persist_login_fields(account, ("session_limit_at",))
 
     def clear_login_refusal(self, account_id: str) -> None:
         """Forget a refusal because the login itself succeeded."""
 
         self._login_refusals.pop(str(account_id), None)
         self._login_failures.pop(str(account_id), None)
+        self._accounts[self._index(account_id)]["session_limit_at"] = ""
+
+    def _confirm_session(self, account_id: str) -> None:
+        self.clear_login_refusal(account_id)
+        self._accounts[self._index(account_id)]["auto_login_unconfirmed"] = False
 
     def _renew_remembered_session(self, account_id: str) -> bool:
         """Make one station session usable again, probing before signing in.
@@ -5696,7 +5864,7 @@ class RelayAccountsDomain:
             return False
         # The probe above is this credential's answer, so the sign-in does
         # not repeat it.
-        restored = self.restore_saved_password(account_id, force=True)
+        restored = self._submit_saved_password(account_id)
         return restored["login_status"] == "signed_in"
 
     def _with_renewed_session(self, account_id: str, read: Callable[[], Any]) -> Any:
@@ -5713,8 +5881,8 @@ class RelayAccountsDomain:
 
         try:
             return read()
-        except RelayAccountsError as exc:
-            if "expired" not in str(exc).lower() or not self._renew_remembered_session(account_id):
+        except RelaySessionRejectedError:
+            if not self._renew_remembered_session(account_id):
                 raise
         return read()
 
@@ -5761,7 +5929,10 @@ class RelayAccountsDomain:
         # before a pane refresh the user made in between — the reconciliation
         # would then compare a staged change against a key list that predates
         # it and report a write as not applied.
-        self._apply_read_memo.pop(str(self._accounts[self._index(account_id)]["id"]), None)
+        account = self._accounts[self._index(account_id)]
+        if account_id in self._pending_login_saves:
+            self._save_verified_login(account, ())
+        self._apply_read_memo.pop(account_id, None)
         result = self._refresh_resources_once(
             account_id,
             _for_apply=_for_apply,
@@ -5770,7 +5941,7 @@ class RelayAccountsDomain:
             only_resources=only_resources,
             for_grouping=for_grouping,
         )
-        if for_grouping:
+        if for_grouping or result.get("resource_status") == "skipped":
             return result
         account = self._accounts[self._index(account_id)]
         needs_recovery = result.get("resource_error") == "login_expired" or (
@@ -5780,6 +5951,8 @@ class RelayAccountsDomain:
             return _public_account(self._accounts[self._index(account_id)])
         try:
             renewed = self._renew_remembered_session(account_id)
+        except RelayLoginSaveError:
+            raise
         except RelayAccountsError:
             # An inconclusive profile or a refused login leaves the last
             # verified keys and the original resource error in place.
@@ -5818,8 +5991,7 @@ class RelayAccountsDomain:
         part of the question "did my write land?".
         """
 
-        index = self._index(account_id)
-        account = self._accounts[index]
+        account = copy.deepcopy(self._accounts[self._index(account_id)])
         catalog_scope = frozenset(only_resources) if only_resources is not None else None
         previous_resources = copy.deepcopy(account.get("resources", []))
         previous_groups = copy.deepcopy(account.get("groups", []))
@@ -5833,19 +6005,29 @@ class RelayAccountsDomain:
         # creates one key per current group, so discarding the group answer on
         # a no_api_keys read left a checked switch with nothing to align to.
         groups = previous_groups
+        private_resources: list[dict[str, Any]] = []
+        balance: tuple[float, str] | None = None
+        balance_read = False
         # A refresh needs usable credentials, not a fresh browser sign-in: a
         # remembered session still reads the station, and an account without
         # any session fails in the first read below with the same unavailable
         # result instead of refusing here on its login observation.
         try:
-            self._clear_resource_cache(account_id)
-            self._fresh_catalogs.pop(account_id, None)
+            headers = self._headers(account)
+        except RelayAccountsError:
+            headers = {}
+        session = dict(self._session_secrets.get(account_id) or account["session"])
+
+        try:
+            if not headers:
+                raise RelayAccountsError("Relay login is unavailable")
             if keys_only:
-                private_resources = (
-                    self._newapi_resources(account, keys_only=True)
-                    if account["type"] == "newapi"
-                    else self._sub2api_resources(account, keys_only=True)
-                )
+                with self._io_gate():
+                    private_resources = (
+                        self._newapi_resources(account, headers, keys_only=True)
+                        if account["type"] == "newapi"
+                        else self._sub2api_resources(account, headers, keys_only=True)
+                    )
                 resources = _safe_resources(private_resources)
                 for resource in resources:
                     models = carried_models.get(str(resource.get("id", "")))
@@ -5855,44 +6037,34 @@ class RelayAccountsDomain:
                 if not resources:
                     raise RelayAccountsError("Relay has no API keys")
             else:
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    cached = None if force or for_grouping else self._recent_balance(account)
+                cached = None if force or for_grouping else self._recent_balance(account)
+                balance_read = cached is None and not for_grouping
+                with self._io_gate(), ThreadPoolExecutor(max_workers=3) as executor:
                     balance_future = (
-                        executor.submit(lambda: self._read_account_balance(account, self._headers(account)))
-                        if cached is None and not for_grouping else None
+                        executor.submit(self._read_account_balance, account, headers) if balance_read else None
                     )
                     groups_future = executor.submit(
                         self._newapi_groups if account["type"] == "newapi" else self._sub2api_groups,
                         account,
+                        headers,
                     )
                     resources_future = executor.submit(
-                        lambda: self._newapi_resources(account, only_resources=catalog_scope)
+                        lambda: self._newapi_resources(account, headers, only_resources=catalog_scope)
                         if account["type"] == "newapi"
                         else self._sub2api_resources(
-                            account, for_apply=_for_apply, only_resources=catalog_scope
+                            account, headers, for_apply=_for_apply, only_resources=catalog_scope
                         )
                     )
                     try:
                         if balance_future is not None:
-                            self._record_balance(account, balance_future.result())
+                            balance = balance_future.result()
                     except Exception:
                         # Balance is an independent account summary. A station
                         # that omits its profile endpoint must not hide usable
                         # API keys, and a documentary read the station drops
                         # leaves the last known balance in place instead of
                         # blanking it for every other round trip.
-                        self._invalidate_balance_observation(account)
-                    else:
-                        # An authenticated dashboard read that *answered* is this
-                        # account's login observation: the station accepted the
-                        # session Core holds, which is what 已登录 states.  A read
-                        # that failed is not, and is left to the key read below
-                        # to classify.  Stamping it here is what lets one read
-                        # settle both questions, so the entry stops paying a
-                        # probe first and a balance afterwards.
-                        if not for_grouping:
-                            account["login_status"] = "signed_in"
-                            account["login_observed_at"] = account["balance_observed_at"]
+                        pass
                     try:
                         groups = groups_future.result()
                     except RelayAccountsError:
@@ -5905,8 +6077,6 @@ class RelayAccountsDomain:
                         # this optional dashboard endpoint.
                         groups = previous_groups
                     private_resources = resources_future.result()
-                if for_grouping and self.external_disk_state()["changed"]:
-                    return {"resource_status": "skipped"}
                 resources = _safe_resources(private_resources)
                 if not resources:
                     raise RelayAccountsError("Relay has no API keys")
@@ -5914,10 +6084,44 @@ class RelayAccountsDomain:
                 if enabled_resources and not any(resource["models"] for resource in enabled_resources):
                     raise RelayAccountsError("Relay API keys have no available models")
         except RelayAccountsError as exc:
-            if for_grouping and self.external_disk_state()["changed"]:
-                return {"resource_status": "skipped"}
-            message = str(exc).lower()
-            if "expired" in message:
+            failure = exc
+        else:
+            failure = None
+
+        index = next((i for i, row in enumerate(self._accounts) if row["id"] == account_id), None)
+        if index is None or (for_grouping and self.external_disk_state()["changed"]):
+            return {"resource_status": "skipped"}
+        current = self._accounts[index]
+        # A concurrent profile check may update observations for the same
+        # session. An account edit, key edit, or credential rotation invalidates
+        # the in-flight read instead, including any rejection it returned.
+        observed_fields = {*_LOGIN_CHECK_FIELDS, "balance", "balance_observed_at", "last_updated_at"}
+        if (
+            any(current.get(key) != value for key, value in account.items() if key not in observed_fields)
+            or (self._session_secrets.get(account_id) or current["session"]) != session
+        ):
+            return {"resource_status": "skipped"}
+        login_confirmed = current["login_status"] == "signed_in" and (
+            current["login_status"], current["login_observed_at"]
+        ) != (account["login_status"], account["login_observed_at"])
+        balance_updated = (current["balance"], current["balance_observed_at"]) != (account["balance"], account["balance_observed_at"])
+        account = copy.deepcopy(current)
+        if balance_read and balance is None and not balance_updated:
+            self._invalidate_balance_observation(account)
+        elif balance is not None and not balance_updated:
+            self._record_balance(account, balance)
+            account.update(login_status="signed_in", login_observed_at=account["balance_observed_at"])
+        self._clear_resource_cache(account_id)
+        self._fresh_catalogs[account_id] = {row["id"] for row in private_resources if row.get("_catalog_fresh")}
+        account.setdefault("resource_keys", {})
+        for row in private_resources:
+            if value := row.get("_key"):
+                account["resource_keys"][row["id"]] = value
+                self._resource_secret_cache[self._resource_cache_key(account_id, row["id"])] = value
+
+        if failure is not None:
+            message = str(failure).lower()
+            if isinstance(failure, RelaySessionRejectedError):
                 # The station answered and refused this session -- but the
                 # credential itself is kept.  Retiring it here was the defect
                 # that made every later entry mint a brand-new station session:
@@ -5927,13 +6131,10 @@ class RelayAccountsDomain:
                 # the very thing that runs out.  Keeping the credential lets the
                 # next read (and :meth:`_renew_remembered_session`) ask whether
                 # it still works, which is the only question that can retire it.
-                account["login_status"] = "expired"
-                # The station answered, and the answer was "this session is
-                # not valid": that is a login observation, so it is stamped
-                # like every other determined one.  A read that failed for
-                # another reason never reaches here and stamps nothing.
-                account["login_observed_at"] = _utc_now_iso()
-                self._invalidate_balance_observation(account)
+                if not login_confirmed and balance is None:
+                    account["login_status"] = "expired"
+                    account["login_observed_at"] = _utc_now_iso()
+                    self._invalidate_balance_observation(account)
                 resource_error = "login_expired"
             elif "no api keys" in message:
                 resource_error = "no_api_keys"
@@ -5990,13 +6191,13 @@ class RelayAccountsDomain:
         # account is signed in even when the separate balance/profile read
         # failed.  Marking it only from the balance read left the pane saying
         # 未登录 beside a key list the same session had just read.
-        self.clear_login_refusal(account_id)
         account["login_status"] = "signed_in"
         account["login_observed_at"] = _utc_now_iso()
         account["resource_status"] = "ready"
         account["last_updated_at"] = _utc_now_iso()
         account["resource_error"] = "none"
         self._accounts[index] = _private_account(account)
+        self._confirm_session(account_id)
         # A read reports the station's own state, and a staged edit has not
         # reached the station yet — so an ordinary read must not overwrite the
         # preview of work this Core already holds.  Without this, 自动分组's
@@ -6153,21 +6354,35 @@ class RelayAccountsDomain:
         if not callable(request):
             raise RelayAccountsError("Relay API key management is unavailable")
         try:
-            if body is None:
-                payload = request(account["origin"], path, headers=self._headers(account))
-            else:
-                payload = request(
-                    account["origin"],
-                    path,
-                    headers=self._headers(account),
-                    body=body,
-                )
+            # A restarted or reloaded Apply must reconcile an uncertain write
+            # before sending it again. Persist that fact before the request.
+            operation = self._sending_operation
+            if operation is not None:
+                if not self._operation_is_current(operation):
+                    raise _RelayReadSuperseded()
+                if operation.get("state") != "local_pending":
+                    self._mark_operation_uncertain(operation)
+            payload = self._key_management_io(account, request, path, **({} if body is None else {"body": body}))
+            if operation is not None and not self._operation_is_current(operation):
+                raise _RelayReadSuperseded()
         except RelayAccountsError:
             raise
         except Exception:
             raise RelayAccountsError("Relay API key operation was rejected") from None
         self._api_key_mutation_succeeded(payload)
         return payload
+
+    def _key_management_io(self, account: Mapping[str, Any], request: Callable[..., object], path: str, **kwargs: object) -> object:
+        current = self._accounts[self._index(account["id"])]
+        if current["origin"] != account["origin"] or current["station_id"] != account["station_id"]:
+            raise _RelayReadSuperseded()
+        headers = self._headers(current)
+        with self._io_gate():
+            result = request(account["origin"], path, headers=headers, **kwargs)
+        current = self._accounts[self._index(account["id"])]
+        if current["origin"] != account["origin"] or current["station_id"] != account["station_id"]:
+            raise _RelayReadSuperseded()
+        return result
 
     def _api_key_remote_id(self, account: Mapping[str, Any], resource_id: object) -> str:
         prefix = "newapi-" if account["type"] == "newapi" else "sub2api-"
@@ -6215,7 +6430,7 @@ class RelayAccountsDomain:
     def _newapi_token_for_update(self, account: Mapping[str, Any], remote_id: str) -> dict[str, Any]:
         try:
             payload = _json_data(
-                self._http.json(account["origin"], f"/api/token/{int(remote_id)}", headers=self._headers(account))
+                self._key_management_io(account, self._http.json, f"/api/token/{int(remote_id)}")
             )
         except RelayAccountsError:
             raise
@@ -6979,8 +7194,10 @@ class RelayAccountsDomain:
         try:
             return self._with_renewed_session(
                 account_id,
-                lambda: self._read_key_once(account, resource, fresh=fresh),
+                lambda: self._read_key_once(self._accounts[self._index(account_id)], resource, fresh=fresh),
             )
+        except _RelayReadSuperseded:
+            raise
         except RelayResourceRemoved:
             # The station answered about the key itself, so the value this app
             # still holds is the residue of a credential nobody can revoke.
@@ -7073,8 +7290,25 @@ class RelayAccountsDomain:
         cached = self._resource_secret_cache.get(cache_key)
         if not fresh and isinstance(cached, str) and cached:
             return cached
+        account_id = account["id"]
+        headers = self._headers(account)
+        session = dict(self._session_secrets.get(account_id, {}))
+        original = copy.deepcopy(account)
+
+        def check_current() -> None:
+            if not any(row is account for row in self._accounts) or account != original or self._session_secrets.get(account_id, {}) != session:
+                raise _RelayReadSuperseded()
+
+        def read(request: Callable[[], object]) -> object:
+            try:
+                with self._io_gate():
+                    return request()
+            finally:
+                # A rejection from an old session must not renew a replacement.
+                check_current()
+
         if account["type"] == "sub2api":
-            keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=self._headers(account)))
+            keys = _json_data(read(lambda: self._http.json(original["origin"], "/api/v1/keys?page=1&page_size=100", headers=headers)))
             if isinstance(keys, Mapping):
                 keys = keys.get("items", [])
             if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
@@ -7127,7 +7361,7 @@ class RelayAccountsDomain:
             token_id = int(token_id_text)
         except ValueError:
             raise RelayAccountsError("The selected relay API resource is unavailable")
-        payload = _json_data(self._http.post(account["origin"], f"/api/token/{token_id}/key", headers=self._headers(account)))
+        payload = _json_data(read(lambda: self._http.post(original["origin"], f"/api/token/{token_id}/key", headers=headers)))
         key = payload.get("key") if isinstance(payload, Mapping) else None
         if not isinstance(key, str) or not key.strip():
             raise RelayAccountsError("Relay API key is unavailable")
@@ -7727,6 +7961,9 @@ class RelayAccountsDomain:
                     )
                 )
                 continue
+            except _RelayReadSuperseded:
+                issues.append(self._apply_issue("resource_key_unavailable", account_id=account_id, resource_id=resource_id))
+                continue
             except Exception:
                 # The station could not hand over the key value.  A key this
                 # Core already holds is that value: using it keeps a local
@@ -7801,9 +8038,13 @@ class RelayAccountsDomain:
     ) -> dict[str, Any]:
         """Stage selected resources as linked (default) or independent models."""
 
+        prepared = self.prepare_resource_import(account_id, resource_ids, mode=import_mode if import_mode is not None else mode)
+        return self.stage_resource_import(prepared, providers_domain)
+
+    def prepare_resource_import(self, account_id: str, resource_ids: object, *, mode: object) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
-        selected_mode = str(import_mode if import_mode is not None else mode).strip().lower()
+        selected_mode = str(mode).strip().lower()
         if selected_mode not in {"linked", "independent"}:
             raise RelayAccountsError("Relay import mode is invalid")
         if not isinstance(resource_ids, Sequence) or isinstance(resource_ids, (str, bytes, bytearray)):
@@ -7814,11 +8055,26 @@ class RelayAccountsDomain:
         selected = [self._selected_resource(account, value) for value in requested]
         if any(resource.get("enabled") is False for resource in selected):
             raise RelayAccountsError("Enable the selected relay API resource before importing")
+        return {
+            "account_id": account_id,
+            "mode": selected_mode,
+            "sources": [self._relay_source(account, resource) for resource in selected],
+            "keys": [self._read_key(account, resource) for resource in selected] if selected_mode == "independent" else [],
+        }
+
+    def stage_resource_import(self, prepared: Mapping[str, Any], providers_domain: object) -> dict[str, Any]:
+        account = self._accounts[self._index(prepared["account_id"])]
+        sources = prepared["sources"]
+        selected_mode = prepared["mode"]
+        selected = [self._selected_resource(account, source["resource_id"]) for source in sources]
+        if any(resource.get("enabled") is False for resource in selected) or [
+            self._relay_source(account, resource) for resource in selected
+        ] != sources:
+            raise RelayAccountsError("Relay API resources changed during import")
         dispatch = getattr(providers_domain, "dispatch", None)
         snapshotter = getattr(providers_domain, "snapshot", None)
         if not callable(dispatch) or not callable(snapshotter):
             raise RelayAccountsError("Provider/model settings are unavailable")
-        sources = [self._relay_source(account, resource) for resource in selected]
         if selected_mode == "linked":
             stage_linked = getattr(providers_domain, "stage_relay_import", None)
             try:
@@ -7857,8 +8113,7 @@ class RelayAccountsDomain:
         models = [dict(item) for item in provider.get("models", []) if isinstance(item, Mapping)]
         imported_models = 0
         selected_names = [str(resource.get("name", "")) for resource in selected]
-        for resource in selected:
-            key = self._read_key(account, resource)
+        for resource, key in zip(selected, prepared["keys"], strict=True):
             key_name = _resource_name(resource["name"], "default")
             if selected_names.count(key_name) > 1:
                 key_name = _resource_name(

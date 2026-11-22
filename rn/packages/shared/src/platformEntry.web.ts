@@ -25,7 +25,7 @@ import { createIpcClient } from "./ipc";
 import { createNativeIpcTransport, createNativeLeafBridgeAdapter } from "./platform/nativeBridge";
 import { createBrowserIpcBridge, createBrowserLeafBridge, type BrowserCoreTransport } from "./platform/browserLeaf";
 import { setBrowserSecretReader, setBrowserSecretStager } from "./platform/browserSecrets";
-import { dismissChildLayer, presentChildLayer } from "./platform/childLayers";
+import { dismissChildLayer, presentChildLayer, resizeChildLayer } from "./platform/childLayers";
 import { askCloseRelayGroupSheet, closeRelayGroupSheet, relayGroupSheetState, setRelayGroupSheetSurface } from "./platform/relayGroupSheet";
 import { HostChromeHost } from "./ui/HostChrome";
 import { RelayGroupSheet } from "./ui/RelayGroupSheet";
@@ -256,6 +256,7 @@ const native = createNativeLeafBridgeAdapter(createBrowserLeafBridge(core, {
   systemLocale,
   presentChild,
   dismissChild: (route) => dismissChildLayer(route),
+  resizeChild: (route, width, height) => resizeChildLayer(route, width, height),
 }));
 
 const ipc = createIpcClient(createNativeIpcTransport(core));

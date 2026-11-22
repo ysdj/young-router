@@ -3050,10 +3050,10 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             self.assertFalse(first_thread.is_alive())
             self.assertFalse(second_thread.is_alive())
-            self.assertTrue(results["first"]["ok"])
+            self.assertFalse(results["first"]["ok"])
             self.assertTrue(results["second"]["ok"])
             models = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"]
-            self.assertTrue(models[0]["probe"]["available"])
+            self.assertIsNone(models[0].get("probe"))
             self.assertTrue(models[1]["probe"]["available"])
             self.assertEqual("https://edited.example.test/v1", core.snapshot()["domains"]["providers_models"]["providers"][0]["api_base"])
 
@@ -3200,6 +3200,71 @@ class CodexSettingsDomainTests(unittest.TestCase):
             domain.dispatch("use_local_api", {"model": "default-chat"})
             self.assertEqual(documents, domain.export(include_sensitive=True))
             self.assertTrue(domain.snapshot()["uses_local_api"])
+
+    def test_the_edit_api_form_reports_the_connection_the_client_is_on(self) -> None:
+        """The dialog prefills what the client is actually connected to.
+
+        With this app's API switched on, the selected provider names the proxy;
+        a form that read only its own direct provider row showed every field
+        empty beside a switch that said the client was connected.  Saving the
+        values it showed has to stay on the proxy route instead of rewriting
+        the client onto a look-alike provider that drops the managed list and
+        the search opt-in.
+        """
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
+            from young_router.core.domains._shared import local_proxy_endpoint
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "relay-model"\n'
+                'model_provider = "relay"\n'
+                '\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
+                'base_url = "https://relay.example.test/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "relay-secret"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+            # A direct route is what the form already reports in that mode.
+            self.assertEqual(
+                "https://relay.example.test/v1",
+                domain.snapshot()["direct_api"]["base_url"],
+            )
+
+            domain.dispatch("use_local_api", {"model": "default-chat"})
+            domain.apply()
+            base_url, key = local_proxy_endpoint(runtime)
+            form = domain.snapshot()["direct_api"]
+            self.assertEqual(base_url, form["base_url"])
+            self.assertEqual("default-chat", form["model"])
+            self.assertTrue(form["key_configured"])
+            # The key field prefills the credential this route uses, which in
+            # local mode is this app's router key.
+            self.assertEqual(key, domain.trusted_secret_value("direct_api_key", "edit-api"))
+
+            domain.dispatch("use_direct_api", {
+                "base_url": base_url,
+                "model": form["model"],
+                "model_catalog_url": "",
+                "api_key": key,
+                "clear_key": False,
+            })
+            domain.apply()
+            documents = domain.export(include_sensitive=True)
+            self.assertTrue(domain.snapshot()["uses_local_api"])
+            self.assertTrue(domain.snapshot()["standalone_search"])
+            self.assertIn('[model_providers.relay]', documents["config_text"])
+            self.assertNotIn('[model_providers.young-router-direct]', documents["config_text"])
+            self.assertIn(key, documents["config_text"] + documents["auth_text"])
 
     def test_use_local_api_follows_a_built_in_openai_selection(self) -> None:
         """A built-in OpenAI selection takes Codex's own base-url override."""

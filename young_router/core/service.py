@@ -496,7 +496,6 @@ _PROVIDER_RELAY_RESOURCE_ACTIONS = frozenset(
     {
         "provider_import_relay_key",
         "model_select_relay_resource",
-        "provider_fetch_relay_resource_models",
     }
 )
 
@@ -1445,6 +1444,7 @@ class CoreStore:
         self._mutation = threading.RLock()
         self._mutation_owner: int | None = None
         self._mutation_depth = 0
+        self._relay_apply_guard = threading.Lock()
         # One lock per registered domain: the write lane an edit in that domain
         # holds, and the only lane an unrelated domain's edit waits on.
         self._domain_locks: dict[str, threading.RLock] = {}
@@ -1585,11 +1585,12 @@ class CoreStore:
         # The WebDAV interval loop is created on request, started by the Core
         # entry point, and stopped with the store.
         self._webdav_scheduler: Any | None = None
+        self._webdav_sync_guard = threading.Lock()
         # Relay balance observations have their own small interval loop.  It
         # never performs WebDAV or resource/catalog refreshes.
         self._relay_balance_scheduler: Any | None = None
-        # When a user action last reached this store.  An automatic WebDAV sync
-        # holds the store for its whole round trip, so it waits for quiet.
+        # When a user action last reached this store. The WebDAV timer uses it
+        # to give edits a chance to reach disk before taking its local copy.
         self._last_activity = time.monotonic()
         # The page host's sign-in windows: a real browser this Core launched at
         # a station's own address, keyed by the id the page polls.  They live
@@ -1758,32 +1759,45 @@ class CoreStore:
         if not nested:
             # The first write of a Core's life may beat every reader to it.
             self._publish_snapshot_view_if_absent()
-        lane = False
-        if len(set(ordered)) > 1 and not self._holds_domain_locks():
-            self._acquire_mutation_lane()
-            lane = True
+        lane = len(set(ordered)) > 1 and not nested
         locks = self._ordered_domain_locks(dict.fromkeys(ordered)) if ordered else []
-        # Stated before the locks are taken: a reader that meets one of them
-        # must always find the writer it belongs to, and answer the last
-        # committed view instead of concluding nobody is writing.
+        self._take_domain_lanes(locks, lane=lane)
         self._note_domain_hold(1)
-        taken: list[threading.RLock] = []
-        frame = {"locks": taken, "lane": lane, "released": False}
+        frame = {"locks": locks, "lane": lane, "released": False}
         self._thread_lane_frames().append(frame)
         try:
-            for lock in locks:
-                lock.acquire()
-                taken.append(lock)
             yield
         finally:
             frames = self._thread_lane_frames()
             if frames and frames[-1] is frame:
                 frames.pop()
             self._note_domain_hold(-1)
-            for lock in reversed(taken):
+            for lock in reversed(locks):
                 lock.release()
             if lane:
                 self._release_mutation_lane()
+
+    def _take_domain_lanes(self, locks: Sequence[threading.RLock], *, lane: bool) -> None:
+        if not lane:
+            for lock in locks:
+                lock.acquire()
+            return
+        # Wait for a busy domain without reserving the other domains or the
+        # transaction lane. This matters when a relay journal owns its writer.
+        while True:
+            self._acquire_mutation_lane()
+            taken = []
+            for lock in locks:
+                if not lock.acquire(blocking=False):
+                    break
+                taken.append(lock)
+            else:
+                return
+            for acquired in reversed(taken):
+                acquired.release()
+            self._release_mutation_lane()
+            with lock:
+                pass
 
     def _thread_lane_frames(self) -> list[dict[str, Any]]:
         """The write scopes this thread is inside, innermost last."""
@@ -1820,18 +1834,24 @@ class CoreStore:
 
         frames = self._thread_lane_frames()
         frame = frames[-1] if frames else None
-        if frame is None or frame["released"] or frame["lane"] or len(frame["locks"]) != 1:
+        if len(frames) != 1 or frame["released"] or frame["lane"] or len(frame["locks"]) != 1:
             yield
             return
+        with self._suspend_domain_scope(frame):
+            yield
+
+    @contextlib.contextmanager
+    def _suspend_domain_scope(self, frame: dict[str, Any]):
         frame["released"] = True
         self._note_domain_hold(-1)
         for lock in reversed(frame["locks"]):
             lock.release()
+        if frame["lane"]:
+            self._release_mutation_lane()
         try:
             yield
         finally:
-            for lock in frame["locks"]:
-                lock.acquire()
+            self._take_domain_lanes(frame["locks"], lane=frame["lane"])
             self._note_domain_hold(1)
             frame["released"] = False
 
@@ -2439,14 +2459,21 @@ class CoreStore:
     def _bind_io_gates(self) -> None:
         """Let a domain that reads a station lend its lane out for that read."""
 
+        def gate():
+            return self._release_lane_for_io()
+
         for adapter in self._domains.values():
             binder = getattr(adapter, "bind_io_gate", None)
             if not callable(binder):
                 continue
             try:
-                binder(self._release_lane_for_io)
+                binder(gate)
             except Exception:
                 continue
+        relay = self._domains.get("relay_accounts")
+        bind_recovery = getattr(relay, "bind_session_write_gate", None)
+        if callable(bind_recovery):
+            bind_recovery(lambda: self._domain_scope("relay_accounts"))
 
     def register_domain(self, adapter: DomainAdapter) -> str:
         name_value = getattr(adapter, "name", None)
@@ -3315,44 +3342,28 @@ class CoreStore:
         requested = tuple(dict.fromkeys(_canonical_domain(domain) for domain in domains))
         if not requested:
             raise CoreError("invalid_domain", "At least one commit-plan domain is required")
+        for name in requested:
+            if name not in self._domains:
+                raise DomainNotFound(name)
+        self._refresh_external_disk_state(requested)
         risks: dict[str, list[str]] = {}
-        with self._domain_scope(*requested):
-            for name in requested:
-                if name not in self._domains:
-                    raise DomainNotFound(name)
-            # Fresh markers, not the last watcher pass: an Apply that overwrites
-            # a file somebody edited outside this app must be able to see it.
-            self._refresh_external_disk_state(requested)
-            if "claude" in requested:
-                adapter = self._domains.get("claude")
-                try:
-                    snapshot = adapter.snapshot() if adapter is not None else {}
-                except Exception:
-                    snapshot = {}
+        if "claude" in requested:
+            # These codes describe the Claude draft. Its own lane is the only
+            # one needed here; Apply checks the confirmations again at commit.
+            with self._domain_scope("claude"):
+                snapshot = self._domains["claude"].snapshot()
                 codes = snapshot.get("risk_confirmations") if isinstance(snapshot, Mapping) else None
                 if isinstance(codes, Sequence) and not isinstance(codes, (str, bytes, bytearray)):
-                    risks["claude"] = [str(code) for code in codes if isinstance(code, str)]
-            # Outside the state lock: the projection's own revision answers from
-            # the snapshot view when another lane is writing, and that read
-            # takes the same lock this one is about to.
-            projected_revision = self.projected_revision
-            with self._lock:
-                drafts = {
-                    name: {
-                        "dirty": bool(entry.get("dirty")),
-                        "base_revision": entry.get("base_revision", self._revision),
-                        "validation": copy.deepcopy(entry.get("validation")),
-                    }
-                    for name, entry in self._drafts.items()
-                }
-                return {
-                    "revision": self._revision,
-                    "projected_revision": projected_revision,
-                    "service": copy.deepcopy(_safe_public(self._service)),
-                    "drafts": drafts,
-                    "disk": {name: copy.deepcopy(self._disk[name]) for name in requested},
-                    "risks": risks,
-                }
+                    risks["claude"] = [code for code in codes if isinstance(code, str)]
+        with self._lock:
+            return {
+                "revision": self._revision,
+                "projected_revision": self.projected_revision,
+                "service": copy.deepcopy(_safe_public(self._service)),
+                "drafts": copy.deepcopy(self._drafts),
+                "disk": {name: copy.deepcopy(self._disk[name]) for name in requested},
+                "risks": risks,
+            }
 
     def disk_state(self, domains: Sequence[str]) -> dict[str, Any]:
         """Refresh only the external-file markers needed by the settings UI."""
@@ -3365,11 +3376,11 @@ class CoreStore:
             raise
         if not requested:
             raise CoreError("invalid_domain", "At least one disk-state domain is required")
-        with self._domain_scope(*requested):
-            for name in requested:
-                if name not in self._domains:
-                    raise DomainNotFound(name)
-            self._refresh_external_disk_state(requested)
+        for name in requested:
+            if name not in self._domains:
+                raise DomainNotFound(name)
+        self._refresh_external_disk_state(requested)
+        with self._lock:
             return {
                 "revision": self._revision,
                 "disk": {name: copy.deepcopy(self._disk[name]) for name in requested},
@@ -4015,26 +4026,29 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Stage only the API resources explicitly selected by the user."""
 
-        should_emit = False
-        with self._domain_scope("relay_accounts", "providers_models"):
+        with self._domain_scope("relay_accounts"):
             self._check_revision(revision)
             relay = self._domains.get("relay_accounts")
             providers = self._domains.get("providers_models")
-            importer = getattr(relay, "import_resources", None) if relay is not None else None
-            if not isinstance(account_id, str) or not account_id or not callable(importer) or providers is None:
+            prepare = getattr(relay, "prepare_resource_import", None)
+            stage = getattr(relay, "stage_resource_import", None)
+            if not isinstance(account_id, str) or not account_id or not callable(prepare) or not callable(stage) or providers is None:
                 raise CoreError("relay_import_failed", "Relay account is unavailable")
-            import_mode = str(mode).strip().lower()
-            if import_mode not in {"linked", "independent"}:
-                raise CoreError("relay_import_failed", "Relay import mode is invalid")
+            try:
+                prepared = prepare(account_id, resource_ids, mode=mode)
+            except Exception as exc:
+                raise CoreError("relay_import_failed", safe_exception_message(exc)) from None
+        with self._domain_scope("relay_accounts", "providers_models"):
             provider_checkpoint = _checkpoint_adapter(providers, error_code="relay_import_failed")
             try:
-                result = importer(account_id, resource_ids, providers, mode=import_mode)
+                result = stage(prepared, providers)
             except Exception as exc:
                 try:
                     _restore_adapter(providers, provider_checkpoint)
                 except Exception:
                     raise CoreError("relay_import_failed", "Provider/model import could not be rolled back") from None
                 raise CoreError("relay_import_failed", safe_exception_message(exc)) from None
+            import_mode = prepared["mode"]
             self._advance_revision()
             provider_dirty = self._adapter_draft_state("providers_models") != self._baselines.get("providers_models")
             self._mark_domain(
@@ -4054,7 +4068,6 @@ class CoreStore:
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
             self._persist_metadata()
-            should_emit = True
             response = {
                 "revision": self._revision,
                 "imported": True,
@@ -4062,8 +4075,7 @@ class CoreStore:
                 "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
-        if should_emit:
-            self._request_emit()
+        self._request_emit()
         return response
 
     def accept_relay_login(
@@ -4108,6 +4120,8 @@ class CoreStore:
         """
 
         remember_choice = remember_password if isinstance(remember_password, bool) else None
+        from .domains.relay_accounts import RelayLoginSaveError
+
         remember_session_choice = remember_session if isinstance(remember_session, bool) else None
         auto_group_choice = auto_grouping if isinstance(auto_grouping, bool) else None
         known_secrets = tuple(
@@ -4145,6 +4159,8 @@ class CoreStore:
                 file_checkpoints = _checkpoint_files(persistence_paths)
             except CoreError:
                 raise CoreError("relay_login_failed", "Relay login could not be prepared") from None
+            session_saved = False
+            new_account = False
             try:
                 current = self._adapter_snapshot("relay_accounts")
                 accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
@@ -4197,6 +4213,7 @@ class CoreStore:
                         station_origin=str(station_origin) if isinstance(station_origin, str) and station_origin else None,
                         remember_password=remember_choice is True,
                     )
+                    new_account = True
                     current = self._adapter_snapshot("relay_accounts")
                     accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
                     matching = next(
@@ -4225,6 +4242,7 @@ class CoreStore:
                         remember_password=remember_choice,
                         remember_session=remember_session_choice,
                         auto_grouping=auto_group_choice,
+                        new_account=new_account,
                     )
                 else:
                     # A host with no browser of its own (the page host) sends
@@ -4258,6 +4276,7 @@ class CoreStore:
                             username=username,
                             password=password,
                             remember_password=remember_choice,
+                            new_account=new_account,
                         )
                     except RelaySessionLimitError:
                         raise CoreError(
@@ -4266,8 +4285,11 @@ class CoreStore:
                         ) from None
                     except RelayTransportError:
                         raise CoreError("relay_unreachable", "Relay is unavailable") from None
+                    except RelayLoginSaveError:
+                        raise
                     except RelayAccountsError:
                         raise CoreError("relay_login_rejected", "Relay login was rejected") from None
+                session_saved = True
                 # Login is the durable browser-session boundary. Resource
                 # discovery is a separate explicit action so a station API
                 # outage cannot change the result of a successful sign-in.
@@ -4285,6 +4307,8 @@ class CoreStore:
                 }
                 self._persist_metadata()
             except CoreError:
+                if session_saved:
+                    raise
                 try:
                     _restore_files(file_checkpoints)
                     relay_restore(relay_state)
@@ -4295,6 +4319,11 @@ class CoreStore:
                     self._baselines = core_checkpoint["baselines"]
                 raise
             except Exception as exc:
+                if session_saved or isinstance(exc, RelayLoginSaveError):
+                    # A local bookkeeping failure cannot undo a session the
+                    # station already issued. The same credentials remain in
+                    # Core, including when its session write needs retrying.
+                    raise CoreError("relay_login_failed", safe_exception_message(exc, known_secrets=known_secrets)) from None
                 rollback_failed = False
                 try:
                     _restore_files(file_checkpoints)
@@ -4367,10 +4396,8 @@ class CoreStore:
         The account's own copy of its sign-in — the username, and the password
         it chose to remember — is typed into that window's form by Core (see
         :func:`relay_browser.start_prefill`): the page never receives the
-        secret, and the form is posted once only when the station's own last
-        answer says this account holds no usable session.  A browser page has
-        no WebKit credential store to restore, so this is the same convenience
-        the two native hosts get from filling their own view.
+        secret. Like the native hosts, the browser fills the form for manual
+        submission. Core's restore path owns automatic password sign-in.
         """
 
         from . import relay_browser
@@ -4387,21 +4414,13 @@ class CoreStore:
             return {"status": "unsupported", "reason": reason}
         if not isinstance(origin, str) or not origin.strip():
             raise CoreError("relay_login_failed", "Relay origin is invalid")
-        # Read before the lock: the window is a quiet re-check of the runtime
-        # settings file, and a pending account has no row to read at all.
         prefill: Mapping[str, Any] = {}
-        if pending_account is not True:
-            relay_for_prefill = self._domains.get("relay_accounts")
-            reader = getattr(relay_for_prefill, "login_prefill", None)
-            if callable(reader):
-                try:
-                    prefill = reader(str(account_id))
-                except Exception:
-                    prefill = {}
-        with self._lock:
+        with self._domain_scope("relay_accounts"):
             relay = self._domains.get("relay_accounts")
             if relay is None or not callable(getattr(relay, "verify_browser_session", None)):
                 raise CoreError("relay_login_failed", "Relay account is unavailable")
+            if pending_account is not True:
+                prefill = relay.login_prefill(str(account_id), account_type=account_type, origin=origin)
             # A window somebody opened and walked away from holds a browser and
             # a profile; the next sign-in is the one moment this side can see it.
             # Taken out of the map here and closed *after* the lock: stopping a
@@ -4442,7 +4461,6 @@ class CoreStore:
             browser,
             username=sign_in_username,
             password=stored_password if isinstance(stored_password, str) else "",
-            submit=prefill.get("submit") is True,
         )
         # What the person types into that page is the one thing the post-login
         # question can offer to keep, and this host has no webview to read it
@@ -4545,7 +4563,7 @@ class CoreStore:
         """
 
         from . import relay_browser
-        from .domains.relay_accounts import RelayAccountsError, RelayTransportError
+        from .domains.relay_accounts import RelayAccountsError, RelaySessionRejectedError
 
         browser = entry["browser"]
         try:
@@ -4564,7 +4582,8 @@ class CoreStore:
             # Neither credential yet: the page is still the login form.
             return None
         user_id = _storage_user_id(storage)
-        signature = f"{header}\u0000{token}\u0000{user_id}"
+        refresh_token = storage.get("refresh_token", "") if entry["type"] == "sub2api" else ""
+        signature = f"{header}\u0000{token}\u0000{user_id}\u0000{refresh_token}"
         if entry.get("last_cookie") == signature:
             return None
         if time.monotonic() < float(entry.get("jar_retry_at") or 0.0):
@@ -4580,20 +4599,16 @@ class CoreStore:
                 account_type=entry["type"],
                 cookie=header,
                 access_token=token,
+                refresh_token=refresh_token,
                 user_id=user_id,
             )
-        except RelayTransportError:
-            # The station never answered, so nothing was learned about this jar.
-            # It used to be remembered before the station was asked: the jar is
-            # final once the person has signed in, so one blip on that poll made
-            # every later one skip it and the window waited forever.  It is
-            # offered again, after a pause rather than on the next poll.
-            entry["jar_retry_at"] = time.monotonic() + _BROWSER_JAR_RETRY_SECONDS
+        except RelaySessionRejectedError:
+            entry["last_cookie"] = signature
             return None
         except RelayAccountsError:
-            # The station answered and did not accept this jar: the window stays
-            # up and the person is still signing in.
-            entry["last_cookie"] = signature
+            # An inconclusive profile says nothing about this jar. The user
+            # may already have signed in; retry its verification, not the form.
+            entry["jar_retry_at"] = time.monotonic() + _BROWSER_JAR_RETRY_SECONDS
             return None
         except Exception:
             entry["last_cookie"] = signature
@@ -4615,6 +4630,7 @@ class CoreStore:
                 username=str(verified.get("username") or entry["username"]),
                 cookie=str(verified.get("cookie", "")),
                 access_token=str(verified.get("access_token", "")),
+                refresh_token=str(verified.get("refresh_token", "")),
                 user_id=str(verified.get("user_id", "")),
                 station_id=entry["station_id"],
                 station_name=entry["station_name"],
@@ -4852,26 +4868,23 @@ class CoreStore:
                     return {"resource_status": "skipped"}
                 if account_id not in relay.maintenance_account_ids(grouping=True):
                     return {"resource_status": "skipped"}
-            relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
-            relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
-            relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
             try:
                 result = refresher(account_id, for_grouping=True) if for_grouping else refresher(account_id, force=force)
             except Exception as exc:
                 raise CoreError("relay_resources_failed", safe_exception_message(exc)) from None
             resources = result.get("resources", []) if isinstance(result, Mapping) else []
             resource_status = result.get("resource_status", "unavailable") if isinstance(result, Mapping) else "unavailable"
-            if for_grouping and resource_status == "skipped":
-                return {"resource_status": "skipped"}
+            if resource_status == "skipped":
+                return {"revision": self._revision, "account_id": account_id, "resource_status": "skipped", "resource_count": 0}
             resource_count = len(resources) if isinstance(resources, list) else 0
             if for_grouping:
                 self._advance_projection_revision()
             else:
                 self._advance_revision()
             self._record_relay_transient_update(
-                was_dirty=relay_was_dirty,
-                prior_baseline=relay_prior_baseline,
-                prior_base_revision=relay_prior_base_revision,
+                was_dirty=bool(self._drafts.get("relay_accounts", {}).get("dirty")),
+                prior_baseline=self._baselines.get("relay_accounts"),
+                prior_base_revision=self._drafts.get("relay_accounts", {}).get("base_revision"),
             )
             if not for_grouping:
                 self._last_actions["relay_accounts"] = {
@@ -4924,6 +4937,7 @@ class CoreStore:
             return TaskResult("skipped")
         if task_id == RELAY_GROUPS:
             names = self._apply_domain_hints("relay_accounts", None)
+            retry_revision = None
             with self._domain_scope(*names):
                 self._refresh_external_disk_state(names)
                 relay = self._domains["relay_accounts"]
@@ -4937,7 +4951,9 @@ class CoreStore:
                     # The journal identifies unattended work after a restart.
                     # In the same process the revision also proves the draft
                     # has not acquired edits since the timer staged it.
-                    return self._apply_automatic_groups(account_id, self._revision)
+                    retry_revision = self._revision
+            if retry_revision is not None:
+                return self._apply_automatic_groups(account_id, retry_revision)
             result = self.refresh_relay_resources(account_id, revision=None, for_grouping=True)
             if result["resource_status"] == "skipped":
                 return TaskResult("skipped")
@@ -4951,9 +4967,8 @@ class CoreStore:
             with self._domain_scope(*names):
                 self._refresh_external_disk_state(names)
                 relay = self._domains["relay_accounts"]
-                # Alignment may retire linked models. Keep the staging and
-                # Apply inside one lane and stand aside for existing edits or
-                # unresolved journal work, including work from a previous run.
+                # Alignment may retire linked models. Stand aside for other
+                # edits; the separate Apply verifies this staging revision.
                 if (
                     cancelled()
                     or not self._revision_covers_settings(result["revision"])
@@ -4969,7 +4984,7 @@ class CoreStore:
                 if not self._drafts["relay_accounts"]["dirty"]:
                     return TaskResult("succeeded")
                 relay.mark_group_poll_operations()
-                return self._apply_automatic_groups(account_id, staged["revision"])
+            return self._apply_automatic_groups(account_id, staged["revision"])
 
         with self._domain_scope("relay_accounts"):
             relay = self._domains["relay_accounts"]
@@ -5039,7 +5054,7 @@ class CoreStore:
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
             session_restorer = getattr(relay, "restore_saved_session", None) if relay is not None else None
-            password_restorer = getattr(relay, "restore_saved_password", None) if relay is not None else None
+            password_restorer = getattr(relay, "_submit_saved_password", None) if relay is not None else None
             status_settler = getattr(relay, "settle_login_status", None) if relay is not None else None
             recent_login_answer = getattr(relay, "recent_login_check_answer", None) if relay is not None else None
             if (
@@ -5083,29 +5098,32 @@ class CoreStore:
                 elif login_status == "unknown" or (
                     login_status in {"signed_out", "expired"} and matching.get("password_saved") is True
                 ):
-                    from .domains.relay_accounts import RelayAccountsError
+                    from .domains.relay_accounts import RelayAccountsError, RelayLoginSaveError
 
                     public = recent_login_answer(str(account_id))
                     if public is None:
                         try:
                             public = session_restorer(str(account_id))
+                        except RelayLoginSaveError:
+                            raise
                         except RelayAccountsError:
-                            # A probe that learned nothing cannot authorize a
-                            # password POST. Only an explicit host expiry may
-                            # replace the observation already stored in Core.
+                            # An unanswered probe cannot retire the current
+                            # session or authorize a password POST.
                             if login_status == "signed_out":
                                 raise CoreError(
                                     "relay_restore_unavailable",
                                     "The saved session could not be verified",
                                 ) from None
-                            public = status_settler(str(account_id), "expired") if login_status == "expired" else matching
+                            public = matching
                         else:
                             if public is None:
                                 if login_status in {"signed_out", "expired"}:
                                     status_settler(str(account_id), str(login_status))
                                 if matching.get("password_saved") is True:
                                     try:
-                                        password_restorer(str(account_id), force=True)
+                                        public = password_restorer(str(account_id))
+                                    except RelayLoginSaveError:
+                                        raise
                                     except RelayAccountsError:
                                         # The projection reports the POST's outcome.
                                         # A backoff leaves the previous outcome in place.
@@ -5132,10 +5150,7 @@ class CoreStore:
                 # the pane's own Apply then raced a background check that had
                 # nothing to say, and answered 更改未生效 over a write that had
                 # landed.  A check that did change something still advances it.
-                if relay_was_dirty or (
-                    _relay_projection_without_the_clock(updated)
-                    != _relay_projection_without_the_clock(current)
-                ):
+                if _relay_projection_without_the_clock(updated) != _relay_projection_without_the_clock(current):
                     self._advance_revision()
                     self._last_actions["relay_accounts"] = {
                         "session_restored": public.get("login_status") == "signed_in",
@@ -5385,74 +5400,107 @@ class CoreStore:
         if base_revision is not None:
             record["base_revision"] = base_revision
 
-    def _dispatch_worker_status(
+    def _dispatch_provider_read(
         self,
         action_type: str,
-        normalized_action: str,
+        operation: str,
         payload: object,
         expected_revision: object | None,
     ) -> dict[str, Any]:
-        """Read a local worker's account state without holding the store lock.
-
-        Starting WorkBuddy or Our Free Model and asking it for the desktop
-        credential is a local round trip with a twenty- or thirty-second
-        ceiling.  The pane that asks is explicitly allowed to wait -- its other
-        controls stay usable -- but Core's store lock is shared by every window:
-        holding it across that wait froze snapshots and queued a debounced
-        Apply behind a worker that was still booting.  The read mutates only the
-        adapter's own observation caches and ``_last_operation`` (assigned as a
-        whole), so it runs outside the lock; the bookkeeping that publishes it
-        is taken under the lock afterwards.
-        """
-
+        """Only the external read lends its lane; its observation and reply stay together."""
         name = "providers_models"
-        with self._lock:
+        with self._domain_scope(name):
             self._check_revision(expected_revision)
             adapter = self._domains.get(name)
             if adapter is None:
                 raise DomainNotFound(name)
-            before = self._adapter_draft_state(name)
+            try:
+                result = adapter.dispatch(action_type, payload)
+            except CoreError:
+                raise
+            except Exception as exc:
+                raise CoreError(getattr(exc, "code", None) or "domain_error", safe_exception_message(exc)) from None
+            entry = _safe_public(_action_summary_entry(name, result))
+            self._last_actions[name] = entry
+            response = {"revision": self._revision}
+            summary = entry.get("operation_summary")
+            if isinstance(summary, Mapping) and summary.get("operation") == operation:
+                response["action_summary"] = summary
+        return response
+
+    def _dispatch_relay_read(
+        self,
+        action_type: str,
+        payload: object,
+        expected_revision: object | None,
+    ) -> dict[str, Any]:
+        """Run relay detection without occupying the account write lane."""
+        name = "relay_accounts"
+        with self._domain_scope(name):
+            self._check_revision(expected_revision)
+            adapter = self._domains.get(name)
+            if adapter is None:
+                raise DomainNotFound(name)
+            start_revision = self._revision
+            try:
+                with self._release_lane_for_io():
+                    result = adapter.dispatch(action_type, payload)
+            except CoreError:
+                raise
+            except Exception as exc:
+                raise CoreError("domain_error", safe_exception_message(exc)) from None
+            safe_result = _safe_public(result) if isinstance(result, Mapping) else {}
+            if self._revision == start_revision:
+                self._last_actions[name] = _action_summary_entry(name, safe_result)
+            response = {"revision": self._revision}
+            if isinstance(safe_result, Mapping):
+                response["action_summary"] = {
+                    key: value for key, value in safe_result.items()
+                    if key in {"detected_type", "confidence", "resource_status"}
+                }
+        return response
+
+    def _dispatch_relay_model_list(self, payload: object, expected_revision: object) -> dict[str, Any]:
+        """Resolve the key, stage its slot, then list models without holding either writer."""
+        name = "providers_models"
+        data = _as_mapping(payload)
         try:
-            result = adapter.dispatch(action_type, payload)
+            with self._domain_scope(name):
+                self._check_revision(expected_revision)
+                providers = self._domains[name]
+                slots = providers.relay_slot_credentials()
+            with self._domain_scope("relay_accounts"):
+                relay = self._domains.get("relay_accounts")
+                if relay is None:
+                    raise CoreError("domain_error", "Relay API resources are unavailable")
+                source = relay.binding_source(data)
+                materials = relay.binding_materials({"resources": [source]}, slot_credentials=slots, catalogs=False)
+                material = next((row for row in materials["resources"] if all(
+                    row.get(k) == source.get(k) for k in ("station_id", "account_id", "resource_id")
+                )), None)
+                if not material or not material.get("api_key"):
+                    raise CoreError("domain_error", "Relay API key material is unavailable")
+            with self._domain_scope(name, "relay_accounts"):
+                # A deleted station or changed origin must not authorize an old credential.
+                current = relay.binding_source(data)
+                if current["api_base"] != material["api_base"]:
+                    raise CoreError("domain_error", "Relay API key does not match the provider Base URL")
+                imported, target = providers.prepare_relay_model_list({"provider_id": data.get("provider_id"),
+                    "source": {**current, "api_key": material["api_key"]}})
+                if imported["imported"]:
+                    self._advance_revision()
+                    self._mark_domain(name, dirty=True)
+                    self._persist_metadata()
+            if imported["imported"]:
+                self._request_emit()
+            with self._domain_scope(name):
+                summary = _safe_public(providers.read_relay_model_list(imported, target))
+                self._last_actions[name] = {"operation_summary": summary}
+                return {"revision": self._revision, "action_summary": summary}
         except CoreError:
             raise
         except Exception as exc:
-            domain_code = getattr(exc, "code", "")
-            if isinstance(domain_code, str) and domain_code.strip():
-                raise CoreError(domain_code.strip(), safe_exception_message(exc)) from None
             raise CoreError("domain_error", safe_exception_message(exc)) from None
-        with self._lock:
-            after = self._adapter_draft_state(name)
-            action_summary: dict[str, Any] | None = None
-            if isinstance(result, Mapping):
-                safe_result = _safe_public(result)
-                if isinstance(safe_result, Mapping):
-                    self._last_actions[name] = _action_summary_entry(name, safe_result)
-                    summary = safe_result.get("operation_summary")
-                    if (
-                        isinstance(summary, Mapping)
-                        and summary.get("operation") == normalized_action
-                    ):
-                        action_summary = dict(summary)
-            # A live read stages nothing; if one somehow moved the draft, mark
-            # it like every other dispatch rather than hiding the change.
-            changed = after != before
-            if changed:
-                self._advance_projection_revision()
-                self._mark_domain(
-                    name,
-                    dirty=after != self._baselines.get(name),
-                    base_revision=self._revision,
-                )
-                self._persist_metadata()
-            response: dict[str, Any] = {"revision": self._revision}
-            if action_summary is not None:
-                response["action_summary"] = action_summary
-        if changed:
-            # Publishing a snapshot is not a state transition; the worker's own
-            # answer must not wait behind it.
-            self._request_emit()
-        return response
 
     def _dispatch_codex_model_catalog_toggle(self, enabled: bool, expected_revision: object | None) -> dict[str, Any]:
         name = "codex"
@@ -5782,14 +5830,13 @@ class CoreStore:
             name: getattr(self._domains.get(name), "revision", None)
             for name in live_domains
         }
-        # The generators read and rewrite client files, and one of them asks the
-        # running proxy what it serves -- which is precisely the question that
-        # cannot be answered while the proxy is being replaced.  The domains keep
-        # their own locks, so this work runs outside the store's: a window
-        # polling its snapshot must never wait for a client document.
+        # Each generator writes only its own client document. The Codex endpoint
+        # read does not need to reserve the Claude or provider lane.
         if include_claude:
-            refresh("refresh_claude_model_list", getattr(self._domains.get("claude"), "refresh_model_lists", None))
-        refresh("refresh_codex_model_catalog", getattr(codex_domain, "refresh_model_catalog", None))
+            with self._domain_scope("claude"):
+                refresh("refresh_claude_model_list", getattr(self._domains.get("claude"), "refresh_model_lists", None))
+        with self._domain_scope("codex"):
+            refresh("refresh_codex_model_catalog", getattr(codex_domain, "refresh_model_catalog", None))
         # The live read belongs to this lane, not to ``snapshot``.  A window
         # polls the projection many times a second while the proxy reloads, and
         # a read taken there both blocks every other request on the store lock
@@ -5904,6 +5951,19 @@ class CoreStore:
         *,
         automatic: bool = False,
     ) -> dict[str, Any]:
+        # A push and a pull share the same remote bundle and local sync state.
+        # This lock orders those operations without holding any editor lane.
+        with self._webdav_sync_guard:
+            return self._run_webdav_sync(operation, payload, expected_revision, automatic=automatic)
+
+    def _run_webdav_sync(
+        self,
+        operation: str,
+        payload: object,
+        expected_revision: object | None,
+        *,
+        automatic: bool,
+    ) -> dict[str, Any]:
         """Run one legacy-bundle WebDAV operation transactionally.
 
         ``automatic`` marks the interval loop's own run.  A window's unsaved
@@ -5918,12 +5978,8 @@ class CoreStore:
         from ..webdav import core as webdav_core
         from ..webdav import operations as webdav_operations
 
-        should_emit = False
-        # ``runtime`` is declared for the master key a pull may install: the
-        # run adopts that domain too, so an edit staged in its pane while the
-        # bundle lands must not interleave with the reload and baseline it
-        # replaces.
-        with self._domain_scope("webdav", "providers_models", "relay_accounts", "runtime"):
+        names = ("webdav", "providers_models", "relay_accounts", "runtime")
+        with self._domain_scope(*names):
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
             webdav = self._domains.get("webdav")
@@ -5960,6 +6016,120 @@ class CoreStore:
             if not _same_path(relay_path, webdav_core.relay_accounts_path(config_path)):
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
 
+        def record_failure(exc: Exception) -> CoreError:
+            if isinstance(exc, CoreError):
+                failure = exc
+            elif isinstance(exc, webdav_core.SyncError):
+                code = exc.code if is_error_code(exc.code) else "webdav_sync_failed"
+                failure = CoreError(code, safe_error_message(exc, known_secrets=(settings.password,)))
+            else:
+                failure = CoreError("webdav_sync_failed", "WebDAV sync failed")
+            try:
+                webdav_core.save_sync_status(status_path, operation, False, failure.code)
+            except Exception:
+                pass
+            self._advance_projection_revision()
+            self._request_emit()
+            return failure
+
+        local = webdav_core.SyncSnapshot(None)
+        incoming = None
+        outcome = operation
+        action_summary: dict[str, Any] = {}
+        try:
+            with self._domain_scope(*names):
+                # Capture the inputs to the decision before talking to the server.
+                if operation != "pull":
+                    local = webdav_core.local_snapshot(config_path)
+                else:
+                    # Explicit pull can repair an invalid local file. Keep its
+                    # bytes for the race check without parsing that file first.
+                    pull_inputs = tuple((path, read_bytes(path)) for _, path, _, _ in webdav_core.sync_targets(config_path))
+                base = webdav_core.baseline_snapshot(state_path) if operation == "sync" else None
+            client = webdav_core.WebDAVClient(settings)
+            if settings.remote_name not in webdav_core.LEGACY_REMOTE_NAMES:
+                try:
+                    adopted = webdav_operations.adopt_renamed_remote_bundle(client, settings, webdav_core.LEGACY_REMOTE_NAMES)
+                except Exception:
+                    adopted = None
+                if adopted is not None:
+                    action_summary["adopted_remote"] = adopted
+
+            state_action = operation
+            if operation == "sync":
+                try:
+                    remote = webdav_operations.read_remote_snapshot(client, settings)
+                except webdav_core.SyncError as exc:
+                    if exc.code != webdav_core.INCOMPATIBLE_BUNDLE_CODE:
+                        raise
+                    action_summary["archived_remote"] = webdav_operations.archive_remote_bundle(client, settings)
+                    remote = webdav_core.SyncSnapshot(None)
+                outcome, remote = webdav_operations.decide_sync(client, settings, local, remote, base)
+                if outcome == "conflict":
+                    merged = webdav_operations.conflict_merge(client, settings, local, remote, base)
+                    if merged is None:
+                        # The compared bundle already contains the texts the
+                        # conflict pane needs. Keep it without another read.
+                        webdav_core.save_conflict_record(
+                            conflict_path, remote.files or {}, (remote.manifest or {}).get("created_at")
+                        )
+                        raise webdav_core.SyncError(
+                            "WebDAV sync stopped because both ends changed the same content", "webdav_sync_conflict"
+                        )
+                    bundle = webdav_core.bundle_from_files(merged)
+                    agreed = webdav_core.bundle_snapshot(*webdav_core.read_config_bundle(bundle))
+                    webdav_operations.upload_bundle(client, settings, bundle, agreed)
+                    incoming = agreed
+                    outcome, state_action = "merge", "sync-merge"
+                    action_summary.update(outcome=outcome, sections=list(sections))
+                elif outcome == "push":
+                    agreed = local
+                    webdav_operations.upload_bundle(client, settings, webdav_core.encode_bundle(agreed), agreed)
+                    state_action = "sync-push"
+                else:
+                    agreed = remote
+                    if outcome == "pull":
+                        incoming = remote
+                        state_action = "sync-pull"
+                    webdav_operations.publish_remote_digests(client, settings, agreed)
+            elif operation == "push":
+                agreed = local
+                webdav_operations.upload_bundle(client, settings, webdav_core.encode_bundle(agreed), agreed)
+            else:
+                # Unlike smart sync, an explicit pull must report a missing
+                # remote bundle as a failed request.
+                bundle = client.get(webdav_core.bundle_url(settings), max_bytes=webdav_core.CONFIG_BUNDLE_MAX_BYTES)
+                agreed = webdav_core.bundle_snapshot(*webdav_core.read_config_bundle(bundle))
+                incoming = agreed
+                webdav_operations.publish_remote_digests(client, settings, agreed)
+        except Exception as exc:
+            raise record_failure(exc) from None
+
+        pulled = incoming is not None
+        with self._domain_scope(*names):
+            self._refresh_external_disk_state(names)
+            try:
+                if settings_getter(committed=automatic) != settings:
+                    raise CoreError("webdav_sync_unsaved", "WebDAV settings changed during synchronization")
+                if pulled:
+                    local_changed = (
+                        any(read_bytes(path) != before for path, before in pull_inputs)
+                        if operation == "pull" else
+                        not local.matches(webdav_core.local_snapshot(config_path))
+                    )
+                    if local_changed or (not automatic and any(self._drafts.get(name, {}).get("dirty") for name in sections)):
+                        raise CoreError("webdav_sync_unsaved", "Local settings changed during WebDAV synchronization")
+                    if operation == "pull" and config_path.exists():
+                        try:
+                            unchanged = webdav_core.local_snapshot(config_path).matches(agreed)
+                        except webdav_core.SyncError:
+                            unchanged = False  # A manual pull may repair a bad local file.
+                        if unchanged:
+                            incoming = None
+                            pulled = False
+            except Exception as exc:
+                raise record_failure(exc) from None
+
             adapter_checkpoints = {
                 name: _checkpoint_adapter(adapter, error_code="webdav_sync_failed")
                 for name, adapter in (("providers_models", providers), ("relay_accounts", relay))
@@ -5986,11 +6156,6 @@ class CoreStore:
             except CoreError:
                 raise CoreError("webdav_sync_failed", "WebDAV sync could not prepare local files") from None
 
-            pulled = False
-            outcome = operation
-            action_summary: dict[str, Any] = {}
-            archived_remote: str | None = None
-            adopted_remote: dict[str, Any] | None = None
             # Read before anything is installed, because the bundle replaces
             # both: the bytes the running proxy was handed, and the key its
             # clients present.  A pull that installs a document without this
@@ -6001,115 +6166,9 @@ class CoreStore:
             runtime_document_before = self._runtime_document_fingerprint()
             master_key_before = _document_master_key(config_path)
             try:
-                client = webdav_core.WebDAVClient(settings)
-                # A setting that still carried an earlier default name is read
-                # as the current one; move the file it pointed at so the
-                # collection keeps one live bundle under this app's name.
-                if settings.remote_name not in webdav_core.LEGACY_REMOTE_NAMES:
-                    try:
-                        adopted_remote = webdav_operations.adopt_renamed_remote_bundle(client, settings, webdav_core.LEGACY_REMOTE_NAMES)
-                    except Exception:
-                        adopted_remote = None
-                if operation == "push":
-                    webdav_operations.push_bundle(client, settings, config_path, state_path, "push")
-                elif operation == "pull":
-                    webdav_operations.pull_bundle(client, settings, config_path, state_path, "pull")
-                    pulled = True
-                else:
-                    local = webdav_core.local_snapshot(config_path)
-                    try:
-                        remote = webdav_operations.read_remote_snapshot(client, settings)
-                    except webdav_core.SyncError as exc:
-                        if exc.code != webdav_core.INCOMPATIBLE_BUNDLE_CODE:
-                            raise
-                        # Smart sync decides by comparing, and a bundle from
-                        # another app identity or archive version cannot be
-                        # compared.  Rather than stopping to ask for a choice
-                        # nothing can inform, the sync keeps that file under a
-                        # dated sibling name and pushes this Mac's state over
-                        # it: the file the guard refuses to read is never lost,
-                        # and the user asked for a sync, not for a decision.
-                        archived_remote = webdav_operations.archive_remote_bundle(client, settings)
-                        remote = webdav_core.SyncSnapshot(None)
-                    base = webdav_core.baseline_snapshot(state_path)
-                    # One comparison decides every sync, including the
-                    # unattended one: a side that moved alone is the side to
-                    # take.  Two sides that both moved are a real conflict --
-                    # the pane shows both texts and the reader keeps one -- and
-                    # no branch asks for a saved direction, because there is no
-                    # such setting any more.  What counts as a move is the
-                    # compared digest: a relay balance another machine read is
-                    # nobody's edit, so it cannot manufacture a conflict. The
-                    # manifest and file digests came from one bundle read.
-                    plan, remote = webdav_operations.decide_sync(client, settings, local, remote, base)
-                    if plan == "unchanged":
-                        # Byte equality proved the remote holds these same
-                        # digests, so they can be stated for it.  The documents
-                        # on disk are the content both ends agreed on, and
-                        # keeping them is what lets a later stopped run merge
-                        # instead of asking.
-                        agreed = remote
-                        webdav_core.save_sync_state(state_path, settings, agreed, "sync")
-                        webdav_operations.publish_remote_digests(client, settings, agreed)
-                        outcome = "unchanged"
-                    elif plan == "push":
-                        webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
-                        outcome = "push"
-                    elif plan == "conflict":
-                        # Both ends moved, so neither snapshot is a version of
-                        # the other -- but the two edits are usually of
-                        # different rows of one document (a route added here, a
-                        # station's key re-bound there).  The documents are
-                        # merged first, and only a real collision -- one field
-                        # of one row changed on both sides, an edit against a
-                        # removal, a merge this app would not load -- leaves the
-                        # reader the choice the pane offers.
-                        merged_files: dict[str, bytes] | None = None
-                        try:
-                            merged_files = webdav_operations.conflict_merge(
-                                client, settings, local, remote, base
-                            )
-                        except Exception:
-                            # A merge that cannot even be attempted is a
-                            # conflict, not a failed sync: the choice below is
-                            # the answer either way.
-                            merged_files = None
-                        if merged_files is not None:
-                            webdav_operations.install_merged_files(
-                                client, settings, config_path, state_path, merged_files
-                            )
-                            pulled = True
-                            outcome = "merge"
-                            # The pane's own summary: this run settled both
-                            # edits, so no comparison window is offered.
-                            action_summary = {"outcome": outcome, "sections": list(sections)}
-                        else:
-                            # Nothing can combine these two sides: the run
-                            # writes nothing, keeps the remote side beside the
-                            # sync state, and stops.  The pane compares the two
-                            # and sends back the side the reader picks.
-                            try:
-                                webdav_operations.remember_remote_bundle(client, settings, conflict_path)
-                            except Exception:
-                                # Failing to keep the comparison is not the cause the
-                                # reader has to act on: the conflict is, and the
-                                # pane can still state it with the choice and no
-                                # diff.
-                                webdav_core.clear_conflict_record(conflict_path)
-                            raise webdav_core.SyncError(
-                                "WebDAV sync stopped because both ends changed the same content",
-                                "webdav_sync_conflict",
-                            )
-                    else:
-                        # The comparison above already read both manifests; a
-                        # second one would only restate what this branch
-                        # knows, so accept the remote bundle directly.
-                        webdav_operations.pull_bundle(
-                            client, settings, config_path, state_path, "sync-pull",
-                            skip_when_unchanged=False,
-                        )
-                        pulled = True
-                        outcome = "pull"
+                if incoming is not None:
+                    webdav_core.install_snapshot(incoming, config_path)
+                webdav_core.save_sync_state(state_path, settings, agreed, state_action)
 
                 # A host serves a projection of the document (see
                 # ``host_profile``), and the key in it is that host's own.  The
@@ -6176,20 +6235,8 @@ class CoreStore:
                     "outcome": outcome,
                     "sections": list(sections),
                 }
-                if adopted_remote is not None:
-                    # A setting renamed from an earlier default moved its file;
-                    # the pane states it when the server would not let the old
-                    # one go.
-                    action_summary["adopted_remote"] = adopted_remote
-                if archived_remote is not None:
-                    # What the pane states after the sync: this Mac's state
-                    # replaced a remote file that is still on the server under
-                    # the name below.
-                    action_summary = {
-                        "outcome": outcome,
-                        "archived_remote": archived_remote,
-                        "sections": list(sections),
-                    }
+                if "archived_remote" in action_summary:
+                    action_summary.update(outcome=outcome, sections=list(sections))
                 if pulled:
                     # A pull replaces the settings documents themselves, so a
                     # caller holding a pre-pull revision is applying over a
@@ -6199,14 +6246,6 @@ class CoreStore:
                 else:
                     self._advance_projection_revision()
                 self._persist_metadata()
-                status_handler = self._service_handlers.get("status")
-                if status_handler is not None:
-                    try:
-                        service_result = status_handler("health")
-                    except Exception:
-                        service_result = None
-                    if isinstance(service_result, Mapping):
-                        self._set_service_from_result(service_result, increment=False)
             except Exception as exc:
                 rollback_failed = False
                 try:
@@ -6247,22 +6286,10 @@ class CoreStore:
                 # is unavailable" while Core was answering everything else.  An
                 # HTTP status is the remote's word, so it stays in the message
                 # and the pane states its own sentence for the failure.
-                named_cause = isinstance(exc, webdav_core.SyncError) and is_error_code(exc.code)
-                cause_code = exc.code if named_cause else "webdav_sync_failed"
-                try:
-                    webdav_core.save_sync_status(status_path, operation, False, cause_code)
-                except Exception:
-                    pass
+                failure = record_failure(exc)
                 if rollback_failed:
-                    raise CoreError(cause_code, "WebDAV sync could not roll back local files") from None
-                if isinstance(exc, CoreError):
-                    raise
-                if isinstance(exc, webdav_core.SyncError):
-                    # The remote's own sentence, redacted and held to the
-                    # one-line/512-byte rule the envelope enforces.
-                    raise CoreError(cause_code, safe_error_message(exc, known_secrets=(settings.password,))) from None
-                raise CoreError(cause_code, "WebDAV sync failed") from None
-            should_emit = True
+                    raise CoreError(failure.code, "WebDAV sync could not roll back local files") from None
+                raise failure from None
             if pulled:
                 # After the commit, not inside it: the restart runs on its own
                 # thread and a rollback must never leave one scheduled.
@@ -6272,8 +6299,7 @@ class CoreStore:
             result: dict[str, Any] = {"revision": self._revision}
             if action_summary:
                 result["action_summary"] = action_summary
-        if should_emit:
-            self._request_emit()
+        self._request_emit()
         return result
 
     def _supersede_probe(self, prepared: Mapping[str, Any]) -> Callable[[], bool]:
@@ -6472,10 +6498,7 @@ class CoreStore:
         """
 
         names = {name}
-        if name == "relay_accounts" and (
-            normalized_action in _RELAY_DEPENDENCY_ACTIONS
-            or normalized_action in _RELAY_RESOURCE_IMPORT_ACTIONS
-        ):
+        if name == "relay_accounts" and normalized_action in _RELAY_DEPENDENCY_ACTIONS:
             names.add("providers_models")
         elif name == "providers_models" and (
             normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS
@@ -6607,35 +6630,78 @@ class CoreStore:
             domain_value is not None
             and _canonical_domain(domain_value) == "providers_models"
             and normalized_action in {
+                "providers_fetch_models",
+                "provider_fetch_models",
+                "fetch_models",
+            }
+        ):
+            return self._dispatch_provider_read(
+                action_type,
+                "fetch_models",
+                data.get("payload"),
+                expected_revision if expected_revision is not None else data.get("expected_revision"),
+            )
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "relay_accounts"
+            and normalized_action in {"detect_type", "account_detect_type", "relay_detect_type"}
+        ):
+            return self._dispatch_relay_read(
+                action_type,
+                data.get("payload"),
+                expected_revision if expected_revision is not None else data.get("expected_revision"),
+            )
+        if domain_value is not None and _canonical_domain(domain_value) == "providers_models" and normalized_action == "provider_fetch_relay_resource_models":
+            return self._dispatch_relay_model_list(data.get("payload"), expected_revision if expected_revision is not None else data.get("expected_revision"))
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "relay_accounts"
+            and normalized_action in {"resources_refresh", "relay_resources_refresh", "account_resources_refresh"}
+        ):
+            resource_data = _as_mapping(data.get("payload"))
+            return _relay_transient_dispatch_result(
+                self.refresh_relay_resources(
+                    resource_data.get("id", resource_data.get("account_id")),
+                    revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
+                    force=resource_data.get("force") is True,
+                )
+            )
+        if domain_value is not None and _canonical_domain(domain_value) == "relay_accounts" and normalized_action in _RELAY_RESOURCE_IMPORT_ACTIONS:
+            resource_data = _as_mapping(data.get("payload"))
+            return _relay_transient_dispatch_result(self.import_relay_resources(
+                resource_data.get("id", resource_data.get("account_id")),
+                resource_data.get("resource_ids"),
+                revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
+                mode=resource_data.get("import_mode", resource_data.get("mode", "linked")),
+            ))
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "providers_models"
+            and normalized_action in {
                 "workbuddy_status",
+                "workbuddy_models",
+                "workbuddy_login",
                 "qoder_status",
                 "qoder_models",
                 "qoder_login",
                 "qoder_logout",
                 "qoder_open_app",
                 "our_free_model_status",
+                "our_free_model_models",
             }
         ):
-            return self._dispatch_worker_status(
+            return self._dispatch_provider_read(
                 action_type,
                 normalized_action,
                 data.get("payload"),
                 expected_revision if expected_revision is not None else data.get("expected_revision"),
             )
-        if domain_value is None and action_type.startswith("service.") and action_type.removeprefix("service.") in SERVICE_PROXY_OPERATIONS:
-            # A proxy operation runs the controller's own replacement, so it
-            # holds the mutation lane (never the state lock): see
-            # ``_dispatch_service``.  Serializing it with panes' edits is what
-            # keeps a restart from rewriting the Codex files under a commit;
-            # snapshots stay live because they take neither lane.
-            should_emit = False
-            with self._mutation_scope():
-                self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
-                previous_revision = self._revision
-                self._dispatch_service(action_type, _as_mapping(data.get("payload")))
-                should_emit = self._revision != previous_revision
-                response = {"revision": self._revision}
-            if should_emit:
+        if domain_value is None and action_type.startswith("service."):
+            self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
+            previous_revision = self.revision
+            self._dispatch_service(action_type, _as_mapping(data.get("payload")))
+            response = {"revision": self.revision}
+            if response["revision"] != previous_revision:
                 self._request_emit()
             return response
         should_emit = False
@@ -6645,8 +6711,6 @@ class CoreStore:
         # rewrites a second domain -- a relay removal that releases linked
         # provider slots, a provider action that resolves relay key material --
         # names both and takes the cross-domain transaction lane as well.
-        # ``service.*`` answers a proxy operation, which touches no domain but
-        # must stay serialized with every writer, so it keeps the whole lane.
         declared = (
             self._dispatch_domain_set(_canonical_domain(domain_value), normalized_action)
             if domain_value is not None
@@ -6657,9 +6721,7 @@ class CoreStore:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
             action_summary: dict[str, Any] | None = None
-            if domain_value is None and action_type.startswith("service."):
-                result = self._dispatch_service(action_type, _as_mapping(data.get("payload")))
-            else:
+            if domain_value is not None:
                 name = _canonical_domain(domain_value)
                 adapter = self._domains.get(name)
                 if adapter is None:
@@ -6700,33 +6762,6 @@ class CoreStore:
                     if file_token is not None:
                         selected_path = self.file_capabilities.resolve(file_token, "import")
                         payload = {"path": str(selected_path)}
-                if name == "relay_accounts" and normalized_action in _RELAY_RESOURCE_IMPORT_ACTIONS:
-                    resource_data = _as_mapping(payload)
-                    # The revision the caller stated is the one this dispatch
-                    # checks, exactly as the ordinary path and the codex/webdav
-                    # special cases do: staging an import from a stale window
-                    # has to conflict instead of silently rewriting the draft.
-                    return _relay_transient_dispatch_result(
-                        self.import_relay_resources(
-                            resource_data.get("id", resource_data.get("account_id")),
-                            resource_data.get("resource_ids"),
-                            revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
-                            mode=resource_data.get("import_mode", resource_data.get("mode", "linked")),
-                        )
-                    )
-                if name == "relay_accounts" and normalized_action in {
-                    "resources_refresh",
-                    "relay_resources_refresh",
-                    "account_resources_refresh",
-                }:
-                    resource_data = _as_mapping(payload)
-                    return _relay_transient_dispatch_result(
-                        self.refresh_relay_resources(
-                            resource_data.get("id", resource_data.get("account_id")),
-                            revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
-                            force=resource_data.get("force") is True,
-                        )
-                    )
                 if name == "providers_models" and normalized_action == "provider_select_relay_station":
                     station_data = _as_mapping(payload)
                     relay = self._domains.get("relay_accounts")
@@ -6786,59 +6821,6 @@ class CoreStore:
                                 "Relay API resource is unavailable",
                             )
                         source = dict(resolved)
-                        if normalized_action == "provider_fetch_relay_resource_models":
-                            materializer = getattr(relay, "binding_materials", None)
-                            if not callable(materializer):
-                                raise CoreError(
-                                    "domain_error",
-                                    "Relay API key material is unavailable",
-                                )
-                            # The durable half of "a key this Core already holds".
-                            # A linked slot persists its value in the provider
-                            # document, while the relay domain's in-process cache
-                            # does not survive a restart -- and an account whose
-                            # dashboard session has expired cannot hand its keys
-                            # over at all.  Passing the slots is what makes 获取模型
-                            # work from the credential already on disk instead of
-                            # reporting the key unresolvable, exactly as an Apply
-                            # resolves it; the station is still read for any
-                            # source the slots do not cover.  The provider domain
-                            # is looked up here rather than reusing the
-                            # dependency-transaction local below, which is None
-                            # for this action.
-                            providers_domain = self._domains.get("providers_models")
-                            slot_reader = getattr(providers_domain, "relay_slot_credentials", None)
-                            # A key the document already carries resolves without
-                            # any request, which is what makes 获取模型 exactly the
-                            # one listing the user asked for.  A slot carrying no
-                            # value is read as the one credential it is: the
-                            # domain's own key read (one page on a sub2api
-                            # station, one token read on New API), never an
-                            # account refresh that also lists every other key.
-                            # ``catalogs=False`` says this caller needs the
-                            # credential and nothing else -- the listing is the
-                            # catalog read.
-                            materials = materializer(
-                                {"resources": [source]},
-                                slot_credentials=slot_reader() if callable(slot_reader) else None,
-                                catalogs=False,
-                            )
-                            rows = materials.get("resources") if isinstance(materials, Mapping) else None
-                            material = next(
-                                (
-                                    item
-                                    for item in rows
-                                    if isinstance(item, Mapping)
-                                    and all(item.get(key) == source.get(key) for key in ("station_id", "account_id", "resource_id"))
-                                ),
-                                None,
-                            ) if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes, bytearray)) else None
-                            if not isinstance(material, Mapping) or not isinstance(material.get("api_key"), str):
-                                raise CoreError(
-                                    "domain_error",
-                                    "Relay API key material is unavailable",
-                                )
-                            source = dict(material)
                         payload = {
                             "provider_id": resource_data.get("provider_id"),
                             **(
@@ -6969,10 +6951,6 @@ class CoreStore:
                         # catalog then reads the shared slot another window's
                         # read has already replaced.
                         expected_operation = {
-                            "fetch_models": "fetch_models",
-                            "providers_fetch_models": "fetch_models",
-                            "provider_fetch_models": "fetch_models",
-                            "provider_fetch_relay_resource_models": "fetch_models",
                             "service_provider_add": "service_provider_add",
                             "service_add_provider": "service_provider_add",
                             "provider_auth_start": "provider_auth_start",
@@ -6983,15 +6961,6 @@ class CoreStore:
                             "service_provider_auth_cancel": "service_provider_auth_cancel",
                             "service_provider_auth_logout": "service_provider_auth_logout",
                             "service_provider_auth_status": "service_provider_auth_status",
-                            "workbuddy_status": "workbuddy_status",
-                            "workbuddy_models": "workbuddy_models",
-                            "workbuddy_login": "workbuddy_login",
-                            "qoder_status": "qoder_status",
-                            "qoder_models": "qoder_models",
-                            "qoder_login": "qoder_login",
-                            "qoder_logout": "qoder_logout",
-                            "our_free_model_status": "our_free_model_status",
-                            "our_free_model_models": "our_free_model_models",
                             "model_add_many": "model_add_many",
                             "add_models": "model_add_many",
                             "model_import_service_catalog": "model_import_service_catalog",
@@ -7206,37 +7175,27 @@ class CoreStore:
         try:
             # A manual restart and a background post-apply restart must never
             # replace the proxy at the same time.
+            full_replacement = operation in {"start", "start_async", "restart"}
             with self._service_transition_guard:
-                result = handler(operation)
-            if not isinstance(result, Mapping):
-                raise CoreError("service_error", "LiteLLM service returned invalid status")
-            # The answer lands while the count is still held: releasing it first
-            # would let a concurrent snapshot read the controller
-            # mid-replacement and publish that reading over the state this
-            # dispatch just settled.
-            reconcile = False
-            with self._lock:
-                self._set_service_from_result(result, increment=False)
-                if str(result.get("state")) == "running" and operation in {"start", "start_async", "restart", "reload"}:
-                    # A manual start or restart replaced the process, so a
-                    # runtime setting that was still owed one now has its
-                    # environment in the running proxy and is no longer owed.
-                    # ``reload`` rolls the workers and does not: it leaves the
-                    # request standing for the pass that can satisfy it.
-                    if operation in {"start", "start_async", "restart"}:
+                with self._service_reload_guard:
+                    owed = full_replacement and self._service_reload_replace_process
+                    if full_replacement:
                         self._service_reload_replace_process = False
-                    reconcile = True
+                try:
+                    result = handler(operation)
+                except BaseException:
+                    self._restore_replace_process_request(owed)
+                    raise
+                if not isinstance(result, Mapping):
+                    self._restore_replace_process_request(owed)
+                    raise CoreError("service_error", "LiteLLM service returned invalid status")
+                if result.get("state") != "running":
+                    self._restore_replace_process_request(owed)
+                with self._lock:
+                    self._set_service_from_result(result, increment=False)
+            reconcile = result.get("state") == "running" and operation in SERVICE_TRANSITION_OPERATIONS
             if reconcile:
-                # Each of these reads and rewrites a client document on disk.
-                # They run on the mutation lane (the proxy operation holds it),
-                # never under the state lock every window polls.
-                self._follow_codex_local_api()
-                self.refresh_client_model_lists(refresh_contexts=False)
-                # A start or restart is also where the image-context switch
-                # and the client's fetch-server entry are reconciled: the
-                # pass reads its switch from the proxy's environment, which
-                # only a replaced process has.
-                self._sync_codex_image_context_mcp(["codex"])
+                self._reconcile_client_documents_after_reload()
             with self._lock:
                 return self._project_service_dispatch(previous_service, payload)
         except CoreError:
@@ -7470,15 +7429,6 @@ class CoreStore:
             # worker probes the live state off every write lane before it decides
             # (see ``_reload_service_after_apply``); refusing here would drop the
             # one pass that can still deliver the environment the commit needs.
-            if (
-                self._service.get("state") not in {"running", "unhealthy"}
-                and not self._service_reload_replace_process
-            ):
-                _note(
-                    "an apply wanted a proxy restart, but the service reads %s"
-                    % self._service.get("state")
-                )
-                return
             _note(
                 "an apply is replacing the proxy (%s)"
                 % ("full replacement" if self._service_reload_replace_process else "rolling reload")
@@ -7489,7 +7439,7 @@ class CoreStore:
                 daemon=True,
             )
             self._service_reload_thread = thread
-        thread.start()
+            thread.start()
 
     def _restore_replace_process_request(self, owed: bool) -> None:
         """Keep owing a full replacement that this pass did not deliver.
@@ -7616,17 +7566,7 @@ class CoreStore:
             running = service_result.get("state") == "running"
         self._request_emit()
         if running:
-            # This reconciliation reads and rewrites the client documents on
-            # disk -- the Codex catalog, the Claude picker, the fetch-server
-            # entry -- and it used to run with the store lock held.  Measured on
-            # lv: a page poll taken while the proxy was being replaced waited
-            # 0.67-0.82 s for that lock, which is a window that feels frozen
-            # exactly when a person is watching the reload happen.  It takes
-            # the mutation lane (so an Apply cannot rewrite the same files
-            # underneath it) and the state lock only for its bookkeeping.
-            with self._mutation_scope():
-                with self._domain_scope("codex", "claude", "clients"):
-                    self._reconcile_client_documents_after_reload()
+            self._reconcile_client_documents_after_reload()
             self._request_emit()
         if self._service_reload_stopping:
             # The host quit while this restart was in flight; shutdown() may
@@ -7643,37 +7583,10 @@ class CoreStore:
         the lock for that bookkeeping alone.
         """
 
-        codex = self._domains.get("codex")
-        refresh_catalog = getattr(codex, "refresh_model_catalog", None)
-        if callable(refresh_catalog):
-            catalog_revision_before = getattr(codex, "revision", None)
-            try:
-                refresh_catalog()
-            except Exception:
-                pass
-            if getattr(codex, "revision", None) != catalog_revision_before:
-                with self._lock:
-                    # A snapshot is memoized on Core's revision; a domain
-                    # observation that changed the catalog must invalidate that
-                    # memo even though no draft moved.
-                    self._advance_revision()
-                    self._snapshot_cache = None
-                    try:
-                        self._persist_metadata()
-                    except PersistenceError:
-                        pass
-        # The caller holds the mutation lane; these rewrite client files and
-        # take the state lock only for their own bookkeeping, never across the
-        # write.
-        self._follow_codex_local_api(codex)
+        with self._domain_scope("codex"):
+            self._follow_codex_local_api()
+            self._sync_codex_image_context_mcp(["codex"])
         self.refresh_client_model_lists(refresh_contexts=False)
-        # The image-context switch lives in the runtime settings and the fetch
-        # server in the client's document.  Reconciling here as well as on Apply
-        # is what makes the two agree after a start: a settings file edited
-        # while the app was closed, or a client file restored from a backup,
-        # would otherwise leave the pass on with no tool to fetch what it
-        # omitted.
-        self._sync_codex_image_context_mcp(["codex"])
 
     def _follow_codex_local_api(self, codex: object | None = None) -> None:
         """Keep a Codex client that uses this app's proxy on its current endpoint.
@@ -7777,156 +7690,143 @@ class CoreStore:
             self._service_supervision_guard.release()
 
     def _supervise_service_once(self) -> TaskResult:
-        # A pass can replace the proxy, which takes seconds.  It holds the
-        # mutation lane so a pane's edit cannot land mid-replacement, while
-        # snapshots keep reading the last committed projection.
-        should_emit = False
-        with self._mutation_scope():
+        with self._lock:
+            if self._service_supervision_stopping or self._service_intent != "running":
+                self._service_supervision_unhealthy_since = None
+                return TaskResult("skipped")
+            if self._service_proxy_operations > 0:
+                return TaskResult("skipped")
+            reload_thread = self._service_reload_thread
+            if reload_thread is not None and reload_thread.is_alive():
+                return TaskResult("skipped")
+            handlers = dict(self._service_handlers)
+        # A forced read: the settled cache would hide the death this pass is
+        # looking for until it expired.
+        status_handler = handlers.get("health") or handlers.get("status")
+        if status_handler is None:
+            return TaskResult("skipped")
+        try:
+            current = status_handler("health" if handlers.get("health") is not None else "status")
+        except Exception as exc:
+            return TaskResult("failed", task_exception_detail(exc, phase="check_proxy_health"))
+        if not isinstance(current, Mapping):
+            return TaskResult("failed", {"phase": "check_proxy_health", "message": "The proxy controller returned no state"})
+        state = str(current.get("state"))
+        now = time.monotonic()
+        if state in {"running", "starting"}:
+            self._service_supervision_unhealthy_since = None
+            self._service_supervision_attempts = 0
+            self._service_supervision_retry_at = 0.0
+            return TaskResult("succeeded")
+        if state == "unhealthy":
+            if self._service_supervision_unhealthy_since is None:
+                self._service_supervision_unhealthy_since = now
+                return TaskResult("skipped")
+            if now - self._service_supervision_unhealthy_since < SERVICE_RECOVERY_PATIENCE_SECONDS:
+                return TaskResult("skipped")
+        elif state != "stopped":
+            # "unknown" is somebody else's listener on the configured port.
+            self._service_supervision_unhealthy_since = None
+            return TaskResult("skipped")
+        if now < self._service_supervision_retry_at:
+            return TaskResult("skipped")
+        operation = "restart" if state == "unhealthy" else "start"
+        recovery_detail: TaskFacts = {"phase": operation, "previous_state": state}
+        handler = handlers.get(operation)
+        if handler is None:
+            return TaskResult("failed", {**recovery_detail, "message": "No proxy recovery handler is configured"})
+        # Stated before the attempt, not after: a recovery that hangs or
+        # dies while replacing the proxy leaves this line as the only
+        # record that anything was being done about it.
+        _note("recovering the proxy (%s -> %s)" % (state, operation))
+        with self._service_transition_guard:
+            published = False
             with self._lock:
+                # Re-read the decision under the guard: a stop, a Core
+                # shutdown, or a person's own start may have landed since
+                # the probe.
                 if self._service_supervision_stopping or self._service_intent != "running":
-                    self._service_supervision_unhealthy_since = None
                     return TaskResult("skipped")
                 if self._service_proxy_operations > 0:
                     return TaskResult("skipped")
-                reload_thread = self._service_reload_thread
-                if reload_thread is not None and reload_thread.is_alive():
+                if self._service_reload_thread is not None and self._service_reload_thread.is_alive():
                     return TaskResult("skipped")
-                handlers = dict(self._service_handlers)
-            # A forced read: the settled cache would hide the death this pass is
-            # looking for until it expired.
-            status_handler = handlers.get("health") or handlers.get("status")
-            if status_handler is None:
-                return TaskResult("skipped")
-            try:
-                current = status_handler("health" if handlers.get("health") is not None else "status")
-            except Exception as exc:
-                return TaskResult("failed", task_exception_detail(exc, phase="check_proxy_health"))
-            if not isinstance(current, Mapping):
-                return TaskResult("failed", {"phase": "check_proxy_health", "message": "The proxy controller returned no state"})
-            state = str(current.get("state"))
-            now = time.monotonic()
-            if state in {"running", "starting"}:
-                self._service_supervision_unhealthy_since = None
-                self._service_supervision_attempts = 0
-                self._service_supervision_retry_at = 0.0
-                return TaskResult("succeeded")
-            if state == "unhealthy":
-                if self._service_supervision_unhealthy_since is None:
-                    self._service_supervision_unhealthy_since = now
-                    return TaskResult("skipped")
-                if now - self._service_supervision_unhealthy_since < SERVICE_RECOVERY_PATIENCE_SECONDS:
-                    return TaskResult("skipped")
-            elif state != "stopped":
-                # "unknown" is somebody else's listener on the configured port.
-                self._service_supervision_unhealthy_since = None
-                return TaskResult("skipped")
-            if now < self._service_supervision_retry_at:
-                return TaskResult("skipped")
-            operation = "restart" if state == "unhealthy" else "start"
-            recovery_detail: TaskFacts = {"phase": operation, "previous_state": state}
-            handler = handlers.get(operation)
-            if handler is None:
-                return TaskResult("failed", {**recovery_detail, "message": "No proxy recovery handler is configured"})
-            # Stated before the attempt, not after: a recovery that hangs or
-            # dies while replacing the proxy leaves this line as the only
-            # record that anything was being done about it.
-            _note("recovering the proxy (%s -> %s)" % (state, operation))
-            with self._service_transition_guard:
-                published = False
-                with self._lock:
-                    # Re-read the decision under the guard: a stop, a Core
-                    # shutdown, or a person's own start may have landed since
-                    # the probe.
-                    if self._service_supervision_stopping or self._service_intent != "running":
-                        return TaskResult("skipped")
-                    if self._service_proxy_operations > 0:
-                        return TaskResult("skipped")
-                    # Hold the replacement count for this pass exactly as an
-                    # explicit operation does: every window must draw 启动中
-                    # while the proxy is being replaced, never the failure it
-                    # is replacing.
-                    self._service_proxy_operations += 1
-                    try:
-                        self._publish_service_transition()
-                        self._advance_projection_revision()
-                        self._persist_metadata()
-                        published = True
-                    except BaseException:
-                        # The finally below only covers the replacement itself;
-                        # a persist failure here would otherwise leave the count
-                        # raised and stop this store from ever projecting a real
-                        # service state again.
-                        self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
-                        raise
-                if published:
-                    # Sent here, not requested: the replacement below may take
-                    # minutes, and every window has to see the proxy leave its
-                    # state before it starts rather than after it ends.
-                    self._emit()
-                reconcile = False
+                # Hold the replacement count for this pass exactly as an
+                # explicit operation does: every window must draw 启动中
+                # while the proxy is being replaced, never the failure it
+                # is replacing.
+                self._service_proxy_operations += 1
                 try:
-                    try:
-                        result = handler(operation)
-                    except Exception as exc:
-                        _note("the proxy recovery (%s) failed" % operation, trace=exc)
-                        recovery_detail.update(task_exception_detail(exc, phase=operation))
-                        result = None
-                    with self._lock:
-                        if isinstance(result, Mapping):
-                            self._set_service_from_result(result, increment=False)
-                            recovery_detail["state"] = self._service["state"]
-                        recovered = isinstance(result, Mapping) and str(result.get("state")) == "running"
-                        if recovered:
-                            self._service_supervision_unhealthy_since = None
-                            self._service_supervision_attempts = 0
-                            self._service_supervision_retry_at = 0.0
-                            # A recovery that replaced the process satisfies a
-                            # runtime setting that was still owed a
-                            # replacement, and it is where a client that points
-                            # at this proxy follows a port change.
-                            self._service_reload_replace_process = False
-                            reconcile = True
-                        else:
-                            self._service_supervision_attempts += 1
-                            self._service_supervision_retry_at = now + _service_recovery_delay(
-                                self._service_supervision_attempts
-                            )
-                            if self._service_supervision_unhealthy_since is not None:
-                                # The wedged child was replaced but its
-                                # replacement is not healthy yet; afford it its
-                                # own patience rather than restarting it on the
-                                # very next pass.
-                                self._service_supervision_unhealthy_since = now
-                finally:
-                    with self._lock:
-                        self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
-                    if self._service_supervision_stopping:
-                        # A quit landed while this pass was replacing the
-                        # proxy, and its own stop may have run before this
-                        # child existed.  End it here rather than leave an
-                        # orphan holding the port.  The stop is idempotent: one
-                        # that already ran finds no owner.
-                        stopper = handlers.get("stop")
-                        if stopper is not None:
-                            try:
-                                stopper("stop")
-                            except Exception:
-                                pass
-                if reconcile:
-                    # Disk work: the Codex endpoint file, the generated client
-                    # lists, and the image-context MCP entry.  It holds the
-                    # document domains it rewrites (nested inside this pass's
-                    # transaction lane) and never the state lock.
-                    with self._domain_scope("codex", "claude", "clients"):
-                        self._follow_codex_local_api()
-                        self.refresh_client_model_lists(refresh_contexts=False)
-                        self._sync_codex_image_context_mcp(["codex"])
-            # ``snapshot`` re-reads the controller once no replacement is in
-            # flight, so a failed pass publishes the real state instead of
-            # leaving the 启动中 it had to claim while it tried.
-            should_emit = True
-        if should_emit:
-            self._request_emit()
+                    self._publish_service_transition()
+                    self._advance_projection_revision()
+                    self._persist_metadata()
+                    published = True
+                except BaseException:
+                    # The finally below only covers the replacement itself;
+                    # a persist failure here would otherwise leave the count
+                    # raised and stop this store from ever projecting a real
+                    # service state again.
+                    self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+                    raise
+            if published:
+                # Sent here, not requested: the replacement below may take
+                # minutes, and every window has to see the proxy leave its
+                # state before it starts rather than after it ends.
+                self._emit()
+            reconcile = False
+            with self._service_reload_guard:
+                owed = self._service_reload_replace_process
+                self._service_reload_replace_process = False
+            try:
+                try:
+                    result = handler(operation)
+                except Exception as exc:
+                    _note("the proxy recovery (%s) failed" % operation, trace=exc)
+                    recovery_detail.update(task_exception_detail(exc, phase=operation))
+                    result = None
+                with self._lock:
+                    if isinstance(result, Mapping):
+                        self._set_service_from_result(result, increment=False)
+                        recovery_detail["state"] = self._service["state"]
+                    recovered = isinstance(result, Mapping) and str(result.get("state")) == "running"
+                    if recovered:
+                        self._service_supervision_unhealthy_since = None
+                        self._service_supervision_attempts = 0
+                        self._service_supervision_retry_at = 0.0
+                        reconcile = True
+                    else:
+                        self._restore_replace_process_request(owed)
+                        self._service_supervision_attempts += 1
+                        self._service_supervision_retry_at = now + _service_recovery_delay(
+                            self._service_supervision_attempts
+                        )
+                        if self._service_supervision_unhealthy_since is not None:
+                            # The wedged child was replaced but its
+                            # replacement is not healthy yet; afford it its
+                            # own patience rather than restarting it on the
+                            # very next pass.
+                            self._service_supervision_unhealthy_since = now
+            finally:
+                with self._lock:
+                    self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+                if self._service_supervision_stopping:
+                    # A quit landed while this pass was replacing the
+                    # proxy, and its own stop may have run before this
+                    # child existed.  End it here rather than leave an
+                    # orphan holding the port.  The stop is idempotent: one
+                    # that already ran finds no owner.
+                    stopper = handlers.get("stop")
+                    if stopper is not None:
+                        try:
+                            stopper("stop")
+                        except Exception:
+                            pass
+        if reconcile:
+            self._reconcile_client_documents_after_reload()
+        # ``snapshot`` re-reads the controller once no replacement is in
+        # flight, so a failed pass publishes the real state instead of
+        # leaving the 启动中 it had to claim while it tried.
+        self._request_emit()
         if recovered:
             return TaskResult("succeeded", recovery_detail)
         recovery_detail.setdefault("message", "The proxy did not reach the running state after recovery")
@@ -8081,7 +7981,7 @@ class CoreStore:
         begin_reads = getattr(relay, "begin_apply_reads", None)
         end_reads = getattr(relay, "end_apply_reads", None)
         try:
-            if callable(begin_reads):
+            if not relay_dependency_only and callable(begin_reads):
                 begin_reads()
             return self._apply_relay_transaction(
                 names,
@@ -8098,7 +7998,7 @@ class CoreStore:
                 binding_materials=binding_materials,
             )
         finally:
-            if callable(end_reads):
+            if not relay_dependency_only and callable(end_reads):
                 end_reads()
 
     def _apply_relay_transaction(
@@ -8150,6 +8050,7 @@ class CoreStore:
         relay_locally_applied = False
         applied: list[str] = []
         operation_total = 0
+        checkpoint_current = True
         # The validation that refuses this Apply, kept across the rollback.
         # ``restore_local_state`` restores the drafts too, so a refusal recorded
         # on the failed draft would disappear before the window can read it --
@@ -8157,10 +8058,39 @@ class CoreStore:
         # with no row marked.  Publish these after the restore instead.
         captured_validation: dict[str, Any] = {}
 
+        def read_station(operation, *, after_commit: bool = False):
+            """Run a journal phase with only the relay writer, then check the local plan."""
+            nonlocal checkpoint_current
+            frames = self._thread_lane_frames()
+            if len(frames) != 1:
+                return operation()
+            revision = self._revision
+            relay_revision = getattr(relay, "revision", None)
+            settings_revision = self._settings_advanced_at
+            checkpoint_current = False
+            with self._suspend_domain_scope(frames[0]):
+                with self._domain_scope("relay_accounts"):
+                    if getattr(relay, "revision", None) != relay_revision:
+                        raise RevisionConflict(revision, self._revision)
+                    result = operation()
+            if not after_commit:
+                self._refresh_external_disk_state(names)
+                if settings_revision != self._settings_advanced_at or any(
+                    self._disk.get(name, {}).get("changed") for name in names
+                ):
+                    raise RevisionConflict(revision, self._revision)
+                checkpoint_current = revision == self._revision
+            return result
+
         def restore_local_state() -> None:
             _restore_files(file_checkpoints)
             for adapter_name, adapter in transaction_adapters.items():
-                _restore_adapter(adapter, adapter_checkpoints[adapter_name])
+                checkpoint = adapter_checkpoints[adapter_name]
+                restore_relay = getattr(adapter, "restore_apply_transaction", None) if adapter is relay else None
+                if callable(restore_relay) and checkpoint["kind"] == "transaction":
+                    restore_relay(checkpoint["value"])
+                else:
+                    _restore_adapter(adapter, checkpoint)
             self._restore_revision(core_checkpoint["revision"])
             self._drafts = copy.deepcopy(core_checkpoint["drafts"])
             self._last_actions = copy.deepcopy(core_checkpoint["last_actions"])
@@ -8250,15 +8180,19 @@ class CoreStore:
                 and operation.get("kind") != "api_key_delete"
                 and operation.get("state", operation.get("status", "staged")) == "staged"
             ]
-            if non_destructive:
-                # We cross the remote boundary immediately before invoking the
-                # helper because a timeout is ambiguous: it may have applied
-                # the remote mutation even when no response was received.
-                remote_boundary_crossed = True
-                execute(prepared, phase="non_destructive")
-
             if not relay_dependency_only:
-                reconciled = reconcile(prepared, phase="non_destructive")
+                def run_non_destructive():
+                    nonlocal remote_boundary_crossed
+                    if non_destructive:
+                        remote_boundary_crossed = True
+                        execute(prepared, phase="non_destructive")
+                    return reconcile(prepared, phase="non_destructive")
+
+                reconciled = (
+                    read_station(run_non_destructive)
+                    if any(isinstance(item, Mapping) and item.get("kind") != "api_key_delete" for item in operations)
+                    else run_non_destructive()
+                )
                 # Transport failures are provisional until the immediate factual
                 # refresh. A lost response may still have applied remotely; only
                 # unresolved reconciliation issues stop the coordinated Apply —
@@ -8407,11 +8341,13 @@ class CoreStore:
                     # A key only a station read could reveal is still reported
                     # unresolved, exactly as it is when the station cannot be
                     # reached at all.
-                    materials = binding_materials(
-                        {"resources": sources},
-                        refresh=True,
-                        slot_credentials=slot_credentials,
-                    )
+                    def resolve_materials():
+                        return binding_materials({"resources": sources}, refresh=True, slot_credentials=slot_credentials)
+
+                    held = slot_credentials if isinstance(slot_credentials, Mapping) else {}
+                    materials = read_station(resolve_materials) if any(
+                        not held.get((source.get("account_id"), source.get("resource_id"))) for source in sources
+                    ) else resolve_materials()
                     materialized = materialize(materials, scope=binding_scope)
                     # Whatever this resolution said becomes the pane's own map
                     # of the linked rows: a successful one clears it, a failed
@@ -8511,23 +8447,6 @@ class CoreStore:
                 and operation.get("kind") == "api_key_delete"
                 and operation.get("state", operation.get("status", "staged")) == "staged"
             ]
-            destructive_failed = False
-            if destructive:
-                # Local configuration is now independent of every key marked
-                # for removal; a failed deletion remains journaled for retry.
-                remote_boundary_crossed = True
-                try:
-                    execute(prepared, phase="destructive")
-                except Exception:
-                    if not provider_locally_applied:
-                        raise
-                    # The document this Apply is about is written, reloaded, and
-                    # live; what failed is the relay's own remote cleanup, and
-                    # its journal keeps it for the next attempt.  Reporting the
-                    # whole Apply as failed while the model was already serving
-                    # is the lie that made a ＋ which had landed read as
-                    # 更改未生效.
-                    destructive_failed = True
             if relay_dependency_only:
                 # This edit carries no relay work of its own, so the journal's
                 # remaining phases are not part of its result: every pending
@@ -8536,14 +8455,29 @@ class CoreStore:
                 issue_count = 0
                 pending = 0
             else:
-                reconciled_after_delete = reconcile(prepared, phase="destructive")
-                finalize_result = finalize()
-                issue_count = (
-                    self._relay_public_issue_count(reconciled_after_delete)
-                    + self._relay_public_issue_count(finalize_result)
-                    + (1 if destructive_failed else 0)
+                def finish_journal():
+                    nonlocal remote_boundary_crossed
+                    failed = False
+                    if destructive:
+                        remote_boundary_crossed = True
+                        try:
+                            execute(prepared, phase="destructive")
+                        except Exception:
+                            if not provider_locally_applied:
+                                raise
+                            failed = True
+                    issues = self._relay_public_issue_count(reconcile(prepared, phase="destructive"))
+                    issues += self._relay_public_issue_count(finalize()) + int(failed)
+                    remaining = self._relay_operation_count(relay)
+                    if not issues and not remaining:
+                        self._mark_relay_coordinated_applied("relay_accounts")
+                    return issues, remaining
+
+                issue_count, pending = (
+                    read_station(finish_journal, after_commit=True)
+                    if any(isinstance(item, Mapping) and item.get("kind") == "api_key_delete" for item in operations)
+                    else finish_journal()
                 )
-                pending = self._relay_operation_count(relay)
             if issue_count or pending:
                 # The local relay document is authoritative for completed
                 # work, while outstanding journal entries keep this domain
@@ -8568,15 +8502,14 @@ class CoreStore:
                     "issues": self._relay_apply_issues(issue_count),
                 }
 
-            if not relay_dependency_only:
-                self._mark_relay_coordinated_applied("relay_accounts")
             self._advance_revision()
             self._persist_metadata()
         except Exception as exc:
             if not remote_boundary_crossed:
                 rollback_failed = False
                 try:
-                    restore_local_state()
+                    if checkpoint_current:
+                        restore_local_state()
                 except Exception:
                     rollback_failed = True
                 if rollback_failed:
@@ -8591,11 +8524,7 @@ class CoreStore:
             # timed out. Do not restore its operation journal or local files
             # that have already committed; leave a visible, retryable partial
             # state instead.
-            if provider_locally_applied:
-                self._mark_relay_coordinated_applied("providers_models")
-            if relay_locally_applied:
-                self._mark_relay_coordinated_applied("relay_accounts")
-            else:
+            if not relay_locally_applied:
                 self._drafts["relay_accounts"]["dirty"] = True
                 self._drafts["relay_accounts"]["validation"] = {"valid": True, "issues": []}
             pending = self._relay_operation_count(relay)
@@ -8671,13 +8600,9 @@ class CoreStore:
     def _apply_domain_hints(self, domain: str | None, domains: Sequence[str] | None) -> tuple[str, ...]:
         """Which write lanes an Apply may need, from its arguments alone.
 
-        The body can grow its domain set while it runs: a provider draft that
-        binds relay material joins the relay transaction, and a runtime or
-        provider commit rewrites the Codex MCP entry.  The scope has to declare
-        those up front -- a lane discovered halfway through a transaction is a
-        lane taken out of order -- so this is deliberately a superset.  An
-        argument this cannot read (an unknown domain, an empty list) declares
-        everything and lets the body answer with its own error.
+        A relay Apply can write provider bindings. A runtime Apply can write
+        the proxy key in the provider document and the MCP entry in Codex.
+        Provider-only edits do not write either client's files.
         """
 
         if domain is None and domains is None:
@@ -8691,11 +8616,32 @@ class CoreStore:
                 names = {_canonical_domain(domain)}
         except CoreError:
             return tuple(self._domain_names())
-        if names & {"providers_models", "relay_accounts"}:
-            names |= {"providers_models", "relay_accounts"}
-        if names & {"providers_models", "runtime", "codex"}:
-            names.add("codex")
+        if "relay_accounts" in names:
+            names.add("providers_models")
+        if "runtime" in names:
+            names.update(("providers_models", "codex"))
         return tuple(sorted(names))
+
+    def _provider_apply_needs_relay(self) -> bool:
+        adapter = self._domains.get("relay_accounts")
+        if "providers_models" not in self._domains or not callable(getattr(adapter, "prepare_apply", None)):
+            return False
+        return bool(
+            set(_relay_binding_projection(self._adapter_draft_state("providers_models"))).difference(
+                _relay_binding_projection(self._baselines.get("providers_models"))
+            )
+        )
+
+    @contextlib.contextmanager
+    def _apply_write_scope(self, hints: tuple[str, ...]):
+        guard = self._relay_apply_guard if "relay_accounts" in hints else contextlib.nullcontext()
+        with guard:
+            with self._domain_scope(*hints):
+                if "relay_accounts" in hints or "providers_models" not in hints or not self._provider_apply_needs_relay():
+                    yield hints
+                    return
+            with self._domain_scope(*hints, "relay_accounts"):
+                yield (*hints, "relay_accounts")
 
     def apply(
         self,
@@ -8707,19 +8653,7 @@ class CoreStore:
         _direct_api: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         should_emit = False
-        # The commit's own restart decision asks whether the proxy is running,
-        # and that answer must be the one observed now, not the row an earlier
-        # commit happened to leave behind.  Probe it here -- outside every write
-        # lane, so a booting controller costs this call its own probe budget and
-        # not a hold on the domains every window edits.
-        self._service_row_is_live()
-        # The lanes this Apply declares before it starts.  A one-section Apply
-        # takes that section's lane plus the domains a coordinated write can
-        # pull in (the relay's key material for a provider draft, the other
-        # half of the relay transaction), and the Codex MCP entry that follows
-        # a runtime or provider commit.  A full Apply -- every dirty draft --
-        # is the cross-domain case and names everything.
-        with self._domain_scope(*self._apply_domain_hints(domain, domains)):
+        with self._apply_write_scope(self._apply_domain_hints(domain, domains)) as write_domains:
             # The caller's revision names the projection it read its edit from.
             # A refresh *inside* this Apply can advance the shared revision by
             # adopting a clean draft whose file changed since that read, and
@@ -8728,7 +8662,7 @@ class CoreStore:
             # already stale when it arrived still conflicts, while one whose
             # only mismatch is the reload this call just performed does not.
             revision_before_refresh = self._revision
-            self._refresh_external_disk_state()
+            self._refresh_external_disk_state(write_domains)
             self._check_revision_before_refresh(revision, revision_before_refresh)
             if domain is not None and domains is not None:
                 raise CoreError("invalid_domain", "Choose either one domain or a domain list")
@@ -8791,10 +8725,7 @@ class CoreStore:
                     # the relay's own backlog (a pending key create, an expired
                     # session) as a failure of an edit that has nothing to do
                     # with the relay.
-                    baseline = self._baselines.get("providers_models")
-                    if baseline is None or _relay_binding_projection(
-                        self._adapter_draft_state("providers_models")
-                    ) != _relay_binding_projection(baseline):
+                    if self._provider_apply_needs_relay():
                         names.append("relay_accounts")
                         # The relay is a *dependency* of this edit, not the
                         # user's own relay work: the edit needs the key it
@@ -9113,7 +9044,7 @@ class CoreStore:
                 if self._domains.get(name) is not adapter:
                     return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
                 try:
-                    value, changed = commit(prepared, value)
+                    value, changed = commit(performed, value)
                 except Exception as exc:
                     return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
                 should_emit = False
@@ -9137,7 +9068,18 @@ class CoreStore:
                 return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
             before = self._adapter_draft_state(name)
             try:
-                value = method(data)
+                # Legacy domains expose one combined probe method rather than
+                # the provider domain's prepare/perform/commit split.  Their
+                # probe owns no durable result, so lend the single-domain lane
+                # back while it waits. WebDAV is the exception: its probe
+                # records ``last_probe`` and a status file, and its adapter
+                # lends the lane only around those two remote requests so the
+                # result remains serialized with WebDAV edits.
+                if name == "webdav":
+                    value = method(data)
+                else:
+                    with self._release_lane_for_io():
+                        value = method(data)
             except Exception as exc:
                 return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
             after = self._adapter_draft_state(name)

@@ -28,8 +28,11 @@ const LAYER_SIZE: Partial<Record<AppRoute, { width: number; height: number }>> =
   "provider-wizard": { width: 620, height: 460 },
   "file-editor": { width: 900, height: 560 },
   "webdav-settings": { width: 600, height: 470 },
-  "codex-api-settings": { width: 540, height: 340 },
-  "claude-api-settings": { width: 540, height: 340 },
+  // The frame includes the layer's own 30 pt title bar, so this is the native
+  // content height (320) plus that bar: the form's first fit resolves to the
+  // same body and the layer does not jump when it opens.
+  "codex-api-settings": { width: 540, height: 350 },
+  "claude-api-settings": { width: 540, height: 350 },
 };
 const DEFAULT_SIZE = { width: 720, height: 520 };
 const MARGIN = 24;
@@ -50,7 +53,16 @@ export function nextLayerOffset(
 type Layer = {
   scrim: HTMLElement;
   close: () => void;
+  /**
+   * Take a new content size.  `width`/`height` are the *body's* size — the
+   * window's content area on a native host — so the title bar this layer draws
+   * itself is added here rather than by every caller.
+   */
+  resize: (width: number, height: number) => void;
 };
+
+/** The layer's own title bar: the native window's title bar has no body height. */
+const TITLE_BAR_HEIGHT = 30;
 
 const layers = new Map<string, Layer>();
 // The body's `overflow` before the first layer locked it.  Held once for the
@@ -159,7 +171,7 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   const titleBar = document.createElement("div");
   titleBar.style.cssText = [
     "flex:0 0 auto", "display:flex", "align-items:center", "gap:8px",
-    "height:30px", "padding:0 6px 0 12px",
+    `height:${TITLE_BAR_HEIGHT}px`, "padding:0 6px 0 12px",
     "border-bottom:1px solid #e5e5e5",
     "background:#f3f3f3", "cursor:grab", "user-select:none",
   ].join(";");
@@ -255,7 +267,32 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   titleBar.addEventListener("pointerup", endDrag);
   titleBar.addEventListener("pointercancel", endDrag);
 
-  layers.set(options.route, { scrim, close: dismiss });
+  const resize = (width: number, height: number): void => {
+    const frameWidth = Math.max(1, Math.round(width));
+    const frameHeight = Math.max(TITLE_BAR_HEIGHT + 1, Math.round(height) + TITLE_BAR_HEIGHT);
+    frame.style.setProperty("width", `min(${frameWidth}px, calc(100vw - ${MARGIN * 2}px))`);
+    // Both declarations, for the reason stated above: an unsupported unit is
+    // dropped and leaves the previous value in place.
+    frame.style.setProperty("height", `min(${frameHeight}px, calc(100vh - ${MARGIN * 2}px))`);
+    frame.style.setProperty("height", `min(${frameHeight}px, calc(100dvh - ${MARGIN * 2}px))`);
+  };
+
+  layers.set(options.route, { scrim, close: dismiss, resize });
+}
+
+/**
+ * Resize one child layer to the body size a form measured for itself.
+ *
+ * The shared UI asks for a *content* size, exactly as it asks a native window
+ * for one, so a form that fits its own height leaves no empty band in the
+ * layer either.  Returns false when that surface is not on screen (a native
+ * host's "no such window").
+ */
+export function resizeChildLayer(route: string, width: number, height: number): boolean {
+  const layer = layers.get(route);
+  if (!layer) return false;
+  layer.resize(width, height);
+  return true;
 }
 
 /** End one child layer; returns false when that surface was not on screen. */

@@ -3255,26 +3255,153 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             "input": original_input,
             "stream": True,
             "reasoning": {"effort": "max", "summary": "detailed"},
+            # LiteLLM can copy this marker onto the first callback request;
+            # an item-cap repair still belongs to this attempt.
+            "litellm_metadata": {"streaming_error_fallback_attempted": True},
             "proxy_server_request": {"path": "/v1/responses"},
             "litellm_call_id": "call-reasoning-heavy-cap",
             "client_metadata": {"thread_id": "thread-reasoning-heavy-cap"},
             "model_info": {"id": "order-0", "order": 0, "route_key": "provider / default-chat / key=primary"},
         }
 
-        chunks = [
-            chunk
-            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
-                user_api_key_dict=None,
-                response=capped_stream(),
-                request_data=request_data,
-            )
-        ]
+        # The recovery poll permits repeated attempts and would conceal a
+        # one-shot fallback incorrectly blocked by the inherited marker.
+        with mock.patch.object(streaming._routing_module, "_recovery_max_seconds", return_value=0):
+            chunks = [
+                chunk
+                async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=None,
+                    response=capped_stream(),
+                    request_data=request_data,
+                )
+            ]
 
         self.assertEqual(1, len(calls))
         self.assertLess(len(calls[0]["input"]), len(original_input))
         self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
         self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
         self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
+
+    async def test_a_replay_refusal_repairs_even_after_a_fallback_marker(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming = importlib.import_module("young_router.proxy.streaming")
+        streaming._REPAIRED_REQUESTS.clear()
+        self.addCleanup(streaming._REPAIRED_REQUESTS.clear)
+        failure = RuntimeError("Responses stream incomplete: max_messages")
+        setattr(failure, streaming._UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                *[
+                    {"type": "reasoning", "id": f"rs-{index}", "summary": []}
+                    for index in range(150)
+                ],
+                {"type": "message", "role": "user", "content": "Continue."},
+            ],
+            "stream": True,
+            "call_type": "aresponses",
+            "litellm_metadata": {"streaming_error_fallback_attempted": True},
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-replay-refusal-marker",
+            "client_metadata": {"thread_id": "thread-replay-refusal-marker"},
+        }
+
+        self.assertTrue(
+            streaming._should_repair_heavy_replay_request(failure, request_data)
+        )
+        self.assertTrue(
+            streaming._repair_heavy_replay_request(
+                request_data, failure, trigger="network"
+            )
+        )
+        self.assertEqual(101, len(request_data["input"]))
+
+    async def test_a_bare_item_cap_repairs_even_without_reasoning_output(self) -> None:
+        """An item-cap terminal may arrive before any reasoning delta.
+
+        Some relays send only ``response.created`` and
+        ``response.incomplete(max_messages)`` when the replay is rejected.
+        LiteLLM already marks that callback as a fallback attempt, but the
+        request still needs one shortened replay before the client sees a
+        failed response.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = importlib.import_module("young_router.proxy.streaming")
+        streaming._REPAIRED_REQUESTS.clear()
+        self.addCleanup(streaming._REPAIRED_REQUESTS.clear)
+        calls: list[dict] = []
+
+        def refused_stream():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-refused"}}
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-refused",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                    },
+                }
+
+            return stream()
+
+        def answered_stream():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-ok"}}
+                yield {"type": "response.output_text.delta", "delta": "the answer"}
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp-ok", "status": "completed", "output": []},
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return answered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        original_input = [
+            *[
+                {"type": "reasoning", "id": f"rs-{index}", "summary": []}
+                for index in range(150)
+            ],
+            {"type": "message", "role": "user", "content": "Continue."},
+        ]
+        request_data = {
+            "model": "default-chat",
+            "input": original_input,
+            "stream": True,
+            "reasoning": {"effort": "max", "summary": "detailed"},
+            "litellm_metadata": {"streaming_error_fallback_attempted": True},
+            "proxy_server_request": {"path": "/v1/responses"},
+            "litellm_call_id": "call-bare-item-cap",
+            "client_metadata": {"thread_id": "thread-bare-item-cap"},
+            "model_info": {
+                "id": "order-0",
+                "order": 0,
+                "route_key": "provider / default-chat / key=primary",
+            },
+        }
+
+        with mock.patch.object(streaming._routing_module, "_recovery_max_seconds", return_value=0):
+            chunks = [
+                chunk
+                async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=None,
+                    response=refused_stream(),
+                    request_data=request_data,
+                )
+            ]
+
+        self.assertEqual(1, len(calls))
+        self.assertLess(len(calls[0]["input"]), len(original_input))
+        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertIn("response.completed", [chunk.get("type") for chunk in chunks])
+        self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
+        self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
 
     async def test_a_heavy_cut_is_answered_by_repairing_the_request_not_the_route(
         self,
@@ -5073,6 +5200,38 @@ class StreamNoProgressWatchdogTests(HookTestCase):
     kept the SSE body alive, so nothing at the wire expired, and the reader sat
     on "waiting for the model" until a person pressed stop.
     """
+
+    async def test_network_recovery_survives_both_watchdogs_inside_a_wrapped_stream(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "probe", "input": "test", "stream": True,
+            "stream_idle_timeout_seconds": 0.025,
+            "litellm_metadata": {"stream_keepalive_interval_seconds": 0.01, "stream_no_progress_seconds": 0.025},
+        }
+        online = asyncio.Event()
+
+        async def wrapped_recovery():
+            yield hooks._route_recovery_sse_keepalive(0, request_data=request, phase="network")
+            await online.wait()
+            yield {"type": "response.completed", "response": {
+                "id": "resp-probe", "status": "completed", "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "online"}]}],
+            }}
+
+        phases, terminals = [], []
+        async with asyncio.timeout(2):
+            async for frame in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                None, wrapped_recovery(), request,
+            ):
+                if frame.get("type") == "response.metadata":
+                    phases.append(frame["metadata"]["phase"])
+                    if phases.count("keepalive") == 5:
+                        online.set()
+                if frame.get("type") in ("response.completed", "response.failed"):
+                    terminals.append(frame["type"])
+        self.assertIn("network", phases)
+        self.assertTrue(online.is_set())
+        self.assertEqual(["response.completed"], terminals)
 
     async def test_silence_that_outlasts_the_budget_ends_the_turn(self) -> None:
         hooks, _proxy_server = load_hook_module()

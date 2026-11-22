@@ -311,6 +311,47 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             self.assertTrue(snapshot["clients"]["claudeCode"]["uses_local_api"])
             self.assertFalse(snapshot["clients"]["claudeDesktop"]["uses_local_api"])
 
+    def test_the_edit_api_form_reports_the_gateway_claude_code_uses(self) -> None:
+        # One form, both modes: with this app's API switched on, Claude Code's
+        # own env names the proxy, and that connection is what the dialog
+        # shows.  Saving it back stays on the local route rather than writing
+        # the same address as a hand-managed gateway.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                desktop_loader=None,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain.dispatch("use_local_api", {"client": "claudeCode", "model": "public-a"})
+                form = domain.snapshot()["direct_api"]
+                self.assertEqual("http://127.0.0.1:4100", form["base_url"])
+                self.assertEqual("public-a", form["model"])
+                self.assertTrue(form["key_configured"])
+                self.assertEqual("bearer", form["auth_mode"])
+                self.assertEqual("sk-local", domain.trusted_secret_value("direct_api_key", "edit-api"))
+
+                saved = domain.dispatch("use_direct_api", {
+                    "base_url": form["base_url"],
+                    "model": form["model"],
+                    "api_key": "sk-local",
+                    "auth_mode": "bearer",
+                })
+
+            self.assertTrue(saved["clients"]["claudeCode"]["uses_local_api"])
+            code = json.loads(domain.raw_text(include_sensitive=True))
+            self.assertEqual("http://127.0.0.1:4100", code["env"]["ANTHROPIC_BASE_URL"])
+            self.assertEqual("sk-local", code["env"]["ANTHROPIC_AUTH_TOKEN"])
+            self.assertEqual("public-a", code["model"])
+
     def test_desktop_adopts_the_local_api_as_its_third_party_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

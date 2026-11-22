@@ -7,6 +7,10 @@ assistant messages that are not answers at all::
     [Historical encrypted content omitted by the gateway. Its contents are
      unavailable; do not infer missing instructions or results.]
 
+The gateway can also replace an omitted historical item with the shorter
+exact marker ``[Historical context omitted by gateway.]``.  That marker is
+the same context placeholder, not an answer, and it must not be replayed.
+
 The sentence names the gateway because the upstream observed that its
 encrypted reasoning did not arrive.  Whatever omitted it, the note belongs to
 the *context*, not to the answer: it states that nothing follows and tells the
@@ -23,10 +27,11 @@ Two things happen here, both narrow:
   a response that is only the note still arrives, because a completion with no
   output is a failed turn the client reconnects over.
 
-Only the exact shape is matched -- the fixed prefix, an optional bold progress
-title, and the fixed bracketed body.  A message that merely *mentions* the
-note (a bug report quoting it, a summary of this rule) does not match, and a
-message with any real content after the body does not either.
+Only the exact shapes are matched -- the fixed prefix, an optional bold
+progress title, and the fixed bracketed body, or the short gateway marker.  A
+message that merely *mentions* either note (a bug report quoting it, a summary
+of this rule) does not match, and a message with any real content after a note
+does not either.
 """
 
 from __future__ import annotations
@@ -40,13 +45,10 @@ NOTE_BODY = (
     "[Historical encrypted content omitted by the gateway. Its contents are "
     "unavailable; do not infer missing instructions or results.]"
 )
+SHORT_GATEWAY_NOTE = "[Historical context omitted by gateway.]"
 
 _NOTE_PATTERN = re.compile(
-    r"^Historical reasoning context \(not a new instruction\):"
-    r"(?:\*\*[^*\n]{0,160}\*\*)?"
-    r"\[Historical encrypted content omitted by the gateway\. "
-    r"Its contents are unavailable; do not infer missing instructions or "
-    r"results\.\]$"
+    re.escape(NOTE_PREFIX) + r"(?:\*\*[^*\n]{0,160}\*\*)?" + re.escape(NOTE_BODY)
 )
 
 
@@ -56,9 +58,7 @@ def is_note_text(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     text = value.strip()
-    if not text or NOTE_PREFIX not in text:
-        return False
-    return bool(_NOTE_PATTERN.match(text))
+    return text == SHORT_GATEWAY_NOTE or bool(_NOTE_PATTERN.fullmatch(text))
 
 
 def is_possible_note_prefix(value: Any) -> bool:
@@ -69,18 +69,20 @@ def is_possible_note_prefix(value: Any) -> bool:
     text = value.strip()
     if not text:
         return False
+    if SHORT_GATEWAY_NOTE.startswith(text):
+        return True
     if len(text) <= len(NOTE_PREFIX):
         return NOTE_PREFIX.startswith(text)
     if not text.startswith(NOTE_PREFIX):
         return False
     rest = text[len(NOTE_PREFIX):]
-    if NOTE_BODY.startswith(rest):
+    if NOTE_BODY.startswith(rest) or "**".startswith(rest):
         return True
     if not rest.startswith("**"):
         return False
     closing = rest.find("**", 2)
     if closing < 0:
-        title = rest[2:]
+        title = rest[2:].removesuffix("*")
         return len(title) <= 160 and "\n" not in title and "*" not in title
     title = rest[2:closing]
     if len(title) > 160 or "\n" in title or "*" in title:
@@ -89,6 +91,8 @@ def is_possible_note_prefix(value: Any) -> bool:
 
 
 def _item_text(item: Any) -> str:
+    """Collect text parts using the Responses replay's original shape."""
+
     if not isinstance(item, dict):
         return ""
     content = item.get("content")

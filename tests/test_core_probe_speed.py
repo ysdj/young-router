@@ -561,6 +561,36 @@ class SpeedReplacesTheAvailabilityProbeTests(unittest.TestCase):
             stored = domain.snapshot()["providers"][0]["models"][0]["probe"]
             self.assertEqual(60.0, stored["speed_test"]["output_token_count_per_second"])
 
+    def test_a_late_probe_cannot_recommend_a_changed_route(self) -> None:
+        """A result for the old credential is discarded after an edit."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["id"]
+            model_id = domain.snapshot()["providers"][0]["models"][0]["editor_id"]
+            prepared = domain.prepare_probe({"provider_id": provider_id, "model_id": model_id})
+
+            domain.dispatch("model.patch", {
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "changes": {"upstream_url_surface": "anthropic"},
+            })
+            result, changed = domain.commit_probe(
+                prepared,
+                {"ok": True, "protocols": ["openai/chat"], "_overlay": {"probe": {"status": "ok"}}},
+            )
+
+            self.assertFalse(changed)
+            self.assertFalse(result["ok"])
+            self.assertEqual("cancelled", result["status"])
+            self.assertNotIn("recommended_surface", result)
+            self.assertEqual(
+                "anthropic",
+                domain.snapshot()["providers"][0]["models"][0]["upstream_url_surface"],
+            )
+
     def test_the_deep_plan_describes_the_deep_test_and_nothing_else(self) -> None:
         """A flash name no longer shortens the plan.
 

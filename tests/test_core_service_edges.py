@@ -13,6 +13,7 @@ from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.service import MemoryDomain
+from young_router.webdav import core as webdav_core
 
 
 CONFIG = """providers:
@@ -68,11 +69,12 @@ class CoreServiceEdgesTests(unittest.TestCase):
             runtime = _RuntimePane(lambda: core._domain_lock("runtime")._is_owned())
             core.register_domain(runtime)
             keys = ["sk-before", "sk-after"]
+            bundle = webdav_core.bundle_from_files({"config.yaml": CONFIG.replace("primary:", "arrived:").encode()})
             with mock.patch("young_router.core.host_profile.active", return_value=False), mock.patch(
                 "young_router.core.service._document_master_key",
                 side_effect=lambda _path: keys.pop(0) if len(keys) > 1 else keys[0],
-            ), mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.pull_bundle"
+            ), mock.patch.object(webdav_core.WebDAVClient, "get", return_value=bundle), mock.patch(
+                "young_router.webdav.operations.publish_remote_digests", return_value=True
             ):
                 core.dispatch(
                     {"domain": "webdav", "type": "pull", "payload": {"sections": ["providers_models", "relay_accounts"]}}

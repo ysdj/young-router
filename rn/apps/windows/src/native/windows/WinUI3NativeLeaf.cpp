@@ -271,7 +271,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   if (route == L"provider-wizard") return {540, 420};
   if (route == L"file-editor") return {900, 560};
   if (route == L"webdav-settings") return {520, 400};
-  if (route == L"codex-api-settings" || route == L"claude-api-settings") return {460, 272};
+  if (route == L"codex-api-settings" || route == L"claude-api-settings") return {460, 300};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
   return {320, 160};
@@ -293,7 +293,7 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
   // the label column plus the widest control (the WebDAV address) inside both
   // insets, and 470 covers those rows above the pinned footer.
   if (route == L"webdav-settings") return {600, 470};
-  if (route == L"codex-api-settings" || route == L"claude-api-settings") return {540, 340};
+  if (route == L"codex-api-settings" || route == L"claude-api-settings") return {540, 320};
   return {320, 160};
 }
 

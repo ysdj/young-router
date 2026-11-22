@@ -18,8 +18,15 @@ from __future__ import annotations
 
 import threading
 import time
+import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest import mock
 
+import yaml
+
+from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.service import CoreStore, MemoryDomain
 
 
@@ -60,6 +67,13 @@ class _ProbeDomain(MemoryDomain):
             "detail": "probe answered",
             "payload": dict(payload or {}) if isinstance(payload, dict) else {},
         }
+
+    def dispatch(self, action: str, payload: object | None = None):
+        if action == "model.delete":
+            self._draft["route_deleted"] = True
+            self.revision += 1
+            return self.snapshot()
+        return super().dispatch(action, payload)
 
 
 class _RelayFixture(MemoryDomain):
@@ -374,6 +388,82 @@ class ProbeJobTests(unittest.TestCase):
             _wait_for(lambda: any(event.get("job_id") == job_id and event.get("state") == "done" for event in events)),
             "the probe job never finished",
         )
+
+    def test_a_same_domain_delete_does_not_wait_for_a_legacy_probe(self) -> None:
+        """A route edit is still immediate for a combined probe adapter."""
+
+        release = threading.Event()
+        domain = _ProbeDomain("providers_models", release=release)
+        core = _store(domain)
+        self.addCleanup(core.stop_jobs)
+        events: list[dict[str, object]] = []
+        unsubscribe = core.subscribe(events.append)
+        self.addCleanup(unsubscribe)
+
+        response = core.dispatch({"domain": "providers_models", "type": "probe", "payload": {}})
+        job_id = str(response["job_id"])
+        self.assertTrue(domain.started.wait(2.0), "the probe never started")
+        try:
+            started = time.monotonic()
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.delete",
+                    "payload": {"model_id": "route-under-test"},
+                }
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        self.assertLess(elapsed, 0.3, f"the route delete waited {elapsed:.3f}s behind the probe")
+        self.assertTrue(
+            _wait_for(lambda: any(event.get("job_id") == job_id and event.get("state") == "done" for event in events)),
+            "the probe job never finished",
+        )
+
+    def test_provider_catalog_read_does_not_hold_the_route_lane(self) -> None:
+        """Deleting and saving a route finish before its provider's listing."""
+
+        entered, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(2) as pool:
+            path = Path(directory) / "config.yaml"
+            path.write_text(yaml.safe_dump({
+                "providers": {"fixture": {"api_base": "https://example.test/v1", "api_keys": [{"name": "default", "value": "sk-replace-test"}]}},
+                "model_list": [{
+                    "model_name": "route-under-test",
+                    "litellm_params": {"model": "openai/route-under-test", "api_base": "https://example.test/v1", "api_key": "sk-replace-test"},
+                    "model_info": {"id": "00000001", "provider": "fixture"},
+                }],
+            }), encoding="utf-8")
+            providers = ProvidersModelsDomain(path)
+            row = providers.snapshot()["providers"][0]
+            core = _store(providers)
+
+            def read(*args):
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return {**args[2], "available": True, "models": ["route-under-test"], "model_count": 1}
+
+            def remove():
+                staged = core.dispatch({"domain": "providers_models", "type": "model.delete", "payload": {
+                    "provider_id": row["id"], "model_id": row["models"][0]["editor_id"],
+                }})
+                return core.apply("providers_models", revision=staged["revision"])
+
+            with mock.patch.object(providers, "_read_provider_models", side_effect=read):
+                listing = pool.submit(core.dispatch, {
+                    "domain": "providers_models", "type": "providers.fetch_models", "payload": {"provider_id": row["id"]},
+                })
+                try:
+                    self.assertTrue(entered.wait(2), "the catalog read never started")
+                    self.assertTrue(pool.submit(remove).result(2)["applied"])
+                    self.assertFalse(listing.done())
+                    self.assertEqual([], yaml.safe_load(path.read_text())["model_list"])
+                finally:
+                    release.set()
+                self.assertEqual(["route-under-test"], listing.result(2)["action_summary"]["models"])
+                self.assertEqual([], core.snapshot()["domains"]["providers_models"]["providers"][0]["models"])
 
 
 class ServiceRowProbeTests(unittest.TestCase):

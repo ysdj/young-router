@@ -14,6 +14,7 @@ import textwrap
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import yaml
@@ -1992,8 +1993,7 @@ class CoreOperationsTests(unittest.TestCase):
             core = CoreStore(domains=[providers, relay, webdav])
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.push_bundle",
-                return_value=(32, {"files": []}),
+                "young_router.webdav.operations.upload_bundle",
             ) as pushed:
                 result = core.dispatch(
                     {
@@ -2040,6 +2040,49 @@ class CoreOperationsTests(unittest.TestCase):
             state = core.webdav_auto_sync_state()
             self.assertTrue(state["enabled"])
             self.assertEqual(15, state["sync_interval_minutes"])
+
+    def test_a_pending_webdav_pull_does_not_block_or_undo_a_group_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(2) as pool:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(PROVIDER_CONFIG, encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=webdav_core.relay_accounts_path(config))
+            core = CoreStore(domains=[providers, relay, self._configured_webdav_domain(root, config)])
+            for order in (1, 2):
+                core.dispatch({"domain": "providers_models", "type": "model.add", "payload": {
+                    "provider_id": "primary", "model": {"name": "same-public-name", "upstream_model": f"wire-{order}", "order": order},
+                }})
+            core.apply("providers_models", revision=core.revision)
+            bundle, _ = webdav_core.create_bundle(config)
+            entered, release = threading.Event(), threading.Event()
+
+            def download(*args, **kwargs):
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return bundle
+
+            def delete_group():
+                staged = core.dispatch({"domain": "providers_models", "type": "public.model_delete", "payload": {"public_model": "same-public-name"}})
+                return core.apply("providers_models", revision=staged["revision"])
+
+            with mock.patch.object(webdav_core.WebDAVClient, "get", side_effect=download), mock.patch(
+                "young_router.webdav.operations.publish_remote_digests", return_value=True
+            ):
+                pending = pool.submit(core.dispatch, {"domain": "webdav", "type": "pull", "payload": {
+                    "sections": ["providers_models", "relay_accounts"],
+                }})
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(pool.submit(delete_group).result(2)["applied"])
+                    self.assertFalse(pending.done())
+                    self.assertEqual([], yaml.safe_load(config.read_text())["model_list"])
+                finally:
+                    release.set()
+                with self.assertRaises(CoreError) as rejected:
+                    pending.result(2)
+            self.assertEqual("webdav_sync_unsaved", rejected.exception.code)
+            self.assertEqual([], yaml.safe_load(config.read_text())["model_list"])
 
     def test_an_automatic_run_is_always_the_comparing_sync(self) -> None:
         """There is no direction to read: every unattended run compares both sides."""
@@ -2094,7 +2137,7 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()) as client, mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot",
                 return_value=webdav_core.SyncSnapshot(None),
-            ), mock.patch("young_router.webdav.operations.push_bundle", side_effect=lambda *args, **kwargs: pushed.append(args)):
+            ), mock.patch("young_router.webdav.operations.upload_bundle", side_effect=lambda *args: pushed.append(args)):
                 core.run_automatic_webdav_sync()
 
             self.assertEqual(1, len(pushed))
@@ -2186,8 +2229,6 @@ class CoreOperationsTests(unittest.TestCase):
                 archived.append("menu-config.bak-20260924-200000.json")
                 return archived[-1]
 
-            pushed: list[str] = []
-
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot",
                 side_effect=webdav_core.SyncError(
@@ -2195,9 +2236,8 @@ class CoreOperationsTests(unittest.TestCase):
                     webdav_core.INCOMPATIBLE_BUNDLE_CODE,
                 ),
             ), mock.patch("young_router.webdav.operations.archive_remote_bundle", side_effect=archive), mock.patch(
-                "young_router.webdav.operations.push_bundle",
-                side_effect=lambda *args, **kwargs: pushed.append(str(args[4] if len(args) > 4 else "push")),
-            ):
+                "young_router.webdav.operations.upload_bundle",
+            ) as pushed:
                 result = core.dispatch(
                     {
                         "domain": "webdav",
@@ -2208,7 +2248,7 @@ class CoreOperationsTests(unittest.TestCase):
                 )
 
             self.assertEqual(["menu-config.bak-20260924-200000.json"], archived)
-            self.assertEqual(["sync-push"], pushed)
+            pushed.assert_called_once()
             self.assertEqual(
                 {"outcome": "push", "archived_remote": "menu-config.bak-20260924-200000.json"},
                 {key: result["action_summary"][key] for key in ("outcome", "archived_remote")},
@@ -2247,8 +2287,8 @@ class CoreOperationsTests(unittest.TestCase):
                 "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=None
             ), mock.patch(
                 "young_router.webdav.operations.remember_remote_bundle"
-            ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
-                "young_router.webdav.operations.pull_bundle"
+            ), mock.patch("young_router.webdav.operations.upload_bundle") as pushed, mock.patch(
+                "young_router.webdav.core.install_snapshot"
             ) as pulled:
                 core.webdav_scheduler()._run()
 
@@ -2284,23 +2324,8 @@ class CoreOperationsTests(unittest.TestCase):
 
             base = {"files": [{"path": "config.yaml", "present": True, "sha256": "base"}]}
             local = {"files": [{"path": "config.yaml", "present": True, "sha256": "local"}]}
-            remote = {"files": [{"path": "config.yaml", "present": True, "sha256": "remote"}]}
+            remote = {"created_at": "2026-09-25T09:59:00Z", "files": [{"path": "config.yaml", "present": True, "sha256": "remote"}]}
             remote_text = original.replace("replace-me-secret", "another-machine-secret")
-            remembered: list[Path] = []
-
-            def remember(_client: object, _settings: object, path: Path) -> None:
-                remembered.append(path)
-                path.write_text(
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "recorded_at": "2026-09-25T10:00:00Z",
-                            "remote_created_at": "2026-09-25T09:59:00Z",
-                            "files": {"config.yaml": remote_text},
-                        }
-                    ),
-                    encoding="utf-8",
-                )
 
             # A window has already read this state: the projection is memoized
             # on the revision, and a stopped run does not move it.
@@ -2309,14 +2334,11 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.core.local_snapshot",
                 return_value=webdav_core.SyncSnapshot(local),
-            ), mock.patch("young_router.webdav.operations.read_remote_snapshot", return_value=webdav_core.SyncSnapshot(remote)), mock.patch(
-                # No record and no bundle to read it from: the run keeps the
-                # comparison and stops, which is this test's subject.
-                "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=None
             ), mock.patch(
-                "young_router.webdav.operations.remember_remote_bundle", side_effect=remember
-            ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
-                "young_router.webdav.operations.pull_bundle"
+                "young_router.webdav.operations.read_remote_snapshot",
+                return_value=webdav_core.SyncSnapshot(remote, {"config.yaml": "remote"}, {"config.yaml": remote_text.encode()}),
+            ), mock.patch("young_router.webdav.operations.upload_bundle") as pushed, mock.patch(
+                "young_router.webdav.core.install_snapshot"
             ) as pulled:
                 with self.assertRaises(CoreError) as raised:
                     core.dispatch(
@@ -2328,7 +2350,6 @@ class CoreOperationsTests(unittest.TestCase):
             pushed.assert_not_called()
             pulled.assert_not_called()
             self.assertEqual(original, config.read_text(encoding="utf-8"))
-            self.assertEqual([root / "webdav-conflict.json"], remembered)
             status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
             self.assertEqual("webdav_sync_conflict", status["code"])
 
@@ -2338,7 +2359,7 @@ class CoreOperationsTests(unittest.TestCase):
             conflict = webdav.snapshot()["conflict"]
             # The Core projection is what the pane actually reads.
             self.assertEqual(conflict, core.snapshot()["domains"]["webdav"]["conflict"])
-            self.assertEqual("2026-09-25T10:00:00Z", conflict["at"])
+            self.assertEqual("2026-09-25T09:59:00Z", conflict["remote_at"])
             self.assertEqual(
                 [{"name": "config", "changed": True, "local_present": True, "remote_present": True}],
                 [row for row in conflict["files"] if row["name"] == "config"],
@@ -2431,11 +2452,9 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot", return_value=remote
             ), mock.patch(
-                "young_router.webdav.operations.push_bundle",
-                side_effect=lambda *args, **kwargs: pushed.append(args[4]) or (32, remote.manifest),
-            ), mock.patch(
-                "young_router.webdav.operations.pull_bundle"
-            ) as pulled, mock.patch("young_router.webdav.operations.publish_remote_digests", return_value=True):
+                "young_router.webdav.operations.upload_bundle",
+                side_effect=lambda _client, _settings, bundle, _snapshot: pushed.append(bundle),
+            ):
                 result = core.dispatch(
                     {
                         "domain": "webdav",
@@ -2448,9 +2467,10 @@ class CoreOperationsTests(unittest.TestCase):
             merged = yaml.safe_load(config.read_text(encoding="utf-8"))
             self.assertEqual(["added-here", "added-there"], [row["model_name"] for row in merged["model_list"]])
             # The merged document is what was published, and the run says so.
-            self.assertEqual(["sync-merge"], pushed)
+            self.assertEqual(1, len(pushed))
+            _, files = webdav_core.read_config_bundle(pushed[0])
+            self.assertEqual(merged, yaml.safe_load(files["config.yaml"]))
             self.assertEqual("merge", result["action_summary"]["outcome"])
-            pulled.assert_not_called()
             self.assertFalse((root / "webdav-conflict.json").exists())
             status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
             self.assertTrue(status["ok"])
@@ -2547,9 +2567,9 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot", return_value=webdav_core.SyncSnapshot(host_manifest, host_digests)
             ), mock.patch(
-                "young_router.webdav.operations.push_bundle",
-                side_effect=lambda *args, **kwargs: pushed.append(args) or (32, host_manifest),
-            ), mock.patch("young_router.webdav.operations.pull_bundle") as pulled:
+                "young_router.webdav.operations.upload_bundle",
+                side_effect=lambda *args: pushed.append(args),
+            ), mock.patch("young_router.webdav.core.install_snapshot") as pulled:
                 core.run_automatic_webdav_sync()
 
             self.assertEqual(1, len(pushed))
@@ -2604,18 +2624,19 @@ class CoreOperationsTests(unittest.TestCase):
             )
 
             pushed: list[object] = []
+            local_files = {"config.yaml": config.read_bytes(), "relay-accounts.json": b"{}"}
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.core.local_snapshot",
-                return_value=webdav_core.SyncSnapshot(local, local_digests),
+                return_value=webdav_core.SyncSnapshot(local, local_digests, local_files),
             ), mock.patch(
                 "young_router.webdav.operations.read_remote_snapshot",
                 return_value=webdav_core.SyncSnapshot(remote, remote_digests),
             ) as read_snapshot, mock.patch(
                 "young_router.webdav.operations.publish_remote_digests", return_value=True
             ), mock.patch(
-                "young_router.webdav.operations.push_bundle",
-                side_effect=lambda *args, **kwargs: pushed.append(args) or (32, local),
-            ), mock.patch("young_router.webdav.operations.pull_bundle") as pulled:
+                "young_router.webdav.operations.upload_bundle",
+                side_effect=lambda *args: pushed.append(args),
+            ), mock.patch("young_router.webdav.core.install_snapshot") as pulled:
                 core.run_automatic_webdav_sync()
 
             read_snapshot.assert_called_once()
@@ -2642,7 +2663,7 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertIsNotNone(webdav.snapshot()["conflict"])
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.push_bundle", return_value=(32, {"files": []})
+                "young_router.webdav.operations.upload_bundle",
             ):
                 core.dispatch(
                     {"domain": "webdav", "type": "push", "payload": {"sections": ["providers_models", "relay_accounts"]}},

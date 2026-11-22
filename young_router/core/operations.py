@@ -2104,28 +2104,14 @@ class OnlineUsageReader:
 
     def __init__(self, config_path: Path, accounts: object | None = None) -> None:
         self.config_path = config_path
-        # The relay-account store owns the durable login material, so it is the
-        # one that keeps a refresh token the station rotated.  It is optional:
-        # a reader built without a store still reads usage, it just cannot make
-        # a rotated credential survive a restart.
         self.accounts = accounts
 
-    def _install_store_readers(self) -> None:
-        """Hand the usage reader the two facts only the account store owns.
-
-        Both are the store's own documentary reads, not a second copy kept for
-        the logs tab: the rotated refresh token it must persist, and the display
-        unit that turns a New API row's credits into the same money its balance
-        is stated in.
-        """
+    def _install_quota_reader(self) -> None:
+        """Use the same display unit as the account's balance."""
 
         from . import remote_usage_logs
 
-        store = self.accounts
-        remote_usage_logs.set_rotated_refresh_sink(
-            getattr(store, "store_rotated_refresh_token", None)
-        )
-        remote_usage_logs.set_quota_unit_reader(getattr(store, "quota_unit", None))
+        remote_usage_logs.set_quota_unit_reader(getattr(self.accounts, "quota_unit", None))
 
     def _relogin(self, account_id: str) -> bool:
         """Sign one relay account in again from its remembered password.
@@ -2178,7 +2164,7 @@ class OnlineUsageReader:
 
         from . import remote_usage_logs
 
-        self._install_store_readers()
+        self._install_quota_reader()
         try:
             records, reason, total, page_rows = remote_usage_logs.collect(
                 self.config_path,
@@ -2190,7 +2176,7 @@ class OnlineUsageReader:
                 # as unsupported.
                 USAGE_PAGE_TIMEOUT_SECONDS,
                 source_id,
-                self._relogin,
+                self._relogin if self.accounts is not None else None,
                 page=page,
                 rows_per_page=rows_per_page,
             )

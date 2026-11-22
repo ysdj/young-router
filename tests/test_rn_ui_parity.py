@@ -343,7 +343,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
         # Only a draft that binds relay material enters the relay transaction.
         self.assertIn("def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:", service)
-        self.assertIn("if baseline is None or _relay_binding_projection(", service)
+        self.assertIn("if self._provider_apply_needs_relay():", service)
         self.assertIn('raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")', service)
 
     def test_one_window_states_each_result_once(self) -> None:
@@ -602,7 +602,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("lastDispatchError", self.ui)
 
     def test_shared_assistant_apply_is_not_blocked_by_the_undefined_default_domain(self) -> None:
-        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):', 1)[1].split(
+        apply_body = self.ui.split('const applyOutcome = ', 1)[1].split(
             "const autoAppliedKey",
             1,
         )[0]
@@ -611,8 +611,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # An Apply is planned from the commit screen, not from the projection:
         # the whole state on every edit is what made a published page wait
         # seconds for a control the native window applies at once.
-        self.assertIn("const plan = await readCommitPlan();", apply_body)
-        self.assertIn("stagedDomainsForRoute(plan)", apply_body)
+        self.assertIn("const plan = await readPlan();", apply_body)
+        self.assertIn(": stagedDomainsForRoute;", apply_body)
         self.assertNotIn("const refreshed = await ipc.snapshot();", apply_body)
 
     def test_settings_shell_applies_staged_domains_without_an_explicit_footer(self) -> None:
@@ -681,7 +681,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         cannot reintroduce it by passing a flag.
         """
 
-        signature = "const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):"
+        signature = "const applyOutcome = "
         apply_body = self.ui.split(signature, 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertNotIn("keepControlsEnabled", apply_body)
         # The third argument of `runOutcome` is the lock; an Apply always passes
@@ -732,13 +732,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('closeRoute();', close_body)
 
     def test_apply_rebases_one_live_projection_revision_conflict(self) -> None:
-        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):', 1)[1].split(
+        apply_body = self.ui.split('const applyOutcome = ', 1)[1].split(
             'const activateProviderAndRestart',
             1,
         )[0]
         self.assertIn('const applyOnce = (nextRevision: number): Promise<IpcResults["apply"]>', apply_body)
         self.assertIn('if (!isRevisionConflict(reason)) throw reason;', apply_body)
-        self.assertIn('const current = await readCommitPlan();', apply_body)
+        self.assertIn('const current = await readPlan();', apply_body)
         self.assertIn('const sameDomains = currentDomains.length === domains.length', apply_body)
         self.assertIn('const sameDiskState = domains.every((name) => (', apply_body)
         # One rebase was not enough while a proxy replacement was still
@@ -748,11 +748,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const APPLY_ATTEMPTS = 3;', apply_body)
         self.assertIn('let nextRevision = plan.revision;', apply_body)
         self.assertIn('result = await applyOnce(nextRevision);', apply_body)
-        self.assertIn('nextRevision = (await readCommitPlan()).revision;', apply_body)
+        self.assertIn('nextRevision = (await readPlan()).revision;', apply_body)
         self.assertIn('if (!sameDomains || !sameDiskState) throw reason;', apply_body)
         # The retries are spent: ask once more whether the write landed before
         # the strip states a save that did not happen.
-        self.assertIn('const settled = await readCommitPlan();', apply_body)
+        self.assertIn('const settled = await readPlan();', apply_body)
         self.assertIn('if (domains.every((name) => !currentDomains.includes(name))) {', apply_body)
         # A conflict that survives every rebase leaves a staged draft and
         # nothing that would try again — the debounce remembers the key it
@@ -764,7 +764,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("autoRetriedKey.current = autoApplyKey;", apply_body)
         self.assertIn('autoAppliedKey.current = "";', apply_body)
         # A different section staying dirty is not evidence this write failed.
-        self.assertIn("const currentDomains = stagedDomainsForRoute(current);", apply_body)
+        self.assertIn("const currentDomains = stagedDomains(current);", apply_body)
         self.assertIn('throw reason;', apply_body)
         # The replacement that moved the revision is still landing; the
         # retry waits for it and reads the revision again rather than
@@ -782,11 +782,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (domains.every((name) => !currentDomains.includes(name))) {", apply_body)
         self.assertIn("if (!sameDiskState || current.revision < plan.revision) throw reason;", apply_body)
         self.assertIn('status: "applied", domains: [...domains]', apply_body)
-        # Two Applies for one edit move the revision under each other, and the
-        # one that loses reports a save that happened as 更改未生效.  The
-        # second caller joins the write already in flight instead.
+        # Routine Applies join the current write. A confirmed route deletion
+        # must be able to save itself while that write waits on another domain.
         self.assertIn("const applyInFlight = useRef<Promise<ApplyOutcome> | undefined>(undefined);", self.ui)
-        self.assertIn("if (running) return running;", apply_body)
+        self.assertIn("if (running && !options?.providerDeletion) return running;", apply_body)
         self.assertIn("applyInFlight.current = started;", apply_body)
         self.assertIn("if (applyInFlight.current === started) applyInFlight.current = undefined;", apply_body)
         self.assertNotIn('appliedRevision.current', self.ui)
@@ -874,15 +873,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'void native.showReadOnlyText({',
             'language: "text"',
             'translate("providers.probeOriginalRequest"',
-            'const applyProbedSurface: ApplyProbedSurface = (providerId, modelId, nextSurface, options) => {',
+            'const applyProbedSurface: ApplyProbedSurface = async (providerId, modelId, nextSurface, inputs, isCurrent, options) => {',
             'const currentSurface = stringValue(currentModel.upstream_url_surface, "openai/responses");',
-            'if (currentSurface === nextSurface) return;',
-            'await enqueueDispatch("model.patch", {',
-            'const applyStagedSurface = (nextRevision: number): Promise<IpcResults["apply"]> => (',
-            'result = await applyStagedSurface(staged.revision);',
-            'result = current.drafts.providers_models?.dirty === true',
-            '? await applyStagedSurface(current.revision)',
-            'upstream_url_surface: nextSurface,',
+            'if (currentSurface === nextSurface) return false;',
+            'if (!matchingModel(current)',
+            'changes: { upstream_url_surface: nextSurface }',
             'const nextSurface = stringValue(result.recommended_surface);',
             'isProbeSurface(nextSurface)',
             'dispatchModelPick("model.add_many", {',
@@ -1432,7 +1427,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The probe's own recommended-surface write is not an edit by the user:
         # the finding is re-keyed on the route that write produced, so a newly
         # added model does not hide the verdict the press just measured.
-        self.assert_ui_has('const applied = await applyProbedSurface(targetProviderId, targetModelId, nextSurface, options);')
+        self.assert_ui_has('applyProbedSurface(targetProviderId, targetModelId, nextSurface, inputs,')
         self.assert_ui_has('setProbeResults((current) => current[key] ? { ...current, [key]: { inputs: nextInputs, result } } : current);')
         self.assert_ui_has('const measuredHere = record !== undefined && record.inputs === inputs;')
         self.assert_ui_has('probeResult: droppedProbeResults[key] === true || (record !== undefined && !measuredHere)')
@@ -1444,7 +1439,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # finding has arrived is never left disabled by its own follow-up.
         self.assert_ui_has('setDroppedProbeResults((current) => ({ ...current, [key]: true }));')
         self.assertNotIn('} finally {\n      probingModelKeys.current.delete(key);', self.ui)
-        self.assertIn('probingModelKeys.current.delete(key);\n    setProbeActivityRevision((value) => value + 1);\n    setProbeResults(', self.ui)
+        probe = self.ui.split("async function probeModel(", 1)[1].split("const nextSurface = ", 1)[0]
+        self.assertLess(probe.index("probingModelKeys.current.delete(key);"), probe.rindex("setProbeResults("))
         # One expression decides both what the button probes and which result it
         # shows, so the two can never disagree about the route; the address and
         # the model name are the pane's own values, a pending edit included.
@@ -1845,10 +1841,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         self.assert_ui_has('const direct = asRecord(staged.action_summary).detected_type;')
-        self.assert_ui_has('if (direct === "newapi" || direct === "sub2api") return direct;')
-        # The shared slot stays as the fallback for a Core that predates this.
-        wizard = self.ui.split("const detectRelayType = useCallback(", 1)[1].split("}, [enqueueDispatch, refresh]);", 1)[0]
-        self.assertIn("await refresh()", wizard)
+        self.assert_ui_has('return direct === "newapi" || direct === "sub2api" ? direct : undefined;')
+        wizard = self.ui.split("const detectRelayType = useCallback(", 1)[1].split("}, [enqueueDispatch]);", 1)[0]
+        self.assertNotIn("await refresh()", wizard)
 
     def test_the_wizard_creates_nothing_before_its_finish(self) -> None:
         """A wizard that has not been finished has no provider in the pane.
@@ -4497,8 +4492,41 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={translate("settings.directApiEdit")}',
             'placeholder={optional} plainText disabled={saving}',
             'domain: client, type: "use_direct_api"',
+            # A child panel draws no pane header, so the form's own body states
+            # the inset that holds its first row off the title bar.
+            'style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_CONTENT}',
+            # The form measures itself and the window takes its height: a fixed
+            # window left a band of empty dialog above the footer.
+            'onContentSizeChange={(_width, height) => fitWindowHeight(height)}',
+            'void native.window.setContentSize?.(route, DIRECT_API_WINDOW_WIDTH, wanted)',
+            # One footer for child forms, and only these two commands: closing
+            # without writing, and writing on the way out.
+            'style={styles.childSurfaceFooter}',
+            '<NativeButton title={translate("status.close")} disabled={saving} onPress={onClose} />',
+            '<NativeButton title={translate("status.saveAndClose")} primary disabled={saving || !keyReady || !url.trim()} busy={saving} onPress={submit} />',
         ):
             self.assert_ui_has(marker)
+        # A command that opens a dialog is a button, and the ellipsis is the
+        # native way to say the dialog is still to come; the link it used to be
+        # read as inline help beside the switch.
+        self.assert_ui_has('<NativeButton title={translate("settings.directApiEdit")} disabled={busy || clientActionBusy} onPress={openDirectApi} style={SETTINGS_FIELD_SLOT_ACTION} />')
+        self.assert_ui_has('const SETTINGS_FIELD_SLOT_ACTION: ViewStyle = { alignSelf: "flex-start" };')
+        self.assertIn('"settings.directApiEdit": "编辑 API…"', self.zh)
+        self.assertIn('"settings.directApiEdit": "Edit API…"', self.en)
+        # It opens at the height its first measurement resolves to: opening at
+        # another height made the whole dialog jump once as it appeared.
+        self.assertIn('contentSize: NSSize(width: 540, height: 320)', self.macos_leaf)
+        self.assertIn(
+            'if (route == L"codex-api-settings" || route == L"claude-api-settings") return {540, 320};',
+            self.windows_leaf,
+        )
+        self.assertIn(
+            '"codex-api-settings": { width: 540, height: 350 },\n  "claude-api-settings": { width: 540, height: 350 },',
+            (ROOT / "rn/packages/shared/src/platform/childLayers.ts").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn('"status.cancel"', self.zh + self.en)
+        self.assertNotIn('translate("status.cancel")', self.ui + self.relay + (ROOT / "rn/packages/shared/src/ui/RelayGroupSheet.tsx").read_text(encoding="utf-8"))
+        self.assertIn('translate("settings.keepEditing")', self.ui)
         self.assertNotIn("function savedRouteMenuGroups(", self.ui)
         self.assertNotIn('dispatch("use_saved_model"', self.ui)
 
@@ -6213,9 +6241,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"provider_fetch_models",',
             '"provider_fetch_relay_resource_models",',
             "function isNonStagingAction(type: string): boolean {",
-            "const unbuffered = isNonStagingAction(type);",
-            "? issue()\n      : dispatchQueue.current.catch(() => undefined).then(issue);",
-            "if (!unbuffered) dispatchQueue.current = queued.then(() => undefined, () => undefined);",
+            "const unbuffered = isNonStagingAction(type) || isReadBackedMutation(type);",
+            "const queued = unbuffered || priorityMutation\n      ? issue()",
         ):
             self.assert_ui_has(marker)
 
@@ -6271,7 +6298,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The three live answers, and nothing else.
             "self._managed_account_remember(document)",
             'self._managed_account_remember({"providers": {provider_id: document.get("status")}})',
-            "provider, self._provider_auth_state(provider), allow_live=True",
         ):
             self.assertIn(marker, domain_source, marker)
         # A projection reaches for the worker only when it is allowed to.
@@ -6918,7 +6944,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "apiKeyActions: relayApiKeyActions,",
         ):
             self.assert_ui_has(marker)
-        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const applyOutcome = ", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn('settingsRoute || route === "providers-models" || route === "data-management" || route === "general-settings" || domain === undefined', apply_body)
         self.assertIn("await dispatchQueue.current;", apply_body)
         self.assertIn('return { draftStaged: next.drafts.relay_accounts?.dirty === true };', self.ui)
@@ -8805,7 +8831,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await relay.commit(\"station.update\", { id: station.id, name, origin, type });", self.ui)
         self.assertIn("onStageStationUpdate=", self.ui)
         self.assertIn('translate("relay.stationUpdateStaged")', relay)
-        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const applyOutcome = ", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn("await dispatchQueue.current;", apply_body)
         # Relay/provider drafts are committed by the shell's immediate apply;
         # the removed footer no longer renders a route-level Apply button.
@@ -9832,7 +9858,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Core's answer travels back to the control: `dispatch` states what
         # became of the action, and every switch hands that promise over.
         self.assert_ui_has("type Dispatch = (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<boolean>;")
-        self.assert_ui_has("}, null, true).then((staged) => staged !== undefined);")
+        self.assert_ui_has("if (staged === undefined) return false;")
         self.assert_ui_has('onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })}')
         self.assert_ui_has('onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch"')
         # A pane's own two-sided switch answers its own outcome instead of
@@ -10128,7 +10154,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
             "refreshAfter = true",
             "if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) {",
-            "}, null, true).then((staged) => staged !== undefined);",
+            "if (staged === undefined) return false;",
             # Leaving a pane with nothing to write is not an Apply: the flush
             # used to cancel after a `staged` read and then read the whole
             # projection back for it, so every sidebar press paid two round trips
@@ -10328,7 +10354,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A + / − that cannot act on the current state is hidden, never greyed
         # out: an empty list shows only the actions that apply to it.
         self.assertIn(
-            '{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}',
+            '{provider ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteProvider} /> : null}',
             self.ui,
         )
         # An account-backed row takes ＋ too: a model added there names the
@@ -10339,7 +10365,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui,
         )
         self.assertIn(
-            '{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}',
+            '{model ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteModel} /> : null}',
             self.ui,
         )
         self.assertIn(
@@ -10580,7 +10606,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (decimals.length === 0) {", self.ui)
 
         self.assertIn('<IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />', self.ui)
-        self.assertIn('<IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} />', self.ui)
+        self.assertIn('<IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteRoute} />', self.ui)
         self.assertIn("const addRoute = (): void => {", self.ui)
         self.assertIn('runMutationOnce(`route.add:${targetProviderID}:${publicModel}`, () => dispatchWithOutcome("model.add", {', self.ui)
         self.assertIn("const confirmDeleteRoute = (): void => {", self.ui)

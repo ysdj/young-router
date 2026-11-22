@@ -772,9 +772,8 @@ async function askRememberPassword(
  *
  * The silent sign-in still runs first, inside that surface: the account's
  * remembered session or password may still work, and that answer needs no
- * browser at all.  A saved password is filled into the station's form by Core
- * (and posted once when the station's own last answer says there is no session
- * to preserve), because the page never receives the secret.
+ * browser at all. If a browser is needed, Core only fills its manual form;
+ * it has already decided whether it can submit a saved password itself.
  *
  * `"unavailable"` is the answer that means "this host has no browser to open,
  * use the credential form instead" — a capability answer, not a failed
@@ -837,7 +836,7 @@ async function browserWindowLogin(
     title: fillLabel(strings?.relaySignInTitle ?? "Sign in", options.label),
     body: strings?.relayBrowserWaiting ?? "",
     live,
-    cancelLabel: strings?.cancel ?? "Cancel",
+    cancelLabel: strings?.cancel ?? "Close",
     showLabel: strings?.relayBrowserShow ?? "",
     // A window can open behind the person's own browser — or onto a Space they
     // are not looking at — and then "nothing happened" is exactly what they
@@ -948,6 +947,13 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
    */
   presentChild?: (route: AppRoute) => void;
   dismissChild?: (route: AppRoute) => boolean;
+  /**
+   * Resize the layer that shows one child route, in the same content-size
+   * terms a native window uses.  The page has no native window to set, so a
+   * form that fits its own body would otherwise leave the layer's fixed height
+   * as an empty band above its footer.
+   */
+  resizeChild?: (route: AppRoute, width: number, height: number) => boolean;
 }): NativeLeafBridge {
   let strings: NativeLocalization | undefined;
   let menuActions: NativeMenuAction[] = [];
@@ -1075,6 +1081,9 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
   (core as BrowserCoreBridge).send = sendWithBrowserDownloads;
 
   return {
+    setWindowContentSize: options.resizeChild
+      ? async (route, width, height) => options.resizeChild!(route, width, height)
+      : undefined,
     openWindow: (route) => {
       // A settings pane is not a child surface. On a native host, opening one
       // focuses the settings *window* the host already has; this host's
@@ -1180,7 +1189,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       message,
       confirmLabel,
       // An empty cancel label is the caller saying "no words of my own"; the
-      // native leaves fall back to the host's localized 取消 and so must this.
+      // native leaves fall back to the host's localized 关闭 and so must this.
       cancelLabel: cancelLabel || strings?.cancel || "",
       destructive: destructive === true,
     }),
@@ -1323,7 +1332,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
           remember: strings?.relaySignInRemember ?? "",
           rememberHint: strings?.relaySignInRememberHint ?? "",
           submit: strings?.relaySignInSubmit ?? "Sign In",
-          cancel: strings?.cancel ?? "Cancel",
+          cancel: strings?.cancel ?? "Close",
         },
         submit: async ({ username, password, rememberPassword }) => {
           try {
@@ -1373,14 +1382,8 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
           username: options.username ?? "",
           // This host has no station cookie of its own to offer -- the page
           // cannot read another origin's jar -- so it states no observation and
-          // Core resolves one: the saved session first, then the remembered
-          // password.  That is the same two-step every native host runs before
-          // it hands Core an answer, and it is why this says `unknown`: a host
-          // that has not asked the station must not hand Core its own guess as
-          // the station's answer.  Measured on a fresh account with no saved
-          // password: the guess was recorded 未登录 with a fresh observation,
-          // so the pane settled on an answer nobody had taken -- and shared it
-          // with every other machine.
+          // Core resolves one for every host, using the account's own session
+          // and saved password. A host's missing cookie is not a verdict.
           login_status: "unknown",
         };
         const result = await core.hostRoute("/ipc/host/relay/restore", body);

@@ -848,16 +848,25 @@ def _replace_top_level_sections(text: str, blocks: dict[str, str]) -> str:
         )
         sections[key_node.value] = (key_node.start_mark.index, end)
 
+    blocks = dict(blocks)
+    # Routes reference anchors defined by the provider block. A valid source
+    # can put literal routes first, but a rewritten route must follow its new
+    # anchor definitions.
+    if "providers" in blocks and "model_list" in blocks and "model_list" in sections:
+        provider_position = sections.get("providers", (len(text), len(text)))[0]
+        if provider_position > sections["model_list"][0]:
+            blocks["model_list"] = blocks["providers"].rstrip() + "\n\n" + blocks["model_list"]
+            blocks["providers"] = ""
     updated = text
     replacements = [
-        (sections[key][0], sections[key][1], block.rstrip() + "\n")
+        (sections[key][0], sections[key][1], block.rstrip() + "\n" if block else "")
         for key, block in blocks.items()
         if key in sections
     ]
     for start, end, block in sorted(replacements, reverse=True):
         updated = updated[:start] + block + updated[end:]
 
-    missing = [block.rstrip() for key, block in blocks.items() if key not in sections]
+    missing = [block.rstrip() for key, block in blocks.items() if key not in sections and block]
     if missing:
         updated = updated.rstrip() + "\n\n" + "\n\n".join(missing) + "\n"
     return updated

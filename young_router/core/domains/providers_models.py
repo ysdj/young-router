@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import http.client
@@ -363,6 +364,12 @@ _SPEED_TEST_ENCODER: Any = None
 
 class ProvidersModelsDomain:
     """Staged providers/models editing through ``young_router.config``."""
+
+    # Core supplies its single-domain I/O context. Direct domain callers do not hold a lane.
+    _io_gate = staticmethod(nullcontext)
+
+    def bind_io_gate(self, gate):
+        self._io_gate = gate
 
     name = "providers_models"
     _MODEL_LIST_PROTOCOL = "openai-models-v1"
@@ -2048,18 +2055,10 @@ class ProvidersModelsDomain:
         provider: Mapping[str, Any],
         provider_id: str,
         api_key_name: str | None = None,
-        *,
-        credential_override: str | None = None,
-        remember_windows: bool = True,
     ) -> dict[str, Any]:
         """Fetch one standard `/v1/models` list without exposing remote details."""
 
-        if credential_override is None:
-            selected_key_name, credential = self._provider_credential(provider, api_key_name)
-        else:
-            selected_key_name = self._api_key_name(api_key_name)
-            self._api_key_index(self._provider_api_keys(provider), selected_key_name)
-            credential = credential_override
+        selected_key_name, credential = self._provider_credential(provider, api_key_name)
         endpoint = self._model_endpoint(self._provider_api_base(provider))
         summary: dict[str, Any] = {
             "operation": "fetch_models",
@@ -2077,6 +2076,12 @@ class ProvidersModelsDomain:
                 "model_count": 0,
             }
 
+        # The request owns the endpoint and credential selected before lending
+        # the lane. Edits during the read cannot redirect this credential.
+        with self._io_gate():
+            return self._read_provider_models(endpoint, credential, summary)
+
+    def _read_provider_models(self, endpoint: str, credential: str, summary: dict[str, Any]) -> dict[str, Any]:
         headers = browser_request_headers()
         if credential:
             headers["Authorization"] = f"Bearer {credential}"
@@ -2161,8 +2166,6 @@ class ProvidersModelsDomain:
         # number its own upstream stated instead of an inferred one.
         if model_windows:
             result["model_windows"] = model_windows
-            if remember_windows:
-                self._remember_listing_windows(provider_id, model_windows)
         return result
 
     def _fetch_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -2193,19 +2196,31 @@ class ProvidersModelsDomain:
             # 获取模型 on a signed-in account asks that account, not the
             # provider's address: the roster it can serve is the one its own
             # login grants, and no API key speaks for it.
-            summary = self._fetch_account_models(
-                provider,
-                self._safe_provider(provider, index)["id"],
-                account_ref,
-            )
+            provider_id = self._safe_provider(provider, index)["id"]
+            editor_id = self._editor_id(provider)
+            with self._io_gate():
+                summary = self._fetch_account_models(provider, provider_id, account_ref)
+            current = self._draft["providers"][self._provider_index({"provider_id": editor_id})]
+            if account_ref not in {entry["ref"] for entry in self._provider_accounts(current)}:
+                raise DomainError("The selected account is no longer available")
             self._last_operation = summary
             return summary
         api_key_name = self._api_key_name(data["api_key_name"]) if "api_key_name" in data else None
+        editor_id = self._editor_id(provider)
+        endpoint = self._provider_api_base(provider)
+        credential = self._provider_credential(provider, api_key_name)
         summary = self._fetch_provider_models(
             provider,
             self._safe_provider(provider, index)["id"],
             api_key_name,
         )
+        current = self._draft["providers"][self._provider_index({"provider_id": editor_id})]
+        if (self._provider_api_base(current) != endpoint
+                or self._provider_credential(current, api_key_name) != credential
+                or self._provider_auth_state(current) != self._provider_auth_state(provider)):
+            raise DomainError("The provider connection changed while its model list was loading")
+        if summary.get("model_windows"):
+            self._remember_listing_windows(editor_id, summary["model_windows"])
         self._last_operation = summary
         return summary
 
@@ -2364,23 +2379,10 @@ class ProvidersModelsDomain:
             "api_base": api_base,
             "api_keys": [{"name": key_name, "value": credential}],
         }
-        return self._fetch_provider_models(
-            transient,
-            token,
-            key_name,
-            # The token is not a provider identity, and nothing re-keys the
-            # entry after the wizard creates its provider.
-            remember_windows=False,
-        )
+        return self._fetch_provider_models(transient, token, key_name)
 
-    def _fetch_relay_resource_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
-        """Fetch models through a dynamically discovered relay API key.
-
-        The Core coordinator supplies the relay credential only for this
-        request.  The staged ProviderKey keeps its stable relay source and is
-        materialized again at Apply time; no relay secret becomes draft or
-        snapshot data.
-        """
+    def prepare_relay_model_list(self, data: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Stage the linked slot and capture the request target together."""
 
         raw_source = data.get("source")
         if not isinstance(raw_source, Mapping):
@@ -2407,12 +2409,25 @@ class ProvidersModelsDomain:
         staged_provider = self._draft["providers"][provider_index]
         if not isinstance(staged_provider, Mapping):
             raise DomainError("The selected provider is unavailable")
-        summary = self._fetch_provider_models(
-            staged_provider,
-            imported["provider_id"],
-            imported["api_key_name"],
-            credential_override=credential.strip(),
-        )
+        slot = next(key for key in self._provider_api_keys(staged_provider) if key["id"] == imported["slot_id"])
+        return imported, {
+            "provider_editor_id": self._editor_id(staged_provider),
+            "api_base": self._provider_api_base(staged_provider),
+            "slot": slot,
+            "api_keys": [{"name": slot["name"], "value": credential.strip()}],
+        }
+
+    def read_relay_model_list(self, imported: Mapping[str, Any], target: Mapping[str, Any]) -> dict[str, Any]:
+        summary = self._fetch_provider_models(target, imported["provider_id"], imported["api_key_name"])
+        editor_id = target["provider_editor_id"]
+        provider = self._draft["providers"][self._provider_index({"provider_id": editor_id})]
+        slot = next((key for key in self._provider_api_keys(provider) if key["id"] == imported["slot_id"]), None)
+        if (self._provider_api_base(provider) != target["api_base"] or slot is None
+                or not self._same_relay_source(slot["source"], target["slot"]["source"])
+                or slot["value"] not in {target["slot"]["value"], target["api_keys"][0]["value"]}):
+            raise DomainError("The provider connection changed while its model list was loading")
+        if summary.get("model_windows"):
+            self._remember_listing_windows(editor_id, summary["model_windows"])
         summary["slot_id"] = imported["slot_id"]
         summary["imported"] = imported["imported"]
         summary["reused"] = imported["reused"]
@@ -4753,9 +4768,12 @@ class ProvidersModelsDomain:
         provider_id = module.AUTH_KIND_TO_PROVIDER[auth_kind]
         display = module.DISPLAY_NAMES[provider_id]
         try:
-            document = self._managed_account_runtime(module).models(
-                provider_id, refresh=selected is None
-            )
+            # The roster is an external worker read.  Keep the local draft
+            # lane available while that read starts or refreshes the worker.
+            with self._io_gate():
+                document = self._managed_account_runtime(module).models(
+                    provider_id, refresh=selected is None
+                )
         except Exception:
             raise DomainError(f"The {display} model list is unavailable") from None
         # Adding the account just answered the account question, so the state
@@ -4849,7 +4867,10 @@ class ProvidersModelsDomain:
 
         provider_id = provider_id or our_free_model_module.AUTH_KIND_TO_PROVIDER[auth_kind]
         try:
-            document = self._our_free_model_runtime().models(provider_id, refresh=True)
+            # Importing the live catalog must not occupy the provider writer
+            # lane while the worker or its upstream is slow.
+            with self._io_gate():
+                document = self._our_free_model_runtime().models(provider_id, refresh=True)
         except our_free_model_module.OurFreeModelCatalogUnavailable:
             self._our_free_model_runtime().ensure_configured()
             return []
@@ -4926,7 +4947,8 @@ class ProvidersModelsDomain:
                 # Opening the desktop app is how this account signs in: the
                 # app owns the credential, so the pane can only hand the user
                 # to it and then re-read what it wrote.
-                document = runtime.open_desktop_app(provider_id)
+                with self._io_gate():
+                    document = runtime.open_desktop_app(provider_id)
                 self._last_operation = {
                     "operation": action,
                     "provider": provider_id,
@@ -4958,7 +4980,8 @@ class ProvidersModelsDomain:
                             "remembered": True,
                         }
                         return
-                document = runtime.status(refresh=refresh)
+                with self._io_gate():
+                    document = runtime.status(refresh=refresh)
                 providers = document.get("providers")
                 # The pane asked the account question directly, so what came
                 # back becomes the state every later projection reports.
@@ -4976,7 +4999,8 @@ class ProvidersModelsDomain:
             # 刷新 button and the account import pass ``refresh``, which reaches
             # upstream; anything else would fetch the whole desktop catalog again
             # on every model switch.
-            document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
+            with self._io_gate():
+                document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
             raise DomainError("The WorkBuddy integration is unavailable") from None
         # A catalog read answers the account question too, and the worker's own
@@ -5013,7 +5037,8 @@ class ProvidersModelsDomain:
             # The sign-in happens in the Qoder desktop app; this hand-off is
             # all this app can do for a region that app is not signed into.
             try:
-                document = runtime.open_desktop_app(provider_id)
+                with self._io_gate():
+                    document = runtime.open_desktop_app(provider_id)
             except Exception:
                 raise DomainError("The Qoder desktop app could not be opened") from None
             self._last_operation = {
@@ -5040,16 +5065,19 @@ class ProvidersModelsDomain:
                             if secret_target
                             else str(data.get("pat", ""))
                         )
-                    document = runtime.login(provider_id, pat)
+                    with self._io_gate():
+                        document = runtime.login(provider_id, pat)
                     # The worker keeps the PAT; this draft copy has no second
                     # use after a successful sign-in.  A refused one stays so
                     # the field's retry still has a value to hand over — the
                     # native field is not re-staged by a second press.
                     if secret_target:
                         with self._qoder_pat_lock:
-                            self._pending_qoder_pats.pop(secret_target, None)
+                            if self._pending_qoder_pats.get(secret_target) == pat:
+                                self._pending_qoder_pats.pop(secret_target, None)
                 else:
-                    document = runtime.logout(provider_id)
+                    with self._io_gate():
+                        document = runtime.logout(provider_id)
             except Exception as exc:
                 raise DomainError(
                     f"The Qoder account could not be changed: {safe_exception_message(exc)}"
@@ -5087,7 +5115,8 @@ class ProvidersModelsDomain:
                             "remembered": True,
                         }
                         return
-                document = runtime.status(refresh=refresh)
+                with self._io_gate():
+                    document = runtime.status(refresh=refresh)
                 providers = document.get("providers")
                 self._managed_account_remember(document)
                 self._last_operation = {
@@ -5097,7 +5126,8 @@ class ProvidersModelsDomain:
                     "providers": dict(providers) if isinstance(providers, Mapping) else {},
                 }
                 return
-            document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
+            with self._io_gate():
+                document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
             raise DomainError("The Qoder integration is unavailable") from None
         self._managed_account_remember({"providers": {provider_id: document.get("status")}})
@@ -5126,9 +5156,9 @@ class ProvidersModelsDomain:
         module = self._managed_account_module_for_provider(provider_id)
         if module is not None:
             try:
-                document = self._managed_account_runtime(module).models(
-                    module.validated_provider(provider_id), refresh=refresh
-                )
+                runtime = self._managed_account_runtime(module)
+                with self._io_gate():
+                    document = runtime.models(module.validated_provider(provider_id), refresh=refresh)
             except ValueError:
                 raise DomainError("The requested service provider is unavailable") from None
             except Exception:
@@ -5150,7 +5180,9 @@ class ProvidersModelsDomain:
         except ValueError:
             raise DomainError("The requested Our Free Model provider is unavailable") from None
         try:
-            document = self._our_free_model_runtime().models(provider_id, refresh=refresh)
+            runtime = self._our_free_model_runtime()
+            with self._io_gate():
+                document = runtime.models(provider_id, refresh=refresh)
         except Exception:
             raise DomainError("The Our Free Model integration is unavailable") from None
         self._remember_published_windows(provider_id, document.get("models"))
@@ -5180,7 +5212,8 @@ class ProvidersModelsDomain:
         runtime = self._our_free_model_runtime()
         try:
             if action == "our_free_model_status":
-                document = runtime.status(refresh=bool(data.get("refresh", False)))
+                with self._io_gate():
+                    document = runtime.status(refresh=bool(data.get("refresh", False)))
                 providers = document.get("providers")
                 self._last_operation = {
                     "operation": action,
@@ -5194,7 +5227,8 @@ class ProvidersModelsDomain:
             # client's remembered answer.  The pane's 刷新 button and the lane
             # import pass ``refresh``, which reaches upstream; anything else
             # would fetch the whole Zen directory again on every model switch.
-            document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
+            with self._io_gate():
+                document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
             raise DomainError("The Our Free Model integration is unavailable") from None
         # The lane's catalog is where its own window per free model is read, so
@@ -5289,7 +5323,9 @@ class ProvidersModelsDomain:
             # which is the same place the 倍率 column comes from.
             return True
         try:
-            document = self._managed_account_runtime(module).models(provider_id, refresh=False)
+            worker = self._managed_account_runtime(module)
+            with self._io_gate():
+                document = worker.models(provider_id, refresh=False)
         except Exception:
             return False
         self._remember_published_rates(provider_id, document.get("models"))
@@ -6356,14 +6392,10 @@ class ProvidersModelsDomain:
             # number in hand is a draft nothing can finish: the Apply never
             # starts (the dumper refuses a route with no order) and validation
             # reads *every* route of the provider, so the next edit of any row
-            # here reported 更改未生效 with this one still marked.  The read the
-            # edit needs is therefore taken now, where it can answer the user's
-            # own action, and an account that states no rate refuses that edit
-            # rather than staging a row nothing can write.
+            # here reported 更改未生效 with this one still marked. An explicit
+            # edit reads rates before copying the draft; normalization only
+            # uses the result already in hand.
             published = self._published_rate(provider, model)
-            if published is None and staged:
-                self._refresh_published_rates(provider)
-                published = self._published_rate(provider, model)
             if published is None:
                 if staged:
                     raise DomainError(
@@ -6373,7 +6405,7 @@ class ProvidersModelsDomain:
                 # A saved row cannot be refused: it is already in the document
                 # this pane has to be able to open.  It keeps the order it
                 # states and reads as manual, so the next edit of any other row
-                # is not blocked by a number nothing here can supply.
+            # is not blocked by a number nothing here can supply.
                 order_mode = "manual"
         # ProviderKey.source is the single relation source of truth.  These
         # editor fields remain derived for old documents/UI readers, but they
@@ -6778,11 +6810,7 @@ class ProvidersModelsDomain:
                 raise DomainError("The requested Our Free Model channel is unavailable") from None
         defaults = self._SERVICE_PROVIDER_DEFAULTS[kind]
         name = str(supplied.get("name", "")).strip() or defaults["name"]
-        if any(
-            isinstance(candidate, Mapping)
-            and str(candidate.get("name", "")).strip().casefold() == name.casefold()
-            for candidate in self._draft.get("providers", [])
-        ):
+        if self._provider_name_exists(self._draft["providers"], name):
             raise DomainError("A provider with this name already exists")
 
         provider: dict[str, Any] = copy.deepcopy(supplied)
@@ -6893,6 +6921,9 @@ class ProvidersModelsDomain:
                 raw_models = []
         if not isinstance(raw_models, Sequence) or isinstance(raw_models, (str, bytes, bytearray)):
             raise DomainError("Service provider models must be a list")
+        # Another create could claim the name during the catalog read.
+        if self._provider_name_exists(self._draft["providers"], name):
+            raise DomainError("A provider with this name already exists")
         used_deployment_ids = {
             str(model.get("deployment_id", "")).strip().lower()
             for candidate in self._draft.get("providers", [])
@@ -6926,7 +6957,7 @@ class ProvidersModelsDomain:
             # this summary states the answer to the question the pane asked
             # rather than a projection that has not observed anything yet.
             "auth_status": self._provider_auth_status(
-                provider, self._provider_auth_state(provider), allow_live=True
+                provider, self._provider_auth_state(provider)
             ),
         }
 
@@ -7006,9 +7037,7 @@ class ProvidersModelsDomain:
             if auth["kind"] != "openai_login":
                 raise DomainError("Only OpenAI login accounts have an active runtime slot")
             try:
-                result = self._auth_manager().activate(
-                    auth["kind"], auth["credential_ref"]
-                )
+                result = self._auth_manager().activate(auth["kind"], auth["credential_ref"])
             except Exception:
                 raise DomainError("The OpenAI service provider could not be activated") from None
             self._last_operation = {
@@ -7365,12 +7394,8 @@ class ProvidersModelsDomain:
                         raise DomainError("Account login is unavailable for this provider")
                     result = {"status": "signed_out", "configured": False}
                 elif action == "provider_auth_start":
-                    # Wait briefly for the device challenge so the native UI can
-                    # display it in the same action result. The worker continues
-                    # polling in the background after this bounded wait.
                     result = self.trusted_provider_auth_start(
-                        self._safe_provider(provider, provider_index)["id"],
-                        credential_ref,
+                        self._safe_provider(provider, provider_index)["id"], credential_ref,
                     )
                 elif action == "provider_auth_cancel":
                     result = manager.cancel(credential_ref)
@@ -7473,17 +7498,9 @@ class ProvidersModelsDomain:
         if auth["kind"] == "api_key" or not ref:
             raise DomainError("Account login is unavailable for this provider")
         manager = self._auth_manager()
-        manager.start(auth["kind"], ref)
-        # Device-code generation is asynchronous. Return promptly with the
-        # current authorizing state; the UI polls auth_status and opens the
-        # WebView as soon as the challenge is available.
-        deadline = time.monotonic() + 2
-        result: Mapping[str, Any] = {}
-        while time.monotonic() < deadline:
-            result = manager.status(auth["kind"], ref)
-            if result.get("user_code") or result.get("verification_uri") or result.get("status") != "authorizing":
-                break
-            time.sleep(0.05)
+        # The host polls for the device challenge. Keep code issuance in the
+        # auth worker so the provider draft can be edited while it waits.
+        result = manager.start(auth["kind"], ref)
         return {
             "provider_id": self._safe_provider(provider, index)["id"],
             "auth_kind": auth["kind"],
@@ -7543,7 +7560,12 @@ class ProvidersModelsDomain:
         # answer is the authority the pick was made against, and the worker
         # answers a non-refresh read only once its own first refresh has
         # finished, so this is never an empty roster.
+        editor_id = self._editor_id(provider)
         self._service_catalog_operation(provider_id, refresh=False)
+        provider_index = self._provider_index({"provider_id": editor_id})
+        provider = self._draft["providers"][provider_index]
+        if self._provider_auth_state(provider).get("kind") != auth_kind:
+            raise DomainError("The provider changed while its catalog was loading")
         catalog = self._last_operation.get("models")
         entries = {
             str(entry.get("id", "")).strip(): entry
@@ -8779,26 +8801,25 @@ class ProvidersModelsDomain:
                 if not isinstance(resource, Mapping):
                     continue
                 station_name = str(resource.get("api_key_name", "")).strip()
-                if not station_name or station_name == key["name"]:
+                if not station_name:
                     continue
                 try:
                     station_name = self._api_key_name(station_name)
                 except DomainError:
                     continue
-                keys = self._provider_api_keys(
-                    {
-                        **provider,
-                        "api_keys": [
-                            item for item in keys if item["id"] != key["id"]
-                        ]
-                        + [{**key, "name": station_name}],
-                    }
+                # The first slot is the default credential. Rename in place
+                # even when two accounts report the same display name.
+                unique_station_name = self._unique_provider_key_name(
+                    [other for other in keys if other is not key], station_name
                 )
+                if unique_station_name == key["name"]:
+                    continue
+                key["name"] = unique_station_name
                 for model in models:
                     if not isinstance(model, dict):
                         continue
                     if str(model.get("provider_key_id", "")).strip() == key["id"]:
-                        model["api_key_name"] = station_name
+                        model["api_key_name"] = unique_station_name
             self._sync_primary_api_key(provider, keys)
             providers[provider_index] = provider
         # Report the station read only where it left a binding unresolved.  An
@@ -9662,6 +9683,22 @@ class ProvidersModelsDomain:
             return
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
+        original = providers[provider_index]
+        rate_edits: Iterable[object] = ()
+        if action in {"model_patch", "patch_model"}:
+            rate_edits = (self._changes(data, "model"),)
+        elif action in {"model_add_many", "add_models"} and isinstance(data.get("models"), list):
+            rate_edits = data["models"]
+        elif action in {"model_add", "add_model"}:
+            rate_edits = (data.get("model", data),)
+        if any(isinstance(edit, Mapping) and edit.get("order_mode") == "relay_multiplier" for edit in rate_edits):
+            if action in {"model_patch", "patch_model"}:
+                self._model_index(original, data)
+            self._refresh_published_rates(original)
+            providers = self._draft["providers"]
+            provider_index = self._provider_index(data)
+            if providers[provider_index] is not original:
+                raise DomainError("The provider changed while reading its published rates")
         provider = self._copy_provider_for_edit(providers[provider_index])
         existing_key_ids = {
             str(item.get("id", "")).strip()
@@ -9852,13 +9889,6 @@ class ProvidersModelsDomain:
             if "order" in changes and "manual_order" not in changes and next_order_mode == "manual":
                 changes["manual_order"] = changes["order"]
             if next_order_mode == "relay_multiplier" and current_order_mode != "relay_multiplier":
-                # The mode is being asked for now, so this is the moment to
-                # learn the number it follows.  An account that states its
-                # rates publishes them on a catalog read, and a relay station's
-                # multiplier arrives with the Apply's own binding read — so a
-                # rate this app has not been told yet is fetched once, here,
-                # instead of being written as a null the dumper then refuses.
-                self._refresh_published_rates(provider)
                 if "effective_order" not in changes:
                     changes["effective_order"] = None
             if "model_enabled" in changes:
@@ -10323,8 +10353,6 @@ class ProvidersModelsDomain:
             self._import_claude_current()
         elif name in {"providers_fetch_models", "provider_fetch_models", "fetch_models"}:
             self._fetch_models(data)
-        elif name == "provider_fetch_relay_resource_models":
-            self._fetch_relay_resource_models(data)
         elif name in {"relay_import", "providers_relay_import"}:
             self._last_operation = self._stage_relay_import(
                 data.get("sources"),
@@ -11082,17 +11110,40 @@ class ProvidersModelsDomain:
     ) -> tuple[dict[str, Any], bool]:
         result = dict(value)
         overlay = result.pop("_overlay", None)
+        if self._probe_superseded(prepared.get("probe_stop")):
+            return {**self._cancelled_probe(), "ok": False, "protocols": []}, False
         if prepared.get("kind") != "model" or not isinstance(overlay, Mapping):
             return result, False
-        provider_index = self._provider_index({"provider_id": prepared.get("provider_id")})
-        provider = self._draft["providers"][provider_index]
-        if not isinstance(provider, Mapping):
-            raise DomainError("The selected provider is unavailable")
-        model_index = self._model_index(provider, {"model_id": prepared.get("model_id")})
-        models = provider.get("models", [])
-        if not isinstance(models, list) or not isinstance(models[model_index], Mapping):
-            raise DomainError("The selected model is unavailable")
-        model = models[model_index]
+
+        def stale() -> tuple[dict[str, Any], bool]:
+            return {
+                "ok": False, "protocols": [], "status": "cancelled",
+                "detail": "The route changed while this check was running",
+            }, False
+
+        try:
+            provider = self._draft["providers"][self._provider_index({"provider_id": prepared["provider_id"]})]
+            model = provider["models"][self._model_index(provider, {"model_id": prepared["model_id"]})]
+            original_provider, original_model = prepared["provider"], prepared["model"]
+            account = self._account_ref_for_probe(provider, model)
+            original_account = self._account_ref_for_probe(original_provider, original_model)
+            credential_matches = account == original_account and (
+                account or self._model_credential(provider, model) == self._model_credential(original_provider, original_model)
+            )
+        except DomainError:
+            return stale()
+        # A finding belongs to the model and credential that answered it.
+        # Edits to sibling routes do not affect that answer.
+        if (
+            self._provider_auth_state(provider) != self._provider_auth_state(original_provider)
+            or self._model_api_base(provider, model) != self._model_api_base(original_provider, original_model)
+            or not credential_matches
+            or any(model.get(field) != original_model.get(field) for field in (
+                "litellm_model", "provider_key_id", "api_key_name", "upstream_url_surface", "upstream_protocol_mode",
+                "precision_reference",
+            ))
+        ):
+            return stale()
         provider_name = str(provider.get("name", "")).strip()
         probe_key = self._probe_model_key(model)
         probe = overlay.get("probe")

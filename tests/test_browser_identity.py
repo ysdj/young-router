@@ -108,10 +108,9 @@ class BrowserIdentityLiteralTests(unittest.TestCase):
                 "webView.customUserAgent = RelayBrowserIdentity.userAgent" in body,
                 controller,
             )
-        for probe_headers in (
-            'request.setValue(RelayBrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")',
-        ):
-            self.assertEqual(2, macOS.count(probe_headers))
+        # Only the manual window verifies a browser login; Core checks saved sessions.
+        probe = macOS.split("private func probe(index: Int", 1)[1].split("private func persistVerifiedLogin", 1)[0]
+        self.assertIn('request.setValue(RelayBrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")', probe)
         self.assertIn("core.Settings().UserAgent(kRelayBrowserUserAgent);", windows)
         self.assertIn("kRelayBrowserUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY", windows)
         # The request carries the same Accept-Language the browser identity

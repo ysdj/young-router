@@ -488,14 +488,7 @@ _PREFILL_SCRIPT = """
   };
   set(user, __USERNAME__);
   set(password, __PASSWORD__);
-  if (!user?.value || !password?.value) return 'partial';
-  if (!__SUBMIT__) return 'filled';
-  const form = password.form;
-  const button = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
-    ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
-  if (button instanceof HTMLElement) { button.click(); return 'submitted'; }
-  if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') { form.requestSubmit(); return 'submitted'; }
-  return 'filled';
+  return ((!__USERNAME__ || user?.value) && (!__PASSWORD__ || password?.value)) ? 'filled' : 'partial';
 })();
 """
 
@@ -506,14 +499,13 @@ def prefill_login_form(
     *,
     username: str,
     password: str,
-    submit: bool,
 ) -> str:
-    """Fill the station's sign-in form, and post it once when authorized.
+    """Fill the station's sign-in form for the person to submit.
 
     Answers in one word: ``none`` (no form on the page yet), ``partial`` (a
     field the person is still typing into is what the other one lacks),
-    ``filled`` (the form now carries the app's own account), ``submitted``
-    (the form was posted), or ``""`` when the page could not be asked at all.
+    ``filled`` (the form now carries the saved fields), or ``""`` when the
+    page could not be asked at all.
 
     A field that already holds a value is left exactly as it is: the app's copy
     is a convenience, never an overwrite of what somebody typed.
@@ -523,7 +515,6 @@ def prefill_login_form(
         _PREFILL_SCRIPT
         .replace("__USERNAME__", json.dumps(username))
         .replace("__PASSWORD__", json.dumps(password))
-        .replace("__SUBMIT__", "true" if submit else "false")
     )
     try:
         outcome = _evaluate_page(port, origin, expression)
@@ -679,7 +670,7 @@ def start_capture(browser: "LoginBrowser") -> None:
     thread.start()
 
 
-def _prefill_loop(browser: "LoginBrowser", username: str, password: str, submit: bool) -> None:
+def _prefill_loop(browser: "LoginBrowser", username: str, password: str) -> None:
     deadline = time.monotonic() + PREFILL_SECONDS
     while not browser.closed and time.monotonic() < deadline:
         outcome = prefill_login_form(
@@ -687,19 +678,14 @@ def _prefill_loop(browser: "LoginBrowser", username: str, password: str, submit:
             browser.origin,
             username=username,
             password=password,
-            submit=submit,
         )
-        # Nothing left to do here: the form carries the account and this window
-        # may not post it, or it was posted.  A page with no form yet is asked
-        # again -- a station that renders its login route after its shell is
-        # the normal shape, not an error.
-        if outcome == "submitted" or (outcome == "filled" and not submit):
+        if outcome == "filled":
             return
         time.sleep(PREFILL_INTERVAL_SECONDS)
 
 
-def start_prefill(browser: "LoginBrowser", *, username: str, password: str, submit: bool) -> None:
-    """Fill the station's form behind the sign-in window, and post it once.
+def start_prefill(browser: "LoginBrowser", *, username: str, password: str) -> None:
+    """Fill the station's form behind the sign-in window.
 
     On its own thread: the window's own answer (its name, its frames, its
     polling) must not wait for the station's page to finish rendering, and the
@@ -710,7 +696,7 @@ def start_prefill(browser: "LoginBrowser", *, username: str, password: str, subm
         return
     thread = threading.Thread(
         target=_prefill_loop,
-        args=(browser, username, password, submit),
+        args=(browser, username, password),
         name="yr-prefill",
         daemon=True,
     )

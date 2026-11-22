@@ -2177,7 +2177,7 @@ private enum NativeRelayOriginPolicy {
     /// passwords.  A malformed or absent answer is "no session", never an
     /// error the account row has to explain: the window then opens at the
     /// station's own address.
-    private static func relaySessionForDashboard(
+    fileprivate static func relaySessionForDashboard(
         accountID: String,
         type: String,
         origin: String
@@ -2188,11 +2188,14 @@ private enum NativeRelayOriginPolicy {
                   target: accountID
               ),
               let data = payload.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["origin"] as? String == origin,
+              object["type"] as? String == type else {
             return nil
         }
         let cookie = (object["cookie"] as? String) ?? ""
         let accessToken = (object["access_token"] as? String) ?? ""
+        guard !cookie.isEmpty || !accessToken.isEmpty else { return nil }
         return NativeRelaySession(
             // The store's own read guard matches the account type and origin, so
             // both travel with the session: a session installed under another
@@ -2239,62 +2242,14 @@ private enum NativeRelayOriginPolicy {
             normalized.path = path.isEmpty ? "" : "/" + path
             return normalized.url ?? originURL
         } ?? originURL
-        guard let session = NativeRelaySessionMemoryStore.readSession(
+        return try? CoreIPCBridge.shared.restoreRelaySession(
             accountID: accountID,
-            accountType: type,
-            origin: canonicalOrigin.absoluteString
-        ) else {
-            return try? CoreIPCBridge.shared.restoreRelaySession(
-                accountID: accountID,
-                type: type,
-                label: label,
-                origin: canonicalOrigin.absoluteString,
-                loginStatus: "signed_out"
-            )
-        }
-        switch NativeRelaySessionProbe.verify(
             type: type,
-            originURL: canonicalOrigin,
-            presetUsername: username?.trimmingCharacters(in: .whitespacesAndNewlines),
-            session: session
-        ) {
-        case .verified(let probe):
-            let refreshedSession = NativeRelaySession(
-                accountType: type,
-                origin: canonicalOrigin.absoluteString,
-                cookie: probe.cookie,
-                accessToken: probe.accessToken,
-                refreshToken: probe.refreshToken,
-                userID: probe.userID
-            )
-            NativeRelaySessionMemoryStore.writeSession(refreshedSession, accountID: accountID)
-            return try? CoreIPCBridge.shared.restoreRelaySession(
-                accountID: accountID,
-                type: type,
-                label: label,
-                origin: canonicalOrigin.absoluteString,
-                loginStatus: "signed_in",
-                username: probe.username,
-                cookie: probe.cookie,
-                accessToken: probe.accessToken,
-                refreshToken: probe.refreshToken,
-                userID: probe.userID,
-                quota: probe.quota
-            )
-        case .expired:
-            return try? CoreIPCBridge.shared.restoreRelaySession(
-                accountID: accountID,
-                type: type,
-                label: label,
-                origin: canonicalOrigin.absoluteString,
-                loginStatus: "expired"
-            )
-        case .unavailable:
-            // A transient network failure cannot safely be presented as an
-            // expired login. Keep the last known state until a later native
-            // check can verify the outcome.
-            return nil
-        }
+            label: label,
+            origin: canonicalOrigin.absoluteString,
+            loginStatus: "unknown",
+            username: username
+        )
     }
 
     func clearRelayPassword(accountID: String) -> Bool {
@@ -3017,8 +2972,14 @@ private enum NativeRelayOriginPolicy {
                 maxSize: nil
             )
         case "codex-api-settings", "claude-api-settings":
+            // The form measures itself and the window takes that height (see
+            // CHILD_SURFACE_*).  This initial height is the one that
+            // measurement resolves to for the four rows the form draws, so the
+            // first fit is a no-op: opening at a different height made the
+            // window jump once as it appeared.  A form with another row still
+            // fits itself; this only states where it opens.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 540, height: 340),
+                contentSize: NSSize(width: 540, height: 320),
                 minSize: NSSize(width: 460, height: 300),
                 maxSize: nil
             )
@@ -6505,9 +6466,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// same password on every sign-in.
     private var restoredPassword: String?
     private var didRestorePassword = false
-    /// Whether the remembered password has already been submitted once, so a
-    /// page that keeps rendering the form is not submitted on every probe.
-    private var didAutoSubmitSavedPassword = false
     private var didRestoreSession = false
     private var didLoadInitialPage = false
     private var didProbeRestoredSession = false
@@ -6737,9 +6695,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         lastEmbeddedContentHeight = nil
         signInProbeAttempts = 0
         clearCapturedCredentials()
-        didAutoSubmitSavedPassword = false
-        attemptSawRefusal = false
-        loginSubmitAuthorized = false
         loginPrefillProbe?.cancel()
         loginPrefillProbe = nil
         loginPrefillAttempts = 0
@@ -7181,24 +7136,31 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private func restoreSessionAndLoad() {
         guard isBrowserFlowLive, !didLoadInitialPage else { return }
         didLoadInitialPage = true
-        restoredSession = NativeRelaySessionMemoryStore.readSession(
-            accountID: accountID,
-            accountType: type,
-            origin: originURL.absoluteString
-        )
+        if mode == .login && !pendingAccount {
+            let accountID = self.accountID
+            let type = self.type
+            let origin = originURL.absoluteString
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let saved = AppKitNativeLeaf.relaySessionForDashboard(accountID: accountID, type: type, origin: origin)
+                DispatchQueue.main.async { [weak self] in
+                    self?.loadInitialPage(session: saved)
+                }
+            }
+            return
+        }
+        loadInitialPage(session: NativeRelaySessionMemoryStore.readSession(
+            accountID: accountID, accountType: type, origin: originURL.absoluteString
+        ))
+    }
+
+    private func loadInitialPage(session: NativeRelaySession?) {
+        guard isBrowserFlowLive else { return }
+        restoredSession = session
         // The local is not named ``cookies``: that identifier is the method
         // called in the same expression, and declaring the result under it makes
         // Swift resolve the call to the array being defined, which fails the
         // build with "cannot call value of non-function type '[Any]'" .
         let restoredCookies = restoredSession.map { cookies(fromHeader: $0.cookie) } ?? []
-        // A presentation with no session on hand has nothing to preserve, so the
-        // remembered password is the only way in and filling it is the sign-in
-        // the user asked for.  A presentation that *does* hold a session is the
-        // opposite case: its cookie is asked first, and only a refusal of that
-        // cookie (see ``probe``) may replace it.  Core applies the same rule to
-        // its own restore, and both exist because each sign-in is one session
-        // against the account's cap.
-        loginSubmitAuthorized = restoredSession == nil
         guard !restoredCookies.isEmpty else {
             webView.load(URLRequest(url: loginURL))
             return
@@ -7296,19 +7258,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     ///
     /// The account's username is always filled.  When the user chose to be
     /// remembered, the password Core keeps is filled beside it -- but only once
-    /// the page is known to be an unauthenticated form that the user actually
-    /// has to answer.  Submitting it is the one action here that asks the
-    /// station to mint a session, and a station caps how many an account may
-    /// hold at once, answering a further request with
-    /// ``AUTH_SESSION_LIMIT``.  A page that still carries its sign-in form is
-    /// therefore *not* enough evidence to submit it: a station that has just
-    /// accepted this browser's own session may not have left /login yet, and a
-    /// restored session that still works renders exactly the same form while its
-    /// cookies are being installed.  The flow verifies one of those first
-    /// (:meth:`startSignInCheck`) and only a station's own refusal of every
-    /// credential it was shown opens the way to :meth:`submitSavedPassword`.
-    /// A form entered while that answer is still outstanding is what kept this
-    /// app minting one session per entry until the account was locked out.
+    /// the form is ready. Only Core performs automatic password sign-in.
     private func prefillLoginWhenReady() {
         guard mode == .login, isBrowserFlowLive, let username = presetUsername, !username.isEmpty else { return }
         // Let a restored session seed local storage and reload before looking
@@ -7355,11 +7305,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 guard let self, self.isBrowserFlowLive else { return }
                 if value as? Bool == true {
                     self.didFillLoginFields = true
-                    // With no session on hand, this form is the sign-in: the
-                    // user opened the account pane to sign in, so submitting it
-                    // is what they asked for.  A presentation that holds a
-                    // session submits only after that session was refused.
-                    if self.loginSubmitAuthorized { self.submitSavedPassword() }
                     return
                 }
                 // The password the app holds is what makes the form complete;
@@ -7380,51 +7325,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
     }
 
-    /// Submit the saved password, because the station refused everything else.
-    ///
-    /// This is the only place this flow asks a station to mint a session of its
-    /// own, and it runs only after the sign-in check showed that neither the
-    /// restored session nor the page's own session is usable
-    /// (:meth:`startSignInCheck`).  A station caps an account's concurrent
-    /// sessions, so each submission is one attempt against that cap; asking
-    /// before the credential on hand was actually refused is what turned every
-    /// pane entry into another session until the account was signed out
-    /// everywhere.  The flag makes the submission once per presentation.
-    private func submitSavedPassword() {
-        guard mode == .login,
-              isBrowserFlowLive,
-              loginSubmitAuthorized,
-              let password = restoredPassword,
-              !password.isEmpty,
-              !didAutoSubmitSavedPassword else { return }
-        didAutoSubmitSavedPassword = true
-        let script = """
-        (() => {
-          const password = document.querySelector('input[type=password], input[autocomplete=current-password]');
-          const user = document.querySelector('input[type=email], input[type=text], input:not([type]), input[name=email], input[name=username], input[autocomplete=username], input[placeholder*="用户名"], input[placeholder*="email" i]');
-          if (!user || !password || !user.value || !password.value) return false;
-          const form = password.form;
-          const submit = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
-            ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
-          if (submit instanceof HTMLElement) { submit.click(); return true; }
-          if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') { form.requestSubmit(); return true; }
-          return false;
-        })();
-        """
-        webView.evaluateJavaScript(script) { [weak self] value, _ in
-            guard let self, self.isBrowserFlowLive else { return }
-            guard value as? Bool == true else {
-                // A form that is gone or incomplete did not submit, and neither
-                // did one with nothing to press (no submit control, no form
-                // around the field): the station was still not asked anything,
-                // so the next probe may try again.
-                self.didAutoSubmitSavedPassword = false
-                return
-            }
-            self.setStatus(self.waitingForSignInStatus)
-        }
-    }
-
     private func jsonLiteral(_ value: String) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: [value]),
               let text = String(data: data, encoding: .utf8), text.count >= 2 else { return "\"\"" }
@@ -7439,7 +7339,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // Each check starts from "the station has not refused anything yet":
         // only an answer this attempt received may justify a sign-in, so a
         // previous attempt's refusal never lends its authority to this one.
-        attemptSawRefusal = false
         checkStartedAt = Date()
         panelClosedDuringCommit = false
         automaticCheckProbe?.cancel()
@@ -7599,7 +7498,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var probes: [Probe] {
         let newapi = [
             Probe(family: "newapi", path: "api/user/self", usernamePaths: [["data", "username"], ["data", "email"]]),
-            Probe(family: "newapi", path: "api/user/auth/refresh", usernamePaths: [["data", "user", "username"], ["data", "user", "email"]]),
         ]
         let sub2api = [
             Probe(family: "sub2api", path: "api/v1/auth/me", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]]),
@@ -7615,36 +7513,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
     }
 
-    /// Whether this attempt has shown the station refusing a credential.
-    ///
-    /// A 401/403 is the station's own answer about the session it was shown, and
-    /// that is the only outcome that justifies replacing it with a sign-in.  A
-    /// timeout, a refused connection, a 5xx, or a 2xx body this probe cannot
-    /// read states nothing about the session, so none of them may be read as
-    /// "the credential is dead" -- submitting the saved password on one of those
-    /// is the app spending a session to answer a question the station never
-    /// spoke to.
-    private var attemptSawRefusal = false
-    /// Whether this presentation may submit the remembered password at all.
-    ///
-    /// It is opened only by a station's refusal of the session on hand, and only
-    /// once: a sign-in the station then refuses must not be followed by another
-    /// one on the next probe, because each attempt is one more session against
-    /// the account's cap.
-    private var loginSubmitAuthorized = false
-
     private func probe(index: Int, cookieHeader: String?, attempt: NativeRelayLoginAttempt, automatically: Bool = false) {
         guard isCurrentCheck(attempt) else { return }
         guard index < probes.count else {
-            // Every surface this station knows about was asked and none accepted
-            // the session on hand.  Only a refusal the station actually stated
-            // opens the way to a sign-in; a station this app could not reach or
-            // could not read leaves the login exactly as it was, which is the
-            // same rule Core applies to its own session check.
-            if attemptSawRefusal, restoredPassword?.isEmpty == false {
-                loginSubmitAuthorized = true
-                submitSavedPassword()
-            }
             finishCheckingFailure(
                 text("No valid sign-in was found. Complete sign-in in the page and try again.", "未检测到有效登录状态。请完成登录后重试。"),
                 attempt: attempt,
@@ -7659,7 +7530,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             return
         }
         var request = URLRequest(url: url)
-        request.httpMethod = probe.path.hasSuffix("auth/refresh") ? "POST" : "GET"
         request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(RelayBrowserIdentity.acceptLanguage, forHTTPHeaderField: "Accept-Language")
@@ -7686,28 +7556,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             guard let self, let attempt, attempt.isActive() else { return }
             guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
                   let data, data.count <= 2 * 1024 * 1024,
-                  let object = try? JSONSerialization.jsonObject(with: data) else {
-                // A status the station chose is an answer; a missing response or
-                // an unreadable body is not.  Only the former says anything about
-                // the session on hand.
-                let refused = (response as? HTTPURLResponse).map { $0.statusCode == 401 || $0.statusCode == 403 } ?? false
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  object["success"] as? Bool != false,
+                  object["code"] == nil || (object["code"] as? NSNumber)?.stringValue == "0" || object["code"] as? String == "0" else {
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
-                    if refused { self.attemptSawRefusal = true }
-                    self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
-                }
-                return
-            }
-            // A New API fork refuses a session in the body as often as in the
-            // status: 200 with {"success": false, "message": "未登录或登录已过期"}.
-            // Core, the Windows probe and this file's own session probe read
-            // that envelope as a refusal.  Reading it as an answer here took
-            // the preset username and the jar on hand and stored the session
-            // the station had just refused as a verified sign-in.
-            if NativeRelaySessionProbe.payloadRefusesSession(object) {
-                DispatchQueue.main.async { [weak self, weak attempt] in
-                    guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
-                    self.attemptSawRefusal = true
                     self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                 }
                 return
@@ -7727,7 +7580,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 let accessToken = detectedAccessToken ?? self.capturedAccessToken ?? self.restoredSession?.accessToken
                 let refreshToken = detectedRefreshToken ?? self.capturedRefreshToken ?? self.restoredSession?.refreshToken
                 let userID = detectedUserID ?? self.capturedUserID ?? self.restoredSession?.userID
-                guard !username.isEmpty,
+                guard detectedUsername != nil || detectedUserID != nil,
+                      !username.isEmpty,
                       !(acceptedCookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true) else {
                     self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                     return
@@ -8220,14 +8074,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private func scheduleAutomaticSignInCheck() {
         guard mode == .login, isBrowserFlowLive, !checking else { return }
-        // Once this window is allowed to submit the remembered password, the
-        // automatic check has done its job: the page is now the station's own
-        // answer surface.  A further check could only repeat the refusal the
-        // submission was authorized by, and each round trip is one more request
-        // against an account whose session count is what runs out, so the loop
-        // hands the decision back to the user, who can finish the sign-in in the
-        // page and close the window on success.
-        guard !loginSubmitAuthorized else { return }
         // A station whose sign-in never answers is not retried forever: past the
         // bound the window states what it found and puts the check back in the
         // user's hands, through the same control that performs it on demand.
@@ -8762,298 +8608,6 @@ private struct NativeRelaySession: Codable {
         userID = try container.decodeIfPresent(String.self, forKey: .userID) ?? ""
         tokenExpiresAt = try container.decodeIfPresent(String.self, forKey: .tokenExpiresAt) ?? ""
         username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
-    }
-}
-
-private struct NativeRelaySessionProbeResult {
-    let username: String
-    let cookie: String
-    let accessToken: String
-    let refreshToken: String
-    let userID: String
-    // The New API ``quota`` the same profile read stated.  Core's balance is
-    // this number divided by the site's display unit, so carrying it over is
-    // what makes the probe answer the balance question too -- and the entry
-    // then costs one authenticated read instead of two.
-    let quota: Double?
-}
-
-private enum NativeRelaySessionProbeOutcome {
-    case verified(NativeRelaySessionProbeResult)
-    case expired
-    case unavailable
-}
-
-private enum NativeRelaySessionProbe {
-    private struct Probe {
-        /// The station family this probe belongs to, so one flow can settle the
-        /// family from whichever probe answers instead of being told in advance.
-        let family: String
-        let path: String
-        let method: String
-        let usernamePaths: [[String]]
-    }
-
-    static func verify(
-        type: String,
-        originURL: URL,
-        presetUsername: String?,
-        session: NativeRelaySession
-    ) -> NativeRelaySessionProbeOutcome {
-        let newAPI: [Probe] = [
-            Probe(family: "newapi", path: "api/user/self", method: "GET", usernamePaths: [["data", "username"], ["data", "email"]]),
-            Probe(family: "newapi", path: "api/user/auth/refresh", method: "POST", usernamePaths: [["data", "user", "username"], ["data", "user", "email"]]),
-        ]
-        let sub2API: [Probe] = [
-            Probe(family: "sub2api", path: "api/v1/auth/me", method: "GET", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]]),
-        ]
-        // An unknown family probes both surfaces instead of being reported as
-        // unavailable: a station this app already signed into answers the same
-        // dashboard routes as the family it turned out to be, so a saved session
-        // is verified from whichever one answers rather than refused because the
-        // caller could not name it up front.  A named family keeps its own single
-        // surface, so a known account still costs one round trip.
-        let probes: [Probe] = type == "newapi" ? newAPI : type == "sub2api" ? sub2API : newAPI + sub2API
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpShouldSetCookies = false
-        let client = URLSession(configuration: configuration, delegate: NativeRelayProbeRedirectGuard(originURL: originURL), delegateQueue: nil)
-        defer { client.invalidateAndCancel() }
-        var sawAuthenticationRejection = false
-        var sawNonAuthenticationFailure = false
-        for probe in probes {
-            guard let url = relayURL(originURL: originURL, path: probe.path), sameOrigin(url, originURL) else {
-                sawNonAuthenticationFailure = true
-                continue
-            }
-            var request = URLRequest(url: url)
-            request.httpMethod = probe.method
-            request.timeoutInterval = 12
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-            request.setValue(RelayBrowserIdentity.acceptLanguage, forHTTPHeaderField: "Accept-Language")
-            request.setValue(RelayBrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let origin = originHeader(originURL)
-            request.setValue(origin, forHTTPHeaderField: "Origin")
-            request.setValue(origin, forHTTPHeaderField: "Referer")
-            if !session.cookie.isEmpty { request.setValue(session.cookie, forHTTPHeaderField: "Cookie") }
-            if !session.accessToken.isEmpty { request.setValue("Bearer \(session.accessToken)", forHTTPHeaderField: "Authorization") }
-            // A New API fork rejects this read without its own account id, which
-            // would present a healthy remembered session as signed out.
-            if type == "newapi", !session.userID.isEmpty {
-                request.setValue(session.userID, forHTTPHeaderField: "New-Api-User")
-            }
-            let semaphore = DispatchSemaphore(value: 0)
-            var outcome: (Data?, HTTPURLResponse?)?
-            client.dataTask(with: request) { data, response, _ in
-                outcome = (data, response as? HTTPURLResponse)
-                semaphore.signal()
-            }.resume()
-            guard semaphore.wait(timeout: .now() + 13) == .success,
-                  let outcome,
-                  let response = outcome.1 else {
-                sawNonAuthenticationFailure = true
-                continue
-            }
-            if response.statusCode == 401 || response.statusCode == 403 {
-                sawAuthenticationRejection = true
-                continue
-            }
-            if !(200..<300).contains(response.statusCode) {
-                sawNonAuthenticationFailure = true
-                continue
-            }
-            guard let data = outcome.0,
-                  data.count <= 2 * 1024 * 1024,
-                  let object = try? JSONSerialization.jsonObject(with: data) else {
-                sawNonAuthenticationFailure = true
-                continue
-            }
-            // A New API fork refuses a session in the body as often as in the
-            // status code: a 200 carrying {"success": false, "message":
-            // "未登录或登录已过期"} is the station's own answer about the
-            // credential on hand, not a read this app failed to make.  Counting
-            // it as the latter reported 未登录 with no refusal and then signed
-            // in again over a session the station had just refused -- one more
-            // minted session per pane entry, until the account's cap refused
-            // even a correct password.  Core classifies the same envelope the
-            // same way, so the two probes agree about one session.
-            if Self.payloadRefusesSession(object) {
-                sawAuthenticationRejection = true
-                continue
-            }
-            guard let username = firstString(object, paths: probe.usernamePaths) ?? presetUsername,
-                  !username.isEmpty, username.utf8.count <= 320 else {
-                sawNonAuthenticationFailure = true
-                continue
-            }
-            let accessToken = firstString(object, paths: [["data", "access_token"], ["access_token"]]) ?? session.accessToken
-            let refreshToken = firstString(object, paths: [["data", "refresh_token"], ["refresh_token"]]) ?? session.refreshToken
-            let cookie = cookieHeader(after: response, existing: session.cookie) ?? session.cookie
-            guard !cookie.isEmpty || !accessToken.isEmpty else {
-                sawNonAuthenticationFailure = true
-                continue
-            }
-            // Prefer the id this answer states over the stored one: it belongs to
-            // the session that just proved itself, so a session whose account
-            // changed cannot keep sending the previous account's id.
-            let userID = stationUserID(object) ?? session.userID
-            // The profile this probe accepted is also the account's balance, so
-            // the number travels with the session it was read beside.
-            let quota = firstNumber(object, paths: ["data", "quota"], ["quota"])
-            return .verified(NativeRelaySessionProbeResult(username: username, cookie: cookie, accessToken: accessToken, refreshToken: refreshToken, userID: userID, quota: quota))
-        }
-        return sawAuthenticationRejection && !sawNonAuthenticationFailure ? .expired : .unavailable
-    }
-
-    /// Whether a 2xx envelope states that the session it was shown is dead.
-    ///
-    /// Mirrors Core's ``_payload_refuses_session``: only an envelope that
-    /// explicitly denies success *and* names the login is a refusal.  An
-    /// envelope that fails for another reason (a missing permission, an
-    /// unknown route) says nothing about the session.
-    fileprivate static func payloadRefusesSession(_ value: Any) -> Bool {
-        guard let object = value as? [String: Any],
-              let success = object["success"] as? Bool, !success else { return false }
-        let markers = [
-            "未登录", "登录已过期", "未登錄", "登錄已過期",
-            "not logged in", "login has expired", "login expired",
-            "session expired", "invalid session", "please log in",
-            "please sign in", "unauthorized", "authentication required"
-        ]
-        for key in ["message", "error", "msg"] {
-            guard let message = (object[key] as? String)?.lowercased(), !message.isEmpty else { continue }
-            if markers.contains(where: { message.contains($0) }) { return true }
-        }
-        return false
-    }
-
-    private static func relayURL(originURL: URL, path: String) -> URL? {
-        guard var components = URLComponents(url: originURL, resolvingAgainstBaseURL: false) else { return nil }
-        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.path = "/" + [basePath, path].filter { !$0.isEmpty }.joined(separator: "/")
-        components.query = nil
-        components.fragment = nil
-        return components.url
-    }
-
-    private static func sameOrigin(_ left: URL, _ right: URL) -> Bool {
-        left.scheme?.lowercased() == right.scheme?.lowercased()
-            && left.host?.lowercased() == right.host?.lowercased()
-            && (left.port ?? (left.scheme?.lowercased() == "https" ? 443 : 80)) == (right.port ?? (right.scheme?.lowercased() == "https" ? 443 : 80))
-    }
-
-    private static func originHeader(_ url: URL) -> String {
-        var components = URLComponents()
-        components.scheme = url.scheme
-        components.host = url.host
-        components.port = url.port
-        return components.string ?? url.absoluteString
-    }
-
-    private static func stationUserID(_ value: Any) -> String? {
-        for path in [["data", "id"], ["data", "user", "id"], ["id"], ["user", "id"]] {
-            var current: Any = value
-            var valid = true
-            for key in path {
-                guard let map = current as? [String: Any], let next = map[key] else { valid = false; break }
-                current = next
-            }
-            guard valid else { continue }
-            let text: String
-            if let number = current as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
-                text = number.stringValue
-            } else if let string = current as? String {
-                text = string.trimmingCharacters(in: .whitespacesAndNewlines)
-            } else {
-                continue
-            }
-            if !text.isEmpty, text.count <= 32, text.allSatisfy({ $0.isNumber }) { return text }
-        }
-        return nil
-    }
-
-    private static func firstNumber(_ value: Any, paths: [String]...) -> Double? {
-        for path in paths {
-            var current: Any = value
-            var valid = true
-            for key in path {
-                guard let map = current as? [String: Any], let next = map[key] else { valid = false; break }
-                current = next
-            }
-            guard valid else { continue }
-            let number: Double?
-            if let value = current as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() {
-                number = value.doubleValue
-            } else if let text = current as? String {
-                number = Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
-            } else {
-                number = nil
-            }
-            if let number, number.isFinite { return number }
-        }
-        return nil
-    }
-
-    private static func firstString(_ value: Any, paths: [[String]]) -> String? {
-        for path in paths {
-            var current: Any = value
-            for key in path {
-                guard let map = current as? [String: Any], let next = map[key] else { current = NSNull(); break }
-                current = next
-            }
-            if let result = current as? String {
-                let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty && trimmed.utf8.count <= 32_768 { return trimmed }
-            }
-        }
-        return nil
-    }
-
-    private static func cookieHeader(after response: HTTPURLResponse, existing: String) -> String? {
-        var values = cookieValues(from: existing)
-        if let url = response.url {
-            let headers = response.allHeaderFields.reduce(into: [String: String]()) { result, entry in
-                guard let key = entry.key as? String, let value = entry.value as? String else { return }
-                result[key] = value
-            }
-            for cookie in HTTPCookie.cookies(withResponseHeaderFields: headers, for: url) {
-                values[cookie.name] = cookie.value
-            }
-        }
-        guard !values.isEmpty else { return nil }
-        return values.keys.sorted().map { "\($0)=\(values[$0] ?? "")" }.joined(separator: "; ")
-    }
-
-    private static func cookieValues(from header: String) -> [String: String] {
-        header.split(separator: ";").reduce(into: [String: String]()) { values, rawPair in
-            let pair = rawPair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            let name = pair.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard pair.count == 2, !name.isEmpty else { return }
-            values[name] = String(pair[1])
-        }
-    }
-}
-
-private final class NativeRelayProbeRedirectGuard: NSObject, URLSessionTaskDelegate {
-    private let originURL: URL
-
-    init(originURL: URL) { self.originURL = originURL }
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        guard let url = request.url,
-              url.scheme?.lowercased() == originURL.scheme?.lowercased(),
-              url.host?.lowercased() == originURL.host?.lowercased(),
-              (url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80)) == (originURL.port ?? (originURL.scheme?.lowercased() == "https" ? 443 : 80)) else {
-            completionHandler(nil)
-            return
-        }
-        completionHandler(request)
     }
 }
 

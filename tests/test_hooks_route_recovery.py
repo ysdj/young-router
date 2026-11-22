@@ -3314,6 +3314,30 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertGreaterEqual(len(attempts), 2)
         await stream.aclose()
 
+    async def test_recovery_does_not_repeat_output_already_delivered(self) -> None:
+        from unittest.mock import patch
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        attempts = []
+
+        async def interrupted_attempt(request, exception, *, attempt, deadline):
+            attempts.append(attempt)
+            self.assertEqual(1, attempt, "the first round already delivered output")
+            yield {"type": "response.output_text.delta", "delta": "already delivered"}
+            raise ConnectionError("connection reset")
+
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        with patch.object(streaming, "_stream_route_recovery_poll_attempt", interrupted_attempt):
+            outcome = [
+                frame async for frame in hooks._stream_route_recovery_poll(
+                    {"model": "probe", "input": "test", "stream": True}, ConnectionError("connection refused")
+                )
+            ]
+        self.assertEqual([1], attempts)
+        self.assertEqual(1, sum(frame.get("type") == "response.output_text.delta" for frame in outcome))
+        self.assertEqual("response.failed", outcome[-1]["type"])
+
     async def test_network_stream_fallback_never_raises_client_reconnect(self) -> None:
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["young_router.proxy.streaming"]

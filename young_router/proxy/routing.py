@@ -7764,7 +7764,16 @@ def _is_network_recovery_exception(exception: Exception) -> bool:
     socket really did close, but nothing about the upstream became unreachable.
     """
 
-    if _is_local_shutdown_exception(exception):
+    if _is_local_shutdown_exception(exception) or _is_ssl_verification_error(exception):
+        return False
+    # An upstream that answered with a refusal was reachable, even if the
+    # adapter calls it a connection error or an earlier attempt disconnected.
+    # The router's own empty-pool 429, on the other hand, has no upstream reply.
+    status = _exception_status_code(exception)
+    if (
+        status is not None and 400 <= status < 500
+        and not _is_no_deployments_available_error(exception)
+    ) or _nested_upstream_status_code(exception) is not None:
         return False
 
     pending = [exception]
@@ -9265,6 +9274,7 @@ def _record_deployment_failure_for_cooldown(
         else _deployment_cooldown_seconds()
     )
     request_log = _request_log_record("cooldown", request_kwargs)
+    network_failure = _is_network_recovery_exception(exception)
 
     def record(cooldowns: dict[str, Any], now: float) -> list[tuple[str, int, float]]:
         started: list[tuple[str, int, float]] = []
@@ -9300,6 +9310,7 @@ def _record_deployment_failure_for_cooldown(
                 failures = int(state.get("failures") or 0) + 1
             state["failures"] = failures
             state["last_failure_at"] = now
+            state["network_failure"] = network_failure
             state["deployment_id"] = deployment_id
             state["route_key"] = route_key
             for key in (
@@ -9486,6 +9497,7 @@ def _deployment_cooldown_trace_entry(
     entry = _trace_deployment(deployment)
     entry["cooldown_key"] = cooldown_key or _deployment_cooldown_key_from_deployment(deployment)
     entry["cooldown_failures"] = state.get("failures")
+    entry["network_failure"] = state.get("network_failure") is True
     entry["cooldown_remaining_seconds"] = round(
         max(0.0, float(state.get("cooldown_until") or 0.0) - now),
         3,

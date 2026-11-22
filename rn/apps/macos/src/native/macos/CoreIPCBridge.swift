@@ -308,7 +308,7 @@ import Foundation
         userID: String? = nil,
         quota: Double? = nil
     ) throws -> RelaySessionRestoreResult {
-        guard ["signed_in", "signed_out", "expired"].contains(loginStatus),
+        guard ["unknown", "signed_in", "signed_out", "expired"].contains(loginStatus),
               accountID.utf8.count <= 96,
               type == "newapi" || type == "sub2api",
               !label.isEmpty, label.utf8.count <= 160,
@@ -344,7 +344,8 @@ import Foundation
         let (data, response, _, restarted) = try performCoreRequest(
             route: "host/relay/restore",
             method: "POST",
-            body: body
+            body: body,
+            timeoutInterval: Self.relayLoginTimeout
         )
         if restarted { scheduleSubscriptionRecovery() }
         guard response.statusCode == 200,
