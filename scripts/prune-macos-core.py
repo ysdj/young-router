@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove development-only payload from the assembled macOS Core."""
+"""Remove development and unused runtime payload from the assembled macOS Core."""
 
 from __future__ import annotations
 
@@ -9,6 +9,13 @@ import os
 from pathlib import Path
 import stat
 import shutil
+import sys
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from prune_our_free_model import prune_our_free_model
 
 
 NODE_DEVELOPMENT_DIRS = {
@@ -125,6 +132,15 @@ def prune_core(core: Path) -> None:
     for package in ("connect-workbuddy", "connect-qoder", "dsh-vision-router"):
         prune_tree(adapters / package, node=True)
 
+    our_free_model = adapters / "our-free-model"
+    prune_our_free_model(our_free_model)
+    # The win32-x64 executable and its packed copy cannot run on this host.
+    (our_free_model / "vendor" / "magpie" / "bin" / "magpie-win32-x64.exe").unlink(
+        missing_ok=True
+    )
+    for shard in (our_free_model / "src" / "engine-parts").glob("win32-x64.*.part"):
+        shard.unlink()
+
     for node_modules in (
         adapters / "connect-workbuddy" / "node_modules",
         adapters / "connect-qoder" / "node_modules",
@@ -207,6 +223,10 @@ def prune_core(core: Path) -> None:
     # (2026-11-11 build).  It is 32 MB of the app, and the release runtime is
     # where that cost belongs: a missing tokenizer backend was an acceptable
     # trade in 1.108, a Core that cannot import LiteLLM is not.
+
+    # This separate forwarding server is optional. Core starts its Python
+    # proxy with the launcher in runtime/bin instead.
+    (site_packages / "bin" / "litellm-gateway").unlink(missing_ok=True)
 
     # The native app never invokes LiteLLM's terminal admin client. Keep the
     # proxy launcher itself, but remove that client command tree.

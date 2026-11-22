@@ -8,6 +8,13 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import sys
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from prune_our_free_model import prune_our_free_model
 
 
 NODE_DEVELOPMENT_DIRS = {
@@ -107,6 +114,10 @@ def prune_python_runtime(runtime: Path) -> None:
         ):
             _remove(entry)
 
+    # uv --target installs the optional Rust gateway in site-packages/bin.
+    # Young Router launches the Python proxy through runtime/bin/litellm.cmd.
+    (site / "bin" / "litellm-gateway.exe").unlink(missing_ok=True)
+
     # LiteLLM's optional web/admin payload is not used by the desktop app.
     shutil.rmtree(site / "litellm" / "proxy" / "client" / "cli", ignore_errors=True)
     (site / "litellm" / "proxy" / "_lazy_openapi_snapshot.json").unlink(missing_ok=True)
@@ -154,6 +165,7 @@ def prune_vendored_repository_data(adapters: Path) -> None:
 
 def prune_core(core: Path) -> None:
     adapters = core / "young_router" / "adapters"
+    prune_our_free_model(adapters / "our-free-model", remove=_remove)
     for package in ("connect-workbuddy", "connect-qoder", "dsh-vision-router", "our-free-model"):
         prune_node_tree(adapters / package)
     prune_vendored_repository_data(adapters)

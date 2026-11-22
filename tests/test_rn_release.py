@@ -54,6 +54,59 @@ class ReactNativeReleaseTests(unittest.TestCase):
             self.assertTrue((site_packages / "mcp-2.3.0.dist-info").is_dir())
             self.assertTrue((site_packages / "mcp-types-2.3.0.dist-info").is_dir())
 
+    def test_macos_core_pruning_drops_windows_magpie_and_optional_gateway(self) -> None:
+        prune_module = runpy.run_path(str(ROOT / "scripts" / "prune-macos-core.py"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            core = Path(temporary_directory) / "Core"
+            our_free_model = core / "young_router" / "adapters" / "our-free-model"
+            magpie = our_free_model / "vendor" / "magpie"
+            engine_parts = our_free_model / "src" / "engine-parts"
+            site = core / "runtime" / "site-packages"
+            removed = (
+                magpie / "bin" / "magpie-win32-x64.exe",
+                engine_parts / "win32-x64.000.part",
+                site / "bin" / "litellm-gateway",
+            )
+            kept = (
+                magpie / "engine.json",
+                magpie / "bin" / "magpie-darwin-arm64",
+                engine_parts / "darwin-arm64.000.part",
+                site / "litellm" / "rust_bridge" / "_native.abi3.so",
+                core / "runtime" / "bin" / "litellm",
+            )
+            for path in removed + kept:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"payload")
+
+            prune_module["prune_core"](core)
+
+            for path in removed:
+                self.assertFalse(path.exists(), path)
+            for path in kept:
+                self.assertEqual(path.read_bytes(), b"payload", path)
+
+    def test_windows_core_pruning_keeps_the_python_proxy_and_native_extension(self) -> None:
+        prune_module = runpy.run_path(str(ROOT / "scripts" / "prune-windows-core.py"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            core = Path(temporary_directory) / "Core"
+            runtime = core / "runtime" / "bin"
+            site = runtime / "Lib" / "site-packages"
+            gateway = site / "bin" / "litellm-gateway.exe"
+            kept = (
+                runtime / "litellm.cmd",
+                site / "litellm" / "rust_bridge" / "_native.pyd",
+                core / "young_router" / "adapters" / "our-free-model" / "src" / "engine-parts" / "win32-x64.000.part",
+            )
+            for path in (gateway, *kept):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"payload")
+
+            prune_module["prune_core"](core)
+
+            self.assertFalse(gateway.exists())
+            for path in kept:
+                self.assertEqual(path.read_bytes(), b"payload", path)
+
     def test_the_windows_core_pruner_drops_a_staged_checkouts_git_data(self) -> None:
         # A staging cache written before the stagers learned to publish a
         # payload without ``.git`` is still reused -- the reuse rule matches the
