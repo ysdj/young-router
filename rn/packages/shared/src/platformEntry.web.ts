@@ -30,7 +30,7 @@ import { askCloseRelayGroupSheet, closeRelayGroupSheet, relayGroupSheetState, se
 import { HostChromeHost } from "./ui/HostChrome";
 import { RelayGroupSheet } from "./ui/RelayGroupSheet";
 import { registerYoungRouter } from "./bootstrap";
-import { canonicalPageRoute, DESKTOP_ROUTES, ROUTES } from "./routes";
+import { canonicalPageRoute, CHILD_ROUTES, DESKTOP_ROUTES, ROUTES } from "./routes";
 import type { AppRoute } from "./types";
 
 /**
@@ -40,7 +40,7 @@ import type { AppRoute } from "./types";
  * deciding whether a fragment names a surface must not depend on the order of
  * the declarations below it.
  */
-const CHILD_SURFACES: readonly AppRoute[] = ["provider-wizard", "file-editor", "webdav-settings"];
+const CHILD_SURFACES = CHILD_ROUTES;
 
 /**
  * The pane this host opens on when the address names none it can draw.

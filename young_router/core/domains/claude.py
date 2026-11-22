@@ -18,7 +18,7 @@ import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 from ... import claude_aliases
 from ...atomic_io import atomic_write_text
@@ -37,14 +37,9 @@ from . import _shared_api
 from ._shared_api import (
     anthropic_base_url,
     desktop_accepts_model_name,
-    normalise_route,
-    one_saved_route,
+    public_direct_api_url,
     read_generated_models,
-    read_route_setting,
-    saved_route_api_key,
-    saved_routes,
     store_generated_models,
-    store_route_setting,
 )
 
 
@@ -85,7 +80,6 @@ _SECRET_KEY_MARKERS = (
     "credential",
     "authorization",
 )
-_SENSITIVE_GATEWAY_QUERY_MARKERS = ("key", "token", "secret", "password", "passwd", "credential", "auth")
 _SAFE_ERROR = "Claude Settings could not be loaded"
 _REDACTED = "configured"
 
@@ -524,15 +518,7 @@ def _is_http_url(value: str) -> bool:
 def _public_gateway_url(value: object) -> str | None:
     """Return a gateway endpoint only when it is safe for the public snapshot."""
 
-    if not isinstance(value, str) or not _is_http_url(value):
-        return None
-    parsed = urlsplit(value)
-    if parsed.fragment:
-        return None
-    for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
-        if any(marker in key.lower() for marker in _SENSITIVE_GATEWAY_QUERY_MARKERS):
-            return None
-    return value
+    return public_direct_api_url(value) or None
 
 
 def _secret_key(key: object) -> bool:
@@ -746,13 +732,6 @@ def _code_auto_compact_window(max_input_tokens: object) -> int | str:
     if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool):
         return "auto"
     return max(_CODE_AUTO_COMPACT_MIN, min(max_input_tokens, _CODE_AUTO_COMPACT_MAX))
-
-
-def _route_from_state(state: Mapping[str, Any], client: str) -> dict[str, str] | None:
-    entry = state.get(client)
-    if not isinstance(entry, Mapping):
-        return None
-    return normalise_route(entry.get("last_route"))
 
 
 def _generated_models_from_state(state: Mapping[str, Any], client: str) -> list[str]:
@@ -1306,18 +1285,12 @@ class ClaudeSettingsDomain:
     ):
         self.settings_path = pathlib.Path(settings_path).expanduser() if settings_path else default_settings_path()
         self._loader = loader or _safe_read
-        # The saved-route actions ("use a specific API") read the same provider
-        # document Codex reads, and the remembered route lives in the runtime
-        # settings beside the catalog pin.  Both stay optional so a caller that
-        # passes an explicit Claude path keeps that path as its only source.
         self.runtime_config_path = (
             pathlib.Path(runtime_config_path).expanduser()
             if runtime_config_path is not None
             else _default_provider_config_path()
         )
-        # This app's own bookkeeping about a Claude client -- the route it was
-        # last put on, and the model list generated for it -- lives in the
-        # app-state root beside the Codex catalog's, never in the client's file.
+        # Generated model list ownership is recorded in the app-state root.
         self.app_state_root = _app_state_root(
             runtime_root, runtime_settings_path, runtime_config_path
         )
@@ -1713,7 +1686,7 @@ class ClaudeSettingsDomain:
         if not generated:
             return False
         current = set(self._desktop.snapshot().get("model_names") or [])
-        return current.issubset(generated) or generated.issubset(current)
+        return bool(current) and (current.issubset(generated) or generated.issubset(current))
 
     def desktop_model_entries(self) -> list[dict[str, str]]:
         """The ``inferenceModels`` rows for this router's public models.
@@ -2487,73 +2460,6 @@ class ClaudeSettingsDomain:
             return False
         return self._names_local_api(self._desktop.gateway_url())
 
-    def _route_named(
-        self, model: str, rows: Sequence[Mapping[str, Any]] | None = None
-    ) -> dict[str, str] | None:
-        """Resolve a client's own model name back to one saved route.
-
-        Only a name exactly one saved route answers resolves.  Two providers
-        can expose the same public model behind two keys, and picking the first
-        would put the client's off direction on a route it was never on.
-        """
-
-        if not model:
-            return None
-        if rows is None:
-            try:
-                _, rows = saved_routes(self.runtime_config_path)
-            except DomainError:
-                return None
-        matches = [row for row in rows if str(row.get("model") or "").strip() == model]
-        if len(matches) != 1:
-            return None
-        row = matches[0]
-        return normalise_route(
-            {
-                "model": row.get("model"),
-                "provider": row.get("provider"),
-                "deployment_id": row.get("deployment_id"),
-            }
-        )
-
-    def client_route(
-        self,
-        client: str,
-        *,
-        state: Mapping[str, Any] | None = None,
-        rows: Sequence[Mapping[str, Any]] | None = None,
-    ) -> dict[str, str] | None:
-        """The saved route this client is on, or the one it last left for us.
-
-        The remembered route answers while the client points at this app's
-        proxy, because the proxy serves public model names and several saved
-        routes may share one: the client's own document has nothing left to
-        identify the route it came from.  A client that points somewhere else
-        answers from its own document instead, so a route the user configured
-        by hand is never reported as this app's choice.
-        """
-
-        remembered = (
-            _route_from_state(state, client)
-            if state is not None
-            else read_route_setting(self.app_state_root, client)
-        )
-        if client == "claudeDesktop":
-            if self.desktop_uses_local_api():
-                return remembered
-            model_names = (
-                self._desktop.snapshot().get("model_names", []) if self._desktop is not None else []
-            )
-            model = str(model_names[0]).strip() if model_names else ""
-            return self._route_named(model, rows) or remembered
-        if self.code_uses_local_api():
-            return remembered
-        env = self._code_env()
-        model = _string(env.get("ANTHROPIC_MODEL"), "env.ANTHROPIC_MODEL") or _string(
-            self._draft.get("model"), "model"
-        )
-        return self._route_named(model or "", rows) or remembered
-
     def _prefer_one_million_context(self) -> None:
         """Show the 1M option, not a standard 200k row, for a 1M route.
 
@@ -2614,7 +2520,7 @@ class ClaudeSettingsDomain:
         discovery off (the app skips it while the list holds no tier alias) and
         keep the picker tied to a file nobody refreshes any more.  Only a list
         whose record proves this app wrote it is cleared; a hand-written profile
-        and the single route the designated-route action writes are left alone.
+        are left alone.
         """
 
         if self._desktop is None or self._desktop.is_dirty():
@@ -2646,26 +2552,25 @@ class ClaudeSettingsDomain:
             return
 
     def snapshot(self) -> dict[str, Any]:
-        state = _shared_api._read_state(self.app_state_root)
-        try:
-            _, saved = saved_routes(self.runtime_config_path)
-        except DomainError:
-            saved = []
+        settings = self._safe_projection(self._draft)
+        uses_local_api = self.code_uses_local_api()
+        env = self._code_env()
+        direct_api = {} if uses_local_api else {
+            "base_url": settings["gateway_url"],
+            "model": settings.get("model"),
+            "key_configured": settings["token_configured"],
+            "auth_mode": "x-api-key" if not env.get("ANTHROPIC_AUTH_TOKEN") and env.get("ANTHROPIC_API_KEY") else "bearer",
+        }
         return {
             "domain": self.name,
             "revision": self._revision,
-            "settings": self._safe_projection(self._draft),
+            "settings": settings,
+            "direct_api": direct_api,
             "desktop": self._desktop.snapshot() if self._desktop is not None else {"available": False},
             "developer": self._developer.snapshot() if self._developer is not None else {"available": False},
-            # The two clients share one domain but not one backend: each carries
-            # its own switch, its own designated route, and its own model list,
-            # so the pane never draws one client's state on the other's row.
             "clients": {
                 "claudeCode": {
-                    "uses_local_api": self.code_uses_local_api(),
-                    "designated_route": self.client_route(
-                        "claudeCode", state=state, rows=saved
-                    ),
+                    "uses_local_api": uses_local_api,
                     "model_list_enabled": self.code_model_list_enabled(),
                     "nonstream_fallback_enabled": self.code_nonstream_fallback_enabled(),
                     "auto_mode_enabled": self.code_auto_mode_enabled(),
@@ -2673,36 +2578,10 @@ class ClaudeSettingsDomain:
                 },
                 "claudeDesktop": {
                     "uses_local_api": self.desktop_uses_local_api(),
-                    "designated_route": self.client_route(
-                        "claudeDesktop", state=state, rows=saved
-                    ),
-                    "model_list_enabled": self.desktop_model_list_enabled(state),
+                    "model_list_enabled": self.desktop_model_list_enabled(),
                 },
             },
-            # The saved routes the designate control offers.  Only identity and
-            # the labels the menu shows: no endpoint, no key.
-            "models": self._saved_route_rows(saved),
         }
-
-    def _saved_route_rows(
-        self, rows: Sequence[Mapping[str, Any]] | None = None
-    ) -> list[dict[str, Any]]:
-        if rows is None:
-            try:
-                _, rows = saved_routes(self.runtime_config_path)
-            except DomainError:
-                return []
-        return [
-            {
-                "model": str(row.get("model") or ""),
-                "provider": str(row.get("provider") or ""),
-                "deployment_id": str(row.get("deployment_id") or ""),
-                "api_key_name": str(row.get("api_key_name") or ""),
-                "upstream_url_surface": str(row.get("upstream_url_surface") or ""),
-            }
-            for row in rows
-            if row.get("model") and row.get("provider") and row.get("deployment_id")
-        ]
 
     def draft_state(self) -> object:
         if self._desktop is None and self._developer is None:
@@ -2765,14 +2644,51 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError(str(exc)) from None
             self._revision += 1
             return self.snapshot()
+        if name == "use_direct_api":
+            from ..model_list_plugin import target_initialized
+
+            base_url = anthropic_base_url(data["base_url"])
+            key, model, auth = data["api_key"], data["model"], data["auth_mode"]
+            candidate = copy.deepcopy(self._draft)
+            env = _mapping(candidate.get("env", {}), "env")
+            auth_key = "ANTHROPIC_API_KEY" if auth == "x-api-key" else "ANTHROPIC_AUTH_TOKEN"
+            old_url = env.get("ANTHROPIC_BASE_URL")
+            if (not key and not data.get("clear_key") and not self.code_uses_local_api()
+                    and isinstance(old_url, str) and anthropic_base_url(old_url) == base_url):
+                key = env.get(auth_key) or ""
+            env["ANTHROPIC_BASE_URL"] = base_url
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_MODEL", None)
+            if key:
+                env[auth_key] = key
+            if model:
+                candidate["model"] = model
+            else:
+                candidate.pop("model", None)
+            candidate["env"] = env
+            if read_generated_models(self.app_state_root, "claudeCode") and not target_initialized("claude"):
+                candidate.pop("modelPicker", None)
+            errors = validate_settings(candidate)
+            if errors:
+                raise ClaudeSettingsError(errors[0])
+            if self._desktop is not None:
+                self._desktop.patch({
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": base_url,
+                    "inferenceGatewayAuthScheme": auth,
+                    "inferenceModels": [],
+                })
+                self._desktop.stage_secret("desktop_gateway_api_key", key)
+            self._draft = candidate
+            self._revision += 1
+            return self.snapshot()
         if name in {"use_local_api", "uselocalapi"}:
             # Point one Claude client at this app's own proxy and adopt its
             # master key.  Claude Code names its gateway in ``env``; Claude
             # Desktop names it in its third-party inference profile.  Both
             # store the Messages root, which carries no ``/v1``: each appends
-            # ``/v1/messages`` itself.  The route the client leaves behind is
-            # remembered, because the proxy serves public model names and the
-            # client's own document can no longer state which route it was on.
+            # ``/v1/messages`` itself.
             client = _claude_client(data)
             base_url, key = _shared_api.endpoint(self.runtime_config_path)
             # The endpoint just adopted *is* this app's proxy, whatever this
@@ -2781,7 +2697,6 @@ class ClaudeSettingsDomain:
             # then contradict the document that was just written.
             self._local_api_base_url = base_url
             base_url = anthropic_base_url(base_url)
-            store_route_setting(self.app_state_root, client, data)
             if client == "claudeDesktop":
                 if self._desktop is None:
                     raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
@@ -2822,72 +2737,6 @@ class ClaudeSettingsDomain:
             if errors:
                 raise ClaudeSettingsError(errors[0])
             self._draft = candidate
-            self._revision += 1
-            return self.snapshot()
-        if name in {"use_saved_model", "usesavedmodel"}:
-            # The counterpart of ``use_local_api``: put one Claude client back
-            # on a saved route's own endpoint, key, and public model name,
-            # instead of going through this app's proxy.  A client on the proxy
-            # has nothing left to read -- the proxy serves public names -- so
-            # the pane names the route explicitly.
-            #
-            # This router's generated picker lineup names models only its proxy
-            # serves, so it leaves with the switch that pointed the client at
-            # the proxy: Claude Code goes back to its built-in list, and Desktop
-            # is left holding the route's own model.  The record of what this
-            # app generated is cleared beside it, or a route whose public name
-            # is also in that record would let a background refresh put the
-            # whole proxy list back onto a client that no longer talks to it.
-            client = _claude_client(data)
-            runtime, rows = saved_routes(self.runtime_config_path)
-            row = one_saved_route(rows, data)
-            route_base_url = str(row.get("api_base") or "").strip()
-            if not route_base_url:
-                raise DomainError("The selected model has no saved provider endpoint")
-            route_key = saved_route_api_key(runtime, str(row.get("deployment_id") or ""))
-            route_model = str(row.get("model") or "").strip()
-            store_route_setting(self.app_state_root, client, data)
-            if client == "claudeDesktop":
-                if self._desktop is None:
-                    raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
-                try:
-                    self._desktop.patch(
-                        {
-                            "inferenceProvider": "gateway",
-                            "inferenceGatewayBaseUrl": anthropic_base_url(route_base_url),
-                        }
-                    )
-                    self._desktop.stage_secret("desktop_gateway_api_key", route_key)
-                    # Desktop deletes a name it cannot map onto an Anthropic
-                    # model, so writing one here would only produce a warning
-                    # on the next launch and an empty picker either way.
-                    self._desktop.set_model_names(
-                        [route_model] if desktop_accepts_model_name(route_model) else []
-                    )
-                except ClaudeDesktopConfigError as exc:
-                    raise ClaudeSettingsError(str(exc)) from None
-                store_generated_models(self.app_state_root, "claudeDesktop", [])
-                self._revision += 1
-                return self.snapshot()
-            candidate = copy.deepcopy(self._draft)
-            candidate.pop("modelPicker", None)
-            env = _mapping(candidate.get("env", {}), "env")
-            env["ANTHROPIC_BASE_URL"] = anthropic_base_url(route_base_url)
-            # The saved route's own key is the credential this route answers,
-            # and it is applied only when this app stores one: a route that
-            # authenticates elsewhere must not carry a stale token forward.
-            if route_key:
-                env.pop("ANTHROPIC_API_KEY", None)
-                env["ANTHROPIC_AUTH_TOKEN"] = route_key
-            if route_model:
-                env["ANTHROPIC_MODEL"] = route_model
-                candidate["model"] = route_model
-            candidate["env"] = env
-            errors = validate_settings(candidate)
-            if errors:
-                raise ClaudeSettingsError(errors[0])
-            self._draft = candidate
-            store_generated_models(self.app_state_root, "claudeCode", [])
             self._revision += 1
             return self.snapshot()
         if name in {"desktop_models_patch", "desktopmodelspatch"}:

@@ -31,7 +31,7 @@ std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"general-settings", L"providers-models", L"codex-settings",
       L"claude-settings", L"runtime-settings", L"data-management",
-      L"provider-wizard", L"file-editor", L"logs"};
+      L"provider-wizard", L"file-editor", L"webdav-settings", L"codex-api-settings", L"claude-api-settings", L"logs"};
   return std::find(std::begin(allowed), std::end(allowed), route) == std::end(allowed)
       ? std::wstring{} : route;
 }
@@ -54,7 +54,8 @@ std::wstring CanonicalRoute(std::wstring route) {
 // Child surfaces are their own process window, so the command line, the
 // spawner, and the window geometry all have to agree on the list.
 bool IsChildRoute(std::wstring_view route) {
-  return route == L"provider-wizard" || route == L"file-editor" || route == L"webdav-settings";
+  return route == L"provider-wizard" || route == L"file-editor" || route == L"webdav-settings" ||
+      route == L"codex-api-settings" || route == L"claude-api-settings";
 }
 
 // A child window's own content size, in 96-DPI DIPs: the wizard is the small
@@ -69,6 +70,11 @@ void ChildContentSize(std::wstring_view route, LONG& width, LONG& height) {
   if (route == L"webdav-settings") {
     width = 600;
     height = 470;
+    return;
+  }
+  if (route == L"codex-api-settings" || route == L"claude-api-settings") {
+    width = 540;
+    height = 340;
     return;
   }
   width = 900;

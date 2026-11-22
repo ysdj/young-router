@@ -48,13 +48,7 @@ from ._shared import (
     _mapping,
     _safe_problem,
 )
-from ._shared_api import (
-    one_saved_route,
-    read_route_setting,
-    saved_route_api_key,
-    saved_routes,
-    store_route_setting,
-)
+from ._shared_api import public_direct_api_url
 
 _CODEX_ENVIRONMENT_LOCK = threading.RLock()
 _CATALOG_SOURCE_REFRESH_SECONDS = 0.5
@@ -89,27 +83,9 @@ def _resolve_runtime_root(
 
     return _app_state_root(runtime_root, runtime_settings_path, runtime_config_path)
 
-# The provider row this app owns in the Codex configuration.  Adopting the
-# local proxy through a dedicated row keeps the client's own backends intact
-# (``使用特定API`` can always go back to them) and gives the row an identity
-# that survives a port or key change, so it can follow the runtime settings.
+# Keep the form's direct connection separate from the managed proxy provider.
 LOCAL_API_PROVIDER_ID = "custom"
-
-# LiteLLM writes an adapter prefix in front of a route's own model id.  A
-# direct client connection talks to the provider itself, so that prefix is
-# dropped; any other leading segment belongs to the provider's own model name.
-_LITELLM_ADAPTER_PREFIXES = ("openai/", "anthropic/")
-
-
-def _direct_model_id(value: str) -> str:
-    """Return the provider's own model id for a direct connection."""
-
-    model = value.strip()
-    for prefix in _LITELLM_ADAPTER_PREFIXES:
-        if model.startswith(prefix) and model[len(prefix) :].strip():
-            return model[len(prefix) :].strip()
-    return model
-
+DIRECT_API_PROVIDER_ID = "young-router-direct"
 
 def _installed_codex_cli(codex_home: Path) -> Path | None:
     """Find the Codex executable belonging to this home, then the installed app."""
@@ -1316,40 +1292,16 @@ class CodexSettingsDomain:
             structured if isinstance(structured, Mapping) else {}
         )
 
-    def designated_route(self) -> dict[str, str] | None:
-        """The saved route this client is on, or the one it last left for us.
-
-        A Codex client on this app's proxy names a public model, which several
-        saved routes may share, so the remembered route is the only answer left;
-        a client pointing anywhere else answers from its own document.
-        """
-
-        remembered = read_route_setting(self.app_state_root, "codex")
-        if self.uses_local_api():
-            return remembered
-        structured = self._draft.get("structured")
-        structured = structured if isinstance(structured, Mapping) else {}
-        model = str(structured.get("model") or "").strip()
-        provider = str(structured.get("model_provider") or "").strip()
-        if not model:
-            return remembered
-        try:
-            _, rows = saved_routes(self.runtime_config_path)
-        except DomainError:
-            return remembered
-        matches = [
-            row
-            for row in rows
-            if str(row.get("model") or "").strip() == model
-            and (not provider or str(row.get("provider") or "").strip() == provider)
-        ]
-        if len(matches) != 1:
-            return remembered
-        row = matches[0]
+    def _direct_api_settings(self, structured: Mapping[str, Any], uses_local_api: bool) -> dict[str, Any]:
+        selected = structured.get("model_provider")
+        provider_id = DIRECT_API_PROVIDER_ID if uses_local_api else selected
+        provider = next((row for row in structured.get("providers", []) if row.get("id") == provider_id), {})
+        base_url = structured.get("openai_base_url") if provider_id == "openai" else provider.get("base_url")
         return {
-            "model": str(row.get("model") or "").strip(),
-            "provider": str(row.get("provider") or "").strip(),
-            "deployment_id": str(row.get("deployment_id") or "").strip(),
+            "base_url": public_direct_api_url(base_url),
+            "model_catalog_url": public_direct_api_url(provider.get("model_catalog_url")),
+            "model": "" if uses_local_api else structured.get("model"),
+            "key_configured": provider_id == DIRECT_API_PROVIDER_ID and provider.get("auth_mode") == "bearer",
         }
 
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
@@ -1358,16 +1310,18 @@ class CodexSettingsDomain:
         if self._catalog_pointer_error:
             warnings = [*(warnings if isinstance(warnings, list) else []), self._catalog_pointer_error]
         public_models = self._catalog_model_names(payload) if self._is_catalog_enabled(payload) else []
+        structured = payload.get("structured") or {}
+        uses_local_api = self.uses_local_api()
         return {
             "domain": "codex",
             "revision": revision,
             "config_exists": bool(payload.get("config_exists")),
             "auth_file_exists": bool(payload.get("auth_exists")),
-            "uses_local_api": self.uses_local_api(),
-            "designated_route": self.designated_route(),
+            "uses_local_api": uses_local_api,
             "standalone_search": self.standalone_search_enabled(),
             "image_context_mcp": self.image_context_mcp_enabled(),
-            "structured": redact(payload.get("structured", {})),
+            "structured": redact(structured),
+            "direct_api": redact(self._direct_api_settings(structured, uses_local_api)),
             "models": redact(payload.get("models", [])),
             "validation_errors": redact(errors if isinstance(errors, list) else []),
             "warnings": redact(warnings if isinstance(warnings, list) else []),
@@ -1420,11 +1374,8 @@ class CodexSettingsDomain:
         # panes can keep the user's work on screen.  A structured *action* is a
         # different caller: it has already decided what to write, so a refusal
         # has to reach the pane instead of becoming this draft's state.  Left
-        # as state, the refusal replaced the whole projection with an empty one
-        # (``editor_payload({}, {})``), and the next action then read no
-        # provider row at all: "use a specific API" invented a second provider,
-        # renamed the client onto it, and could no longer tell that this app's
-        # model catalog was the one it was leaving.
+        # as state, the refusal would replace the projection with an empty one
+        # and the next action would no longer know the active provider.
         if patch is not None:
             errors = synced.get("validation_errors")
             if isinstance(errors, list) and errors:
@@ -1437,58 +1388,6 @@ class CodexSettingsDomain:
         synced["config_exists"] = bool(self._raw.get("config_exists"))
         synced["auth_exists"] = bool(self._raw.get("auth_exists"))
         return synced
-
-    def _saved_model_patch(self, data: Mapping[str, Any]) -> dict[str, Any]:
-        """Build a direct-connection patch for one saved provider route.
-
-        This app already stores every route's endpoint and key.  Restoring a
-        client onto one of them writes those exact values under the provider
-        ``model_provider`` already names, so the client talks to the provider
-        itself instead of this app's proxy — the counterpart of the "use this
-        API" action — and the client's own provider identity never changes.
-
-        The two settings that exist only for this proxy's own surface leave
-        with it, because both are written *into* the client's document and
-        would keep applying to a client that no longer talks to this app: the
-        managed catalog names models only this proxy serves, and the standalone
-        search opt-in points Codex at ``{base_url}/alpha/search``, which only a
-        gateway this app fronts answers.  Clearing the opt-in (rather than
-        stating ``false``) is what keeps adoption able to state it again, and
-        it is also the state the pane's disabled switches then read.
-        """
-
-        runtime, rows = saved_routes(self.runtime_config_path)
-        row = one_saved_route(rows, data)
-        base_url = str(row.get("api_base") or "").strip()
-        if not base_url:
-            raise DomainError("The selected model has no saved provider endpoint")
-        surface = str(row.get("upstream_url_surface") or "").strip().lower()
-        if not surface.endswith("responses"):
-            # A client talking to the provider itself speaks Codex's wire, and
-            # Codex accepts only ``responses`` from a custom provider row.  A
-            # chat-only route can therefore never be a direct backend, and
-            # writing ``wire_api = "chat"`` here made the whole document
-            # invalid, which Codex refuses together with the settings pane.
-            raise DomainError(
-                "The selected route serves only the chat API; Codex can only connect to a responses route"
-            )
-        patch = self._active_provider_patch(
-            base_url=base_url,
-            key=saved_route_api_key(runtime, str(row.get("deployment_id") or "")),
-            wire_api="responses",
-        )
-        if not patch.get("api_key"):
-            patch.pop("api_key", None)
-        if self._is_catalog_enabled(self._draft):
-            patch["model_catalog_json"] = None
-        structured = self._draft.get("structured")
-        structured = structured if isinstance(structured, Mapping) else {}
-        active = str(structured.get("model_provider") or "").strip()
-        for entry in patch.get("providers") or []:
-            if isinstance(entry, dict) and str(entry.get("id") or "").strip() == active:
-                entry["supports_standalone_web_search"] = None
-        patch["model"] = _direct_model_id(str(row.get("upstream_model") or row.get("model") or ""))
-        return patch
 
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         name = _action_name(action)
@@ -1522,14 +1421,6 @@ class CodexSettingsDomain:
                     patch = {"litellm_model": data.get("selection")}
                 self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"use_local_api", "uselocalapi"}:
-            # Point the external client at this app's own proxy through the
-            # provider row this app owns, and adopt its master key.  The pane
-            # names the route the client leaves behind: the proxy serves the
-            # route's public model name, so keeping the client's own provider
-            # model id would leave it asking for a model the proxy cannot
-            # resolve.  That route is also what the off direction returns to,
-            # and it is remembered here because the client's own document can
-            # no longer state it once it points at the proxy.
             patch = self._local_api_patch()
             patch.update(self._surface_sync_patch())
             config_text = _remove_legacy_computer_mcp(config_text)
@@ -1537,12 +1428,30 @@ class CodexSettingsDomain:
             if model:
                 patch["model"] = model
             self._draft = self._sync(config_text, auth_text, patch)
-            store_route_setting(self.app_state_root, "codex", data)
-        elif name in {"use_saved_model", "usesavedmodel"}:
-            # Restore the client directly onto one saved provider route: the
-            # chosen model, that provider's own endpoint, and the route's key.
-            self._draft = self._sync(config_text, auth_text, self._saved_model_patch(data))
-            store_route_setting(self.app_state_root, "codex", data)
+        elif name == "use_direct_api":
+            from .. import codex_config
+
+            base_url = data["base_url"].rstrip("/")
+            catalog_url = data.get("model_catalog_url")
+            path = ("model_providers", DIRECT_API_PROVIDER_ID)
+            current = codex_config._provider_mapping(config_text, DIRECT_API_PROVIDER_ID)
+            key = data.get("api_key")
+            old_url = current.get("base_url")
+            if not key and not data.get("clear_key") and isinstance(old_url, str) and old_url.rstrip("/") == base_url:
+                key = current.get("experimental_bearer_token")
+            for field, value in {
+                "name": "Direct API",
+                "base_url": base_url,
+                "wire_api": "responses",
+                "model_catalog_url": catalog_url,
+                "experimental_bearer_token": key,
+            }.items():
+                config_text = (codex_config.set_table_value(config_text, path, field, value)
+                               if value else codex_config.remove_table_value(config_text, path, field))
+            patch = {"model_provider": DIRECT_API_PROVIDER_ID, "model": data.get("model") or None}
+            if self._catalog_pointer_is_managed(self._draft):
+                patch["model_catalog_json"] = None
+            self._draft = self._sync(config_text, auth_text, patch)
         elif name == "codex_feature_set":
             feature = data.get("feature")
             enabled_value = data.get("enabled")
@@ -1860,7 +1769,8 @@ class CodexSettingsDomain:
 
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
-        active = str(structured.get("model_provider") or "").strip()
+        selected = str(structured.get("model_provider") or "").strip()
+        active = LOCAL_API_PROVIDER_ID if selected == DIRECT_API_PROVIDER_ID else selected
         if active == "openai":
             return {"api_key": key, "direct_connection": {"provider": "openai", "base_url": base_url}}
         providers = [
@@ -1883,7 +1793,7 @@ class CodexSettingsDomain:
             if standalone_web_search is not None:
                 entry["supports_standalone_web_search"] = standalone_web_search
             entry["auth_mode"] = "openai_auth"
-            return {"api_key": key, "providers": providers}
+            return {"api_key": key, "model_provider": active, "providers": providers}
         entry = next(
             (item for item in providers if str(item.get("id") or "").strip() == LOCAL_API_PROVIDER_ID),
             None,
@@ -1948,6 +1858,8 @@ class CodexSettingsDomain:
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
         active = str(structured.get("model_provider") or "").strip()
+        if active == DIRECT_API_PROVIDER_ID:
+            active = LOCAL_API_PROVIDER_ID
         already_decided = any(
             isinstance(item, Mapping)
             and str(item.get("id") or "").strip() == active

@@ -123,6 +123,8 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     # means one window's paste can never answer for the other region.
     ("providers_models", "qoder_pat"): True,
     ("codex", "api_key"): False,
+    ("codex", "direct_api_key"): True,
+    ("claude", "direct_api_key"): True,
     ("claude", "deployment_token"): False,
     ("claude", "desktop_gateway_api_key"): False,
     ("claude", "auto_memory_directory"): False,
@@ -143,6 +145,8 @@ _SECRET_READ_LOCK_TIMEOUT_SECONDS = 0.05
 _PLAINTEXT_SECRET_FIELDS = {
     ("providers_models", "api_key"),
     ("codex", "api_key"),
+    ("codex", "direct_api_key"),
+    ("claude", "direct_api_key"),
     ("claude", "deployment_token"),
     ("claude", "desktop_gateway_api_key"),
     ("relay_accounts", "api_key"),
@@ -1470,6 +1474,7 @@ class CoreStore:
         self._our_free_model_runtime = our_free_model_runtime
         self._domains: dict[str, DomainAdapter] = {}
         self._baselines: dict[str, object] = {}
+        self._direct_api_keys: dict[str, tuple[str, str]] = {}
         self._drafts: dict[str, dict[str, Any]] = {}
         self._subscribers: dict[str, Callable[[dict[str, Any]], None]] = {}
         # Publishing is off the mutation lane: a commit marks an event pending
@@ -3736,6 +3741,10 @@ class CoreStore:
                     raise CoreError("invalid_secret", "The requested secret field is unavailable")
                 target_value = None
             adapter = self._domains.get(name)
+            if field_name == "direct_api_key" and adapter is not None:
+                staged = self._direct_api_keys.get(name)
+                return {"domain": name, "field": field_name, "target": target_value,
+                        "revision": self._revision, "present": bool(staged and staged[0] == target_value)}
             presence = getattr(adapter, "secret_present", None) if adapter is not None else None
             staging = getattr(adapter, "stage_secret", None) if adapter is not None else None
             if not callable(presence) or not callable(staging):
@@ -3845,6 +3854,9 @@ class CoreStore:
         # the value this lease is later presented for.
         revision = self._revision
         adapter = self._domains.get(name)
+        if field_name == "direct_api_key" and adapter is not None:
+            return {"domain": name, "field": field_name, "target": target_value,
+                    "revision": revision, "present": False}, ""
         reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
         if not callable(reader):
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
@@ -3961,6 +3973,12 @@ class CoreStore:
             self._check_revision(revision)
             descriptor = self.secret_descriptor(domain, field, target)
             name = str(descriptor["domain"])
+            if field == "direct_api_key":
+                if value.strip():
+                    self._direct_api_keys[name] = (str(descriptor["target"]), value.strip())
+                elif self._direct_api_keys.get(name, (None, ""))[0] == target:
+                    self._direct_api_keys.pop(name)
+                return {"revision": self._revision, "present": bool(value.strip())}
             adapter = self._domains[name]
             before = copy.deepcopy(self._baselines.get(name))
             try:
@@ -6616,18 +6634,58 @@ class CoreStore:
         if not isinstance(action_type, str) or not action_type.strip():
             raise CoreError("invalid_action", "A Core action is required")
         domain_value = data.get("domain")
-        normalized_action = action_type.replace("-", "_").replace(".", "_").lower()
+        normalized_action = action_type.strip().replace("-", "_").replace(".", "_").lower()
         if normalized_action == "model_list_plugin":
             from . import model_list_plugin
             payload = _as_mapping(data.get("payload"))
             host, operation = payload.get("host"), payload.get("operation")
-            if host not in {"codex", "claude"} or operation not in {"status", "install", "uninstall", "enable", "disable", "configure", "sync"}:
+            if (not isinstance(host, str) or host not in model_list_plugin.HOSTS
+                    or not isinstance(operation, str) or operation not in model_list_plugin.OPERATIONS):
                 raise CoreError("invalid_action", "Invalid model-list-plugin request")
             try:
-                result = model_list_plugin.manage(host, operation, options=payload)
+                result = model_list_plugin.manage(host, operation)
             except Exception as exc:
                 raise CoreError("domain_error", safe_exception_message(exc)) from None
             return {"revision": self._current_revision(), "action_summary": result}
+        if normalized_action == "use_direct_api":
+            client = _canonical_domain(domain_value)
+            if client not in ("codex", "claude"):
+                raise CoreError("invalid_action", "Invalid direct API client")
+            payload = _as_mapping(data.get("payload"))
+            fields = {"base_url", "model", "key_token"}
+            fields.add("model_catalog_url" if client == "codex" else "auth_mode")
+            clear_key = payload.get("clear_key", False)
+            if (set(payload) - (fields | {"clear_key"}) or not isinstance(clear_key, bool)
+                    or any(not isinstance(payload[field], str) for field in fields & payload.keys())):
+                raise CoreError("invalid_action", "Invalid direct API settings")
+            auth = payload.get("auth_mode", "bearer")
+            if auth not in {"bearer", "x-api-key"}:
+                raise CoreError("invalid_action", "Invalid API authentication method")
+            from .domains._shared_api import direct_api_url
+
+            try:
+                base_url = direct_api_url(payload.get("base_url"))
+            except ValueError as exc:
+                raise CoreError("invalid_direct_api_url", str(exc)) from None
+            try:
+                catalog_url = direct_api_url(payload.get("model_catalog_url"), optional=True)
+            except ValueError as exc:
+                raise CoreError("invalid_model_catalog_url", str(exc)) from None
+            applied = self.apply(
+                client,
+                revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
+                _direct_api={"base_url": base_url, "model_catalog_url": catalog_url,
+                             "auth_mode": auth, "model": payload.get("model", "").strip(),
+                             "key_token": payload.get("key_token", ""), "clear_key": clear_key},
+            )
+            from .model_list_plugin import sync_if_enabled
+
+            try:
+                plugin_result = sync_if_enabled(client)
+            except Exception as exc:
+                # The client connection has already been committed.
+                plugin_result = {"last_error": safe_exception_message(exc)}
+            return {"revision": applied["revision"], "action_summary": plugin_result}
         if domain_value is not None and normalized_action == "probe":
             # A probe is the one action whose answer is a job: it reads the
             # upstream, it can take minutes, and nothing else in the store has
@@ -8778,6 +8836,7 @@ class CoreStore:
         domains: Sequence[str] | None = None,
         revision: int | None = None,
         confirmation: str | Sequence[str] | None = None,
+        _direct_api: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         should_emit = False
         # The commit's own restart decision asks whether the proxy is running,
@@ -8955,6 +9014,14 @@ class CoreStore:
             # and publish it after the restore.
             captured_validation: dict[str, Any] = {}
             try:
+                if _direct_api is not None:
+                    name = names[0]
+                    token = _direct_api["key_token"]
+                    staged = self._direct_api_keys.get(name)
+                    if token and (staged is None or staged[0] != token):
+                        raise CoreError("invalid_secret", "Enter the direct API key again")
+                    key = staged[1] if token and staged is not None else ""
+                    adapters[name].dispatch("use_direct_api", {**_direct_api, "api_key": key})
                 for name in names:
                     if f"overwrite_external_{name}" not in overwrite_codes:
                         continue
@@ -9020,6 +9087,8 @@ class CoreStore:
                 self._sync_codex_image_context_mcp(applied)
                 self._advance_revision()
                 self._persist_metadata()
+                if _direct_api is not None:
+                    self._direct_api_keys.pop(names[0], None)
             except Exception as exc:
                 rollback_failed = False
                 try:

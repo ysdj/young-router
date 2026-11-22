@@ -1390,6 +1390,7 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
                 "id": str(provider_id),
                 "name": _get_text(provider.get("name")) or "",
                 "base_url": _get_text(provider.get("base_url")) or "",
+                "model_catalog_url": _get_text(provider.get("model_catalog_url")) or "",
                 "wire_api": _get_text(provider.get("wire_api")) or "responses",
                 "env_key": _get_text(provider.get("env_key")) or "",
                 "requires_openai_auth": provider.get("requires_openai_auth")

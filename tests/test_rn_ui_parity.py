@@ -518,7 +518,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('import { routeMenuActions } from "./routes";', self.platform_entry)
         self.assertIn('routeMenuActions(bootstrapTranslate)', self.platform_entry)
         self.assertIn('{ id: "logs", titleKey: "status.logs" }', routes)
-        self.assertIn('id !== "claude-settings" && id !== "provider-wizard"', routes)
+        self.assertIn('id !== "claude-settings" && !CHILD_ROUTES.includes(id)', routes)
 
     def test_status_menu_uses_one_localized_recovery_logs_action(self) -> None:
         self.assertIn('function recoveryLogMenuTitle(', self.ui)
@@ -2074,7 +2074,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy)',
             'busy={probing}',
             'busy={saving} disabled={saving || target === undefined || !editorDirty}',
-            'busy={designateBusy}',
+            'busy={pending === installAction}',
             'busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)}',
             'busy={cooldownClearPending}',
             'busy={pendingAction === "import"}',
@@ -4489,27 +4489,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("clearTitle=", self.ui)
         self.assertNotIn("onClear=", self.ui)
 
-    def test_client_actions_follow_the_selected_provider_row(self) -> None:
-        # Codex names its gateway in ``model_provider``.  Both client actions
-        # rewrite that row in place instead of inventing a provider named after
-        # the route, and the pane resolves the route behind the proxy by the
-        # public model name the proxy serves.
-        core = (ROOT / "young_router/core/domains/codex.py").read_text(encoding="utf-8")
-        self.assertIn("def _active_provider_patch(", core)
-        self.assertIn('entry["base_url"] = base_url', core)
-        self.assertIn('return {"api_key": key, "direct_connection": {"provider": "openai", "base_url": base_url}}', core)
-        self.assertIn('patch["model"] = _direct_model_id(str(row.get("upstream_model") or row.get("model") or ""))', core)
-        self.assertNotIn('"model_provider": provider,', core)
-        # The saved-route resolution is one shared reader: the same rows answer
-        # Codex and both Claude apps, so a route resolves identically in all
-        # three and none of them can pick a route the others would not.
-        shared = (ROOT / "young_router/core/domains/_shared_api.py").read_text(encoding="utf-8")
-        self.assertIn("def one_saved_route(", shared)
-        self.assertIn("def saved_routes(", shared)
-        self.assertIn("if len(candidates) != 1:", shared)
-        self.assertIn("function clientRouteLabel(provider: string, model: string): string {", self.ui)
-        self.assertIn("function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate)", self.ui)
-        self.assertIn("function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }", self.ui)
+    def test_client_api_switch_opens_the_shared_direct_connection_form(self) -> None:
+        for marker in (
+            'client === "codex" ? "codex-api-settings" : "claude-api-settings"',
+            'client={directApiClient}',
+            'field="direct_api_key" target={keyToken}',
+            'domain: client, type: "use_direct_api"',
+        ):
+            self.assert_ui_has(marker)
+        self.assertNotIn("function savedRouteMenuGroups(", self.ui)
+        self.assertNotIn('dispatch("use_saved_model"', self.ui)
 
     def test_external_settings_list_only_registered_client_files_with_paths(self) -> None:
         # The client controls and the file rows are two components because one
@@ -4521,20 +4510,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui,
         )
         for marker in (
-            'accessibilityLabel={labelled("settings.useLocalApi")}',
+            'const label = translate("settings.useLocalApi");',
             'translate("settings.editFile")',
-            # The designate control points the client straight at one saved
-            # provider route and names the provider and model it points at;
-            # its chevron rides the title's trailing edge.
-            'title={designatedRoute}',
-            # The control names the API the client uses and stays empty on
-            # this app's proxy, where no specific API is selected.
-            'designatedRoute={localApiActive ? "" : codexRouteLabel}',
-            'symbol="chevron-up-down"',
-            "symbolTrailing",
-            "void onUseSavedModel(selection).finally(() => setDesignateBusy(false));",
-            'void showGroupedActionMenu({ title: translate("settings.designateAs"), groups, anchor: { x, y, width, height } })',
-            "{designateButtonRef}",
             "void ipc.files()",
             ".then((result) => { if (active) setFiles(result.files); })",
             "{file.name}",
@@ -4577,8 +4554,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, self.ui)
         self.assertNotIn("AssistantFileEditorDialog", self.ui)
         self.assertNotIn("activeAssistantFile", self.ui)
-        # Model-list controls manage the host plugin and offer installation
-        # after a successful API switch.
+        # Claude's model-list controls offer installation after a successful
+        # API switch. Codex only saves its connection.
         for absent in ("CodexRestartNotice", "showCodexRestartConfirmation", "restartCodex"):
             self.assertNotIn(absent, self.ui)
         for marker in (
@@ -4586,11 +4563,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("settings.pluginLabel")',
             '"settings.pluginInstalled"',
             'translate("settings.pluginUninstall")',
-            'const useApiAndOfferPlugin = async',
+            'onUseLocalApi={() => saveLocalApi(onUseLocalApi)}',
+            'const useClaudeApiAndOfferPlugin = async',
             'title: translate("settings.pluginInstallTitle")',
-            'if (success === false) return false;',
+            'if (await stage() === false) return false;',
             'await onApplyClientSettings();',
-            'await managePlugin(host, "install")',
+            'await managePlugin("install")',
             "proxyOnly={localApiActive}",
             "disabled={busy || !proxyOnly}",
             'translate("settings.useLocalApiRequired")',
@@ -4616,10 +4594,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.ui if marker not in pane else pane)
         for marker in (
-            # The client backend is fields of the pane's own settings grid,
-            # never a header control beside the detail title: the switch and
-            # the control that names the designated provider and model share
-            # one label column and one control column.
             '{selectedClient === "codex" ? <>',
             "SETTINGS_FIELD_ROW_INDENTED",
             "SETTINGS_FIELD_LABEL",
@@ -4627,63 +4601,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "SETTINGS_FIELD_HELP_SLOT",
             # One on/off setting is a switch, never a checkbox.
             "<NativeToggle",
-            "return onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
-            # On the proxy the model is only a public name, so the route the
-            # user last chose decides where "off" goes instead of the first
-            # matching row; Core remembers it because the client's own file no
-            # longer carries it.
-            "designatedSelection={codexRoute}",
-            # A client that never named a route has no destination to return to,
-            # so unchecking asks for one at the control that names a route
-            # instead of bouncing the box back onto the proxy.
-            "if (designatedSelection) { designateSavedModel(designatedSelection); return; }",
-            "const savedModelCount = menuGroups.reduce((total, group) => total + group.labels.length, 0);",
-            'onStatus?.(translate("settings.designateAsUnavailable"));',
-            'onStatus?.(translate("settings.useLocalApiOffPrompt"));',
-            "openSavedModelMenu(designateButtonRef.current);",
-            "designateSavedModel(designatedSelection);",
             "value={localApiActive}",
-            'accessibilityLabel={labelled("settings.useLocalApi")}',
+            'const label = translate("settings.useLocalApi");',
             'translate("settings.useLocalApiHint")',
-            # The switch is a real two-way switch driven by the config: on
-            # adopts this app's proxy, off returns the client to the saved
-            # route the control names, and a client that never named one is
-            # asked for a route instead of having the box bounce back.  A check
-            # nobody can answer re-mounts the box onto the configured value.
-            "disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}",
+            "disabled={busy || clientActionBusy}",
             "onValueChange={toggleLocalApi}",
-            # On is one write this switch owns, so its answer goes back to the
-            # control; off with no remembered route asks the user instead.
-            "const toggleLocalApi = (enabled: boolean): void | Promise<unknown> => {",
-            "return onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
-            "const [switchGeneration, setSwitchGeneration] = useState(0);",
-            "const assembleSwitch = (): void => setSwitchGeneration((current) => current + 1);",
-            "const menuGroups = useMemo(() => savedRouteMenuGroups(models, translate), [models, translate]);",
-            "{designateButtonRef}",
-            # The control names the saved route's public provider and model
-            # (the spelling the menu itself offers) and truncates inside its
-            # own column instead of widening the row.
-            'titleWidth="flex"',
-            'designatedRoute={localApiActive ? "" : codexRouteLabel}',
-            'clientProvider={codexClientProvider}',
-            'clientModel={codexClientModel}',
             'localApiActive={codexUsesLocalApi}',
-            "const codexClientProvider = stringValue(codexStructured.model_provider).trim();",
-            'onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")}',
+            'onUseLocalApi={() => dispatch("use_local_api", {}, "codex")}',
             'const codexUsesLocalApi = booleanValue(codexState.uses_local_api);',
-            # The same three fields answer for both Claude apps, each naming its
-            # own client so Core writes the right document.
-            'onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")}',
-            'onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")}',
+            'onClaudeUseLocalApi={(app) => dispatch("use_local_api", { client: app }, "claude")}',
         ):
             self.assertIn(marker, self.ui if marker not in pane else pane)
-        # Core -- not the pane -- remembers the route a client leaves: once the
-        # client points at this proxy its own file names a public model that
-        # several saved routes may share, so only Core can answer where "off"
-        # goes back to.
-        for path in (ROOT / "young_router/core/domains/codex.py", ROOT / "young_router/core/domains/claude.py"):
-            domain = path.read_text(encoding="utf-8")
-            self.assertIn('read_route_setting(self.app_state_root, "codex")', domain) if "codex" in path.name else self.assertIn('read_route_setting(self.app_state_root, client)', domain)
         # The path itself is the reveal control: a native link button whose
         # long title is bounded by its own column instead of the button's
         # reserved label width.  It shows the home-shortened spelling of the
@@ -4710,7 +4638,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         # The Core listing is the only path source, and the pane no longer
         # renders label/input structured editing for any client.
-        for removed in ("TextField", "PickerField", "NativeSecretField", "settings.structured", "assistantQuickGrid"):
+        for removed in ("PickerField", "NativeSecretField", "settings.structured", "assistantQuickGrid"):
             self.assertNotIn(removed, pane)
         self.assertIn("SETTINGS_RAIL_BODY", self.ui)
         # The pane aligns its rail exactly like the backup & sync pane: the
@@ -4996,7 +4924,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('titleKey: "claude.codeSection"', self.ui)
         self.assertNotIn('titleKey: "claude.desktopSection"', self.ui)
         self.assertIn("const claudeApps:", self.ui)
-        self.assertIn('models={claudeModels}', self.ui)
+        self.assertIn('client="claude"', self.ui)
         # The external settings pane lists client files instead of structured
         # Codex/Claude fields, so it localizes display metadata only.
         self.assertNotIn("localizeCodexValidationMessage(message, translate)", self.ui)
@@ -5082,9 +5010,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp",
         ):
             self.assertNotIn("image-context", (ROOT / path).read_text(encoding="utf-8"), path)
-        # The remaining child surfaces are the wizard, the raw editor, and the
-        # WebDAV detail form.
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "webdav-settings" {', MACOS_LEAF.read_text(encoding="utf-8"))
+        self.assertIn('["provider-wizard", "file-editor", "webdav-settings", "codex-api-settings", "claude-api-settings"].contains(windowRoute)', MACOS_LEAF.read_text(encoding="utf-8"))
         self.assertIn(
             'if (!IsChildRoute(route)) return;',
             (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8"),
@@ -5713,19 +5639,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'hintKey: "clients.claudeFilesHint"',
             "const claudeApps:",
             "const claudeLocalApiActive = claudeApps.every(",
-            # The fan-out is stated once for both controls: a switch that reads
-            # "on" only when every app is on has to write to every app.
-            "const forEveryClaudeApp = async (",
-            # The remembered route has to be *absent*, not empty: the shared
-            # switch reads absence as "ask for a route" and an empty record as
-            # "return to a route", so an always-object answer made the Claude
-            # box dispatch an unchosen route where Codex opens the list.
-            "const claudeDesignated = (claudeCode.designated_route ?? claudeDesktop.designated_route) as UnknownRecord | undefined;",
-            "const claudeRoute = claudeDesignated ? asRecord(claudeDesignated) : undefined;",
-            "designatedSelection={claudeRoute}",
-            'for (const { app } of claudeApps) if (await action(app, selection) === false) return false;',
-            'onUseLocalApi={(selection) => useApiAndOfferPlugin("claude", () => forEveryClaudeApp(onClaudeUseLocalApi, selection))}',
-            "onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}",
+            'for (const { app } of claudeApps) if (await onClaudeUseLocalApi(app) === false) return false;',
+            'onUseLocalApi={useClaudeApiAndOfferPlugin}',
             # Every Claude app's files under those controls.
             'files={claudeFiles}',
             "function FileEditorWorkspace",
@@ -10772,18 +10687,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ):
                 self.assertIn(key, locale)
 
-        # One route is one designate row, and an ambiguous name decides nothing:
-        # two routes of one public name stay two menu entries (named by the key
-        # they answer with), and a client whose provider this pane cannot match
-        # is never moved onto another provider's route.
-        self.assertIn(r"const identity = `${row.provider}\u001f${row.deploymentId}`;", self.ui)
-        self.assertIn(r'`${row.model} · ${row.keyName || translate("providers.undefinedKey")}`', self.ui)
-        # An ambiguous name resolves to nothing: Core answers a client's own
-        # model back to one saved route only when exactly one route carries it,
-        # and the pane's off direction uses that same answer.
-        domain = (ROOT / "young_router/core/domains/_shared_api.py").read_text(encoding="utf-8")
-        self.assertIn("    if len(candidates) != 1:", domain)
-        self.assertIn("def _route_named(", (ROOT / "young_router/core/domains/claude.py").read_text(encoding="utf-8"))
         core = (ROOT / "young_router/core/codex_config.py").read_text(encoding="utf-8")
         self.assertIn('"api_key_name": str(info.get("api_key_name") or "").strip(),', core)
         self.assertIn('"order": params.get("order"),', core)
@@ -10811,8 +10714,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The pane edits files directly; the old structured heading is gone,
         # and the one remaining client-level shortcut lives in Codex's header.
         self.assertNotIn('translate("settings.structured")', self.ui)
-        self.assertIn('dispatch("use_local_api", selection, "codex")', self.ui)
-        self.assertNotIn('dispatch("use_local_api", selection, "claude")', self.ui)
+        self.assertIn('dispatch("use_local_api", {}, "codex")', self.ui)
+        self.assertIn('dispatch("use_local_api", { client: app }, "claude")', self.ui)
         self.assertNotIn('translate("webdav.subtitle")', self.ui)
 
     def test_settings_surfaces_omit_static_draft_tips_but_keep_actionable_disk_conflicts(self) -> None:
@@ -10951,8 +10854,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('{ id: "webdav-settings", titleKey: "webdav.detailsTitle" }', routes)
         # A child route is no pane: it is filtered out of the sidebar rail, the
         # menu actions, and the shared settings shell.
-        self.assertIn('id !== "provider-wizard" && id !== "webdav-settings"', routes)
-        self.assertIn('route !== "file-editor" && route !== "webdav-settings"', routes)
+        self.assertIn('!CHILD_ROUTES.includes(id)', routes)
+        self.assertIn('!CHILD_ROUTES.includes(route)', routes)
         self.assertIn('| "webdav-settings"', types)
         self.assertIn("routeWebDavSettings: string;", types)
         self.assertIn('{ id: "general-settings", titleKey: "status.general" }', routes)
@@ -10969,11 +10872,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # spawn it beside the workspace it belongs to.
         self.assertIn('case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")', self.macos_leaf)
         self.assertIn('if (route == L"webdav-settings") return Localized("routeWebDavSettings", L"WebDAV Sync Settings");', self.windows_leaf)
-        self.assertIn('@[@"home", @"provider-wizard", @"file-editor", @"webdav-settings"]', macos_app)
+        self.assertIn('@[@"home", @"provider-wizard", @"file-editor", @"webdav-settings", @"codex-api-settings", @"claude-api-settings"]', macos_app)
         self.assertIn('route == L"webdav-settings"', windows_app)
         # Both hosts present it the way every child surface is presented, so
         # the pane behind it is locked until the form closes.
-        self.assertIn('windowRoute == "webdav-settings"', self.macos_leaf)
+        self.assertIn('["provider-wizard", "file-editor", "webdav-settings", "codex-api-settings", "claude-api-settings"].contains(windowRoute)', self.macos_leaf)
         self.assertIn('native.window.open("webdav-settings")', self.ui)
 
     def test_language_is_one_setting_in_the_general_pane(self) -> None:

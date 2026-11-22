@@ -288,6 +288,7 @@ private enum NativeRelayOriginPolicy {
         "routeRuntimeSettings": "Runtime",
         "routeDataManagement": "Data Management", "routeLogs": "Tasks & Logs",
         "routeWebDavSettings": "WebDAV Sync Settings",
+        "routeDirectApiSettings": "Direct API Settings",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
         "modelChooserProvider": "Provider", "modelChooserKey": "Key", "modelChooserSearch": "Search models",
         "modelChooserAll": "All", "modelChooserSelectAllVisible": "Select all visible models",
@@ -468,7 +469,7 @@ private enum NativeRelayOriginPolicy {
             // the screen only when the user opens the document it edits.
             configureImmediatePresentation(window)
             withoutAnimations { window.orderOut(nil) }
-        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "webdav-settings" {
+        } else if ["provider-wizard", "file-editor", "webdav-settings", "codex-api-settings", "claude-api-settings"].contains(windowRoute) {
             // The wizard and the file editor are children of the workspace they
             // open from: each is its own movable window with the rest of the
             // app locked until it closes, exactly like the model chooser. A
@@ -3015,6 +3016,12 @@ private enum NativeRelayOriginPolicy {
                 minSize: NSSize(width: 720, height: 420),
                 maxSize: nil
             )
+        case "codex-api-settings", "claude-api-settings":
+            return RouteWindowLayout(
+                contentSize: NSSize(width: 540, height: 340),
+                minSize: NSSize(width: 460, height: 300),
+                maxSize: nil
+            )
         case "webdav-settings":
             // The detail form is one column of the settings grid's rows: 600
             // holds the label column plus the widest control (the WebDAV
@@ -3061,6 +3068,7 @@ private enum NativeRelayOriginPolicy {
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
         case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")
+        case "codex-api-settings", "claude-api-settings": return localized("routeDirectApiSettings", fallback: "Direct API Settings")
         default: return nil
         }
     }

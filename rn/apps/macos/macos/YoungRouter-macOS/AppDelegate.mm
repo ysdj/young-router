@@ -100,7 +100,7 @@
     // shell, so an explicit whitelist here silently gives a missed pane
     // (General) a plain titled window while the shell still reserves its
     // title-bar inset.
-    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"webdav-settings"]];
+    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"webdav-settings", @"codex-api-settings", @"claude-api-settings"]];
     const BOOL settingsShell = ![standaloneRoutes containsObject:route];
     NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"YoungRouter" initialProperties:props];
     // RCTSurfaceHostingView defaults to an opaque white background on macOS.
@@ -216,7 +216,7 @@
     }
     // Keep this equal to the routes the leaf can title: a valid route missing
     // here is dropped with no window and no message.
-    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"file-editor", @"webdav-settings", @"logs"]];
+    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"file-editor", @"webdav-settings", @"codex-api-settings", @"claude-api-settings", @"logs"]];
     if (![routes containsObject:route]) {
       continue;
     }

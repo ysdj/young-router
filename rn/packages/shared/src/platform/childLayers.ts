@@ -28,6 +28,8 @@ const LAYER_SIZE: Partial<Record<AppRoute, { width: number; height: number }>> =
   "provider-wizard": { width: 620, height: 460 },
   "file-editor": { width: 900, height: 560 },
   "webdav-settings": { width: 600, height: 470 },
+  "codex-api-settings": { width: 540, height: 340 },
+  "claude-api-settings": { width: 540, height: 340 },
 };
 const DEFAULT_SIZE = { width: 720, height: 520 };
 const MARGIN = 24;

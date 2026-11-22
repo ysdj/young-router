@@ -12,6 +12,8 @@ import threading
 
 NAME = "model-list-plugin"
 PLUGIN_ID = f"{NAME}@{NAME}"
+HOSTS = {"codex", "claude"}
+OPERATIONS = {"status", "install", "uninstall", "enable", "disable", "sync"}
 _LOCK = threading.RLock()
 
 
@@ -110,21 +112,37 @@ def status(host: str) -> dict:
     row = _row(host, executable)
     if not row:
         return {"installed": False, "available": True, "enabled": False}
-    plugin = _json(str(_binary(host, row)), ["status"])
+    plugin = _json(str(_binary(host, row)), ["status", "--host", host])
     return {
         "installed": True, "available": True,
         "enabled": bool(row.get("enabled", True) and plugin.get("enabled") and plugin.get("targets", {}).get(host)),
         "host_enabled": bool(row.get("enabled", True)),
         "version": row.get("version", ""),
-        "configured_provider": plugin.get("configuredProvider", {}),
         "last_sync": (plugin.get("lastSyncAtByTarget") or {}).get(host, ""),
         "last_error": plugin.get("lastError", ""),
         "last_update_error": (plugin.get("lastUpdateErrorByHost") or {}).get(host, ""),
     }
 
 
-def manage(host: str, action: str, *, options: dict | None = None) -> dict:
-    if host not in {"codex", "claude"} or action not in {"status", "install", "uninstall", "enable", "disable", "configure", "sync"}:
+def sync_if_enabled(host: str) -> dict:
+    """Refresh an installed plugin after the client settings commit."""
+    if not target_enabled(host):
+        return {}
+    with _LOCK:
+        executable = _executable(host)
+        row = _row(host, executable) if executable else None
+        if not row or not row.get("enabled", True):
+            return {}
+        try:
+            _run(str(_binary(host, row)), ["sync", "--host", host])
+        except RuntimeError:
+            # Sync records its fetch error separately from the connection save.
+            pass
+        return status(host)
+
+
+def manage(host: str, action: str) -> dict:
+    if host not in HOSTS or action not in OPERATIONS:
         raise ValueError("Invalid model-list-plugin request")
     with _LOCK:
         if action == "status":
@@ -149,7 +167,7 @@ def manage(host: str, action: str, *, options: dict | None = None) -> dict:
             if not row.get("enabled", True):
                 _run(executable, ["plugin", "add", PLUGIN_ID] if host == "codex" else ["plugin", "enable", PLUGIN_ID, "--scope", "user"])
             binary = str(_binary(host, row))
-            _run(binary, ["install"])
+            _run(binary, ["install", "--host", host])
             _run(binary, ["enable", "--host", host, "--defer"])
             try:
                 _run(binary, ["sync", "--host", host])
@@ -169,19 +187,6 @@ def manage(host: str, action: str, *, options: dict | None = None) -> dict:
                 if action == "enable" and not row.get("enabled", True):
                     _run(executable, ["plugin", "add", PLUGIN_ID] if host == "codex" else ["plugin", "enable", PLUGIN_ID, "--scope", "user"])
                 _run(binary, [action, "--host", host])
-            elif action == "configure":
-                options = options or {}
-                names = ("base_url", "metadata_url", "auth_env")
-                if any(not isinstance(options.get(name), str) for name in names):
-                    raise ValueError("The plugin configuration is invalid")
-                _run(binary, ["configure", "--base-url", options["base_url"], "--metadata-url", options["metadata_url"], "--auth-env", options["auth_env"]])
-                if target_enabled(host):
-                    try:
-                        _run(binary, ["sync", "--host", host])
-                    except RuntimeError:
-                        # The source was saved. The plugin reports a fetch
-                        # failure separately in status, beside the sync action.
-                        pass
             else:
                 _run(binary, ["sync", "--host", host])
         return status(host)

@@ -28,6 +28,8 @@ export type AppRoute =
   | "runtime-settings"
   | "data-management"
   | "webdav-settings"
+  | "codex-api-settings"
+  | "claude-api-settings"
   | "relay-accounts"
   | "relay-add"
   | "provider-wizard"
@@ -894,6 +896,7 @@ export interface NativeLocalization {
   routeRuntimeSettings: string;
   routeDataManagement: string;
   routeWebDavSettings: string;
+  routeDirectApiSettings: string;
   routeProviderWizard: string;
   routeFileEditor: string;
   routeLogs: string;

@@ -17,12 +17,14 @@ export const ROUTES: readonly RouteDefinition[] = [
   // belongs to; it is a route because a child surface is a window, never an
   // overlay over the pane that opened it.
   { id: "webdav-settings", titleKey: "webdav.detailsTitle" },
+  { id: "codex-api-settings", titleKey: "settings.directApiTitle" },
+  { id: "claude-api-settings", titleKey: "settings.directApiTitle" },
   { id: "logs", titleKey: "status.logs" },
 ];
 
-export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(
-  ({ id }) => id !== "claude-settings" && id !== "provider-wizard" && id !== "webdav-settings",
-);
+export const CHILD_ROUTES: readonly AppRoute[] = ["provider-wizard", "file-editor", "webdav-settings", "codex-api-settings", "claude-api-settings"];
+
+export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(({ id }) => id !== "claude-settings" && !CHILD_ROUTES.includes(id));
 
 /**
  * Panes of the single settings window. The native hosts keep one window for
@@ -54,7 +56,7 @@ export function isSettingsPaneRoute(route: AppRoute | undefined): boolean {
 
 /** Every non-home, non-sheet route renders inside the settings shell. */
 export function isSettingsShellRoute(route: AppRoute | undefined): boolean {
-  return route !== undefined && route !== "home" && route !== "provider-wizard" && route !== "file-editor" && route !== "webdav-settings";
+  return route !== undefined && route !== "home" && !CHILD_ROUTES.includes(route);
 }
 
 export function routeMenuActions(

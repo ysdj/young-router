@@ -271,6 +271,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   if (route == L"provider-wizard") return {540, 420};
   if (route == L"file-editor") return {900, 560};
   if (route == L"webdav-settings") return {520, 400};
+  if (route == L"codex-api-settings" || route == L"claude-api-settings") return {460, 272};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
   return {320, 160};
@@ -292,6 +293,7 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
   // the label column plus the widest control (the WebDAV address) inside both
   // insets, and 470 covers those rows above the pinned footer.
   if (route == L"webdav-settings") return {600, 470};
+  if (route == L"codex-api-settings" || route == L"claude-api-settings") return {540, 340};
   return {320, 160};
 }
 
@@ -474,10 +476,7 @@ bool RunOwnedModalWindow(
     SetForegroundWindow(owner);
   }
   if (message_result == 0) PostQuitMessage(static_cast<int>(message.wParam));
-  // A viewer that failed to load is not a viewer the user closed: the caller
-  // used to read both as a normal end, so a broken record looked like a
-  // dismissal.
-  return finished && !state->failed && message_result >= 0;
+  return finished && message_result >= 0;
 }
 
 void FailReadOnlyCodeViewer(std::weak_ptr<ReadOnlyCodeViewerState> const& weak_state) noexcept {
@@ -1381,7 +1380,7 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
         InitializeReadOnlyCodeViewer(weak_state, viewer_html, viewer_text, viewer_language);
       });
 
-  const bool completed = RunOwnedModalWindow(dialog, window_handle_, {760, 520}, state->finished);
+  RunOwnedModalWindow(dialog, window_handle_, {760, 520}, state->finished);
   try {
     if (state->core && state->web_message_token.value != 0) {
       state->core.WebMessageReceived(state->web_message_token);
@@ -1407,7 +1406,6 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
   state->core = nullptr;
   state->webview = nullptr;
   state->dialog = nullptr;
-  (void)completed;
 }
 
 std::optional<std::pair<size_t, size_t>> WinUI3NativeLeaf::ShowGroupedActionMenu(
@@ -3278,6 +3276,8 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
   if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
   if (route == L"webdav-settings") return Localized("routeWebDavSettings", L"WebDAV Sync Settings");
+  if (route == L"codex-api-settings" || route == L"claude-api-settings")
+    return Localized("routeDirectApiSettings", L"Direct API Settings");
   // Settings panes share one window, so its title is the app name while the
   // sidebar selection names the active pane (System Settings style).
   return Localized("appTitle", L"Young Router");

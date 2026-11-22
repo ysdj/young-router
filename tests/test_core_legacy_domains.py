@@ -3078,6 +3078,11 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These fixtures do not have the model-list plugin installed.
+        plugin = mock.patch("young_router.core.model_list_plugin.target_initialized", return_value=False)
+        plugin.start()
+        self.addCleanup(plugin.stop)
 
     def test_image_context_switch_writes_and_removes_only_this_apps_mcp_entry(self) -> None:
         """The switch alone never edits Codex: only an explicit MCP choice does."""
@@ -3427,60 +3432,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 self.assertFalse(disabled.follow_local_api_endpoint())
                 self.assertFalse(disabled.snapshot()["standalone_search"])
 
-    def test_use_saved_model_restores_the_provider_endpoint_key_and_default_model(self) -> None:
-        """The designate action points the client straight at one saved route."""
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / "config.yaml"
-            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
-            home = root / "codex"
-            home.mkdir()
-            # The client currently runs a public model name through the local
-            # proxy, so every part of the designated route has to be written —
-            # the default model, that route's endpoint, and its key — while the
-            # provider ``model_provider`` names keeps its identity.
-            (home / "config.toml").write_text(
-                'model = "stale-model"\n'
-                'model_provider = "newapi"\n'
-                '\n'
-                '[model_providers.newapi]\n'
-                'name = "newapi"\n'
-                'base_url = "http://127.0.0.1:12390/v1"\n'
-                'wire_api = "responses"\n'
-                'requires_openai_auth = true\n',
-                encoding="utf-8",
-            )
-            (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-young-router"}\n', encoding="utf-8")
-            domain = CodexSettingsDomain(runtime, codex_home=home)
-
-            domain.dispatch(
-                "use_saved_model",
-                {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
-            )
-            domain.apply()
-
-            documents = domain.export(include_sensitive=True)
-            self.assertIn('model = "default-chat"', documents["config_text"])
-            self.assertNotIn('model = "stale-model"', documents["config_text"])
-            # The designation rewrites the provider the client already names —
-            # its URL, API surface, and key — instead of inventing a provider
-            # named after the route.
-            self.assertIn('model_provider = "newapi"', documents["config_text"])
-            self.assertNotIn('model_provider = "primary"', documents["config_text"])
-            self.assertNotIn("[model_providers.primary]", documents["config_text"])
-            newapi = next(
-                item for item in domain.snapshot()["structured"]["providers"] if item["id"] == "newapi"
-            )
-            self.assertEqual("https://example.test/v1", newapi["base_url"])
-            self.assertEqual("responses", newapi["wire_api"])
-            self.assertIn('base_url = "https://example.test/v1"', documents["config_text"])
-            # The route's own key replaces the router's master key.
-            self.assertIn("replace-me-secret", documents["auth_text"])
-            self.assertNotIn("sk-young-router", documents["auth_text"])
-
     @mock.patch("young_router.core.codex_config.local_exposed_models", return_value=([], False))
-    def test_use_saved_model_clears_the_settings_that_name_this_proxy(self, _live_models) -> None:
+    def test_direct_api_switch_leaves_the_managed_proxy_provider(self, _live_models) -> None:
         """A client leaving the proxy takes the proxy's own settings with it.
 
         The managed model list and the standalone search opt-in are both
@@ -3523,76 +3476,24 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(domain.snapshot()["model_catalog"]["enabled"])
             self.assertTrue(domain.snapshot()["standalone_search"])
 
-            left = domain.dispatch(
-                "use_saved_model",
-                {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
-            )
+            left = domain.dispatch("use_direct_api", {
+                "base_url": "https://other.example.test/v1", "model": "direct-chat", "api_key": "fixture-direct",
+            })
             domain.apply()
 
             documents = domain.export(include_sensitive=True)
             self.assertNotIn("model_catalog_json", documents["config_text"])
-            self.assertNotIn("supports_standalone_web_search", documents["config_text"])
+            self.assertIn("supports_standalone_web_search = true", documents["config_text"])
             self.assertFalse(left["model_catalog"]["enabled"])
             self.assertFalse(domain.snapshot()["standalone_search"])
 
-            # Adoption states the opt-in again.  An off direction that wrote
-            # ``false`` instead of clearing the key would have read as the
-            # operator's own decision and kept search off for good.
+            # Switching back restores the proxy while retaining direct settings.
             domain.dispatch("use_local_api", {})
             domain.apply()
+            self.assertTrue(domain.snapshot()["uses_local_api"])
             self.assertIn(
                 "supports_standalone_web_search = true",
                 domain.export(include_sensitive=True)["config_text"],
-            )
-
-    def test_use_saved_model_refuses_a_route_the_client_cannot_talk_to(self) -> None:
-        """A chat-only route is refused instead of becoming an invalid document.
-
-        Codex accepts only ``responses`` from a custom provider row, so a saved
-        route that serves the chat API alone can never be a direct backend.
-        Writing ``wire_api = "chat"`` for it made the whole document invalid —
-        Codex refused it together with the pane, and the staged refusal then
-        replaced the draft's projection with an empty one.
-        """
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / "config.yaml"
-            runtime.write_text(
-                textwrap.dedent(PROVIDER_CONFIG).lstrip().replace(
-                    "upstream_url_surface: openai/responses",
-                    "upstream_url_surface: openai/chat",
-                ),
-                encoding="utf-8",
-            )
-            home = root / "codex"
-            home.mkdir()
-            original = (
-                'model = "stale-model"\n'
-                'model_provider = "newapi"\n'
-                '\n'
-                '[model_providers.newapi]\n'
-                'name = "newapi"\n'
-                'base_url = "http://127.0.0.1:12390/v1"\n'
-                'wire_api = "responses"\n'
-                'requires_openai_auth = true\n'
-            )
-            (home / "config.toml").write_text(original, encoding="utf-8")
-            (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-young-router"}\n', encoding="utf-8")
-            domain = CodexSettingsDomain(runtime, codex_home=home)
-
-            with self.assertRaises(DomainError) as raised:
-                domain.dispatch(
-                    "use_saved_model",
-                    {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
-                )
-            self.assertIn("responses", str(raised.exception))
-            # The refusal left the document alone: no chat wire, and the
-            # provider the client names is still the one it named.
-            self.assertEqual(original, domain.export(include_sensitive=True)["config_text"])
-            self.assertEqual(
-                "newapi",
-                (domain.snapshot()["structured"] or {}).get("model_provider"),
             )
 
     def test_a_rejected_patch_leaves_the_projection_it_was_staged_against(self) -> None:
@@ -3635,40 +3536,6 @@ class CodexSettingsDomainTests(unittest.TestCase):
             structured = domain.snapshot()["structured"] or {}
             self.assertEqual("newapi", structured.get("model_provider"))
             self.assertEqual(["newapi"], [row.get("id") for row in structured.get("providers") or []])
-
-    def test_a_created_provider_row_keeps_the_clients_own_provider_id(self) -> None:
-        """The off direction never moves the client onto a second provider.
-
-        A document whose provider table the projection cannot read used to take
-        the fallback row, which renamed ``model_provider`` to this app's own
-        ``custom``; the reconciliation then deleted the row the client had
-        named.  The identity is what the action promises to keep, so the row is
-        created under the client's own id.
-        """
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / "config.yaml"
-            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
-            home = root / "codex"
-            home.mkdir()
-            (home / "config.toml").write_text(
-                'model = "default-chat"\nmodel_provider = "newapi"\n', encoding="utf-8"
-            )
-            (home / "auth.json").write_text('{}\n', encoding="utf-8")
-            domain = CodexSettingsDomain(runtime, codex_home=home)
-
-            staged = domain.dispatch(
-                "use_saved_model",
-                {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
-            )
-            self.assertEqual("newapi", (staged["structured"] or {}).get("model_provider"))
-            domain.apply()
-            text = domain.export(include_sensitive=True)["config_text"]
-            self.assertIn('model_provider = "newapi"', text)
-            self.assertIn("[model_providers.newapi]", text)
-            self.assertNotIn("model_provider = \"custom\"", text)
-            self.assertNotIn("[model_providers.custom]", text)
 
     def test_staged_edits_preserve_existing_codex_file_presence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

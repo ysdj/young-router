@@ -19,7 +19,8 @@ namespace {
 // Child surfaces open as their own process window: the provider wizard, the raw
 // file editor, and the WebDAV detail form.
 bool IsChildRoute(std::wstring_view route) {
-  return route == L"provider-wizard" || route == L"file-editor" || route == L"webdav-settings";
+  return route == L"provider-wizard" || route == L"file-editor" || route == L"webdav-settings" ||
+      route == L"codex-api-settings" || route == L"claude-api-settings";
 }
 
 std::wstring Utf8ToWide(std::string const& value) {

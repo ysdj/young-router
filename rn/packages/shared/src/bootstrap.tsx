@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { AppRegistry } from "react-native";
-import { canonicalWindowRoute, DESKTOP_ROUTES, isSettingsPaneRoute, LOG_TABS } from "./routes";
+import { canonicalWindowRoute, CHILD_ROUTES, DESKTOP_ROUTES, isSettingsPaneRoute, LOG_TABS } from "./routes";
 import { YoungRouterApp } from "./ui/YoungRouterApp";
 import { RenderFaultBoundary } from "./ui/renderFaultBoundary";
 import type { AppRoute, IpcClient, LogTab, NativeLeafAdapter } from "./types";
@@ -36,6 +36,7 @@ export function registerYoungRouter(componentName: string, dependencies: Desktop
         if (route === "logs") setLogTabRequest(tab && LOG_TABS.includes(tab) ? tab : "requests");
         const requestedWindow = canonicalWindowRoute(route);
         const currentWindow = canonicalWindowRoute(props.initialRoute ?? "home");
+        if (isSettingsPaneRoute(currentWindow) && CHILD_ROUTES.includes(requestedWindow)) return;
         // The settings window hosts every settings pane, so any open-* action
         // that targets a pane belongs to this root even though the requested
         // pane is not the route the window was created with.

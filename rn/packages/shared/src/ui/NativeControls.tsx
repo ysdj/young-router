@@ -2119,56 +2119,59 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
   // The shared controller owns the auto-commit debounce; this leaf stages only
   // when that commit arrives as `commitRequest`.
   const inputRef = React.useRef<TextInput>(null);
-  const valueRef = React.useRef("");
-  // The loaded value is written straight into the field's DOM node. React
-  // state must not carry a secret, and React Native for Web's `setNativeProps`
-  // does not update an uncontrolled `<input>`'s value.
+  const edited = React.useRef(false);
+  // Read and write the uncontrolled field within the host leaf.
   const fieldId = React.useRef(`yr-secret-${nextSecretFieldId()}`);
-  const setFieldValue = (next: string): void => {
+  const fieldElement = (): HTMLInputElement | HTMLTextAreaElement | undefined => {
     const node = document.getElementById(fieldId.current);
-    if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) node.value = next;
+    if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) return node;
+  };
+  const setFieldValue = (next: string): void => {
+    const node = fieldElement();
+    if (node) node.value = next;
   };
   const lastCommit = React.useRef(0);
   const lastReset = React.useRef(resetRequest ?? 0);
-  const report = (status: string, present: boolean, error = "", revision = 0): void => {
-    onSecretState?.({ revision, present, status, error, commitRequest: commitRequest ?? 0 });
+  const stateListener = React.useRef(onSecretState);
+  stateListener.current = onSecretState;
+  const report = (status: string, present: boolean, error = "", revision = 0, request = lastCommit.current): void => {
+    stateListener.current?.({ revision, present, status, error, commitRequest: request });
   };
-  const stage = React.useCallback((): void => {
+  const stage = React.useCallback((request: number): void => {
     const stager = getBrowserSecretStager();
+    const value = fieldElement()?.value ?? "";
     if (!stager) {
-      report("error", valueRef.current.length > 0, "The secret field is unavailable");
+      report("error", value.length > 0, "The secret field is unavailable", 0, request);
       return;
     }
-    report("saving", valueRef.current.length > 0);
-    void stager({ domain, field, target, value: valueRef.current }).then((staged) => {
+    report("saving", value.length > 0, "", 0, request);
+    void stager({ domain, field, target, value }).then((staged) => {
       // `saved` is the completion state emitted by both native secure-input
       // leaves.  `ready` means an idle/read state; using it here made the
       // WebDAV child ignore a password-only stage, leaving Save disabled even
       // after Core accepted the value.
-      report("saved", staged.present, "", staged.revision);
-    }).catch((error: unknown) => report("error", valueRef.current.length > 0, error instanceof Error ? error.message : "The secret could not be saved"));
+      report("saved", staged.present, "", staged.revision, request);
+    }).catch((error: unknown) => report("error", value.length > 0, error instanceof Error ? error.message : "The secret could not be saved", 0, request));
   }, [domain, field, target]);
   React.useEffect(() => {
     let current = true;
-    valueRef.current = "";
+    edited.current = false;
     setFieldValue("");
     inputRef.current?.clear();
     const reader = getBrowserSecretReader();
     if (!reader) return () => { current = false; };
     report("loading", false);
     void reader({ domain, field, target }).then((secret) => {
-      if (!current) return;
-      const value = secret.value ?? "";
-      valueRef.current = value;
-      if (value) setFieldValue(value);
+      if (!current || edited.current || lastCommit.current !== 0) return;
+      if (secret.value) setFieldValue(secret.value);
       report("ready", secret.present);
-    }).catch(() => { if (current) report("error", false, "The secret field is unavailable"); });
+    }).catch(() => { if (current && !edited.current && lastCommit.current === 0) report("error", false, "The secret field is unavailable"); });
     return () => { current = false; };
   }, [domain, field, target]);
   React.useEffect(() => {
     if (lastReset.current === (resetRequest ?? 0)) return;
     lastReset.current = resetRequest ?? 0;
-    valueRef.current = "";
+    edited.current = true;
     setFieldValue("");
     inputRef.current?.clear();
     report("ready", false);
@@ -2179,7 +2182,7 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     const request = commitRequest ?? 0;
     if (request === 0 || request === lastCommit.current) return;
     lastCommit.current = request;
-    stage();
+    stage(request);
   }, [commitRequest, stage]);
   // There is deliberately no blur completion here.  The shared controller
   // owns the quiet auto-commit timer, and a blur can happen before its 500 ms
@@ -2196,7 +2199,7 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     autoCapitalize="none"
     autoCorrect={false}
     onChangeText={(next) => {
-      valueRef.current = next;
+      edited.current = true;
       // `dirty` is what makes the shared controller schedule its quiet-period
       // commit (for an auto-commit field) or enable its own button.  The write
       // itself is one call, from `commitRequest`: a second timer here would

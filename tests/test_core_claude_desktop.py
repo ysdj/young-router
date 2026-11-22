@@ -54,6 +54,12 @@ def _write_desktop_config(root: pathlib.Path, config: dict[str, object]) -> path
 
 
 class ClaudeDesktopConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These fixtures do not have the model-list plugin installed.
+        plugin = mock.patch("young_router.core.model_list_plugin.target_initialized", return_value=False)
+        plugin.start()
+        self.addCleanup(plugin.stop)
+
     def test_developer_mode_uses_claude_desktop_developer_settings_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "Claude" / "developer_settings.json"
@@ -271,7 +277,7 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
     def test_desktop_and_code_adopt_the_local_api_independently(self) -> None:
         # One domain, two apps: pointing Claude Code at this app's proxy leaves
         # Claude Desktop's profile untouched, and each app reports its own
-        # switch and its own remembered route.
+        # switch.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -304,13 +310,6 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             self.assertEqual("public-a", code["model"])
             self.assertTrue(snapshot["clients"]["claudeCode"]["uses_local_api"])
             self.assertFalse(snapshot["clients"]["claudeDesktop"]["uses_local_api"])
-            # A remembered route is what the off direction returns to, and it is
-            # this app's own bookkeeping, never a field of the client's document.
-            self.assertEqual(
-                {"model": "public-a", "provider": "prov-a", "deployment_id": "dep-a"},
-                snapshot["clients"]["claudeCode"]["designated_route"],
-            )
-            self.assertTrue((root / "client-routes.json").is_file())
 
     def test_desktop_adopts_the_local_api_as_its_third_party_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1084,52 +1083,7 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             # gateway's own models.
             self.assertEqual([], cleared["desktop"]["model_names"])
 
-    def test_use_saved_model_restores_the_routes_own_endpoint_and_key(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            runtime_config = root / "config.yaml"
-            runtime_config.write_text(
-                """
-model_list:
-  - model_name: public-a
-    litellm_params:
-      model: anthropic/claude-upstream
-      api_base: https://relay.example.test/v1
-      api_key: sk-route
-    model_info:
-      id: dep-a
-      provider: prov-a
-      upstream_url_surface: anthropic
-providers:
-  prov-a:
-    api_base: https://relay.example.test/v1
-general_settings:
-  master_key: sk-router
-""",
-                encoding="utf-8",
-            )
-            desktop_root = root / "configLibrary"
-            _write_desktop_config(desktop_root, {})
-            domain = ClaudeSettingsDomain(
-                root / "settings.json",
-                desktop_config_library_path=desktop_root,
-                runtime_config_path=runtime_config,
-                runtime_root=root,
-            )
-
-            snapshot = domain.dispatch(
-                "use_saved_model",
-                {"client": "claudeCode", "model": "public-a", "provider": "prov-a", "deployment_id": "dep-a"},
-            )
-
-            env = json.loads(domain.raw_text(include_sensitive=True))["env"]
-            self.assertEqual("https://relay.example.test", env["ANTHROPIC_BASE_URL"])
-            self.assertEqual("sk-route", env["ANTHROPIC_AUTH_TOKEN"])
-            self.assertEqual("public-a", env["ANTHROPIC_MODEL"])
-            self.assertFalse(snapshot["clients"]["claudeCode"]["uses_local_api"])
-            self.assertEqual("prov-a", snapshot["clients"]["claudeCode"]["designated_route"]["provider"])
-
-    def test_use_saved_model_clears_the_picker_list_that_named_this_proxy(self) -> None:
+    def test_direct_api_clears_the_picker_list_that_named_this_proxy(self) -> None:
         """A client leaving the proxy drops the picker list this app generated.
 
         Claude Code's lineup holds this router's public model names, which only
@@ -1183,26 +1137,18 @@ general_settings:
             self.assertIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
             self.assertTrue(domain.snapshot()["clients"]["claudeDesktop"]["model_list_enabled"])
 
-            left = domain.dispatch(
-                "use_saved_model",
-                {"client": "claudeCode", "model": "public-a", "provider": "prov-a", "deployment_id": "dep-a"},
-            )
+            left = domain.dispatch("use_direct_api", {
+                "base_url": "https://relay.example.test/v1",
+                "api_key": "fixture-direct",
+                "auth_mode": "bearer",
+                "model": "claude-direct",
+            })
             self.assertNotIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
             self.assertFalse(left["clients"]["claudeCode"]["model_list_enabled"])
-            # Desktop is still on this app's list: leaving for one client never
-            # touches the other's picker.
-            self.assertTrue(left["clients"]["claudeDesktop"]["model_list_enabled"])
-
-            desktop = domain.dispatch(
-                "use_saved_model",
-                {"client": "claudeDesktop", "model": "public-a", "provider": "prov-a", "deployment_id": "dep-a"},
-            )
-            self.assertFalse(desktop["clients"]["claudeDesktop"]["model_list_enabled"])
-            # Desktop keeps only a name it can map onto an Anthropic model, so
-            # this route's own public name leaves an empty list -- and that is
-            # what the record must say, or a refresh would read "a subset of
-            # what we generated" and put the whole proxy list back.
-            self.assertEqual([], desktop["desktop"]["model_names"])
+            self.assertFalse(left["clients"]["claudeDesktop"]["model_list_enabled"])
+            self.assertEqual([], left["desktop"]["model_names"])
+            self.assertEqual("https://relay.example.test", left["desktop"]["gateway_url"])
+            domain.apply()
             with mock.patch.object(domain, "_public_models", return_value=["public-a", "public-b"]):
                 self.assertFalse(domain.refresh_model_lists())
             self.assertEqual([], domain.snapshot()["desktop"]["model_names"])
@@ -1579,44 +1525,6 @@ general_settings:
             self.assertEqual([], domain.snapshot()["desktop"]["model_names"])
             stored = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertNotIn("inferenceModels", stored)
-
-    def test_use_saved_model_never_writes_a_name_desktop_would_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            runtime_config = root / "config.yaml"
-            runtime_config.write_text(
-                """
-model_list:
-  - model_name: grok-4.7
-    litellm_params:
-      model: openai/grok-4.7
-      api_base: https://relay.example.test/v1
-      api_key: sk-route
-    model_info:
-      id: dep-a
-      provider: prov-a
-""",
-                encoding="utf-8",
-            )
-            desktop_root = root / "configLibrary"
-            _write_desktop_config(desktop_root, {})
-            domain = ClaudeSettingsDomain(
-                root / "settings.json",
-                desktop_config_library_path=desktop_root,
-                runtime_config_path=runtime_config,
-                runtime_root=root,
-            )
-
-            snapshot = domain.dispatch(
-                "use_saved_model",
-                {"client": "claudeDesktop", "model": "grok-4.7", "provider": "prov-a", "deployment_id": "dep-a"},
-            )
-
-            # The route is still what the client talks to; only the picker name
-            # is withheld, because Desktop would delete it on the next launch.
-            self.assertEqual([], snapshot["desktop"]["model_names"])
-            config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
-            self.assertEqual("https://relay.example.test", config["inferenceGatewayBaseUrl"])
 
 
 if __name__ == "__main__":

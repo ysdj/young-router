@@ -1688,6 +1688,8 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // user with a staged edit and nothing to do about it.
     revision_conflict: "common.notAppliedRetry",
     validation_failed: "error.validationFailed",
+    invalid_direct_api_url: "settings.directApiInvalidURL",
+    invalid_model_catalog_url: "settings.directApiInvalidCatalog",
     // Both of these are raised by this app, not by Core: a write that named
     // no settings document, and a probe whose recommended surface arrived
     // after the model it belonged to was removed. Each states the way out in
@@ -2237,7 +2239,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeWebDavSettings: translate("webdav.detailsTitle"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("status.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeWebDavSettings: translate("webdav.detailsTitle"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeDirectApiSettings: translate("settings.directApiTitle"), routeLogs: translate("status.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
       // The page's own sign-in surface.  The native hosts never show it: their
@@ -3141,6 +3143,7 @@ function CompactDetailBar({ title, onBack, translate }: { title: string; onBack:
 
 function RouteSurface({ route, shell = false, initialClient, windowRoute, snapshot, ipc, native, translate, logTabRequest, fileIdRequest, nativeAction, eventChannel, onSnapshot, onNavigate, onClose, onRegisterFlush }: { route: AppRoute; shell?: boolean; initialClient?: ClientFile["client"]; windowRoute?: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; fileIdRequest?: string; nativeAction?: { id: string; sequence: number }; eventChannel: React.MutableRefObject<EventChannelState>; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void; onRegisterFlush?: (flush?: () => Promise<boolean>) => void }): React.JSX.Element {
   const settingsRoute = isAssistantSettingsRoute(route);
+  const directApiClient = route === "codex-api-settings" ? "codex" : route === "claude-api-settings" ? "claude" : undefined;
   // The Codex and Claude settings routes are aliases for one shared surface.
   // Both domains stay visible and staged together, so there is no active tab
   // that can hide the other assistant's draft.
@@ -4388,6 +4391,10 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       native.window.close("provider-wizard");
       return;
     }
+    if (directApiClient) {
+      native.window.close(route);
+      return;
+    }
     if (route === "webdav-settings") {
       // 关闭 discards the panel's draft: the only part of it Core holds is the
       // secret the native field staged, and it goes with the window instead of
@@ -4409,7 +4416,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   const requestClose = async (): Promise<void> => {
     // The provider wizard is a native child window. Its Cancel button and
     // title-bar close both dismiss that child directly.
-    if (route === "provider-wizard") {
+    if (route === "provider-wizard" || directApiClient) {
       closeRoute();
       return;
     }
@@ -4598,12 +4605,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     apiKeyActions: relayApiKeyActions,
     applyStagedQuietly,
   }), [applyStagedQuietly, commitRelayMetadata, detectRelayType, refresh, refreshRelayResources, relayApiKeyActions]);
-  // The assistant file editor is its own window on macOS and a route on
-  // Windows: RouteSurface owns its state, and the host presents the window
-  // instead of a pane-clipped overlay in the detail column it opened from.
-  // Codex is the one client whose file names its own gateway, so the pane
-  // item can tell whether it already points at this app's proxy — and, when
-  // it points somewhere else, which provider and model that target is.
   const codexState = asRecord(domainState(snapshot, "codex"));
   const codexUsesLocalApi = booleanValue(codexState.uses_local_api);
   // Codex's Responses Lite lane never carries the hosted web_search tool, so the
@@ -4611,25 +4612,12 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // real search executor. The pane shows the row's own state, not a Codex default.
   const codexStandaloneSearch = booleanValue(codexState.standalone_search);
   const codexStructured = asRecord(codexState.structured);
-  const codexClientProvider = stringValue(codexStructured.model_provider).trim();
-  const codexClientModel = stringValue(codexStructured.model).trim();
-  // The router's own model list backs the pane's restore action: the client
-  // chooses among the models this app serves instead of a hand-typed slug.
-  const codexModelRows = asRecords(domainState(snapshot, "codex").models);
   // The pane's Codex switch mirrors the managed catalog the macOS status menu
   // toggles: checked installs this app's public model list as Codex's own
   // catalog, unchecked removes the pointer so Codex keeps its built-in list.
   const codexModelCatalogEnabled = booleanValue(codexModelCatalogState(snapshot).enabled);
-  // The saved route Codex was put on — the one "use this app's API" returns to.
-  // Core remembers it because a client on the proxy names a public model that
-  // several saved routes may share.
-  const codexDesignatedRoute = codexState.designated_route as UnknownRecord | undefined;
-  // Claude is one rail entry and two apps: each carries its own switch, its own
-  // designated route, and its own generated model list.  Core owns both, so the
-  // pane only reads what it published.
   const claudeState = asRecord(domainState(snapshot, "claude"));
   const claudeClients = asRecord(claudeState.clients);
-  const claudeModelRows = asRecords(claudeState.models);
   // One strip per window. Backup & sync reports per tab, so the strip shows the
   // active tab's own result; every other route reports its own work here.
   // A wait is never Ready.  A counted run clears its result before it starts,
@@ -4653,6 +4641,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     setStatusBarControls(null);
   }, [route]);
 
+  if (directApiClient) return <View style={[styles.windowSurface, styles.childRouteContent]}>
+    <DirectApiSettings key={directApiClient} client={directApiClient} ipc={ipc} translate={translate} onClose={closeRoute} />
+  </View>;
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
@@ -4660,7 +4651,21 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
-    {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onApplyClientSettings={applyStagedQuietly} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeDesktopAvailable={asRecord(claudeState.desktop).available !== false} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")} onToggleClaudeAutoMode={(enabled) => dispatch("claude.auto_mode.set", { enabled }, "claude")} onToggleClaudeAutoMemory={(enabled) => dispatch("claude.auto_memory.set", { enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace
+      initialClient={initialClient} busy={busy} native={native} codexModelCatalogEnabled={codexModelCatalogEnabled}
+      standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")}
+      codexFeatures={asRecord(codexStructured.features)} localApiActive={codexUsesLocalApi}
+      onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")}
+      onApplyClientSettings={applyStagedQuietly} onUseLocalApi={() => dispatch("use_local_api", {}, "codex")}
+      claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }}
+      claudeDesktopAvailable={asRecord(claudeState.desktop).available !== false}
+      onClaudeUseLocalApi={(app) => dispatch("use_local_api", { client: app }, "claude")}
+      onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")}
+      onToggleClaudeAutoMode={(enabled) => dispatch("claude.auto_mode.set", { enabled }, "claude")}
+      onToggleClaudeAutoMemory={(enabled) => dispatch("claude.auto_memory.set", { enabled }, "claude")}
+      claudeRevision={numberValue(claudeState.revision)}
+      translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult}
+    /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} onStatus={setResult} /> : null}
@@ -11650,86 +11655,21 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   </View>;
 }
 
-/**
- * The native action menu rejects a list above this shared host limit, so a
- * long model list is offered up to the count both apps can actually pop up.
- */
-const NATIVE_ACTION_MENU_ITEM_LIMIT = 32;
-
-/** Both hosts also reject a group above this many items, so each group is capped too. */
-const NATIVE_ACTION_MENU_GROUP_ITEM_LIMIT = 64;
-
-/** One saved provider route, as the pane's controls name and send it. */
-/**
- * One saved route, as the designate control and the off direction read it.
- *
- * The public model name is a route's identity on this app's proxy, and several
- * saved routes may share one, so the deployment id travels with it: a label
- * alone cannot tell two routes of one model apart.
- */
-type ClientRoute = { model: string; provider: string; deployment_id: string; label: string };
-
-function clientRouteLabel(provider: string, model: string): string {
-  return [provider.trim(), model.trim()].filter((part) => part.length > 0).join(" / ");
-}
-
-/**
- * The saved-route menu one designate control opens.
- *
- * Every client asks the same question of the same list, so the menu is built
- * once: a provider is the menu's own level so a long model list stays
- * navigable, and each provider keeps its models in stored order.  One route is
- * one row — a provider can serve one public name from two routes (two keys, a
- * fallback ordering), and collapsing them by name offered only the first — so
- * where a name is shared the row says which key it answers with.
- */
-function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate): Array<{ title: string; labels: string[]; selections: UnknownRecord[] }> {
-  const rows = models.flatMap((row) => {
-    const model = stringValue(row.model).trim();
-    const provider = stringValue(row.provider).trim();
-    const deploymentId = stringValue(row.deployment_id).trim();
-    if (!model || !provider || !deploymentId) return [];
-    return [{ model, provider, deploymentId, keyName: stringValue(row.api_key_name).trim() }];
-  });
-  const shared = new Map<string, number>();
-  for (const row of rows) {
-    const identity = `${row.provider}\u001f${row.model}`;
-    shared.set(identity, (shared.get(identity) ?? 0) + 1);
-  }
-  const providers = new Map<string, { labels: string[]; selections: UnknownRecord[] }>();
-  const seen = new Set<string>();
-  for (const row of rows) {
-    const identity = `${row.provider}\u001f${row.deploymentId}`;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    const duplicated = (shared.get(`${row.provider}\u001f${row.model}`) ?? 0) > 1;
-    const entry = providers.get(row.provider) ?? { labels: [], selections: [] };
-    entry.labels.push(duplicated ? `${row.model} · ${row.keyName || translate("providers.undefinedKey")}` : row.model);
-    entry.selections.push({ model: row.model, provider: row.provider, deployment_id: row.deploymentId });
-    providers.set(row.provider, entry);
-  }
-  return [...providers].map(([provider, entry]) => ({ title: provider, labels: entry.labels, selections: entry.selections }));
-}
-
-type ModelListPluginHost = "codex" | "claude";
-type ModelListPluginOperation = "install" | "uninstall" | "enable" | "disable" | "configure" | "sync";
-type ModelListPluginSource = { base_url: string; metadata_url: string; auth_env: string };
+type ModelListPluginOperation = "install" | "uninstall" | "enable" | "disable" | "sync";
 type ModelListPluginInfo = { state?: UnknownRecord; error?: string };
 
-const MODEL_LIST_SOURCE_FIELDS = [
-  ["base_url", "settings.pluginBaseUrl"],
-  ["metadata_url", "settings.pluginMetadataUrl"],
-  ["auth_env", "settings.pluginAuthEnv"],
-] as const;
+async function requestClaudePlugin(ipc: IpcClient, operation: ModelListPluginOperation | "status"): Promise<UnknownRecord> {
+  const result = await ipc.dispatch({ type: "model_list_plugin", payload: { host: "claude", operation } });
+  return asRecord(result.action_summary);
+}
 
 function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
   info?: ModelListPluginInfo;
   busy: boolean;
   pending?: ModelListPluginOperation;
   translate: Translate;
-  onAction: (operation: ModelListPluginOperation, source?: ModelListPluginSource) => Promise<boolean>;
+  onAction: (operation: ModelListPluginOperation) => Promise<boolean>;
 }): React.JSX.Element {
-  const [source, setSource] = useState<ModelListPluginSource>();
   const state = info?.state;
   const installed = state?.installed === true;
   const enabled = state?.enabled === true;
@@ -11740,17 +11680,6 @@ function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
   const facts = [status, stringValue(state?.version), enabled && syncTime ? translate("settings.pluginLastSync", { time: syncTime }) : ""].filter(Boolean).join(" · ");
   const error = info?.error || (enabled ? stringValue(state?.last_error) : "") || stringValue(state?.last_update_error);
   const installAction = installed ? "uninstall" : "install";
-  const openSource = (): void => {
-    const provider = asRecord(state?.configured_provider);
-    setSource({ base_url: stringValue(provider.baseUrl), metadata_url: stringValue(provider.metadataUrl), auth_env: stringValue(provider.authEnv) });
-  };
-  const saveSource = async (): Promise<void> => {
-    if (!source || busy) return;
-    const saved = await onAction("configure", {
-      base_url: source.base_url.trim(), metadata_url: source.metadata_url.trim(), auth_env: source.auth_env.trim(),
-    });
-    if (saved) setSource(undefined);
-  };
   return <View style={styles.pluginSection}>
     <SettingsActionRow
       title={<Text style={SETTINGS_SECTION_TITLE}>{translate("settings.pluginLabel")}</Text>}
@@ -11759,10 +11688,10 @@ function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
         title={installed ? translate("settings.pluginUninstall") : translate("settings.pluginInstall")}
         disabled={busy || state === undefined || state.available === false}
         busy={pending === installAction}
-        onPress={() => { void onAction(installAction).then((ok) => { if (ok) setSource(undefined); }); }}
+        onPress={() => { void onAction(installAction); }}
       />}
     />
-    {installed && (source === undefined ?
+    {installed && <>
       <View style={styles.pluginControls}>
         <View style={SETTINGS_FIELD_ROW}>
           <Text style={SETTINGS_FIELD_LABEL}>{translate("settings.pluginEnabled")}</Text>
@@ -11774,152 +11703,192 @@ function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
             style={SETTINGS_FIELD_SWITCH_SLOT}
           />
         </View>
-        <View style={styles.pluginActions}>
-          <NativeButton title={translate("settings.pluginSync")} disabled={busy || !enabled} busy={pending === "sync"} onPress={() => { void onAction("sync"); }} />
-          <NativeButton title={translate("settings.pluginConfigure")} disabled={busy} onPress={openSource} />
-        </View>
-      </View> :
-      <View style={styles.pluginForm}>
-        <Text style={[SETTINGS_SECTION_TITLE, styles.pluginNote]}>{translate("settings.pluginConfigure")}</Text>
-        <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginSourceHint")}</Text>
-        {MODEL_LIST_SOURCE_FIELDS.map(([field, label]) => <View key={field} style={SETTINGS_FIELD_ROW_INDENTED}>
-          <Text style={SETTINGS_FIELD_LABEL}>{translate(label)}</Text>
-          <View style={SETTINGS_FIELD_CELL_WIDE}>
-            <NativeTextField
-              accessibilityLabel={translate(label)}
-              value={source[field]}
-              editable={!busy}
-              autoCapitalize="none"
-              autoCorrect={false}
-              onChangeText={(text) => setSource((current) => current && { ...current, [field]: text })}
-              style={styles.input}
-            />
-          </View>
-        </View>)}
-        <View style={[styles.pluginActions, styles.pluginFormActions]}>
-          <NativeButton title={translate("status.cancel")} disabled={busy} onPress={() => setSource(undefined)} />
-          <NativeButton title={translate("common.save")} primary disabled={busy} busy={pending === "configure"} onPress={saveSource} />
-        </View>
+        <NativeButton title={translate("settings.pluginSync")} disabled={busy || !enabled} busy={pending === "sync"} onPress={() => { void onAction("sync"); }} />
       </View>
-    )}
+      <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginSourceHint")}</Text>
+    </>}
     {error ? <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote, styles.pluginError]} accessibilityLiveRegion="polite">{error}</Text> : null}
   </View>;
 }
 
-function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }: {
-  /** Disambiguates two clients' identical labels inside one pane. */
-  accessibilityPrefix?: string;
-  /** The saved routes this app serves, as the designate menu lists them. */
-  models: UnknownRecord[];
+type DirectApiClient = "codex" | "claude";
+
+function ClientBackendFields({ client, native, localApiActive, busy, onUseLocalApi, translate }: {
+  client: DirectApiClient;
   native: NativeLeafAdapter;
   localApiActive: boolean;
-  /** The route the client is on, empty while it points at this app's proxy. */
-  designatedRoute: string;
-  /** What the off direction returns to; absent when nothing is remembered. */
-  designatedSelection?: UnknownRecord;
   busy: boolean;
-  /** States a result the row could not perform where the window's strip reads it. */
-  onStatus?: (message?: string) => void;
-  onUseLocalApi: (selection: UnknownRecord) => Promise<unknown>;
-  onUseSavedModel: (selection: UnknownRecord) => Promise<unknown>;
+  onUseLocalApi: () => Promise<unknown>;
   translate: Translate;
 }): React.JSX.Element {
-  const menuGroups = useMemo(() => savedRouteMenuGroups(models, translate), [models, translate]);
-  const savedModelCount = menuGroups.reduce((total, group) => total + group.labels.length, 0);
   const [clientActionBusy, setClientActionBusy] = useState(false);
-  const [designateBusy, setDesignateBusy] = useState(false);
-  // A controlled native switch only repaints on a *changed* value prop, so an
-  // action that cannot name a saved route re-mounts it onto the configured
-  // value instead of drifting from the file.
   const [switchGeneration, setSwitchGeneration] = useState(0);
-  const designateButtonRef = useRef<HostInstance | null>(null);
-  const labelled = (key: string): string => (accessibilityPrefix ? `${accessibilityPrefix}: ${translate(key)}` : translate(key));
-  const assembleSwitch = (): void => setSwitchGeneration((current) => current + 1);
-  const designateSavedModel = (selection: UnknownRecord | undefined): void => {
-    if (!selection || designateBusy || clientActionBusy) return;
-    setDesignateBusy(true);
-    void onUseSavedModel(selection).finally(() => setDesignateBusy(false));
+  const label = translate("settings.useLocalApi");
+  const openDirectApi = (): void => {
+    const route = client === "codex" ? "codex-api-settings" : "claude-api-settings";
+    native.window.open(route);
+    native.window.focus(route);
   };
-  // One menu backs both controls: a provider is the menu's own level, so a
-  // long model list stays navigable.  The host answers the chosen
-  // ``{group, item}`` pair, or nothing when the menu was dismissed, which
-  // leaves the client as it was.
-  const openSavedModelMenu = (anchor: HostInstance | null): void => {
-    const showGroupedActionMenu = native.showGroupedActionMenu;
-    if (!anchor || !showGroupedActionMenu || savedModelCount === 0) return;
-    const groups = menuGroups
-      .slice(0, NATIVE_ACTION_MENU_ITEM_LIMIT)
-      .map((group) => ({ title: group.title, items: group.labels.slice(0, NATIVE_ACTION_MENU_GROUP_ITEM_LIMIT) }));
-    anchor.measureInWindow((x, y, width, height) => {
-      void showGroupedActionMenu({ title: translate("settings.designateAs"), groups, anchor: { x, y, width, height } })
-        .then((choice) => { if (choice) designateSavedModel(menuGroups[choice.group]?.selections[choice.item]); });
-    });
-  };
-  // A real two-way switch: on adopts this app's proxy through the row this app
-  // owns, off puts the client back on the saved route the control names — the
-  // remembered route, so unchecking opens no menu.
-  const toggleLocalApi = (enabled: boolean): void | Promise<unknown> => {
-    if (clientActionBusy || designateBusy) { assembleSwitch(); return; }
-    if (enabled) {
-      setClientActionBusy(true);
-      // The proxy serves public model names, so adopting it also states the
-      // route the client is leaving; that is what "off" returns to later.
-      return onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));
+  const toggleLocalApi = async (enabled: boolean): Promise<void> => {
+    if (clientActionBusy) return;
+    if (!enabled) {
+      // The switch reflects the file until the child saves a replacement.
+      setSwitchGeneration((current) => current + 1);
+      openDirectApi();
+      return;
     }
-    if (designatedSelection) { designateSavedModel(designatedSelection); return; }
-    // Off with no destination remembered — a client this app adopted before it
-    // had a route to remember, or one whose memory was cleared — is not a
-    // switch this pane can flip by itself: the client's document has to point
-    // somewhere.  The route that answers it is what "使用特定API" picks, so the
-    // unchecked box asks for that route at that control instead of silently
-    // bouncing back onto the proxy.  A dismissed menu leaves the client as it
-    // was, and a router with no saved route says so rather than offering none.
-    assembleSwitch();
-    if (savedModelCount === 0) { onStatus?.(translate("settings.designateAsUnavailable")); return; }
-    onStatus?.(translate("settings.useLocalApiOffPrompt"));
-    openSavedModelMenu(designateButtonRef.current);
+    setClientActionBusy(true);
+    try {
+      if (await onUseLocalApi() === false) setSwitchGeneration((current) => current + 1);
+    } finally {
+      setClientActionBusy(false);
+    }
   };
-  return <View style={SETTINGS_FIELD_LIST}>
-    <View style={SETTINGS_FIELD}>
+  return <View style={SETTINGS_FIELD}>
       <View style={SETTINGS_FIELD_ROW_INDENTED}>
-        <TooltipText numberOfLines={1} tooltip={translate("settings.useLocalApi")} style={SETTINGS_FIELD_LABEL} accessibilityLabel={labelled("settings.useLocalApi")}>{translate("settings.useLocalApi")}</TooltipText>
+        <TooltipText numberOfLines={2} tooltip={label} style={SETTINGS_FIELD_LABEL}>{label}</TooltipText>
         <View style={SETTINGS_FIELD_VALUE_SLOT}>
           <NativeToggle
             key={`use-local-api-${switchGeneration}`}
-            accessibilityLabel={labelled("settings.useLocalApi")}
+            accessibilityLabel={label}
             value={localApiActive}
-            disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}
+            disabled={busy || clientActionBusy}
             onValueChange={toggleLocalApi}
             style={SETTINGS_FIELD_SWITCH_SLOT}
           />
         </View>
       </View>
-      <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("settings.useLocalApiHint")}</Text></View>
-    </View>
-    <View style={SETTINGS_FIELD}>
-      <View style={SETTINGS_FIELD_ROW_INDENTED}>
-        <TooltipText numberOfLines={1} tooltip={translate("settings.designateAs")} style={SETTINGS_FIELD_LABEL} accessibilityLabel={labelled("settings.designateAs")}>{translate("settings.designateAs")}</TooltipText>
-        <View style={SETTINGS_FIELD_VALUE_SLOT}>
-          <NativeButton
-            ref={designateButtonRef}
-            title={designatedRoute}
+      <View style={SETTINGS_FIELD_HELP_SLOT}>{localApiActive
+        ? <Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("settings.useLocalApiHint")}</Text>
+        : <NativeButton title={translate("settings.directApiEdit")} link compact disabled={busy || clientActionBusy} onPress={openDirectApi} />}
+      </View>
+  </View>;
+}
 
-            accessibilityLabel={designatedRoute ? `${translate("settings.designateAs")}: ${designatedRoute}` : labelled("settings.designateAs")}
-            titleWidth="flex"
-            symbol="chevron-up-down"
-            symbolWithTitle
-            symbolTrailing
-            disabled={(busy && !designateBusy) || designateBusy || clientActionBusy || savedModelCount === 0}
-            busy={designateBusy}
-            onPress={() => {
-              if (designateBusy || clientActionBusy) return;
-              openSavedModelMenu(designateButtonRef.current);
-            }}
-          />
-        </View>
+type DirectApiSettingsProps = {
+  client: DirectApiClient;
+  ipc: IpcClient;
+  translate: Translate;
+  onClose: () => void;
+};
+
+function DirectApiSettings(props: DirectApiSettingsProps): React.JSX.Element {
+  const { client, ipc, translate, onClose } = props;
+  const [connection, setConnection] = useState<UnknownRecord>();
+  const [error, setError] = useState<string>();
+  useEffect(() => {
+    let active = true;
+    // A child window may mount from the shell's cached snapshot immediately
+    // after a save. Read the committed connection before initializing fields.
+    void ipc.snapshot().then((current) => {
+      if (active) setConnection(asRecord(domainState(current, client).direct_api));
+    }, (reason: unknown) => {
+      if (active) setError(errorMessage(reason, translate));
+    });
+    return () => { active = false; };
+  }, [client, ipc, translate]);
+  if (connection) return <DirectApiForm {...props} connection={connection} />;
+  return <>
+    <View style={assistantFileSurfaceStyles.editorLoading}>
+      <Text style={assistantFileSurfaceStyles.filesStatus}>{error ?? translate("common.loading")}</Text>
+    </View>
+    <View style={assistantFileSurfaceStyles.editorFooter}>
+      <View style={assistantFileSurfaceStyles.editorFooterActions}>
+        <NativeButton title={translate("status.cancel")} onPress={onClose} />
       </View>
     </View>
-  </View>;
+  </>;
+}
+
+function DirectApiForm({ client, connection, ipc, translate, onClose }: DirectApiSettingsProps & { connection: UnknownRecord }): React.JSX.Element {
+  const [url, setURL] = useState(() => stringValue(connection.base_url));
+  const [model, setModel] = useState(() => stringValue(connection.model));
+  const [catalog, setCatalog] = useState(() => stringValue(connection.model_catalog_url));
+  const [apiKeyAuth, setApiKeyAuth] = useState(() => connection.auth_mode === "x-api-key");
+  const [clearKey, setClearKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const [commitRequest, setCommitRequest] = useState(0);
+  const [keyToken] = useState(() => `direct-api-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const pendingSecret = useRef(0);
+  const stagedKey = useRef(false);
+  const optional = translate("settings.directApiOptional");
+  const auth = apiKeyAuth ? "x-api-key" : "bearer";
+  const keepKeyAvailable = connection.key_configured === true && url.trim() === connection.base_url
+    && (client === "codex" || auth === connection.auth_mode);
+
+  const save = async (withKey: boolean): Promise<void> => {
+    try {
+      const snapshot = await ipc.snapshot();
+      await ipc.dispatch({ domain: client, type: "use_direct_api", payload: {
+        base_url: url.trim(), model: model.trim(), key_token: withKey ? keyToken : "", clear_key: clearKey,
+        ...(client === "codex" ? { model_catalog_url: catalog.trim() } : { auth_mode: auth }),
+      } }, snapshot.revision);
+      onClose();
+    } catch (reason) {
+      setError(errorMessage(reason, translate));
+      setSaving(false);
+    }
+  };
+  const submit = (): void => {
+    if (saving || !url.trim()) return;
+    setError(undefined);
+    setSaving(true);
+    if (clearKey || stagedKey.current) {
+      void save(!clearKey);
+      return;
+    }
+    pendingSecret.current = commitRequest + 1;
+    setCommitRequest(pendingSecret.current);
+  };
+  const secretChanged = ({ status, present, commitRequest: request }: SecretState): void => {
+    if (status === "dirty") {
+      stagedKey.current = false;
+      setClearKey(false);
+    }
+    if (!pendingSecret.current || request !== pendingSecret.current || !["ready", "saved", "error"].includes(status)) return;
+    pendingSecret.current = 0;
+    if (status === "error") {
+      setError(translate("settings.directApiKeyAgain"));
+      setSaving(false);
+    } else {
+      stagedKey.current = status === "saved" && present;
+      void save(stagedKey.current);
+    }
+  };
+  const input = (label: string, value: string, change: (next: string) => void, required = false): React.ReactNode => <NativeFormRow label={label} required={required}>
+    <NativeTextField accessibilityLabel={label} value={value} placeholder={required ? "https://" : optional} editable={!saving} autoCapitalize="none" autoCorrect={false} onChangeText={change} style={styles.input} />
+  </NativeFormRow>;
+  const keyLabel = translate("general.apiKey");
+  const authLabel = translate("settings.directApiAuth");
+  const authChoices = [translate("settings.directApiBearer"), "x-api-key"];
+  return <>
+    <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_BODY}>
+      {input(translate("providers.baseUrl"), url, setURL, true)}
+      {client === "claude" ? <NativeFormRow label={authLabel}>
+        <NativePicker accessibilityLabel={authLabel} labels={authChoices} selectedValue={authChoices[apiKeyAuth ? 1 : 0]} disabled={saving} onChange={({ nativeEvent }) => setApiKeyAuth(nativeEvent.index === 1)} />
+      </NativeFormRow> : null}
+      <NativeFormRow label={keyLabel}>
+        <NativeSecureTextInput
+          domain={client} field="direct_api_key" target={keyToken} label={keyLabel}
+          placeholder={keepKeyAvailable && !clearKey ? translate("settings.directApiKeepKey") : optional}
+          disabled={saving} commitRequest={commitRequest} onSecretState={secretChanged} style={styles.nativeSecretInput}
+        />
+      </NativeFormRow>
+      {keepKeyAvailable ? <View style={SETTINGS_FIELD_HELP_SLOT}>
+        <NativeButton title={translate(clearKey ? "settings.directApiRestoreKey" : "settings.directApiClearKey")} link compact disabled={saving} onPress={() => setClearKey((current) => !current)} />
+      </View> : null}
+      {input(translate("settings.directApiModel"), model, setModel)}
+      {client === "codex" ? input(translate("settings.directApiCatalog"), catalog, setCatalog) : null}
+    </PersistentScrollView>
+    <View style={assistantFileSurfaceStyles.editorFooter}>
+      <Text style={assistantFileSurfaceStyles.editorError} accessibilityLiveRegion="polite">{error ?? ""}</Text>
+      <View style={assistantFileSurfaceStyles.editorFooterActions}>
+        <NativeButton title={translate("status.cancel")} disabled={saving} onPress={onClose} />
+        <NativeButton title={translate("common.save")} primary disabled={saving || !url.trim()} busy={saving} onPress={submit} />
+      </View>
+    </View>
+  </>;
 }
 
 /**
@@ -12030,36 +11999,29 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
   return <>{files.map(row)}</>;
 }
 
-function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexFeature, onApplyClientSettings, onUseLocalApi, onUseSavedModel, claudeClients, claudeDesktopAvailable, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeNonstreamFallback, onToggleClaudeAutoMode, onToggleClaudeAutoMemory, translate, ipc, filesToken, onOpenFile, onStatus }: {
+function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCatalogEnabled, standaloneSearch, onToggleStandaloneSearch, codexFeatures, localApiActive, onToggleCodexFeature, onApplyClientSettings, onUseLocalApi, claudeClients, claudeDesktopAvailable, onClaudeUseLocalApi, onToggleClaudeNonstreamFallback, onToggleClaudeAutoMode, onToggleClaudeAutoMemory, translate, ipc, claudeRevision, filesToken, onOpenFile, onStatus }: {
   /** The client the route named, when it named one (`claude-settings`). */
   initialClient?: ClientFile["client"];
   busy: boolean;
   native: NativeLeafAdapter;
-  codexModels: UnknownRecord[];
   codexModelCatalogEnabled: boolean;
-  /** The saved route Codex is on, or the one it last left for this app. */
-  codexRoute?: ClientRoute;
   standaloneSearch: boolean;
   onToggleStandaloneSearch: (enabled: boolean) => Promise<unknown>;
   codexFeatures?: UnknownRecord;
-  clientProvider: string;
-  clientModel: string;
   localApiActive: boolean;
   onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<unknown>;
   onApplyClientSettings: () => Promise<void>;
-  onUseLocalApi: (selection: UnknownRecord) => Promise<unknown>;
-  onUseSavedModel: (selection: UnknownRecord) => Promise<unknown>;
-  /** One entry per Claude app: its own switch, route, and model list. */
+  onUseLocalApi: () => Promise<unknown>;
+  /** One entry per Claude app. */
   claudeClients: Record<ClaudeClientApp, UnknownRecord>;
   claudeDesktopAvailable: boolean;
-  claudeModels: UnknownRecord[];
-  onClaudeUseLocalApi: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>;
-  onClaudeUseSavedModel: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>;
+  onClaudeUseLocalApi: (app: ClaudeClientApp) => Promise<unknown>;
   onToggleClaudeNonstreamFallback: (enabled: boolean) => Promise<unknown>;
   onToggleClaudeAutoMode: (enabled: boolean) => Promise<unknown>;
   onToggleClaudeAutoMemory: (enabled: boolean) => Promise<unknown>;
   translate: Translate;
   ipc: IpcClient;
+  claudeRevision: number;
   filesToken: number;
   onOpenFile: (file: ClientFile) => void;
   /** Where the window states a row's own result, so a control that cannot
@@ -12068,8 +12030,8 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
 }): React.JSX.Element {
   const [files, setFiles] = useState<ClientFile[]>();
   const [error, setError] = useState<string>();
-  const [pluginInfo, setPluginInfo] = useState<Partial<Record<ModelListPluginHost, ModelListPluginInfo>>>({});
-  const [pluginPending, setPluginPending] = useState<{ host: ModelListPluginHost; operation: ModelListPluginOperation }>();
+  const [pluginInfo, setPluginInfo] = useState<ModelListPluginInfo>();
+  const [pluginPending, setPluginPending] = useState<ModelListPluginOperation>();
   // A phone draws the client rail as a strip above the detail it opens; the
   // selection it names is this component's state either way.
   const compactWeb = useCompactWebShell();
@@ -12077,65 +12039,43 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   // The starting entry is the route's own when it named one, so a deep link to
   // the Claude settings shows Claude rather than Codex.
   const [selectedClient, setSelectedClient] = useState<ClientFile["client"]>(initialClient ?? "codex");
-  const pluginHost = selectedClient === "codex" || selectedClient === "claude" ? selectedClient : undefined;
-  const pluginRequest = useCallback(async (host: ModelListPluginHost, operation: ModelListPluginOperation | "status", source?: ModelListPluginSource): Promise<UnknownRecord> => {
-    const result = await ipc.dispatch({ type: "model_list_plugin", payload: { host, operation, ...source } });
-    return asRecord(result.action_summary);
-  }, [ipc]);
-  const setPluginResult = useCallback((host: ModelListPluginHost, info: ModelListPluginInfo) => {
-    setPluginInfo((current) => ({ ...current, [host]: info }));
-  }, []);
   useEffect(() => {
-    if (!pluginHost) return;
+    if (selectedClient !== "claude") return;
     let active = true;
-    void pluginRequest(pluginHost, "status").then(
-      (state) => { if (active) setPluginResult(pluginHost, { state }); },
-      (reason: unknown) => { if (active) setPluginResult(pluginHost, { error: errorMessage(reason, translate) }); },
+    void requestClaudePlugin(ipc, "status").then(
+      (state) => { if (active) setPluginInfo({ state }); },
+      (reason: unknown) => { if (active) setPluginInfo({ error: errorMessage(reason, translate) }); },
     );
     return () => { active = false; };
-  }, [pluginHost, pluginRequest, setPluginResult, translate]);
-  const managePlugin = async (host: ModelListPluginHost, operation: ModelListPluginOperation, source?: ModelListPluginSource): Promise<boolean> => {
+  }, [claudeRevision, filesToken, ipc, selectedClient, translate]);
+  const managePlugin = async (operation: ModelListPluginOperation): Promise<boolean> => {
     if (pluginPending) return false;
-    setPluginPending({ host, operation });
+    setPluginPending(operation);
     try {
-      const state = await pluginRequest(host, operation, source);
-      setPluginResult(host, { state });
+      const state = await requestClaudePlugin(ipc, operation);
+      setPluginInfo({ state });
       onStatus(translate("common.saved"));
       return true;
     } catch (reason) {
       // Installation may have completed even if a later command failed.
-      const state = await pluginRequest(host, "status").catch(() => undefined);
+      const state = await requestClaudePlugin(ipc, "status").catch(() => undefined);
       const error = errorMessage(reason, translate);
-      setPluginResult(host, { state, error });
+      setPluginInfo({ state, error });
       onStatus(error);
       return false;
     } finally {
       setPluginPending(undefined);
     }
   };
-  const useApiAndOfferPlugin = async (host: ModelListPluginHost, stage: () => Promise<unknown>): Promise<boolean> => {
-    const success = await stage();
-    if (success === false) return false;
+  const saveLocalApi = async (stage: () => Promise<unknown>): Promise<boolean> => {
+    if (await stage() === false) return false;
     try {
-      // The plugin discovers its source from the saved client files. Finish
-      // the API change before letting the install write to those same files.
       await onApplyClientSettings();
+      return true;
     } catch (reason) {
       onStatus(errorMessage(reason, translate));
       return false;
     }
-    try {
-      const state = await pluginRequest(host, "status");
-      setPluginResult(host, { state });
-      if (state.available === true && state.installed !== true && await native.showConfirmation({
-        title: translate("settings.pluginInstallTitle"),
-        message: translate("settings.pluginInstallPrompt"),
-        confirmLabel: translate("settings.pluginInstall"),
-      })) await managePlugin(host, "install");
-    } catch (reason) {
-      onStatus(errorMessage(reason, translate));
-    }
-    return true;
   };
   useEffect(() => { if (initialClient) setSelectedClient(initialClient); }, [initialClient]);
   useEffect(() => {
@@ -12183,22 +12123,27 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
     ? [{ app: "claudeCode", state: claudeCode }, { app: "claudeDesktop", state: claudeDesktop }]
     : [{ app: "claudeCode", state: claudeCode }];
   const claudeLocalApiActive = claudeApps.every(({ state }) => booleanValue(state.uses_local_api));
-  // Both controls that point a client somewhere drive the whole pair, so the
-  // fan-out is stated once: a switch that reads "on" only when every app is on
-  // must write to every app when it moves.
-  const forEveryClaudeApp = async (
-    action: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>,
-    selection: UnknownRecord,
-  ): Promise<boolean> => {
-    for (const { app } of claudeApps) if (await action(app, selection) === false) return false;
+  const useClaudeLocalApi = async (): Promise<boolean> => {
+    for (const { app } of claudeApps) if (await onClaudeUseLocalApi(app) === false) return false;
     return true;
   };
-  // Absent, not empty: the pane reads a remembered route as "off returns here,
-  // silently" and its absence as "off has to ask", so an empty record would
-  // make the switch dispatch a route nobody chose instead of opening the menu
-  // Codex opens.  Both apps remember their own; the pair answers once.
-  const claudeDesignated = (claudeCode.designated_route ?? claudeDesktop.designated_route) as UnknownRecord | undefined;
-  const claudeRoute = claudeDesignated ? asRecord(claudeDesignated) : undefined;
+  const useClaudeApiAndOfferPlugin = async (): Promise<boolean> => {
+    // The plugin reads the saved client file and may write to it on install.
+    if (!await saveLocalApi(useClaudeLocalApi)) return false;
+    try {
+      const state = await requestClaudePlugin(ipc, "status");
+      setPluginInfo({ state });
+      if (state.enabled === true) await managePlugin("sync");
+      else if (state.available === true && state.installed !== true && await native.showConfirmation({
+        title: translate("settings.pluginInstallTitle"),
+        message: translate("settings.pluginInstallPrompt"),
+        confirmLabel: translate("settings.pluginInstall"),
+      })) await managePlugin("install");
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+    }
+    return true;
+  };
   // A file this app generates only stays the user's while its own switch is
   // off: with the switch on, Core rewrites that file whenever the list it came
   // from changes, so an edit needs one explicit confirmation first.
@@ -12217,13 +12162,6 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
     if (file.id === CLAUDE_CODE_SETTINGS_FILE_ID) { generatedFileOpen(file, booleanValue(claudeCode.model_list_enabled)); return; }
     onOpenFile(file);
   };
-  // The control names the API a client uses.  On this app's proxy no specific
-  // API is selected — the client talks to the proxy — so the field stays
-  // empty there, and picking a route is what fills it and moves the switch
-  // off.  The route remembered for a later "off" is deliberately not shown: it
-  // is where the switch would go, not where the client is.
-  const codexRouteLabel = codexRoute?.label
-    ?? [clientProvider, clientModel].filter((part) => part.length > 0).join(" / ");
   const featureKeys = Object.keys(codexFeatures ?? {}).filter((feature) => feature.endsWith("_use"));
   // Browser and Computer Use are Codex's own capabilities and are on by default
   // there, so a switch for them here only restated another app's setting — and
@@ -12234,14 +12172,6 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   const codexFeatureRows = featureKeys
     .filter((feature) => !codexHandedOverSurfaces.has(feature))
     .sort();
-  const pluginCard = pluginHost ? <ModelListPluginFields
-    key={pluginHost}
-    info={pluginInfo[pluginHost]}
-    busy={pluginPending !== undefined}
-    pending={pluginPending?.host === pluginHost ? pluginPending.operation : undefined}
-    translate={translate}
-    onAction={(operation, source) => managePlugin(pluginHost, operation, source)}
-  /> : null;
   return <View style={[SETTINGS_RAIL_BODY, compactWeb && styles.compactRailBody]}>
     <SettingsRail
       rows={railRows}
@@ -12257,18 +12187,13 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
       <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_BODY} horizontal={false} showsVerticalScrollIndicator>
         {selectedClient === "codex" ? <>
           <ClientBackendFields
-            models={codexModels}
+            client="codex"
             native={native}
             localApiActive={localApiActive}
-            designatedRoute={localApiActive ? "" : codexRouteLabel}
-            designatedSelection={codexRoute}
             busy={busy}
-            onStatus={onStatus}
-            onUseLocalApi={(selection) => useApiAndOfferPlugin("codex", () => onUseLocalApi(selection))}
-            onUseSavedModel={onUseSavedModel}
+            onUseLocalApi={() => saveLocalApi(onUseLocalApi)}
             translate={translate}
           />
-          {pluginCard}
           {/* The opt-in aims Codex at this proxy's own ``/alpha/search``. */}
           <ProxyScopedToggleField
             label={translate("codex.standaloneSearch")}
@@ -12321,18 +12246,20 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text>
           : null}
         {selectedClient === "claude" && files !== undefined ? <ClientBackendFields
-            models={claudeModels}
+            client="claude"
             native={native}
             localApiActive={claudeLocalApiActive}
-            designatedRoute={claudeLocalApiActive || !claudeRoute ? "" : clientRouteLabel(stringValue(claudeRoute.provider), stringValue(claudeRoute.model))}
-            designatedSelection={claudeRoute}
             busy={busy}
-            onStatus={onStatus}
-            onUseLocalApi={(selection) => useApiAndOfferPlugin("claude", () => forEveryClaudeApp(onClaudeUseLocalApi, selection))}
-            onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}
+            onUseLocalApi={useClaudeApiAndOfferPlugin}
             translate={translate}
           /> : null}
-        {selectedClient === "claude" ? pluginCard : null}
+        {selectedClient === "claude" ? <ModelListPluginFields
+          info={pluginInfo}
+          busy={pluginPending !== undefined}
+          pending={pluginPending}
+          translate={translate}
+          onAction={managePlugin}
+        /> : null}
         {selectedClient === "claude" && files !== undefined ? <>
           <ClientToggleField
             label={translate("claude.nonstreamFallback")}
@@ -18315,9 +18242,6 @@ const styles = StyleSheet.create({
   settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitleBlock: { flex: 1, minWidth: 0 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   pluginSection: { ...SETTINGS_SECTION, paddingRight: SETTINGS_FIELD_LEAD, paddingVertical: SETTINGS_FIELD_GAP, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control },
   pluginControls: { ...SETTINGS_FIELD_ROW_INDENTED, flexWrap: "wrap", justifyContent: "space-between" },
-  pluginActions: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: SETTINGS_FIELD_GAP },
-  pluginForm: { ...SETTINGS_FIELD, gap: SETTINGS_FIELD_GAP },
-  pluginFormActions: { justifyContent: "flex-end" },
   pluginNote: { marginLeft: SETTINGS_FIELD_LEAD },
   pluginError: { color: systemColors.red },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
