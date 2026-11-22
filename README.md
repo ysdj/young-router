@@ -4,7 +4,7 @@
 
 **One local address for all your AI tools — and it keeps working when a provider doesn't.**
 
-Young Router is a native macOS and Windows app that runs a local AI gateway (built on [LiteLLM](https://github.com/BerriAI/litellm)). Point Codex, Claude Code, or any OpenAI-compatible tool at one local address, and Young Router spreads every request across your providers, keys, official accounts, and relay stations — with automatic failover and capability bridges. No Docker, no Python, no terminal.
+Young Router is a native macOS and Windows app that runs a local AI gateway (built on [LiteLLM](https://github.com/BerriAI/litellm)). Point Codex, Claude Code, or any OpenAI-compatible tool at one local address, and Young Router spreads every request across your providers, keys, official accounts, and relay stations — with automatic failover and capability bridges. Its desktop releases bundle Python and the proxy runtime, so desktop users do not need Docker, Python, or a terminal.
 
 ## Highlights
 
@@ -132,7 +132,7 @@ MIT License. See [LICENSE](./LICENSE).
 
 **一个本地地址，接上你所有的 AI 工具——上游有问题，它也不轻易停。**
 
-漾路由是一款 macOS 与 Windows 原生应用，用于运行基于 [LiteLLM](https://github.com/BerriAI/litellm) 的本地 AI 网关。把 Codex、Claude Code 或任意 OpenAI 兼容工具指向同一个本地地址，漾路由就会把每个请求分发到你的所有供应商、密钥、官方账号和中转站之间，并自动回退、自动补齐缺失能力。不需要 Docker、Python 或命令行。
+漾路由是一款 macOS 与 Windows 原生应用，用于运行基于 [LiteLLM](https://github.com/BerriAI/litellm) 的本地 AI 网关。把 Codex、Claude Code 或任意 OpenAI 兼容工具指向同一个本地地址，漾路由就会把每个请求分发到你的所有供应商、密钥、官方账号和中转站之间，并自动回退、自动补齐缺失能力。桌面版自带 Python 与代理运行时，桌面用户无需安装 Docker、Python 或使用命令行。
 
 ## 核心优势
 

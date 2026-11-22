@@ -5,6 +5,9 @@
 node_modules
 **/node_modules
 rn/vendor
+rn/apps/macos
+rn/apps/windows
+rn/scripts
 rn/apps/*/node_modules
 rn/packages/*/node_modules
 rn/apps/web/dist
@@ -12,6 +15,7 @@ output
 artifacts
 target
 .pytest_cache
+tests
 __pycache__
 *.py[cod]
 *.egg-info

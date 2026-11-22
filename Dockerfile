@@ -56,6 +56,8 @@ ENV HOME=/data \
     LITELLM_PORT=12390 \
     LITELLM_NUM_WORKERS=2 \
     YOUNG_ROUTER_BROWSER=chromium \
+    WORKBUDDY_AUTH_FILE=/data/workbuddy/auth/workbuddy-desktop.info \
+    YOUNG_ROUTER_QODER_SESSION_FILE=/data/qoder/auth/qoder-desktop.info \
     PYTHONPATH=/opt/young-router \
     PATH=/opt/young-router/runtime/bin:$PATH
 USER 1000:1000

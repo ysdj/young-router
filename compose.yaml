@@ -6,8 +6,6 @@ services:
     ports:
       - "127.0.0.1:${YOUNG_ROUTER_PORT:-12390}:12390"
     environment:
-      LITELLM_CONFIG_FILE: /data/config.yaml
-      LITELLM_RUNTIME_CONFIG: /data/.litellm-runtime/served.yaml
       LITELLM_NUM_WORKERS: ${YOUNG_ROUTER_WORKERS:-2}
     volumes:
       - router-data:/data
