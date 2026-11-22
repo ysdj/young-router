@@ -37,7 +37,6 @@ from update_common import (
     UpdateError,
     STAGED_RELEASE_MARKER,
     request_bytes,
-    copy_tree,
     find_npm,
     record_staged_release,
     reused_staged_release,
@@ -382,8 +381,9 @@ def update(
             )
 
         payload = work / "payload"
-        copy_tree(checkout, payload, package_name=PACKAGE_NAME)
-        shutil.rmtree(payload / ".git", ignore_errors=True)
+        # Git pack files are read-only on Windows. Keep the checkout's Git
+        # metadata out of the staged runtime from the start.
+        shutil.copytree(checkout, payload, symlinks=True, ignore=shutil.ignore_patterns(".git"))
         # The reuse decision is made on the upstream payload alone, before the
         # peer closure is installed: an unchanged release reuses the staged
         # peers, and installing them first only to discard the result was the
