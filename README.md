@@ -49,7 +49,8 @@ Linux servers can run the [published container image](https://github.com/ysdj/yo
 on x86-64 or ARM64 with Docker Engine and Compose. The image includes the same
 Core, proxy, WebUI, and headless Chromium; it keeps configuration and runtime
 state in `/data` and publishes one local port for both `/ui` and `/v1`.
-From the directory containing `compose.yaml`, run:
+Keep [compose.yaml](compose.yaml) and [chromium-seccomp.json](chromium-seccomp.json)
+in the same directory so Chromium can use its sandbox. From that directory, run:
 
 ```bash
 docker compose up -d --wait
@@ -178,7 +179,8 @@ MIT License. See [LICENSE](./LICENSE).
 Linux 服务器可在 x86-64 或 ARM64 上使用 Docker Engine 与 Compose 运行
 [发布镜像](https://github.com/ysdj/young-router/pkgs/container/young-router)。镜像包含同一套
 Core、代理、WebUI 和无界面 Chromium；配置与运行状态保存在 `/data`，`/ui` 与
-`/v1` 共用一个本地端口。在 `compose.yaml` 所在目录执行：
+`/v1` 共用一个本地端口。将 [compose.yaml](compose.yaml) 和 [chromium-seccomp.json](chromium-seccomp.json)
+放在同一目录，让 Chromium 可以启用自身的沙箱。在该目录执行：
 
 ```bash
 docker compose up -d --wait
