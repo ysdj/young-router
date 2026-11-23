@@ -14,6 +14,7 @@ from .. import api_base as _api_base_module
 from . import anthropic_non_stream as _anthropic_non_stream_module
 from . import anthropic_sse as _anthropic_sse_module
 from . import codex_fast_tier as _codex_fast_tier_module
+from . import codex_contract as _codex_contract_module
 from . import context_window as _context_window_module
 from . import messages_web_search as _messages_web_search_module
 from . import responses_request as _responses_request_module
@@ -57,6 +58,7 @@ from .base import (
     _ROUTING_CONSTRAINT_PATCH_ATTR,
     _RESTORED_REASONING_REPLAY_KEY,
     _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
+    _SURFACE_TARGET_DEPLOYMENT_ID_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
@@ -1641,13 +1643,37 @@ def _install_selected_deployment_marker_patch() -> None:
         )
         token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         try:
-            response = await _reasoning_replay_module.call_with_replay_repair(
-                lambda: _call_deployment_with_reasoning_parameters_compat(
+            async def dispatch(**payload: Any) -> Any:
+                kwargs.clear()
+                kwargs.update(payload)
+                return await _call_deployment_with_reasoning_parameters_compat(
                     original_make_call,
                     self,
                     original_function,
                     args,
-                    kwargs,
+                    payload,
+                )
+
+            def prepare_chat_retry(active: dict) -> Optional[dict]:
+                retry = active.copy()
+                if not _routing_module._apply_current_selected_deployment_to_request(retry):
+                    return None
+                deployment_id = _routing_module._deployment_id_from_request(retry)
+                if not deployment_id:
+                    return None
+                # Legacy LiteLLM resolves a model id directly, including in
+                # versions whose selector no longer calls _get_all_deployments.
+                retry["model"] = deployment_id
+                retry[_SURFACE_TARGET_DEPLOYMENT_ID_KEY] = deployment_id
+                return retry
+
+            response = await _reasoning_replay_module.call_with_replay_repair(
+                lambda: (
+                    _codex_contract_module._call_with_deepseek_tool_choice(
+                        dispatch, kwargs, "acompletion", prepare_retry=prepare_chat_retry
+                    )
+                    if getattr(original_function, "__name__", "") == "_acompletion"
+                    else dispatch(**kwargs)
                 ),
                 kwargs,
             )
@@ -2265,11 +2291,6 @@ def _install_generic_deployment_failover_patch() -> None:
                     target_order=target_order,
                     excluded_deployment_ids=kwargs.get("_excluded_deployment_ids"),
                 )
-                # The budget is a property of the failure, not of the process:
-                # a class the upstream itself contradicts (a coin flip on the
-                # same payload) gets its one extra attempt even when the
-                # configured budget is the default zero.
-                #
                 # The proxy's own web-search call keeps none: its caller is the
                 # turn that asked for the search, which has its own way on.
                 # The per-failure budget replaced a per-call one and lost this
@@ -2292,15 +2313,11 @@ def _install_generic_deployment_failover_patch() -> None:
                         max_retries=retry_budget,
                         configured_delay_seconds=retry_delay_seconds,
                     )
-                    # Asking again with the same bytes gets the same answer
-                    # when the refusal is about a field: a thinking route
-                    # refuses every forced ``tool_choice`` while serving the
-                    # same history with ``auto``.  This proxy is the one that
-                    # put that field there (``codex_contract`` forces
-                    # ``required`` so a progress message cannot end the turn),
-                    # so the retry relaxes it instead of repeating it.
-                    if _routing_module._is_forced_tool_choice_unsupported_error(
-                        exc, kwargs
+                    if (
+                        _routing_module._is_forced_tool_choice_unsupported_error(
+                            exc, kwargs
+                        )
+                        and _routing_module._can_relax_tool_choice(kwargs)
                     ):
                         _routing_module._mark_protocol_fallback_relax_tool_choice(
                             kwargs
@@ -2606,7 +2623,10 @@ def _install_rust_dispatch_patch() -> None:
             _routing_module._apply_current_selected_deployment_to_request(kwargs)
             if op == "acompletion":
                 response = await _reasoning_replay_module.call_with_replay_repair(
-                    lambda: provider_call(**kwargs), kwargs
+                    lambda: _codex_contract_module._call_with_deepseek_tool_choice(
+                        provider_call, kwargs, op
+                    ),
+                    kwargs,
                 )
             else:
                 response = await provider_call(**kwargs)

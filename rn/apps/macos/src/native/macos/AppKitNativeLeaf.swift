@@ -6390,6 +6390,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let usernamePaths: [[String]]
     }
 
+    private struct BrowserAccess: Equatable {
+        let token: String
+        let userID: String?
+    }
+
     private let accountID: String
     /// The account type shared only when the caller already knew it; ``auto``
     /// means "find out from what the station answers".  Resolved by the first
@@ -6494,6 +6499,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var loginWatchProbe: DispatchWorkItem?
     private var observedLoginSignature: String?
     private var observedLoginForm: Bool?
+    private var browserAccess: BrowserAccess?
     private var checkStartedAt: Date?
     private var panelClosedDuringCommit = false
     private var activeCheck: NativeRelayLoginAttempt?
@@ -6621,6 +6627,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         if mode == .login {
             configuration.userContentController.add(self, name: "litellmRelayPassword")
             configuration.userContentController.add(self, name: "litellmRelayPage")
+            if self.mode == .login, type != "sub2api" {
+                installNewAPIAccessObserver(on: configuration.userContentController)
+            }
         }
         buildPanel()
     }
@@ -7331,6 +7340,39 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         return String(text.dropFirst().dropLast())
     }
 
+    private func installNewAPIAccessObserver(on controller: WKUserContentController) {
+        guard let login = relayURL(path: "api/user/login"),
+              let refresh = relayURL(path: "api/user/auth/refresh") else { return }
+        // New API keeps the bearer from its own auth response in memory. The
+        // HttpOnly cookie from that response can renew it but cannot read the profile.
+        let script = """
+        (() => {
+          const login = new URL(\(jsonLiteral(login.absoluteString)));
+          const refresh = new URL(\(jsonLiteral(refresh.absoluteString)));
+          if (location.origin !== login.origin) return;
+          const send = XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.send = function () {
+            const read = () => {
+              if (this.status < 200 || this.status >= 300 || !this.responseURL) return;
+              const url = new URL(this.responseURL);
+              if (url.origin !== login.origin || (url.pathname !== login.pathname && url.pathname !== refresh.pathname)) return;
+              try {
+                const result = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+                const data = result?.data;
+                const token = data?.access_token;
+                if (result?.success !== true || typeof token !== 'string' || !token || token.length > 32768) return;
+                window.webkit.messageHandlers.litellmRelayPage.postMessage({ access_token: token, user: { id: data.user?.id ?? null } });
+              } catch {}
+            };
+            this.addEventListener('loadend', read, { once: true });
+            try { return Reflect.apply(send, this, arguments); }
+            catch (error) { this.removeEventListener('loadend', read); throw error; }
+          };
+        })();
+        """
+        controller.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+    }
+
     private func startSignInCheck(automatically: Bool) {
         guard !finished, !checking else { return }
         let attempt = NativeRelayLoginAttempt()
@@ -7354,7 +7396,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
             self.collectCookies(attempt: attempt) { [weak self, weak attempt] cookieHeader in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
-                guard !automatically || cookieHeader != nil || self.capturedAccessToken != nil else {
+                guard !automatically || cookieHeader != nil || self.capturedAccessToken != nil || self.browserAccess != nil else {
                     self.finishCheckingFailure(
                         text("Waiting for sign-in...", "等待完成登录..."),
                         attempt: attempt,
@@ -7374,6 +7416,16 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard mode == .login, message.frameInfo.isMainFrame else { return }
         if message.name == "litellmRelayPage" {
+            if let fields = message.body as? [String: Any] {
+                guard isBrowserFlowLive, type != "sub2api",
+                      let url = message.frameInfo.request.url, sameOrigin(url),
+                      let token = firstString(in: fields, paths: [["access_token"]]),
+                      token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return }
+                browserAccess = BrowserAccess(token: token, userID: stationUserID(in: fields))
+                signInProbeAttempts = 0
+                scheduleAutomaticSignInCheck()
+                return
+            }
             // The page routed itself: the sign-in step may just have been
             // replaced by the station console, and the form geometry changed
             // with it.  A route *is* a fresh step, so the probe budget reopens
@@ -7538,7 +7590,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         request.setValue(originHeader, forHTTPHeaderField: "Origin")
         request.setValue(originHeader, forHTTPHeaderField: "Referer")
         if let cookieHeader, !cookieHeader.isEmpty { request.setValue(cookieHeader, forHTTPHeaderField: "Cookie") }
-        let probeAccessToken = capturedAccessToken ?? restoredSession?.accessToken
+        let browserAccess = self.browserAccess
+        let probeAccessToken = browserAccess?.token ?? capturedAccessToken ?? restoredSession?.accessToken
         if let probeAccessToken, !probeAccessToken.isEmpty {
             request.setValue("Bearer \(probeAccessToken)", forHTTPHeaderField: "Authorization")
         }
@@ -7548,7 +7601,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // states one in a way the header accepts, so nothing is sent.  The
         // header belongs to the New API family, so it follows the family this
         // probe belongs to when the caller did not name one.
-        let probeUserID = capturedUserID ?? restoredSession?.userID
+        let probeUserID = if let browserAccess {
+            browserAccess.userID
+        } else {
+            capturedUserID ?? (capturedAccessToken == nil ? restoredSession?.userID : nil)
+        }
         if probe.family == "newapi" || type == "newapi", let probeUserID, !probeUserID.isEmpty {
             request.setValue(probeUserID, forHTTPHeaderField: "New-Api-User")
         }
@@ -7576,10 +7633,16 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             let acceptedCookie = self.cookieHeader(after: response, existing: cookieHeader)
             DispatchQueue.main.async { [weak self, weak attempt] in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
+                // A new auth response may arrive while a profile request is
+                // out. Re-read its cookie before saving the new session.
+                guard self.browserAccess == browserAccess else {
+                    self.finishCheckingFailure(self.waitingForSignInStatus, attempt: attempt, quiet: true)
+                    return
+                }
                 let username = detectedUsername ?? self.presetUsername ?? ""
-                let accessToken = detectedAccessToken ?? self.capturedAccessToken ?? self.restoredSession?.accessToken
+                let accessToken = detectedAccessToken ?? probeAccessToken
                 let refreshToken = detectedRefreshToken ?? self.capturedRefreshToken ?? self.restoredSession?.refreshToken
-                let userID = detectedUserID ?? self.capturedUserID ?? self.restoredSession?.userID
+                let userID = detectedUserID ?? probeUserID
                 guard detectedUsername != nil || detectedUserID != nil,
                       !username.isEmpty,
                       !(acceptedCookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true) else {
@@ -8183,6 +8246,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     private func clearCapturedCredentials() {
+        browserAccess = nil
         capturedAccessToken = nil
         capturedRefreshToken = nil
         capturedUserID = nil

@@ -86,7 +86,7 @@ try {
   if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv is required to build the self-contained Windows Core runtime."
   }
-  & uv run --no-project --python 3.12 (Join-Path $ProjectRoot "scripts\update_litellm.py")
+  & uv run --no-project --python 3.12 (Join-Path $ProjectRoot "scripts\update_litellm.py") --sync-venv
   if ($LASTEXITCODE -ne 0) { throw "Could not update LiteLLM to the latest stable release." }
   $NodeRuntimeUpdater = Join-Path $ProjectRoot "scripts\update_node_runtime.py"
   & uv run --no-project --python 3.12 $NodeRuntimeUpdater `

@@ -558,10 +558,8 @@ STAGING_PIDS+=("$!")
 
 pnpm install --frozen-lockfile
 
-if [[ "${YOUNG_ROUTER_LITELLM_VERSION_UPDATED:-}" != "1" ]]; then
-  "$PROJECT_ROOT/scripts/update-litellm.sh"
-  export YOUNG_ROUTER_LITELLM_VERSION_UPDATED=1
-fi
+LITELLM_UV_BIN="$UV_BIN" "$PROJECT_ROOT/scripts/update-litellm.sh" --sync-venv
+LITELLM_VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")"
 
 # The installed app already carries the exact portable Python runtime a repeat
 # local build needs. Reuse it only when no caller supplied another runtime, its
@@ -574,7 +572,7 @@ if [[ -z "$RUNTIME_SOURCE" ]]; then
     && -x "$INSTALLED_RUNTIME/bin/python" \
     && -x "$INSTALLED_RUNTIME/bin/litellm" \
     && -f "$INSTALLED_RUNTIME/LITELLM_VERSION" \
-    && "$(tr -d '[:space:]' < "$INSTALLED_RUNTIME/LITELLM_VERSION")" == "$(tr -d '[:space:]' < "$ROOT/LITELLM_VERSION")" ]]; then
+    && "$(tr -d '[:space:]' < "$INSTALLED_RUNTIME/LITELLM_VERSION")" == "$LITELLM_VERSION" ]]; then
     export YOUNG_ROUTER_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"
     RUNTIME_SOURCE="$INSTALLED_RUNTIME"
     printf 'Reusing installed Core runtime: %s\n' "$INSTALLED_RUNTIME"
@@ -898,7 +896,6 @@ else
       ;;
   esac
   mkdir -p "$RUNTIME_WORK/python-installs" "$CORE/runtime/bin" "$CORE/runtime/site-packages"
-  LITELLM_VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")"
   # Assembling the portable runtime is the longest step a build cannot overlap
   # with anything else: uv unpacks a standalone CPython and then resolves and
   # installs a hundred-odd wheels for the pinned LiteLLM release.  Neither half

@@ -19,14 +19,25 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, renameSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 const pageUrl = process.argv[2];
 const jsonOnly = process.argv.includes("--json");
+const sessionLimitRetry = process.argv.includes("--session-limit-retry");
 const resizeColumnsIndex = process.argv.indexOf("--resize-columns");
+const modelSelectionIndex = process.argv.indexOf("--model-selection");
+const modelSelection = modelSelectionIndex >= 0 ? process.argv[modelSelectionIndex + 1] : undefined;
+const modelSelectionEventFirst = modelSelection?.startsWith("event-first") ?? false;
+const modelSelectionUserChanges = modelSelection?.endsWith("user-change") ?? false;
+const rowChangeIndex = process.argv.indexOf("--row-change");
+const rowChange = rowChangeIndex >= 0 ? process.argv[rowChangeIndex + 1] : undefined;
+const routeNavigationIndex = process.argv.indexOf("--route-navigation");
+const routeNavigation = routeNavigationIndex >= 0 ? process.argv[routeNavigationIndex + 1] : undefined;
+const groupSelection = process.argv.includes("--group-selection");
+const traceSelectionIndex = process.argv.indexOf("--trace-selection");
 // Optional link shaping, so a local run states the same defect a published page
 // shows: `--latency 250 --downstream 125000` is the round trip and the bandwidth
 // measured between a home connection and a gateway in another country.
@@ -100,10 +111,96 @@ async function openTarget(port, url, shaping) {
   await cdp.send("Network.enable");
   await cdp.send("Runtime.enable");
   await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 950, deviceScaleFactor: 1, mobile: false });
-  if (resizeColumnsIndex >= 0) {
+  if (resizeColumnsIndex >= 0 || modelSelection || sessionLimitRetry || rowChange || routeNavigation || groupSelection || traceSelectionIndex >= 0) {
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-      source: `Object.defineProperty(navigator, "languages", { get: () => ["zh-CN"] });`,
+      source: `Object.defineProperty(navigator, "languages", { get: () => [${modelSelection || rowChange || routeNavigation || groupSelection || traceSelectionIndex >= 0 ? '"en"' : '"zh-CN"'}] });`,
     });
+  }
+  if (traceSelectionIndex >= 0) {
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      const fetchCore = window.fetch.bind(window);
+      window.fetch = async (url, init) => {
+        const request = init?.body ? JSON.parse(init.body) : null;
+        const response = await fetchCore(url, init);
+        if (request?.method === 'logs' && request.params?.tab === 'route-trace') {
+          const body = JSON.stringify(await response.clone().json());
+          if (body.includes('trace-model-29') && !body.includes('trace-model-28')) window.traceUpdateArrived = true;
+        }
+        return response;
+      };` });
+  }
+  if (modelSelection) {
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `
+        const fetchCore = window.fetch.bind(window);
+        const eventFirst = ${modelSelectionEventFirst};
+        const release = new Promise((resolve) => { window.releaseModelUpdate = resolve; });
+        const apply = new Promise((resolve) => { window.releaseModelApply = resolve; });
+        let importStarted = false;
+        window.fetch = async (url, init) => {
+          const path = new URL(url, location.href).pathname;
+          const request = path === "/ipc" && init?.body ? JSON.parse(init.body) : null;
+          const importing = request?.method === "dispatch" && request.params.action.type === "model.add_many";
+          if (importing) importStarted = true;
+          if (eventFirst && request?.method === "apply") {
+            window.modelApplyWaiting = true;
+            await apply;
+          }
+          const response = await fetchCore(url, init);
+          if (eventFirst && importing) {
+            window.modelUpdateWaiting = true;
+            await release;
+          }
+          if (!eventFirst && importStarted && path === "/ipc/events" && response.ok) {
+            const { event } = await response.clone().json();
+            if (event?.domains?.includes("providers_models") || event?.event === "resync" || event?.event === "snapshot") {
+              window.modelUpdateWaiting = true;
+              await release;
+            }
+          }
+          return response;
+        };`,
+    });
+  }
+  if (rowChange) {
+    const { action, answerFirst } = rowChanges[rowChange];
+    // Install before the page starts its first long poll, which can already
+    // be waiting for the mutation's event when the click happens.
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      const fetchCore = window.fetch.bind(window);
+      const release = new Promise((resolve) => { window.releaseRowChange = resolve; });
+      window.accountRefreshes = new Set();
+      window.accountProviderLinked = false;
+      window.accountBootstrapApplied = false;
+      let actionStarted = false;
+      window.fetch = async (url, init) => {
+        const path = new URL(url, location.href).pathname;
+        const request = path === '/ipc' && init?.body ? JSON.parse(init.body) : null;
+        const mutation = request?.method === 'dispatch' && request.params.action.type === ${JSON.stringify(action)};
+        if (mutation) actionStarted = true;
+        const response = await fetchCore(url, init);
+        if (${rowChange === "delete-account"} && (request?.method === 'dispatch' || request?.method === 'apply')) {
+          const body = await response.clone().json();
+          if (body.ok && request?.params?.action?.type === 'resources.refresh') {
+            window.accountRefreshes.add(request.params.action.payload.account_id);
+          }
+          if (body.ok && request?.params?.action?.type === 'provider.select_relay_station') window.accountProviderLinked = true;
+          if (body.ok && request?.method === 'apply' && window.accountProviderLinked) window.accountBootstrapApplied = true;
+        }
+        if (mutation) window.rowDispatchAnswered = true;
+        const holdReply = mutation && !${Boolean(answerFirst)};
+        const holdProjection = ${Boolean(answerFirst)} && actionStarted && request?.method === 'snapshot';
+        let holdEvent = false;
+        if (${Boolean(answerFirst)} && actionStarted && path === '/ipc/events' && response.ok) {
+          const { event } = await response.clone().json();
+          holdEvent = event?.domains?.includes('providers_models') || event?.event === 'resync' || event?.event === 'snapshot';
+        }
+        if (holdReply || holdEvent || holdProjection) {
+          window.rowChangeWaiting = true;
+          await release;
+        }
+        return response;
+      };` });
   }
   if (shaping) {
     await cdp.send("Network.emulateNetworkConditions", {
@@ -137,6 +234,244 @@ async function clickAt(cdp, x, y) {
   await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0 });
   await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
   await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+}
+
+async function waitForValue(cdp, expression) {
+  for (let attempt = 0; attempt < 125; attempt += 1) {
+    const value = await evaluate(cdp, expression);
+    if (value) return value;
+    await sleep(40);
+  }
+  throw new Error(`The page never showed ${expression}`);
+}
+
+async function clickControl(cdp, selector, index = 0) {
+  const point = await waitForValue(cdp, `(() => {
+    const node = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
+    if (!node || node.disabled || node.getAttribute("aria-disabled") === "true") return null;
+    const rect = node.getBoundingClientRect();
+    return rect.width && rect.height ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null;
+  })()`);
+  await clickAt(cdp, point.x, point.y);
+}
+
+async function checkModelSelection(cdp) {
+  await clickControl(cdp, '[aria-label^="upstream-0-2,"]');
+  await waitForValue(cdp, `document.querySelector('[aria-selected="true"][aria-label^="upstream-0-2,"]') !== null`);
+  await evaluate(cdp, `(() => {
+    window.selectedModels = [];
+    const record = () => {
+      const row = document.querySelector('[aria-selected="true"][aria-label*="public-0-"], [aria-selected="true"][aria-label^="added-model,"]');
+      const label = row?.getAttribute("aria-label").split(",")[0] ?? null;
+      if (window.selectedModels.at(-1) !== label) window.selectedModels.push(label);
+    };
+    new MutationObserver(record).observe(document.querySelector("#root"), { subtree: true, childList: true, attributes: true, attributeFilter: ["aria-selected"] });
+    record();
+  })()`);
+  await clickControl(cdp, '[aria-label="Fetch models"]');
+  await clickControl(cdp, '#host-chrome [role="checkbox"][aria-label="added-model"]');
+  await clickControl(cdp, '#host-chrome [aria-label="Add Selected"]');
+  const newRow = '#root [aria-label^="added-model,"]';
+  const selected = `document.querySelector('${newRow}[aria-selected="true"]') !== null`;
+  const chooserClosed = `!document.querySelector('#host-chrome [role="dialog"]')`;
+  await waitForValue(cdp, "window.modelUpdateWaiting");
+  if (modelSelectionEventFirst) {
+    // The row is already rendered when the dispatch answer names its ID.
+    await waitForValue(cdp, `document.querySelector('${newRow}') !== null`);
+  } else {
+    // The chooser has finished saving while the row is still in flight.
+    await waitForValue(cdp, chooserClosed);
+  }
+  const beforeArrival = await evaluate(cdp, "window.selectedModels");
+  assert.ok(
+    beforeArrival.every((selection) => selection === "upstream-0-2" || selection === "added-model"),
+    `the import briefly selected an unrelated model: ${JSON.stringify(beforeArrival)}`,
+  );
+  if (modelSelectionUserChanges) {
+    // Windows closes its native picker before the pane's write resolves. Let
+    // the underlying page accept a real row click while that write is pending
+    // to cover a host where the parent is interactive during the wait.
+    await evaluate(cdp, "document.querySelector('#root').inert = false");
+    await clickControl(cdp, '[aria-label^="upstream-0-3,"]');
+    await waitForValue(cdp, `document.querySelector('[aria-selected="true"][aria-label^="upstream-0-3,"]') !== null`);
+    const afterUserChoice = await evaluate(cdp, "window.selectedModels");
+    assert.deepEqual(afterUserChoice, [...beforeArrival, "upstream-0-3"]);
+  }
+  await evaluate(cdp, "window.releaseModelUpdate()");
+  if (!modelSelectionUserChanges) await waitForValue(cdp, selected);
+  if (modelSelectionEventFirst) {
+    // Selection must not need a second model update from Apply.
+    await waitForValue(cdp, "window.modelApplyWaiting");
+    await evaluate(cdp, "window.releaseModelApply()");
+  }
+  await waitForValue(cdp, chooserClosed);
+  const selections = await evaluate(cdp, `window.selectedModels`);
+  assert.deepEqual(selections, modelSelectionUserChanges
+    ? [...beforeArrival, "upstream-0-3"]
+    : ["upstream-0-2", "added-model"]);
+  return { selections };
+}
+
+const rowChanges = {
+  "delete-provider": { action: "provider.delete", before: "provider1", after: "provider2" },
+  "delete-model": { action: "model.delete", before: "upstream-0-2", after: "upstream-0-3" },
+  "delete-account": { action: "account.delete", before: "fixture-account-1", after: "fixture-account-2" },
+  "move-model": { action: "model.move_provider", before: "provider0/upstream-0-2", after: "provider1/upstream-0-2", answerFirst: true },
+  "move-route": { action: "model.move_provider", before: "upstream-0-2, provider0", after: "upstream-0-2, provider1", routes: true },
+  "rename-group": { action: "public.model_patch", before: "public-0-2", after: "renamed-model", routes: true },
+  "add-route": { action: "model.add_many", before: "public-0-2", after: "public-0-2, provider0", routes: true },
+};
+
+async function checkRowChange(cdp, name) {
+  const { action, before, after, answerFirst, routes } = rowChanges[name];
+  if (routes) await clickControl(cdp, '[aria-label="Routes"]');
+  if (name === "delete-account") {
+    // The fixture starts three account probes and an automatic provider bind.
+    // Let their writes finish before exercising the account deletion itself.
+    await waitForValue(cdp, "window.accountRefreshes.size === 3 && window.accountBootstrapApplied");
+  }
+  const beforeLabel = before.split("/").at(-1);
+  const group = name === "rename-group" || name === "add-route";
+  const provider = name === "delete-provider";
+  await clickControl(cdp, provider || group ? `button[aria-label="${beforeLabel}"]` : `button[aria-label^="${beforeLabel},"]`);
+  const current = `(() => {
+    const labels = [...document.querySelectorAll('#root button[aria-selected="true"][aria-label]')]
+      .map((row) => row.getAttribute('aria-label'));
+    const model = labels.find((label) => label.startsWith('upstream-') || label.startsWith('public-') || label === 'renamed-model');
+    const provider = labels.find((label) => /^provider[0-9]$/.test(label));
+    if (${name === "delete-account"}) return labels.find((label) => label.startsWith('fixture-account-') && label.includes(','))?.split(',')[0] ?? null;
+    if (${Boolean(routes)}) return model?.split(', ').slice(0, 2).join(', ') ?? null;
+    if (${name === "move-model"}) return [provider, model?.split(',')[0]].join('/');
+    return ${name === "delete-provider"} ? provider ?? null : model?.split(',')[0] ?? null;
+  })()`;
+  await waitForValue(cdp, `${current} === ${JSON.stringify(before)}`);
+  await evaluate(cdp, `(() => {
+    window.rowSelections = [];
+    const record = () => {
+      const selection = ${current};
+      if (window.rowSelections.at(-1) !== selection) window.rowSelections.push(selection);
+    };
+    new MutationObserver(record).observe(document.querySelector('#root'), {
+      subtree: true, childList: true, attributes: true, attributeFilter: ['aria-selected', 'aria-label'],
+    });
+    record();
+  })()`);
+  if (action.endsWith(".delete")) {
+    const label = name === "delete-account" ? "Remove locally" : "Delete";
+    await clickControl(cdp, `#root [aria-label="${label}"]`, name === "delete-model" ? 1 : 0);
+    await clickControl(cdp, `#host-chrome [aria-label="${label}"]`);
+  } else if (action === "model.move_provider") {
+    await evaluate(cdp, `(() => {
+      const select = document.querySelector('select[aria-label="Provider"]');
+      select.value = 'provider1';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+  } else if (action === "public.model_patch") {
+    await clickControl(cdp, 'input[aria-label="Public model"]');
+    await evaluate(cdp, "document.activeElement.select()");
+    await cdp.send("Input.insertText", { text: "renamed-model" });
+    await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  } else {
+    await clickControl(cdp, '[aria-label="New route"]');
+  }
+
+  await waitForValue(cdp, "window.rowChangeWaiting && window.rowDispatchAnswered");
+  if (answerFirst) {
+    // Give the dispatch consumer a paint while the patch is still withheld.
+    await evaluate(cdp, "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))");
+    assert.deepEqual(await evaluate(cdp, "window.rowSelections"), [before]);
+  } else if (name === "add-route") {
+    await waitForValue(cdp, `document.querySelector('[aria-label^="${after},"]') !== null`);
+    assert.deepEqual(await evaluate(cdp, "window.rowSelections"), [before]);
+  } else if (name !== "delete-account") {
+    await waitForValue(cdp, `${current} === ${JSON.stringify(after)}`);
+  }
+  // Account deletion can publish its updated list after the dispatch answer.
+  // The recorded sequence below checks both possible arrival orders.
+  await evaluate(cdp, "window.releaseRowChange()");
+  await waitForValue(cdp, `${current} === ${JSON.stringify(after)}`);
+  await waitForValue(cdp, `document.body.innerText.includes("Saved")`);
+  const selections = await evaluate(cdp, "window.rowSelections");
+  assert.deepEqual(selections, [before, after]);
+  return { selections };
+}
+
+async function checkRouteNavigation(cdp, kind) {
+  await clickControl(cdp, '[aria-label="Routes"]');
+  const row = kind === "group" ? 'button[aria-label="public-1-2"]' : 'button[aria-label^="upstream-1-2, provider1,"]';
+  await clickControl(cdp, row);
+  await waitForValue(cdp, `document.querySelector(${JSON.stringify(`${row}[aria-selected="true"]`)}) !== null`);
+  await clickControl(cdp, '[aria-label="Providers"]');
+  await waitForValue(cdp, `document.querySelector('button[aria-label="provider1"][aria-selected="true"]') !== null`);
+  await waitForValue(cdp, `document.querySelector('button[aria-label^="upstream-1-2,"][aria-selected="true"]') !== null`);
+  return { provider: "provider1", model: "upstream-1-2" };
+}
+
+async function checkGroupSelection(cdp) {
+  await clickControl(cdp, '[aria-label="Group Manager"]');
+  const sheet = '[role="dialog"][aria-label="Group Manager"]';
+  const selectedRow = `${sheet} button[aria-selected="true"]`;
+  await clickControl(cdp, `${sheet} button[aria-label^="duplicate-key,"]`);
+  await waitForValue(cdp, `document.querySelector(${JSON.stringify(selectedRow)})?.getAttribute('aria-label').startsWith('duplicate-key,')`);
+  await evaluate(cdp, `(() => {
+    window.groupSelections = [];
+    const record = () => {
+      const label = document.querySelector(${JSON.stringify(selectedRow)})?.getAttribute('aria-label').split(',')[0] ?? null;
+      const detail = document.querySelector(${JSON.stringify(`${sheet} input[aria-label="Key name"]`)})?.value ?? null;
+      const value = [label, detail];
+      if (JSON.stringify(window.groupSelections.at(-1)) !== JSON.stringify(value)) window.groupSelections.push(value);
+    };
+    new MutationObserver(record).observe(document.querySelector(${JSON.stringify(sheet)}), {
+      subtree: true, childList: true, attributes: true, attributeFilter: ['aria-selected', 'aria-label', 'value'],
+    });
+    record();
+  })()`);
+  await clickControl(cdp, `${sheet} [role="checkbox"][aria-label="Automatic grouping"]`);
+  await waitForValue(cdp, `document.querySelector(${JSON.stringify(selectedRow)})?.getAttribute('aria-label').startsWith('premium,')`);
+  const selections = await evaluate(cdp, 'window.groupSelections');
+  assert.deepEqual(selections, [['duplicate-key', 'duplicate-key'], ['premium', 'premium']]);
+  return { selections };
+}
+
+async function checkTraceSelection(cdp) {
+  await clickControl(cdp, '[aria-label="Route Trace"]');
+  await clickControl(cdp, 'button[aria-label^="trace-model-28 ·"]');
+  const selectedRow = 'button[aria-selected="true"][aria-label^="trace-model-"]';
+  await waitForValue(cdp, `document.querySelector(${JSON.stringify(selectedRow)})?.getAttribute('aria-label').startsWith('trace-model-28')`);
+  const point = await evaluate(cdp, `(() => {
+    window.traceSelections = [];
+    const record = () => {
+      const label = document.querySelector(${JSON.stringify(selectedRow)})?.getAttribute('aria-label').split(' · ')[0] ?? null;
+      if (window.traceSelections.at(-1) !== label) window.traceSelections.push(label);
+    };
+    new MutationObserver(record).observe(document.querySelector('#root'), {
+      subtree: true, childList: true, attributes: true, attributeFilter: ['aria-selected'],
+    });
+    record();
+    let node = document.querySelector(${JSON.stringify(selectedRow)});
+    while (node && !(getComputedStyle(node).overflowY === 'auto' && node.scrollHeight > node.clientHeight)) node = node.parentElement;
+    if (!node) return null;
+    window.traceScrollEvents = 0;
+    node.addEventListener('scroll', () => { window.traceScrollEvents += 1; });
+    const rect = node.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + 100 };
+  })()`);
+  assert.ok(point, 'the trace list can scroll');
+  renameSync(process.argv[traceSelectionIndex + 1], process.argv[traceSelectionIndex + 2]);
+  let arrived = false;
+  for (let attempt = 0; attempt < 180 && !arrived; attempt += 1) {
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...point, deltaX: 0, deltaY: attempt % 2 === 0 ? 35 : -35 });
+    await sleep(65);
+    arrived = await evaluate(cdp, 'window.traceUpdateArrived === true');
+  }
+  assert.ok(arrived, 'the refreshed trace arrived while the user was scrolling');
+  await evaluate(cdp, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))');
+  assert.deepEqual(await evaluate(cdp, 'window.traceSelections'), ['trace-model-28']);
+  assert.ok(await evaluate(cdp, 'window.traceScrollEvents') > 10, 'the list received scrolling events');
+  await waitForValue(cdp, `document.querySelector(${JSON.stringify(selectedRow)})?.getAttribute('aria-label').startsWith('trace-model-27')`);
+  const selections = await evaluate(cdp, 'window.traceSelections');
+  assert.deepEqual(selections, ['trace-model-28', 'trace-model-27']);
+  return { selections };
 }
 
 /**
@@ -407,6 +742,55 @@ async function main() {
       }
     }
     if (!ready) throw new Error("the browser did not open its debugging port");
+
+    if (sessionLimitRetry) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      const retry = '[aria-label="重试登录"]';
+      await waitForValue(cdp, `document.body.innerText.includes("上次登录时，中转站报告会话数已满")`);
+      result.measured.before = await evaluate(cdp, `({ refusal: document.body.innerText.includes("上次登录时，中转站报告会话数已满"), retry: Boolean(document.querySelector('${retry}')) })`);
+      await clickControl(cdp, retry);
+      await waitForValue(cdp, `!document.querySelector('${retry}') && document.body.innerText.includes("已登录")`);
+      await cdp.send("Page.reload", { ignoreCache: true });
+      await waitForValue(cdp, `document.body.innerText.includes("已登录") && !document.querySelector('${retry}')`);
+      result.measured.after = await evaluate(cdp, `({ signedIn: document.body.innerText.includes("已登录"), retry: Boolean(document.querySelector('${retry}')) })`);
+      result.ok = true;
+      return;
+    }
+
+    if (modelSelection) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      result.measured = await checkModelSelection(cdp);
+      result.ok = true;
+      return;
+    }
+
+    if (rowChange) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      result.measured = await checkRowChange(cdp, rowChange);
+      result.ok = true;
+      return;
+    }
+
+    if (routeNavigation) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      result.measured = await checkRouteNavigation(cdp, routeNavigation);
+      result.ok = true;
+      return;
+    }
+
+    if (groupSelection) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      result.measured = await checkGroupSelection(cdp);
+      result.ok = true;
+      return;
+    }
+
+    if (traceSelectionIndex >= 0) {
+      cdp = await openTarget(port, new URL("#/logs", pageUrl).href);
+      result.measured = await checkTraceSelection(cdp);
+      result.ok = true;
+      return;
+    }
 
     if (resizeColumnsIndex >= 0) {
       cdp = await openTarget(port, new URL("#/logs", pageUrl).href);

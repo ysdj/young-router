@@ -31,7 +31,7 @@ from ..values import positive_int as _positive_int
 from .persistence import PersistenceError, atomic_write_json, read_json
 
 
-UNKNOWN_MODEL_CONTEXT_WINDOW = 272_000
+UNKNOWN_MODEL_CONTEXT_WINDOW = 500_000
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
 
 # How far an upstream's stated window must sit from an *inferred* one before the
@@ -370,18 +370,18 @@ def _record(
     }
 
 
-# These are the policy values used when the process is offline.  Codex's
-# native agent profiles intentionally use 272k even though some API surfaces
-# advertise a larger hard limit; the effective 95% display is therefore about
-# 258k, matching the Codex UI.  Other current Young Router routes use the
+# These are the policy values used when the process is offline.  GPT routes
+# default to a 500k public window, which Codex's 95% effective display shows
+# as about 475k; an explicit route window or a higher-priority downloaded
+# profile replaces this policy.  Other current Young Router routes use the
 # provider limits as their starting policy and can be refreshed below.
 _BUNDLED_RECORDS: dict[str, dict[str, Any]] = {
-    "gpt-5.6": _record(272_000, priority=25),
-    "gpt-5.6-sol": _record(272_000, priority=25),
-    "gpt-5.6-terra": _record(272_000, priority=25),
-    "gpt-5.6-luna": _record(272_000, priority=25),
-    "gpt-5.5": _record(272_000, priority=25),
-    "gpt-5.2": _record(272_000, priority=25),
+    "gpt-5.6": _record(500_000, priority=25),
+    "gpt-5.6-sol": _record(500_000, priority=25),
+    "gpt-5.6-terra": _record(500_000, priority=25),
+    "gpt-5.6-luna": _record(500_000, priority=25),
+    "gpt-5.5": _record(500_000, priority=25),
+    "gpt-5.2": _record(500_000, priority=25),
     "gemini-3.1-pro-preview": _record(1_048_576),
     "gemini-3.1-flash-lite": _record(1_048_576),
     "gemini-3.1-flash-lite-preview": _record(1_048_576),
@@ -472,7 +472,7 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
     # A generator with no stated window has no window to publish.  The public
     # catalogs state ``limit.context: 0`` for ``gpt-image-2.5-flare`` and its
     # siblings -- they are cogs with no conversation to hold -- and folding
-    # that into the unknown-model placeholder published 272,000 as if pi.dev
+    # that into the unknown-model placeholder published 500,000 as if pi.dev
     # had said it, on the pane's 公开上下文 and in the catalog Codex compacts
     # against.  ``0`` is the whole statement here, so the record keeps it and
     # every surface reads "no window" instead of a number nobody declared.
@@ -1013,7 +1013,7 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
         top_records = [item[1] for item in suffix_matches if item[0] == top_priority]
         # Provider-qualified copies of the same public model often share a
         # family while advertising slightly different windows. Falling through
-        # to the unknown default hides a known 1M-class model as 258k.
+        # to the unknown default hides a known 1M-class model as 475k.
         context, maximum, percent = min(_context_window_policy(record) for record in top_records)
         selected = dict(top_records[0])
         selected["context_window"] = context
@@ -2242,7 +2242,7 @@ class ModelContextRegistry:
             # A generator no profile describes does not fall back to the
             # unknown-model placeholder; that placeholder is a guess about a
             # conversation, and this route has none.  The managed catalog and
-            # the pane then state "no window" instead of 272,000 tokens of
+            # the pane then state "no window" instead of 500,000 tokens of
             # memory for a model that never reads a prompt.
             return ContextRecord(
                 context_window=0,

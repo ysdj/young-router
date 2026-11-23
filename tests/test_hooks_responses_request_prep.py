@@ -506,6 +506,132 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["tool_choice"], "required")
         self.assertNotIn("<young_router_codex_descendant_cleanup>", modified.get("instructions") or "")
 
+    async def test_deepseek_deployment_preserves_auto_for_cleanup_and_progress(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        request["input"].extend(
+            {"role": "assistant", "content": [{"type": "output_text", "text": text}]}
+            for text in ("Checking.", "Continuing.")
+        )
+        request["tool_choice"] = "auto"
+        request["api_base"] = "https://previous.example/v1"
+        request["litellm_params"] = {"api_base": "https://api.deepseek.com/v1"}
+        request["_young_router_upstream_url_surface"] = "openai/chat"
+        request["use_chat_completions_api"] = True
+        hook = hooks.YoungRouterHook()
+
+        for reasoning in (None, {"effort": "minimal"}, {"effort": "none"}):
+            candidate = {**request, "reasoning": reasoning}
+            modified = await hook.async_pre_call_deployment_hook(candidate, "aresponses")
+            self.assertEqual((modified or candidate)["tool_choice"], "auto")
+            # The next deployment hook receives fresh routing parameters after
+            # the previous hook stripped its internal routing container.
+            next_attempt = {
+                **(modified or candidate),
+                "litellm_params": request["litellm_params"],
+                "_young_router_upstream_url_surface": "openai/chat",
+            }
+            repeated = await hook.async_pre_call_deployment_hook(
+                next_attempt, "aresponses"
+            )
+            self.assertEqual((repeated or next_attempt)["tool_choice"], "auto")
+
+    async def test_deepseek_restores_injected_choice_after_route_selection(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        request["tool_choice"] = "auto"
+        payload = hooks._build_streaming_error_fallback_payload(
+            request, method_name="aresponses"
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["tool_choice"]["name"], "list_agents")
+        # The Chat bridge changes the named-choice representation.
+        payload["tool_choice"] = {
+            "type": "function", "function": {"name": "list_agents"}
+        }
+        payload["litellm_params"] = {"api_base": "https://api.deepseek.com/v1"}
+        payload["_young_router_upstream_url_surface"] = "openai/chat"
+        payload["use_chat_completions_api"] = True
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
+            payload, "aresponses"
+        )
+        self.assertEqual((modified or payload)["tool_choice"], "auto")
+        self.assertNotIn(contract._INJECTED_TOOL_CHOICE_KEY, (modified or payload)["litellm_metadata"])
+
+    def test_deepseek_thinking_switch_and_other_routes(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["input"].extend(
+            {"role": "assistant", "content": [{"type": "output_text", "text": text}]}
+            for text in ("Checking.", "Continuing.")
+        )
+        request["tool_choice"] = "auto"
+        request["api_base"] = "https://api.deepseek.com/v1"
+        request["_young_router_upstream_url_surface"] = "openai/responses"
+        self.assertIsNone(contract.with_progress_message_contract(request))
+        request["reasoning"] = {"effort": "none"}
+        self.assertEqual(contract.with_progress_message_contract(request)["tool_choice"], "required")
+        request["_young_router_upstream_url_surface"] = "openai/chat"
+        self.assertIsNone(contract.with_progress_message_contract(request))
+        request["extra_body"] = {"thinking": {"type": "disabled"}}
+        self.assertEqual(contract.with_progress_message_contract(request)["tool_choice"], "required")
+        request["thinking"] = {"type": "enabled"}
+        self.assertEqual(contract.with_progress_message_contract(request)["tool_choice"], "required")
+        request["extra_body"]["thinking"] = {"type": "enabled"}
+        self.assertIsNone(contract.with_progress_message_contract(request))
+        request.pop("thinking")
+        request.pop("extra_body")
+        request["api_base"] = "https://another.example/v1"
+        self.assertEqual(contract.with_progress_message_contract(request)["tool_choice"], "required")
+
+    def test_explicit_choice_survives_cleanup_and_cached_protocol_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        for choice in ("required", "none", {"type": "function", "name": "spawn_agent"}):
+            candidate = {
+                **request,
+                "api_base": "https://api.deepseek.com/v1",
+                "tool_choice": choice,
+            }
+            hooks._routing_module._mark_protocol_fallback_relax_tool_choice(candidate)
+            modified = hooks._codex_contract_module.with_descendant_cleanup_barrier(candidate)
+            self.assertEqual((modified or candidate)["tool_choice"], choice)
+            self.assertFalse(hooks._routing_module._protocol_fallback_relax_tool_choice(candidate))
+            hooks._routing_module._apply_surface_adapter_to_request(
+                candidate, "openai/chat", "deepseek-test"
+            )
+            self.assertEqual(candidate["tool_choice"], choice)
+
     def test_codex_progress_message_contract_holds_the_turn_open(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
@@ -915,15 +1041,13 @@ class HookResponsesRequestPrepTests(HookTestCase):
             arguments='{"task_name":"audit","message":"check"}',
             output='{"agent_name":"/root/audit"}',
         )
-        request["tool_choice"] = "required"
+        request["tool_choice"] = "auto"
 
         modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        # Snapshot recovery has exactly one valid action, so the barrier names
-        # it rather than leaving a generic ``required`` the model can satisfy
-        # with an unrelated tool.
+        # Snapshot recovery has exactly one valid action.
         self.assertEqual(
             modified["tool_choice"],
             {"type": "function", "name": "list_agents"},

@@ -505,7 +505,7 @@ class PublicModelDomainTests(unittest.TestCase):
 
     def test_snapshot_carries_the_registry_default_for_each_public_model(self) -> None:
         contexts = self.domain.snapshot()["model_contexts"]
-        self.assertEqual(272000, contexts["gpt-5.6-sol"]["context_window"])
+        self.assertEqual(500000, contexts["gpt-5.6-sol"]["context_window"])
         self.assertEqual(262144, contexts["kimi-k3"]["context_window"])
 
     def test_two_spellings_of_one_name_are_two_public_models(self) -> None:
@@ -745,7 +745,7 @@ class PublicModelDomainTests(unittest.TestCase):
         # The pane reads the custom value from its model rows and keeps the
         # registry default beside it as the fallback hint.
         self.assertEqual(
-            272000,
+            500000,
             self.domain.snapshot()["model_contexts"]["gpt-5.6-sol"]["context_window"],
         )
 
@@ -787,7 +787,7 @@ class PublicModelDomainTests(unittest.TestCase):
         the refresh and rewrites the one cache file.  A reading taken before
         that write kept answering the unknown-model window for every model the
         refresh is what taught this installation about -- so a model added
-        right afterwards was drawn as 272,000 while pi.dev named its profile.
+        right afterwards was drawn as 500,000 while pi.dev named its profile.
         """
 
         import json
@@ -837,7 +837,7 @@ class PublicModelDomainTests(unittest.TestCase):
             )
             after = domain.snapshot()["model_contexts"]["gemini-4-argon"]
 
-        self.assertEqual(272000, before["context_window"])
+        self.assertEqual(500000, before["context_window"])
         self.assertEqual(1_048_576, after["context_window"])
         self.assertEqual(1_048_576, after["max_context_window"])
 

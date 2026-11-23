@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.request
@@ -71,9 +73,35 @@ def latest_stable_version() -> str:
     return max(candidates)[1]
 
 
+def sync_development_venv(version: str) -> None:
+    venv = ROOT / ".venv"
+    windows = sys.platform == "win32"
+    interpreter = venv / ("Scripts/python.exe" if windows else "bin/python")
+    if not (venv / "pyvenv.cfg").is_file() or not interpreter.is_file():
+        return
+    if windows:
+        # The Windows app bundles x64 Python even on ARM64. Check the venv's
+        # interpreter, since the proxy wheel needs x64, independent of the host.
+        platform = subprocess.check_output(
+            [str(interpreter), "-I", "-c", "import sysconfig; print(sysconfig.get_platform())"],
+            text=True,
+        ).strip()
+        if platform != "win-amd64":
+            print(f"LiteLLM proxy sync skipped for {venv}: use x64 Python (found {platform}).", file=sys.stderr)
+            return
+    uv = shutil.which(os.environ.get("LITELLM_UV_BIN") or "uv")
+    if uv is None:
+        print(f"LiteLLM proxy sync skipped for {venv}: uv is unavailable.", file=sys.stderr)
+        return
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(venv), f"litellm[proxy]=={version}"],
+        check=True,
+    )
+
+
 def main(arguments: list[str]) -> int:
-    if any(argument not in {"--check"} for argument in arguments) or len(arguments) > 1:
-        print("usage: update-litellm.sh [--check]", file=sys.stderr)
+    if arguments not in ([], ["--check"], ["--sync-venv"]):
+        print("usage: update-litellm.sh [--check | --sync-venv]", file=sys.stderr)
         return 64
     latest = latest_stable_version()
     current = LOCK_FILE.read_text(encoding="utf-8").strip() if LOCK_FILE.exists() else ""
@@ -85,6 +113,8 @@ def main(arguments: list[str]) -> int:
         return 0
     LOCK_FILE.write_text(f"{latest}\n", encoding="utf-8")
     print(f"Updated LiteLLM lock: {current or 'missing'} -> {latest}")
+    if arguments == ["--sync-venv"]:
+        sync_development_venv(latest)
     print("The current desktop build will package this exact LiteLLM release.")
     return 0
 
@@ -92,6 +122,6 @@ def main(arguments: list[str]) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1)

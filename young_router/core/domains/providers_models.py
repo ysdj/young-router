@@ -61,7 +61,7 @@ from ...browser_identity import browser_request_headers
 from ...public_names import display_upstream_model, import_name_case, imported_public_name, public_name_key
 from ...values import explicit_bool
 from ...values import int_or_none as _int_or_none
-from ...api_base import api_base_for_surface, isolated_http_opener, service_root
+from ...api_base import api_base_for_surface, isolated_http_opener, normalize_configured_api_base, service_root
 from ..entity_ops import EntityOp, entity_key, index_entities
 from ..security import (
     REDACT_TEXT,
@@ -1814,7 +1814,7 @@ class ProvidersModelsDomain:
     def _model_endpoint(cls, api_base: str) -> str | None:
         """Normalize an OpenAI-compatible base to its model-list endpoint."""
 
-        root = service_root(api_base)
+        root = service_root(normalize_configured_api_base(api_base))
         return f"{root}/v1/models" if isinstance(root, str) and root else None
 
     @classmethod
@@ -4544,18 +4544,24 @@ class ProvidersModelsDomain:
         raise DomainError("The selected provider is unavailable")
 
     @staticmethod
-    def _provider_name_exists(
+    def _provider_index_by_name(
         providers: list[Any], name: object, *, exclude_index: int | None = None
-    ) -> bool:
+    ) -> int | None:
         normalized = str(name or "").strip().casefold()
         if not normalized:
-            return False
-        return any(
-            index != exclude_index
+            return None
+        return next((
+            index for index, candidate in enumerate(providers)
+            if index != exclude_index
             and isinstance(candidate, Mapping)
             and str(candidate.get("name", "")).strip().casefold() == normalized
-            for index, candidate in enumerate(providers)
-        )
+        ), None)
+
+    @classmethod
+    def _provider_name_exists(
+        cls, providers: list[Any], name: object, *, exclude_index: int | None = None
+    ) -> bool:
+        return cls._provider_index_by_name(providers, name, exclude_index=exclude_index) is not None
 
     @staticmethod
     def _changes(data: Mapping[str, Any], key: str) -> dict[str, Any]:
@@ -6497,7 +6503,7 @@ class ProvidersModelsDomain:
                         )
                 self._normalize_model_binding(provider, model, staged=False)
 
-    def _dispatch_provider_key(self, action: str, data: Mapping[str, Any]) -> None:
+    def _dispatch_provider_key(self, action: str, data: Mapping[str, Any], *, credential: str = "") -> None:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
         provider = self._copy_provider_for_edit(providers[provider_index])
@@ -6509,13 +6515,13 @@ class ProvidersModelsDomain:
             name = self._api_key_name(data.get("name"))
             if any(str(item.get("name", "")).strip() == name for item in keys):
                 raise DomainError("The API key name is already in use")
-            # The value is filled only through the native secret capability.
-            # Validation remains false until that secure staging step finishes.
+            # Only a value already staged through the secret capability can
+            # accompany the new slot.
             keys.append(
                 {
                     "id": self._new_provider_key_id(),
                     "name": name,
-                    "value": "",
+                    "value": credential,
                     "source": {"kind": "independent"},
                 }
             )
@@ -6678,7 +6684,7 @@ class ProvidersModelsDomain:
         if self._provider_name_exists(
             providers, station_name, exclude_index=provider_index
         ):
-            raise DomainError("A provider with this name already exists")
+            raise DomainError("A provider with this name already exists", code="provider_name_duplicate")
         original = providers[provider_index]
         current_source = self._provider_source_state(provider)
         current_name = str(original.get("name", "")).strip()
@@ -7156,12 +7162,29 @@ class ProvidersModelsDomain:
             if source["kind"] != "custom":
                 raise DomainError("Select a relay station to create a relay provider")
             self._set_provider_source(provider, {"kind": "custom"})
-            if self._provider_name_exists(providers, provider.get("name")):
-                raise DomainError("A provider with this name already exists")
-            auth = self._configure_provider_auth(provider, requested_auth_kind)
-            self._apply_auth_to_models(provider, auth["kind"])
-            providers.append(provider)
-            self._register_new_provider(provider)
+            duplicate_index = self._provider_index_by_name(providers, provider.get("name"))
+            if duplicate_index is not None:
+                duplicate = providers[duplicate_index]
+                endpoint = self._model_endpoint(self._provider_api_base(provider))
+                # A matching provider may appear while its wizard is in the
+                # key or model step. Adopt the staged key on the matched row
+                # without changing its connection, keys, or models.
+                if (data.get("reuse_same_provider") is not True or endpoint is None
+                        or self._model_endpoint(self._provider_api_base(duplicate)) != endpoint
+                        or self._provider_auth_state(duplicate)["kind"] != "api_key"):
+                    raise DomainError("A provider with this name already exists", code="provider_name_duplicate")
+                provider = duplicate
+                if pending_keys:
+                    self._dispatch_provider_key(
+                        "provider_key_add", {"provider_id": self._editor_id(provider), "name": initial_api_key_name or "default"},
+                        credential=next(iter(pending_keys.values())),
+                    )
+            else:
+                auth = self._configure_provider_auth(provider, requested_auth_kind)
+                self._apply_auth_to_models(provider, auth["kind"])
+                providers.append(provider)
+                self._register_new_provider(provider)
+            self._last_operation = {"operation": "provider_add", "provider_id": self._editor_id(provider)}
             # The token is one-time: the value it filed belongs to the create
             # that just landed, and to nothing else.
             if pending_token:

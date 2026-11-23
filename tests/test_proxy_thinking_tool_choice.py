@@ -1,17 +1,4 @@
-"""A route that refuses ``tool_choice`` while it thinks.
-
-DeepSeek answers ``400 thinking mode does not support this tool_choice`` to a
-Codex turn.  It is *not* the field: the identical replay with ``tool_choice``
-removed is refused the same way (measured live 2026-11-04), and the same payload
-signature is served outright about half the time.  So the refusal is the route
-answering about this turn, and what it must not do is sit first in every request
-while a sibling could answer: one Codex task paid it on every turn -- ~10 s and a
-full upload of a 60 MB replay, 178 times in three hours.
-
-These tests pin the two halves: the classifier reads that wording and nothing
-else, and the policy parks the route after the ordinary failure threshold instead
-of ending the turn.
-"""
+"""Thinking-mode tool-choice refusals are request compatibility errors."""
 
 from __future__ import annotations
 
@@ -88,16 +75,192 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
             )
         )
 
-    def test_a_refusal_parks_the_route_instead_of_ending_the_turn(self) -> None:
+    def test_a_refusal_is_a_request_error(self) -> None:
         hooks, _ = load_hook_module()
         routing = hooks._routing_module
+        self.set_env(routing._RECOVERY_POLICY_REQUEST_ERROR_ENV, "cooldown")
+        self.set_env(routing._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "1")
+        token = routing._CURRENT_ATTEMPT_STARTED_AT.set(time.monotonic() - 10)
+        self.addCleanup(routing._CURRENT_ATTEMPT_STARTED_AT.reset, token)
 
         self.assertEqual(
             routing._recovery_policy_for_exception(_tool_choice_error()),
-            routing._RECOVERY_POLICY_COOLDOWN,
+            routing._RECOVERY_POLICY_ERROR,
         )
 
-    def test_two_refusals_park_the_route_for_the_cooldown_window(self) -> None:
+    async def test_unresolved_official_wire_is_repaired_after_the_specific_refusal(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = {
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "check the fixture"}],
+            "tool_choice": "required",
+            "thinking": {"type": "enabled"},
+        }
+        refusal = _tool_choice_error()
+        refusal.request = types.SimpleNamespace(
+            method="POST", url="https://api.deepseek.com/v1/chat/completions"
+        )
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise refusal
+            return "tool call returned"
+
+        self.assertEqual("tool call returned", await contract._call_with_deepseek_tool_choice(upstream, request))
+        self.assertEqual(["required", "auto"], [call["tool_choice"] for call in calls])
+        self.assertNotIn("extra_body", calls[0])
+        self.assertEqual({"type": "enabled"}, calls[1]["thinking"])
+        self.assertIs(request["messages"], calls[1]["messages"])
+
+    async def test_known_official_route_adapts_before_sending_without_changing_reasoning(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = {
+            **_route_request(),
+            "api_base": "https://api.deepseek.com/v1",
+            "tool_choice": "required",
+            "extra_body": {
+                "tool_choice": "required",
+                "function_call": {"name": "bash"},
+                "temperature": 0.5,
+            },
+        }
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            raise refusal
+
+        refusal = _tool_choice_error()
+        refusal.request = types.SimpleNamespace(method="GET", url="https://litellm.ai")
+        with self.assertRaises(_BadRequest) as error:
+            await contract._call_with_deepseek_tool_choice(upstream, request)
+
+        self.assertIs(refusal, error.exception)
+        self.assertEqual(["auto"], [call["tool_choice"] for call in calls])
+        self.assertEqual({"temperature": 0.5}, calls[0]["extra_body"])
+        self.assertEqual(request["reasoning"], calls[0]["reasoning"])
+        self.assertIs(request["tools"], calls[0]["tools"])
+
+    async def test_injected_choice_is_repaired_when_the_official_wire_was_unknown(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = contract._with_injected_tool_choice({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "check the fixture"}],
+            "tool_choice": "auto",
+            "reasoning_effort": "high",
+        }, "required")
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                refusal = _tool_choice_error()
+                refusal.request = types.SimpleNamespace(
+                    method="POST", url="https://api.deepseek.com/v1/chat/completions"
+                )
+                raise refusal
+            return "tool call returned"
+
+        self.assertEqual(
+            "tool call returned", await contract._call_with_deepseek_tool_choice(upstream, request)
+        )
+        self.assertEqual(["required", "auto"], [call["tool_choice"] for call in calls])
+        self.assertEqual("high", calls[1]["reasoning_effort"])
+
+    async def test_messages_adaptation_preserves_thinking_and_uses_messages_auto_shape(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = {
+            "api_base": "https://api.deepseek.com/anthropic",
+            "call_type": "anthropic_messages",
+            "messages": [{"role": "user", "content": "check"}],
+            "tool_choice": {"type": "tool", "name": "inspect"},
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+        }
+        calls = []
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            return "tool call returned"
+
+        self.assertEqual("tool call returned", await contract._call_with_deepseek_tool_choice(upstream, request))
+        self.assertEqual(1, len(calls))
+        self.assertEqual({"type": "auto"}, calls[0]["tool_choice"])
+        self.assertEqual(request["thinking"], calls[0]["thinking"])
+
+    async def test_synthetic_error_uses_selected_default_deepseek_provider(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        self.set_env("DEEPSEEK_API_BASE", "")
+        request = {"model": "fixture", "tool_choice": "required", "reasoning_effort": "high"}
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                refusal = _tool_choice_error()
+                refusal.request = types.SimpleNamespace(method="GET", url="https://litellm.ai")
+                raise refusal
+            return "ok"
+
+        def selected_route(active):
+            return {**active, "litellm_params": {"model": "deepseek/fixture"}}
+
+        self.assertEqual(
+            "ok", await contract._call_with_deepseek_tool_choice(upstream, request, prepare_retry=selected_route)
+        )
+        self.assertEqual(["required", "auto"], [call["tool_choice"] for call in calls])
+        self.assertEqual("high", calls[1]["reasoning_effort"])
+        self.set_env("DEEPSEEK_API_BASE", "https://relay.example/v1")
+        self.assertFalse(contract._request_targets_official_deepseek(selected_route(request)))
+
+    async def test_explicitly_disabled_thinking_keeps_forced_choice(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = {
+            "api_base": "https://api.deepseek.com/v1",
+            "tool_choice": "required",
+            "thinking": {"type": "disabled"},
+        }
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            return "ok"
+
+        self.assertEqual("ok", await contract._call_with_deepseek_tool_choice(upstream, request))
+        self.assertEqual(["required"], [call["tool_choice"] for call in calls])
+
+    async def test_official_chat_preserves_native_thinking_in_wire_body(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = {
+            "api_base": "https://api.deepseek.com/v1",
+            "call_type": "acompletion",
+            "tool_choice": "required",
+            "thinking": {"type": "enabled"},
+            "extra_body": {"temperature": 0.5},
+        }
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs)
+            return "ok"
+
+        self.assertEqual("ok", await contract._call_with_deepseek_tool_choice(upstream, request))
+        self.assertEqual("auto", calls[0]["tool_choice"])
+        self.assertEqual({"type": "enabled"}, calls[0]["thinking"])
+        self.assertEqual({"thinking": {"type": "enabled"}, "temperature": 0.5}, calls[0]["extra_body"])
+        self.assertEqual({"temperature": 0.5}, request["extra_body"])
+
+        request["extra_body"]["thinking"] = {"type": "disabled"}
+        self.assertFalse(contract._deepseek_thinking_rejects_forced_choice(request))
+
+    def test_refusals_do_not_park_the_route(self) -> None:
         hooks, _ = load_hook_module()
         routing = hooks._routing_module
         routing._DEPLOYMENT_COOLDOWNS.clear()
@@ -115,7 +278,7 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
             for state in routing._DEPLOYMENT_COOLDOWNS.values()
             if isinstance(state, dict) and state.get("cooldown_until")
         ]
-        self.assertTrue(states, routing._DEPLOYMENT_COOLDOWNS)
+        self.assertFalse(states, routing._DEPLOYMENT_COOLDOWNS)
         routing._DEPLOYMENT_COOLDOWNS.clear()
 
     def _parked_states(self, routing):
@@ -187,30 +350,16 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
             ]
         )
 
-    def test_the_refusal_earns_one_more_attempt_on_the_same_route(self) -> None:
-        """A coin flip is asked again, on the route that flipped it.
-
-        Measured through this proxy: the request DeepSeek refused carried
-        ``tool_choice: null``, so there was nothing to relax and the bytes were
-        not the problem -- the same payload signature is served outright about
-        half the time.  With the configured budget at its default of zero the
-        only outcomes were a sibling (which a single-route group does not have)
-        or a failed turn, and the cooldown that parked the route had nothing to
-        wait for.
-        """
-
+    def test_the_refusal_is_not_repeated_on_the_same_route(self) -> None:
         hooks, _ = load_hook_module()
         routing = hooks._routing_module
-        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "0")
-        self.assertEqual(0, routing._same_deployment_retries())
+        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "2")
 
-        self.assertGreaterEqual(
-            routing._same_deployment_retry_budget(_tool_choice_error()), 1
-        )
-        # Everything else keeps the configured budget: this allowance is about
-        # one class, not a global change of retry behaviour.
         self.assertEqual(
-            0,
+            routing._same_deployment_retry_budget(_tool_choice_error()), 0
+        )
+        self.assertEqual(
+            2,
             routing._same_deployment_retry_budget(
                 _tool_choice_error(
                     "litellm.BadRequestError: OpenAIException - tool_choice "
@@ -219,23 +368,18 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
             ),
         )
 
-    def test_the_extra_attempt_is_asked_again_immediately(self) -> None:
-        """Waiting the recovery interval would make the flake cost seconds.
-
-        Nothing has to recover for this class: the route is up and answering,
-        it just answered the other way this time.
-        """
+    def test_unrelated_rate_limit_keeps_the_configured_delay(self) -> None:
 
         hooks, _ = load_hook_module()
         routing = hooks._routing_module
         recovery_interval = routing._stream_route_exhaustion_retry_delay_seconds()
         self.assertGreater(recovery_interval, 0.2)
 
-        self.assertLessEqual(
+        self.assertEqual(
             routing._route_exhaustion_retry_delay_for_exception(
                 _tool_choice_error(), recovery_interval
             ),
-            0.2,
+            recovery_interval,
         )
         # A rate-limit answer keeps the configured delay when it names no
         # retry-after.  The wrapper class is a 400, so the status has to be set
@@ -288,14 +432,7 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
         routing._allow_the_failed_deployment_again(refusal, request)
         self.assertNotIn("_excluded_deployment_ids", request)
 
-    async def test_a_served_retry_ends_the_turn_and_parks_nothing(self) -> None:
-        """The retry is the whole remedy: no cooldown, no second refusal.
-
-        The upstream serves this payload signature about half the time, so one
-        route asked twice usually answers.  Running it through the generic
-        helper is what proves the attempt is spent on the same route instead of
-        advancing to a peer that does not exist.
-        """
+    async def test_a_single_route_refusal_is_not_replayed(self) -> None:
 
         hooks, _ = load_hook_module()
         routing = hooks._routing_module
@@ -335,9 +472,10 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
             original_generic_function,
             **request,
         )
+        events = [jsonable_stream_chunk(chunk) async for chunk in response]
 
-        self.assertEqual({"served": True}, response)
-        self.assertEqual(2, len(attempts))
+        self.assertEqual(1, len(attempts))
+        self.assertEqual("response.failed", events[-1]["type"])
         self.assertFalse(
             [
                 state
@@ -359,7 +497,7 @@ class InternalSearchCallKeepsNoRetryTests(HookTestCase):
     async def _attempts(self, metadata: dict) -> int:
         hooks, _ = load_hook_module()
         routing = hooks._routing_module
-        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "1")
         self.set_env(routing._RECOVERY_INTERVAL_SECONDS_ENV, "0")
         routing._DEPLOYMENT_COOLDOWNS.clear()
 
@@ -381,7 +519,8 @@ class InternalSearchCallKeepsNoRetryTests(HookTestCase):
 
         async def original_generic_function(**kwargs):
             attempts.append(1)
-            error = _tool_choice_error()
+            error = _tool_choice_error("temporary server failure")
+            error.status_code = 503
             error.failed_deployment_id = "ce96bf46"
             routing._mark_exception_for_deployment_failover(error, kwargs)
             raise error

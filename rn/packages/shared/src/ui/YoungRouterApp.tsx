@@ -9,6 +9,7 @@ import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScroll
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { orderedModelGroupIDs } from "./modelGroupOrder";
+import { useRowSelection } from "./rowSelection";
 import { displayUpstreamModel, groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";
 import { apiKeyDisplayName, providerKeyChoiceLabel, relaySourceName } from "./providerKeyLabels";
 import { AccountsTable } from "./AccountsTable";
@@ -44,7 +45,7 @@ import {
 import { relayLoginLandedAccount, stationSurfacePath, suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
 import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from "../applyPatch";
-import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
+import { postActionRefreshNeeded, publishSnapshot, type EventChannelState } from "./snapshotStore";
 import { followedCredentialChoiceID, providerCredentialKeys, relayCredentialKey } from "./providerCredentials";
 import { focusProviderAfterWizard, isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, providerWizardFocusID, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
@@ -1715,6 +1716,7 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // that is genuinely unusable reads as a validation failure, while a relay
     // that is not ready states its own cause instead of blaming the edit.
     provider_model_invalid: "error.validationFailed",
+    provider_name_duplicate: "providers.wizard.duplicateName",
     relay_preflight_failed: "error.relayNotReady",
     relay_not_ready: "error.relayNotReady",
     // A linked relay key that could not be resolved names its own cause: the
@@ -3606,14 +3608,14 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     }
     return true;
   };
-  const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined> => {
+  const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false, reportFailure?: (message: string) => void): Promise<CoreSnapshot | undefined> => {
     // Keep a stable, narrowed domain for the asynchronous outcome projection.
     // `targetDomain` is optional on the public helper because most callers use
     // the route's domain, but action summaries are keyed by a concrete domain.
     const actionDomain = targetDomain;
     let succeeded = false;
     let outcome: CoreSnapshot | undefined;
-    await run(async () => {
+    await runOutcome(async () => {
       const staged = await enqueueDispatch(type, payload, targetDomain);
       succeeded = true;
       // Capture the refresh belonging to this action. Reading
@@ -3641,7 +3643,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
         onSnapshot(outcome);
       }
       return staged;
-    }, null, keepControlsEnabled || isNonStagingAction(type) || isReadBackedMutation(type), false);
+    }, null, keepControlsEnabled || isNonStagingAction(type) || isReadBackedMutation(type), false, undefined, reportFailure);
     return succeeded ? outcome : undefined;
   };
   const addOfficialAccount = async (kind: ServiceProviderKind, name?: string): Promise<string> => {
@@ -4690,7 +4692,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} dispatchModelPick={(type, payload) => enqueueDispatch(type, payload, "providers_models")} withModelPickSave={withModelPickSave} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} applyStagedQuietly={applyStagedQuietly} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
-    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} applyStagedQuietly={applyStagedQuietly} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace
       initialClient={initialClient} busy={busy} native={native} codexModelCatalogEnabled={codexModelCatalogEnabled}
@@ -4815,7 +4817,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onClose, onKeyToken, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string> }): React.JSX.Element {
+function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onClose, onKeyToken, relay, addOfficialAccount, applyStagedQuietly }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean, reportFailure?: (message: string) => void) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; applyStagedQuietly: () => Promise<void> }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
   type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
@@ -4828,6 +4830,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [providerType, setProviderType] = useState<WizardType>("api");
   const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
   const [providerSelection, setProviderSelection] = useState(PROVIDER_WIZARD_NEW_PROVIDER);
+  const [stagedProviderID, setStagedProviderID] = useState("");
   const [providerName, setProviderName] = useState("");
   const [providerBaseURL, setProviderBaseURL] = useState("");
   // The live relay-family probe, keyed by the origin that answered it.  A
@@ -5123,6 +5126,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // A provider this wizard is creating does not exist yet, so its key value is
   // staged under the wizard's own token (see `providerWizardKeyTarget`).
   const creatingProvider = providerMode === "new" && !providerID;
+  const finishingProvider = creatingProvider || (stagedProviderID !== "" && stagedProviderID === providerID);
   const stagedKeyTarget = providerWizardKeyTarget(pendingKeyToken, stagedKeyName);
   // The field's identity is the secret target it stages under: a different
   // selection is a different field, whose own state starts empty.  Written
@@ -5188,9 +5192,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const manualSelectedKeyName = selectedKeyChoice?.name ?? (activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? keyName.trim() : "");
   const selectedKeyReady = Boolean(selectedKeyChoice && selectedKeyChoice.kind === "independent" && selectedKeyChoice.state?.configured) || keyReady;
   const modelCandidates = useMemo(() => {
-    const values = [...(selectedProvidedChoice?.models ?? []), ...fetchedModelCandidates];
+    const values = genericModelStep && usingProvidedKeyPath(keyPath)
+      ? selectedProvidedChoice?.models ?? [] : fetchedModelCandidates;
     return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-  }, [fetchedModelCandidates, selectedProvidedChoice?.models]);
+  }, [fetchedModelCandidates, genericModelStep, keyPath, selectedProvidedChoice?.models]);
   // A provided key whose models the snapshot files as empty: the step asks the
   // station once for that key, then stops asking.  The read is the account's
   // resource read — the same one the key table's 刷新 pays — because a provider
@@ -5383,14 +5388,21 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // on every render would fight the refresh button beside the account.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, providerType]);
-  const providerStepValid = (): boolean => {
+  const providerStepValid = (allowMatchingProvider = false): boolean => {
     const name = providerName.trim();
     if (!name) {
       setValidation(translate("providers.wizard.required"));
       return false;
     }
-    if (providerNameExists(providers, name, providerMode === "existing" ? providerID : "")) {
+    const matchingProvider = allowMatchingProvider && providerType === "api"
+      ? providerAtAddress(providers, serviceBaseURL, name)
+      : undefined;
+    const existingID = providerMode === "existing" ? providerID
+      : matchingProvider && providerAuthKind(matchingProvider) === "api_key" ? editorIdentifier(matchingProvider) : "";
+    if (providerNameExists(providers, name, existingID)) {
       setValidation(translate("providers.wizard.duplicateName"));
+      stepRef.current = "provider";
+      setStep("provider");
       return false;
     }
     // A provider carries its own address only when this step asks for one: the
@@ -5912,20 +5924,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
       const summaryProviderID = stringValue(summary.provider_id);
       const providerIdentity = selectedProvider ? identifier(selectedProvider) : "";
-      if (stringValue(summary.operation) !== "fetch_models"
+      if (stringValue(summary.operation) !== "fetch_models" || summary.available !== true
         || (summaryProviderID !== fetchIdentity && summaryProviderID !== providerIdentity)) {
         setModelFetchState("unavailable");
         return;
       }
-      if (summary.available === false) {
-        setModelFetchState("unavailable");
-        return;
-      }
       const candidates = [...new Set(stringList(summary.models).map((value) => value.trim()).filter(Boolean))];
-      if (candidates.length === 0) {
-        setModelFetchState("empty");
-        return;
-      }
       setFetchedModelCandidates(candidates);
       const capabilityRecords: Record<string, UnknownRecord> = {};
       for (const [modelID, value] of Object.entries(asRecord(summary.model_capabilities))) {
@@ -5933,9 +5937,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         if (Object.keys(capabilities).length > 0) capabilityRecords[modelID] = capabilities;
       }
       setFetchedModelCapabilities(capabilityRecords);
-      const available = new Set([...(selectedProvidedChoice?.models ?? []), ...candidates]);
+      const available = new Set(candidates);
       setSelectedModels((current) => current.filter((model) => available.has(model)));
-      setModelFetchState("ready");
+      setModelFetchState(candidates.length > 0 ? "ready" : "empty");
     } catch {
       if (request === modelFetchRequest.current) {
         setModelFetchState("unavailable");
@@ -6027,10 +6031,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         account_id: choice.accountID,
         resource_id: choice.resourceID,
       },
-    });
-    // The dispatch already stated its own refusal in the strip; this is the
-    // answer that carries no slot at all, and the step is where it is asked.
-    const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+    }, "providers_models", false, setValidation);
+    if (!next) return undefined;
+    const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
     const id = stringValue(summary.slot_id);
     const name = stringValue(summary.api_key_name);
     if (!id || !name) {
@@ -6038,6 +6041,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return undefined;
     }
     return { id, name };
+  };
+  const wizardRelayStation = stationForProvider
+    ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? selectedStationAccount?.stationID));
+  const bindWizardStation = async (targetProviderID: string): Promise<boolean> => {
+    if (!wizardRelayStation) return true;
+    const bound = await dispatchWithOutcome("provider.select_relay_station", {
+      provider_id: targetProviderID,
+      station_id: wizardRelayStation.id,
+    }, "providers_models", false, setValidation);
+    return bound !== undefined;
   };
   /**
    * The wizard's one create — 完成 is what mints the provider.
@@ -6061,7 +6074,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // `providerStepValid` is the one place that states why nothing can be
     // created, the empty name included: short-circuiting on the name here
     // returned silently, and 完成 read as a press that did nothing.
-    if (!providerStepValid()) return undefined;
+    if (!providerStepValid(true)) return undefined;
     const name = providerName.trim();
     if (isWorkBuddyType || isQoderType) {
       // The account publishes the roster this step listed, and the pick is the
@@ -6141,7 +6154,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setValidation(translate("providers.wizard.required"));
       return undefined;
     }
-    const existingIDs = new Set(providers.map(editorIdentifier));
     const usingProvidedKey = keyPath === "login";
     const next = await dispatchWithOutcome("provider.add", {
       provider: {
@@ -6158,26 +6170,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         }),
       },
       ...(usingProvidedKey ? {} : { pending_api_key: pendingKeyToken }),
-    });
+      ...(providerType === "api" ? { reuse_same_provider: true } : {}),
+    }, "providers_models", false, setValidation);
     if (!next) return undefined;
-    const nextProviders = snapshotProviderRecords(next);
-    const added = nextProviders.find((entry) => !existingIDs.has(editorIdentifier(entry)))
-      ?? nextProviders.find((entry) => stringValue(entry.name).trim() === name);
-    if (!added) return undefined;
-    const createdID = editorIdentifier(added);
+    const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+    const createdID = stringValue(summary.provider_id);
+    if (stringValue(summary.operation) !== "provider_add" || !createdID) return undefined;
     // The wizard now edits the provider it just made: a 完成 that still has
     // work left (its models) continues on this entry instead of creating a
     // second one with the same name.
+    setStagedProviderID(createdID);
     setProviderMode("existing");
     setProviderSelection(createdID);
     focusProviderAfterWizard(createdID);
-    // A provider that belongs to a relay station is bound to it now, while
-    // its provided keys are what its models route through.
-    if (usingProvidedKey) {
-      const station = stationForProvider
-        ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? selectedStationAccount?.stationID ?? ""));
-      if (station) await dispatchWithOutcome("provider.select_relay_station", { provider_id: createdID, station_id: station.id });
-    }
     setValidation("");
     return createdID;
   };
@@ -6693,7 +6698,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         }
       }
       advanceStepToModel();
-      if (modelCandidates.length === 0) void fetchWizardModels();
+      setModelFetchTicket((current) => current + 1);
       return;
     }
     // Model step.
@@ -6808,6 +6813,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // provider arrives with its key, and the models follow on it.
       const targetProviderID = providerID || await commitWizardProvider();
       if (!targetProviderID) return;
+      if (finishingProvider && usingProvidedKey && !await bindWizardStation(targetProviderID)) return;
       const providedKey = usingProvidedKey && selectedProvidedChoice
         ? await importProvidedKey(targetProviderID, selectedProvidedChoice)
         : undefined;
@@ -6838,14 +6844,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    * and a wizard that demands a model cannot register a supplier whose roster
    * is not worth adding yet.  So this is 完成's own create (the provider, its
    * key, its station binding) minus the routes, which 获取模型 adds later.  It
-   * is drawn only where the create is this step's work: an existing provider has
-   * nothing to write without a model, and 关闭 is that answer.
+   * is drawn while this wizard has a provider to finish, including a save retry.
    */
   const finishWithoutModels = async (): Promise<void> => {
-    // Like 仅保存供应商, this is a create.  An existing provider has nothing to
-    // write without a model, so the footer does not draw it and the function
-    // refuses a caller that reaches it anyway.
-    if (!creatingProvider) return;
+    if (!finishingProvider) return;
     if (processing || advanceInFlight.current || stepRef.current !== step) return;
     advanceInFlight.current = true;
     setValidation("");
@@ -6855,7 +6857,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (!targetProviderID) return;
       // The key the user signed in for is still theirs to keep: a provider
       // created without routes carries the slot those routes would name.
-      if (usingProvidedKeyPath(keyPath) && selectedProvidedChoice && !await importProvidedKey(targetProviderID, selectedProvidedChoice)) return;
+      if (usingProvidedKeyPath(keyPath)) {
+        if (!await bindWizardStation(targetProviderID)) return;
+        if (selectedProvidedChoice && !await importProvidedKey(targetProviderID, selectedProvidedChoice)) return;
+      }
+      await applyStagedQuietly();
       onClose();
     } catch (reason) {
       setValidation(errorMessage(reason, translate));
@@ -6881,12 +6887,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // row and its station association, so "save provider only" would save
     // nothing and then close as if it had; the button is not offered there and
     // this guard keeps every other path to it honest too.
-    if (!creatingProvider) return;
+    if (!finishingProvider) return;
     if (processing || advanceInFlight.current || stepRef.current !== step) return;
     if (step !== "keys" || keyPath !== "login") return;
-    const station = stationForProvider
-      ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? selectedStationAccount?.stationID ?? ""));
-    if (!station) {
+    if (!wizardRelayStation) {
       setValidation(translate("providers.wizard.loginFirstHint"));
       return;
     }
@@ -6896,13 +6900,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     try {
       const targetProviderID = providerID || await commitWizardProvider();
       if (!targetProviderID) return;
-      // Bind the row even when the create already did: the station this step
-      // found may be the account's own station rather than one matched by the
-      // typed URL, and re-binding the same station is Core's no-op.  This
-      // finish is provider-first: the row is created here, then associated, so
-      // pressing it never saves a station on its own.
-      const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: station.id });
-      if (!bound) return;
+      if (!await bindWizardStation(targetProviderID)) return;
+      await applyStagedQuietly();
       focusProviderAfterWizard(targetProviderID);
       onClose();
     } catch (reason) {
@@ -7203,6 +7202,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               /* One wheel for one wait: the toolbar's row above already states
                  it above, so no block repeats the same wait below. */
             }
+            {!usingProvidedKeyPath(keyPath) && modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : null}
+            {!usingProvidedKeyPath(keyPath) && modelFetchState === "unavailable" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.modelsUnavailable")}</Text> : null}
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate(usingProvidedKeyPath(keyPath) ? "providers.wizard.providedModels" : "providers.wizard.discoveredModels")}</Text></View>
               <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
@@ -7247,10 +7248,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       <View style={styles.childSurfaceFooterActions}>
         <NativeButton title={translate("status.close")} disabled={processing} onPress={onClose} />
         {step !== "provider" || loginPhase === "sign-in" ? <NativeButton title={translate("providers.wizard.back")} disabled={busy || processing} onPress={goBack} /> : null}
-        {step === "model" && creatingProvider && genericModelStep
-          ? <NativeButton title={translate("providers.wizard.finishWithoutModels")} disabled={wizardBusy && !processing} onPress={() => { void finishWithoutModels(); }} />
+        {step === "model" && finishingProvider && genericModelStep
+          ? <NativeButton title={translate("providers.wizard.finishWithoutModels")} busy={processing} disabled={wizardBusy && !processing} onPress={() => { void finishWithoutModels(); }} />
           : null}
-        {step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"
+        {step === "keys" && finishingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"
           && (stationForProvider || selectedProvidedChoice || selectedStationAccount)
           ? <NativeButton title={translate("providers.wizard.saveProviderOnly")} busy={processing} disabled={wizardBusy && !processing} onPress={() => { void finishProviderOnly(); }} />
           : null}
@@ -7300,18 +7301,10 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
   }
 }
 
-/**
- * The provider list, subscribed to its own domain instead of the root state.
- *
- * The workspace around it draws the selected provider, its routes and its
- * inspector, so it redraws whenever any of that moves.  The list itself only
- * depends on `domains.providers_models`, and `applyPatch` keeps every other
- * domain's object reference, so a patch that touches codex, logs or the service
- * row neither notifies this table nor re-renders it.  That is what the memo
- * boundary is for: the props are the slow-moving drafts and validation rows,
- * and the fast-moving rows come from the store.
- */
-const ProviderListTable = React.memo(function ProviderListTable({ translate, selectedProviderId, providerNameDrafts, validationIssues, onSelect }: {
+/** The table uses the same provider projection as its highlight and inspector. */
+const ProviderListTable = React.memo(function ProviderListTable({ providers, bindingIssues, translate, selectedProviderId, providerNameDrafts, validationIssues, onSelect }: {
+  providers: UnknownRecord[];
+  bindingIssues: UnknownRecord[];
   translate: Translate;
   selectedProviderId: string;
   providerNameDrafts: Record<string, string>;
@@ -7319,9 +7312,6 @@ const ProviderListTable = React.memo(function ProviderListTable({ translate, sel
   validationIssues: UnknownRecord[];
   onSelect: (key: string) => void;
 }): React.JSX.Element {
-  const state = useDomainRecord("providers_models");
-  const providers = useMemo(() => asRecords(state?.providers), [state]);
-  const bindingIssues = useMemo(() => asRecords(state?.binding_issues), [state]);
   const rows = useMemo(
     () => providers.map((item) => {
       const id = editorIdentifier(item);
@@ -7361,7 +7351,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // table below is memoized on this prop.
     [snapshot?.drafts.providers_models?.validation.issues],
   );
-  const [selectedProvider, setSelectedProvider] = useState<string>();
+  const [providerSelection, setSelectedProvider] = useState<string>();
+  const [modelSelection, setSelectedModel] = useState<string>();
+  const [routeSelection, setRouteSelection] = useState<string>();
+  const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});
   const [providerBaseUrlDrafts, setProviderBaseUrlDrafts] = useState<Record<string, string>>({});
   const [modelNameDrafts, setModelNameDrafts] = useState<Record<string, string>>({});
@@ -7419,38 +7412,27 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       if (!activeKeys.has(selectionKey)) autoRelaySelectionKeys.current.delete(selectionKey);
     }
   }, [busy, dispatch, providers, relayStations]);
-  const pendingModelIds = useRef<({ providerId: string } & ({ ids: Set<string> } | { id: string })) | undefined>(undefined);
-  // A pick that staged nothing new — the model the fetch offered is the row
-  // already on that key, which Core now refuses to duplicate — must not leave
-  // its ids waiting: the next unrelated row to appear would otherwise steal the
-  // selection.  The effect above clears the ref only when it finds the new row,
-  // so the add's own answer is what releases a no-op pick.
-  const settlePendingModels = (next: unknown, targetProviderId: string): void => {
-    const pending = pendingModelIds.current;
-    if (!pending || pending.providerId !== targetProviderId || !("ids" in pending)) return;
-    const added = snapshotProviderRecords(next as CoreSnapshot | undefined)
-      .find((entry) => editorIdentifier(entry) === targetProviderId);
-    const appeared = added
-      ? asRecords(added.models).map(modelRecord).some((entry) => !pending.ids.has(editorIdentifier(entry)))
-      : false;
-    if (!appeared) pendingModelIds.current = undefined;
-  };
-  // A route ＋ created is selected once the routes list carries it.  The key is
-  // not known until the snapshot arrives a render later, and setting a key the
-  // table does not know would be repaired to the first route — the pane would
-  // then edit the wrong row.
-  const pendingRouteKey = useRef<string | undefined>(undefined);
-  // The list owns the selection, and it always names a provider: a row the
-  // snapshot no longer carries (nothing chosen yet, or the provider was renamed
-  // or removed) falls back to the first one.  An empty selection is not a state
-  // this pane has — it would leave the models list, the + / − headers and the
-  // editor standing on nothing, and the only way back would be a click on a row
-  // the user had not been told was needed.
-  const provider = useMemo(
-    () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],
-    [providers, selectedProvider],
-  );
-  const providerId = provider ? editorIdentifier(provider) : "";
+  const [pendingModelSelection, setPendingModelSelection] = useState<{ providerId: string } & ({ id: string } | { name: string } | { waiting: true })>();
+  const [pendingProviderName, setPendingProviderName] = useState<string>();
+  const [pendingRouteSelection, setPendingRouteSelection] = useState<{ key?: string; renameFrom?: string }>();
+  const [movingModel, setMovingModel] = useState<{ modelId: string; destinationId: string; fromRoute?: string }>();
+  const clearPendingSelection = useCallback(() => {
+    setPendingModelSelection(undefined);
+    setPendingProviderName(undefined);
+    setPendingRouteSelection(undefined);
+    setMovingModel(undefined);
+  }, []);
+  // Core moves the same editor ID between providers in one update. Keep the
+  // source selected until that update can supply the destination and model together.
+  const arrivedMove = movingModel && providers.some((entry) => editorIdentifier(entry) === movingModel.destinationId
+    && asRecords(entry.models).some((item) => editorIdentifier(item) === movingModel.modelId)) ? movingModel : undefined;
+  const providerKeys = useMemo(() => providers.map(editorIdentifier), [providers]);
+  const addedProvider = pendingProviderName === undefined ? undefined : providers.find((entry) => stringValue(entry.name) === pendingProviderName);
+  const providerId = useRowSelection(providerKeys, providerSelection, setSelectedProvider, {
+    first: providerKeys[0],
+    target: arrivedMove?.destinationId ?? (addedProvider ? editorIdentifier(addedProvider) : undefined),
+  }) ?? "";
+  const provider = providers.find((item) => editorIdentifier(item) === providerId);
   const providerKindSelected = provider ? providerKind(provider) : "apiKey" as ProviderKind;
   // 账号管理 data for any provider row (used by the detail pane).
   const stationForProvider = useCallback((entry: UnknownRecord | undefined): RelayStation | undefined => {
@@ -7507,18 +7489,36 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     })) : [],
     [provider, validationIssues],
   );
-  const [selectedModel, setSelectedModel] = useState<string>();
-  // The model row that was pressed, not merely the model it named: a model
-  // with no credential of its own is listed under every credential group, so
-  // the group is part of what the user clicked.  Without it the pane repaired
-  // the selection onto the first group that lists the model, and the row under
-  // the pointer lost its highlight while another copy lit up — the click read
-  // as a flash that had not taken.
-  const [selectedModelRow, setSelectedModelRow] = useState<string>();
+  const modelCredentials = useMemo(() => providerCredentials(provider, translate), [provider, translate]);
+  // The table and deletion repair must see the same order, including keys
+  // whose routes are interleaved in the config.
+  const modelGroups = useMemo(() => {
+    const groups = new Map<string, UnknownRecord[]>();
+    for (const model of models) {
+      const credential = modelCredentials.length > 0
+        ? modelCredential(model, provider ?? {}, modelCredentials)
+        : modelProviderKeyState(model, provider ?? {});
+      const id = credential?.id ?? "";
+      const entries = groups.get(id);
+      if (entries) entries.push(model);
+      else groups.set(id, [model]);
+    }
+    const credentials = modelCredentials.length > 0 ? modelCredentials : providerKeyStates(provider ?? {});
+    const order = credentials.map((credential) => credential.id);
+    return orderedModelGroupIDs([...groups.keys()], order).map((id) => ({ id, models: groups.get(id)! }));
+  }, [modelCredentials, models, provider]);
+  const modelKeys = useMemo(() => modelGroups.flatMap((group) => group.models.map(editorIdentifier)), [modelGroups]);
+  const pendingModel = pendingModelSelection?.providerId === providerId
+    ? models.find((item) => "id" in pendingModelSelection
+      ? editorIdentifier(item) === pendingModelSelection.id
+      : "name" in pendingModelSelection && stringValue(item.model_name ?? item.name) === pendingModelSelection.name)
+    : undefined;
+  const selectedModel = useRowSelection(modelKeys, modelSelection, setSelectedModel, {
+    list: providerId,
+    target: arrivedMove?.modelId ?? (pendingModel ? editorIdentifier(pendingModel) : undefined),
+    preserve: Boolean(movingModel && !arrivedMove && movingModel.modelId === modelSelection),
+  });
   const [providerSourceModel, setProviderSourceModel] = useState<string>();
-  // Adding a provider from the list header selects it as soon as the snapshot
-  // carries it, so the editor below opens on the provider that was just made.
-  const pendingProviderIds = useRef<Set<string> | undefined>(undefined);
   const model = useMemo(
     () => models.find((item) => editorIdentifier(item) === selectedModel),
     [models, selectedModel],
@@ -7527,7 +7527,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // the picker follows the row the user is looking at (see
   // `preferredFetchKeyID`).
   const selectedModelKeyID = model ? (modelProviderKeyState(model, provider ?? {})?.id ?? "") : "";
-  const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   // A phone has one column.  The lists fill it, and a row opens its inspector
   // in their place; `compactDetail` is that one bit of navigation.  No
   // selection defaults into it: a provider is selected as soon as one exists,
@@ -7535,13 +7534,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // This pane keeps its own, wider breakpoint (see `useCompactProvidersPane`).
   const compactWeb = useCompactProvidersPane();
   const [compactDetail, setCompactDetail] = useState(false);
-  const [selectedRoute, setSelectedRoute] = useState<string>();
-  // The routes view selects either one route (its model detail) or one public
-  // model's group (its own settings surface).
-  const [selectedPublicModel, setSelectedPublicModel] = useState<string>();
   // Where 设置 came from: the route detail the public-model pane can return to.
   const [publicModelReturn, setPublicModelReturn] = useState<{ routeKey: string; label: string }>();
-  const [fetchKeyID, setFetchKeyID] = useState<string>();
+  const [fetchKeyOverride, setFetchKeyOverride] = useState<{ providerId: string; modelId?: string; id: string }>();
   const [fetchModelsBusy, setFetchModelsBusy] = useState(false);
   // 获取模型 answers for one credential, so a picker that moves while the
   // station is being read makes that answer belong to a question nobody is
@@ -7553,16 +7548,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // between a click and the next render, and an answer read from render state
   // there is already the wrong one.
   const fetchModelsGeneration = useRef(0);
-  const fetchKeyIDRef = useRef<string | undefined>(undefined);
-  const chooseFetchKey = (id: string | undefined): void => {
-    // The same credential is not a new question: selecting another row of the
-    // key group a listing is already reading leaves that listing alone.
-    if (id === fetchKeyIDRef.current) return;
-    fetchKeyIDRef.current = id;
-    fetchModelsGeneration.current += 1;
-    setFetchModelsBusy(false);
-    setFetchKeyID(id);
-  };
   // Native command buttons stay pressable while they show progress. CRUD
   // mutations therefore need a semantic single-flight guard as well as the
   // pane's visual busy state, otherwise a fast double-click creates/deletes
@@ -7595,7 +7580,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyGlobal"
     || providerKindSelected === "ourFreeModel";
   const relayAccountPrefixByID = useMemo(() => relayAccountPrefixes(snapshot), [snapshot]);
-  const fetchKeyChoices = useMemo(() => {
+  const fetchKeyChoices = useMemo<ProviderKeyChoice[]>(() => {
     if (!provider) return [];
     // 获取模型 asks one credential for its roster, so the picker lists the
     // row's credentials: every signed-in account, then every key.  A slot whose
@@ -7667,7 +7652,31 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ? selectedModelKeyID
       : usable?.id ?? fetchKeyChoices[0]?.id ?? "";
   }, [fetchKeyChoices, selectedModelKeyID]);
-  const selectedFetchKey = fetchKeyID ?? preferredFetchKeyID;
+  // A manual key choice belongs to the row that was selected when it was made.
+  // Derive its override with the row so a model change never paints its old key.
+  const overrideKey = fetchKeyOverride?.providerId === providerId && fetchKeyOverride.modelId === selectedModel
+    ? followedCredentialChoiceID(fetchKeyChoices, fetchKeyOverride.id) : undefined;
+  const selectedFetchKey = overrideKey ?? preferredFetchKeyID;
+  const fetchChoice = fetchKeyChoices.find((choice) => choice.id === selectedFetchKey);
+  // A relay resource acquiring a local slot keeps the same credential key.
+  const fetchIdentity = `${providerId}\x1f${fetchChoice?.credentialKey ?? fetchChoice?.id ?? ""}`;
+  const fetchIdentityRef = useRef(fetchIdentity);
+  const trackFetchIdentity = useCallback((identity: string): void => {
+    if (identity === fetchIdentityRef.current) return;
+    fetchIdentityRef.current = identity;
+    fetchModelsGeneration.current += 1;
+    setFetchModelsBusy(false);
+  }, []);
+  React.useLayoutEffect(() => {
+    trackFetchIdentity(fetchIdentity);
+    if (overrideKey === undefined) setFetchKeyOverride(undefined);
+  }, [fetchIdentity, overrideKey, trackFetchIdentity]);
+  const chooseFetchKey = (id: string): void => {
+    const choice = fetchKeyChoices.find((entry) => entry.id === id);
+    if (!choice) return;
+    trackFetchIdentity(`${providerId}\x1f${choice.credentialKey ?? choice.id}`);
+    setFetchKeyOverride({ providerId, modelId: selectedModel, id });
+  };
   const workspaceService = provider ? providerService(provider) : undefined;
   const workspaceCatalogProviderID = serviceCatalogProviderID(workspaceService, provider);
   // The 倍率 column reads the catalog through `peekServiceRate`, which is a
@@ -7797,61 +7806,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }, 1_000);
     return () => clearInterval(timer);
   }, [dispatchWithOutcome, native, providers, translate]);
-  // The previous list of rows, so a vanished selection can land where it was
-  // instead of jumping to the top: see `adjacentSelectionAfterRemoval`.
-  const previousProviderKeys = useRef<string[]>([]);
-  useEffect(() => {
-    const keys = providers.map((item) => editorIdentifier(item));
-    if (providers.length === 0) {
-      previousProviderKeys.current = keys;
-      if (selectedProvider !== undefined) setSelectedProvider(undefined);
-      return;
-    }
-    const next = keys.includes(selectedProvider ?? "")
-      ? selectedProvider
-      : adjacentSelectionAfterRemoval(previousProviderKeys.current, keys, selectedProvider ?? "");
-    previousProviderKeys.current = keys;
-    if (next !== undefined && next !== selectedProvider) setSelectedProvider(next);
-  }, [providers, selectedProvider]);
-  // The model rows of the list currently on screen, so a deleted model can be
-  // replaced by its neighbour rather than by the list's first row.
-  const previousModelKeys = useRef<{ providerId: string; ids: string[] }>({ providerId: "", ids: [] });
-  useEffect(() => {
-    const pending = pendingModelIds.current;
-    if (pending?.providerId === providerId) {
-      const added = models.find((item) => "id" in pending
-        ? editorIdentifier(item) === pending.id
-        : !pending.ids.has(editorIdentifier(item)));
-      if (added) {
-        const addedId = editorIdentifier(added);
-        setSelectedModel(addedId);
-        setProviderSourceModel(undefined);
-        pendingModelIds.current = undefined;
-        return;
-      }
-    }
-    const ids = models.map((item) => editorIdentifier(item));
-    // Switching providers replaces the whole list; that is a new question, not
-    // a deletion, so only a vanished row inside the *same* provider's list is
-    // repaired to its neighbour.
-    const sameList = previousModelKeys.current.providerId === providerId;
-    const next = selectedModel !== undefined && !ids.includes(selectedModel)
-      ? (sameList ? adjacentSelectionAfterRemoval(previousModelKeys.current.ids, ids, selectedModel) : undefined)
-      : selectedModel;
-    previousModelKeys.current = { providerId, ids };
-    if (next !== selectedModel) {
-      setSelectedModel(next);
-      if (next !== undefined) setProviderSourceModel(undefined);
-    }
-  }, [models, providerId, selectedModel]);
-  useEffect(() => {
-    const pending = pendingProviderIds.current;
-    if (!pending) return;
-    const added = providers.find((item) => !pending.has(editorIdentifier(item)));
-    if (!added) return;
-    pendingProviderIds.current = undefined;
-    setSelectedProvider(editorIdentifier(added));
-  }, [providers]);
+  React.useLayoutEffect(() => {
+    if (!addedProvider && !pendingModel && !arrivedMove) return;
+    setProviderSourceModel(undefined);
+    if (addedProvider) setPendingProviderName(undefined);
+    if (pendingModel) setPendingModelSelection(undefined);
+    if (arrivedMove) setMovingModel(undefined);
+  }, [addedProvider, arrivedMove, pendingModel]);
   // A provider created by the wizard is the one the pane should open.  The
   // wizard is its own React root on the native hosts, so it leaves the row in
   // the shared gate; the pane consumes it as soon as the snapshot carries it.
@@ -7863,41 +7824,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!focusID || appliedProviderFocus.current === focusID) return;
     if (!providers.some((item) => editorIdentifier(item) === focusID)) return;
     appliedProviderFocus.current = focusID;
+    clearPendingSelection();
     setSelectedProvider(focusID);
     setSelectedModel(undefined);
     setProviderSourceModel(undefined);
-  }, [providerFocusRevision, providers]);
-  useEffect(() => {
-    if (fetchKeyID === undefined || fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) return;
-    // A station key that acquired its slot is still the credential the user
-    // chose: the picker's id moved from `relay:…` to the slot's, and following
-    // it is a repair, not a new question.  Repairing through `chooseFetchKey`
-    // bumped the fetch generation, so the listing that was still answering for
-    // that key was discarded and the picker fell back to the first usable row.
-    const followed = followedCredentialChoiceID(fetchKeyChoices, fetchKeyID);
-    if (followed !== undefined) {
-      fetchKeyIDRef.current = followed;
-      setFetchKeyID(followed);
-      return;
-    }
-    // The credential itself is gone (another provider, a deleted key): that is
-    // a new question, and the first usable choice is the only answer left.
-    chooseFetchKey(preferredFetchKeyID);
-  }, [fetchKeyChoices, fetchKeyID, preferredFetchKeyID, providerId]);
-  // 获取模型 asks one credential for its roster, and the row the user is
-  // looking at names that credential.  A picker left on whatever key happened
-  // to be first opened the Gemini group's roster beside a Pro route the user
-  // had just selected; the list was right and the key was not.  The picker
-  // follows the selected model's key until the user picks another one, and a
-  // selection with no key of its own falls back to it again.
-  const followedModelKey = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (followedModelKey.current === selectedModel) return;
-    followedModelKey.current = selectedModel;
-    const key = fetchKeyChoices.find((choice) => choice.id === selectedModelKeyID);
-    if (key) chooseFetchKey(key.id);
-    else if (selectedModel === undefined) chooseFetchKey(undefined);
-  }, [selectedModel, selectedModelKeyID, fetchKeyChoices]);
+  }, [clearPendingSelection, providerFocusRevision, providers]);
   /**
    * Answer the open chooser's 添加: true ends its window, false keeps it.
    *
@@ -7930,6 +7861,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     handedOver: readonly string[],
     write: (models: string[]) => Promise<IpcResults["dispatch"]>,
   ): Promise<void> => withModelPickSave(async () => {
+    let selection: { providerId: string } & ({ id: string } | { waiting: true }) = { providerId, waiting: true };
+    setPendingModelSelection(selection);
     const roster = new Set(offered);
     const accepted = (models: readonly string[]): string[] => [...new Set(models)].filter((model) => roster.has(model));
     // Pre-existing selections are recorded without an ID and never discarded.
@@ -7959,9 +7892,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         // dispatching them again or asking about their spelling again.
         const id = picked.map((name) => submitted.get(name)).find(Boolean);
         if (id) {
-          pendingModelIds.current = { providerId, id };
-          setSelectedModel(id);
-          setProviderSourceModel(undefined);
+          // The list event and answer can arrive in either order. A later
+          // choice by the user takes precedence over this import's answer.
+          const previous = selection;
+          selection = { providerId, id };
+          const target = selection;
+          setPendingModelSelection((current) => current === previous ? target : current);
           await applyStagedQuietly();
         }
         await answerModelPick(translate(id ? "common.saved" : "providers.fetchNothingNew"), true);
@@ -7979,7 +7915,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     } catch (reason) {
       onStatus(errorMessage(reason, translate));
     }
-    pendingModelIds.current = undefined;
+    setPendingModelSelection((current) => current === selection ? undefined : current);
   });
   // The model pane's own listing handler, for a provider whose models are read
   // the generic ``/v1/models`` way.
@@ -8117,7 +8053,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const ownerService = providerHoldsNoKey
       ? managedServiceForSlot(true, providerAuthKind(provider))
       : "";
-    const choice = fetchKeyChoices.find((item) => item.id === selectedFetchKey);
+    const choice = fetchChoice;
     if (!ownerService && !choice) return;
     const relaySource = choice?.kind === "relay" ? choice.source : undefined;
     // A service that mints its own slot has no user credential to address and
@@ -8209,8 +8145,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   };
   const addModel = (): void => {
     if (!provider) return;
-    const knownModelIds = new Set(models.map(editorIdentifier));
-    pendingModelIds.current = { providerId, ids: knownModelIds };
     // A new model starts **enabled**: the user asked for rows to be live
     // without a second press, and the placeholder name (carried as its own
     // upstream route) keeps the document valid while the user fills it in —
@@ -8237,7 +8171,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ? ""
       : modelCredential(model, provider, providerCredentials(provider, translate))?.accountRef
         ?? stringValue(asRecords(provider.accounts)[0]?.ref);
-    runMutationOnce(`model.add:${providerId}`, () => dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}), ...(inheritedAccount ? { account_ref: inheritedAccount } : {}) } }));
+    runMutationOnce(`model.add:${providerId}`, async () => {
+      const selection = { providerId, name };
+      setPendingModelSelection(selection);
+      if (!await dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}), ...(inheritedAccount ? { account_ref: inheritedAccount } : {}) } })) {
+        setPendingModelSelection((current) => current === selection ? undefined : current);
+      }
+    });
   };
 
   const addProvider = (): void => {
@@ -8247,12 +8187,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // button.
     const base = translate("providers.newProvider");
     const name = uniquePlaceholderName(providers.map((item) => providerDisplayName(item)), base);
-    pendingProviderIds.current = new Set(providers.map(editorIdentifier));
-    setSelectedModel(undefined);
-    setProviderSourceModel(undefined);
     // A new provider starts enabled the way a new model does: it carries no
     // model yet, so it contributes no deployment until the user adds one.
-    runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));
+    runMutationOnce("provider.add", async () => {
+      setPendingProviderName(name);
+      if (!await dispatch("provider.add", { provider: { name, models: [], enabled: true } })) {
+        setPendingProviderName((current) => current === name ? undefined : current);
+      }
+    });
   };
   const duplicateModel = (): void => {
     if (!model) return;
@@ -8362,19 +8304,31 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const globalConcurrencyLimit = numberValue(state.model_concurrency_default, 128);
   // Why the last relay-bound Apply refused: Core hands back the rows it named,
   // so the pane marks the key or route instead of only stating the outcome.
-  const bindingIssues = asRecords(state.binding_issues);
-  const activePublicGroup = selectedPublicModel === undefined
-    ? undefined
-    : routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel));
-  const activeRoute = routes.find((entry) => entry.key === selectedRoute);
+  const bindingIssues = useMemo(() => asRecords(state.binding_issues), [state.binding_issues]);
+  const routeKeys = useMemo(() => routeGroups.flatMap((group) => [
+    routePublicModelRowKey(group.name), ...group.entries.map((entry) => entry.key),
+  ]), [routeGroups]);
+  const pendingRouteKey = pendingRouteSelection?.renameFrom === undefined || !routeKeys.includes(pendingRouteSelection.renameFrom)
+    ? pendingRouteSelection?.key : undefined;
+  const movedRouteKey = arrivedMove?.fromRoute === routeSelection && arrivedMove?.fromRoute !== undefined
+    ? routes.find((entry) => editorIdentifier(entry.provider) === arrivedMove.destinationId
+      && editorIdentifier(entry.model) === arrivedMove.modelId)?.key : undefined;
+  const selectedRouteKey = useRowSelection(routeKeys, routeSelection, setRouteSelection, {
+    first: viewMode === "routes" ? routes[0]?.key : undefined,
+    target: movedRouteKey ?? pendingRouteKey,
+    preserve: Boolean(movingModel?.fromRoute && !arrivedMove && movingModel.fromRoute === routeSelection),
+  });
+  React.useLayoutEffect(() => {
+    if (pendingRouteKey !== undefined && selectedRouteKey === pendingRouteKey) setPendingRouteSelection(undefined);
+  }, [pendingRouteKey, selectedRouteKey]);
+  const activePublicGroup = routeGroups.find((group) => routePublicModelRowKey(group.name) === selectedRouteKey);
+  const activeRoute = routes.find((entry) => entry.key === selectedRouteKey);
   // The group a route belongs to is every row serving the same name.
   const activeRouteGroup = activeRoute ? routes.filter((entry) => publicModelKey(entry.publicModel) === publicModelKey(activeRoute.publicModel)) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
   // The group a move rewrites is the one the pane draws: its own name, so
   // the action names the group the table and the settings pane name.
-  const activePublicGroupName = activeRoute
-    ? (routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(activeRoute.publicModel))?.name ?? activeRoute.publicModel)
-    : "";
+  const activePublicGroupName = activePublicGroup?.name ?? activeRoute?.publicModel ?? "";
   // One route that follows a relay multiplier locks the whole group: its order
   // is the station's own number, so Core refuses to permute the group's typed
   // values at all (moving a plain route in such a group is the same rewrite).
@@ -8383,34 +8337,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const routeMoveTitleKey = activeRouteGroupUsesMultiplier ? "providers.reorderMultiplierLocked" : undefined;
   const canMoveRouteUp = !activeRouteGroupUsesMultiplier && activeRouteIndex > 0;
   const canMoveRouteDown = !activeRouteGroupUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
-  const previousRouteKeys = useRef<string[]>([]);
-  useEffect(() => {
-    // A public-model row is a selection of its own, so ``selectedRoute`` is
-    // empty while one is highlighted.  Anything else is a list that has lost
-    // the route it named (deleted, or moved to another provider): it takes the
-    // row that slid into that place, or the one above it -- standing with
-    // nothing highlighted, or jumping to the top of the list, both moved the
-    // person away from the rows they were working in.
-    const keys = routes.map((entry) => entry.key);
-    if (viewMode !== "routes" || routes.length === 0 || selectedPublicModel !== undefined) {
-      previousRouteKeys.current = keys;
-      return;
-    }
-    if (selectedRoute !== undefined && keys.includes(selectedRoute)) {
-      previousRouteKeys.current = keys;
-      return;
-    }
-    const next = adjacentSelectionAfterRemoval(previousRouteKeys.current, keys, selectedRoute ?? "") ?? keys[0];
-    previousRouteKeys.current = keys;
-    setSelectedRoute(next);
-  }, [routes, selectedPublicModel, selectedRoute, viewMode]);
-  useEffect(() => {
-    const pending = pendingRouteKey.current;
-    if (!pending || !routes.some((entry) => entry.key === pending)) return;
-    pendingRouteKey.current = undefined;
-    setSelectedPublicModel(undefined);
-    setSelectedRoute(pending);
-  }, [routes]);
   // The group's own numbers, in list order: a route that follows a relay
   // multiplier has no typed number of its own, so it never reaches here.
   const routeOrderValues = activeRouteGroup.map((entry) => modelOrderValue(editorIdentifier(entry.provider), entry.model));
@@ -8457,59 +8383,49 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const addRoute = (): void => {
     // The new row states the group's own spelling, so adding a route to a group
     // never introduces a third case of its name.
-    const publicModel = (selectedPublicModel ?? activePublicGroupName).trim();
+    const publicModel = activePublicGroupName.trim();
     const targetProvider = activeRoute?.provider ?? providers[0];
     if (!targetProvider) return;
     const targetProviderID = editorIdentifier(targetProvider);
     const targetModels = asRecords(targetProvider.models).map(modelRecord);
-    const knownModelIds = new Set(targetModels.map(editorIdentifier));
-    pendingModelIds.current = { providerId: targetProviderID, ids: knownModelIds };
     const name = publicModel || uniquePlaceholderName(targetModels.map((item) => stringValue(item.model_name ?? item.name)), translate("providers.newModel"));
     // The row inherits the key the user is working in, the way the models pane
     // does, so ＋ files it in a real key group instead of an invented one.
     const inheritedKey = (activeRoute && editorIdentifier(activeRoute.provider) === targetProviderID ? modelProviderKeyState(activeRoute.model, targetProvider) : undefined)
       ?? providerKeyStates(targetProvider).find((key) => key.id === selectedFetchKey)
       ?? providerKeyStates(targetProvider)[0];
-    runMutationOnce(`route.add:${targetProviderID}:${publicModel}`, () => dispatchWithOutcome("model.add", {
-      provider_id: targetProviderID,
-      model: {
-        name,
-        upstream_model: publicModel || "",
-        enabled: false,
-        order: 0,
-        ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}),
-      },
-    }).then((next) => {
-      if (!next || !publicModel) {
-        // A refused add staged nothing, so it must not leave its ids armed:
-        // a later row to appear would otherwise be selected in its place.
-        settlePendingModels(next, targetProviderID);
-        return;
-      }
-      const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === targetProviderID);
-      const added = nextProvider ? asRecords(nextProvider.models).map(modelRecord).find((entry) => !knownModelIds.has(editorIdentifier(entry)) && stringValue(entry.model_name ?? entry.name).trim() === name) : undefined;
-      pendingModelIds.current = undefined;
-      if (added) pendingRouteKey.current = `${targetProviderID}:${stringValue(added.editor_id, stringValue(added.deployment_id, identifier(added))).trim()}`;
-    }));
+    runMutationOnce(`route.add:${targetProviderID}:${publicModel}`, async () => {
+      const selection = {};
+      setPendingRouteSelection(selection);
+      const next = await dispatchWithOutcome("model.add_many", {
+        provider_id: targetProviderID,
+        models: [{
+          name,
+          upstream_model: publicModel || "",
+          enabled: false,
+          order: 0,
+          ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}),
+        }],
+      });
+      const addedRows = asRecords(asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary).added_rows);
+      const id = stringValue(addedRows[0]?.id);
+      // The dispatch can name the row before or after the table sees it.
+      setPendingRouteSelection((current) => current === selection ? (id ? { key: `${targetProviderID}:${id}` } : undefined) : current);
+    });
   };
   // − deletes what the user selected: one route, or — with a public model's own
   // row selected — every route that serves that name.  The group case is one
   // Core action, so the group is removed in one apply instead of route by
   // route, and the confirmation states the count it is about to remove.
   const confirmDeleteRoute = (): void => {
-    const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel)) : undefined;
+    const selectedGroup = activePublicGroup;
     if (selectedGroup) {
       runMutationOnce(`route.delete-group:${selectedGroup.name}`, () => native.showConfirmation({
         title: translate("providers.deletePublicModel", { model: selectedGroup.name }),
         message: translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length }),
         confirmLabel: translate("common.delete"),
         destructive: true,
-      }).then(async (confirmed) => {
-        if (confirmed && await dispatch("public.model_delete", { public_model: selectedGroup.name })) {
-          setSelectedPublicModel(undefined);
-          setSelectedRoute("");
-        }
-      }));
+      }).then((confirmed) => confirmed ? dispatch("public.model_delete", { public_model: selectedGroup.name }) : undefined));
       return;
     }
     if (!activeRoute) return;
@@ -8521,9 +8437,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       message: translate("providers.deleteRouteMessage", { provider: providerDisplayName(activeRoute.provider), upstream, model: activeRoute.publicModel }),
       confirmLabel: translate("common.delete"),
       destructive: true,
-    }).then(async (confirmed) => {
-      if (confirmed && await dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID })) setSelectedRoute("");
-    }));
+    }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID }) : undefined));
   };
   const confirmDeleteProvider = (): void => {
     if (!provider) return;
@@ -8560,92 +8474,34 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       // this pane (another window, an IPC client) gets the same cleanup.  The
       // native credential leases are released from Core's durable tombstone,
       // so a delete that happens while this window is closed still clears them.
-      return dispatch(action, { provider_id: providerId }).then(() => {
-        setSelectedProvider(undefined);
-        setSelectedModel(undefined);
-        setProviderSourceModel(undefined);
-      });
+      return dispatch(action, { provider_id: providerId });
     }));
   };
   const confirmDeleteModel = (): void => {
     if (!model) return;
     const modelId = editorIdentifier(model);
-    runMutationOnce(`model.delete:${providerId}:${modelId}`, () => native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined));
+    runMutationOnce(`model.delete:${providerId}:${modelId}`, () => native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }) : undefined));
   };
-  // A login row serves its models on its credentials, not on a key: every
-  // account and every custom key is a group of its own, and the model list
-  // states that hierarchy instead of dropping every row into one column.  The
-  // groups are every account the row owns — a signed-out one included, because
-  // its routes are still listed and a heading is how the reader sees that
-  // they are parked — and then every custom key.
-  const modelCredentials = useMemo(
-    () => providerCredentials(provider, translate),
-    [provider, translate],
-  );
-  const modelRows = useMemo(() => {
-    // The key name is its own column: one spanning row per key, with that
-    // key's models listed (and indented) underneath it.  A route that names no
-    // key — the draft ＋ just created on a provider that has none — is listed
-    // under a heading that says so (未定义密钥, the same word the key picker
-    // uses for its own "no key" choice), because a model row drawn above every
-    // heading reads as a route whose key the pane simply forgot to state.  The
-    // heading is not an invented credential: its id is the empty one, which no
-    // slot can carry, so nothing can be filed under it by mistake and no route
-    // is presented as answering with a key the document does not name.
-    // One group is one provider key, addressed by its own slot id: a station
-    // key and a custom key that read the same are two keys with two groups,
-    // and a model is filed under the key it names, never under a namesake.
-    // This table carries no 顺序 column: a model's order orders the routes
-    // that share one public name, and these rows are grouped by key, so the
-    // same column read down the pane would compare numbers that belong to
-    // different public models — three models with three public names have no
-    // one sequence between them.  The value is edited where it belongs (the
-    // inspector's own 顺序 field) and read where its group is the list: the
-    // routes table, whose rows are the public model's routes in that order.
-    // 倍率 is the other way round and therefore is a column here: a rate is a
-    // property of the row itself — its key's group, or its own entry in the
-    // account's catalog — so two rates read down this pane are two prices that
-    // can be compared, and the model the row names is the thing being priced.
-    // A row whose rate is not known states nothing rather than a placeholder:
-    // an em dash in a numeric column reads as zero, and the reader of this
-    // column is comparing numbers.  The three widths are sized for the pane
-    // this table is actually drawn in: the model list keeps ~280 pt at the
-    // settings window's own default size, and a fourth of that is not room to
-    // spare — a trailing column that does not fit is reduced to nothing by the
-    // native layout, which is how 倍率 would read as a column that never
-    // existed rather than one that is merely narrow.
-    const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
-    const ungrouped: UnknownRecord[] = [];
-    const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();
-    // The key table's own order, which is what the groups follow (see
-    // ``orderedModelGroupIDs``): a key's place is the key table's, never a
-    // by-product of which of its routes the document happens to list first.
-    const keyOrder = providerKeyStates(provider ?? {}).map((key) => key.id);
-    for (const item of models) {
-      // A route of an account-backed row is filed by the credential it answers
-      // with, and an account is not a key slot: asking the key first put every
-      // account's route in the ungrouped bucket, beside the group that was
-      // there to hold it.
-      if (modelCredentials.length === 0) {
-        const key = modelProviderKeyState(item, provider ?? {});
-        if (!key) {
-          ungrouped.push(item);
-          continue;
-        }
-        const list = grouped.get(key.id);
-        if (list) {
-          list.models.push(item);
-          continue;
-        }
-        grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });
-        continue;
+  const moveModel = (sourceId: string, modelId: string, destinationId: string, fromRoute?: string): void => {
+    if (sourceId === destinationId) return;
+    runMutationOnce(`model.move:${modelId}`, async () => {
+      const move = { modelId, destinationId, fromRoute };
+      setMovingModel(move);
+      if (!await dispatch("model.move_provider", { provider_id: sourceId, model_id: modelId, destination_provider_id: destinationId })) {
+        setMovingModel((current) => current === move ? undefined : current);
       }
-      if (!modelCredential(item, provider ?? {}, modelCredentials)) {
-        // Neither an account nor a key this row carries: the list still has to
-        // show the row so it can be repaired or deleted.
-        ungrouped.push(item);
-      }
-    }
+    });
+  };
+  const renamePublicModel = async (from: string, to: string): Promise<boolean> => {
+    const selection = { key: routePublicModelRowKey(to), renameFrom: routePublicModelRowKey(from) };
+    setPendingRouteSelection(selection);
+    const renamed = await dispatch("public.model_patch", { public_model: from, changes: { name: to } });
+    if (!renamed) setPendingRouteSelection((current) => current === selection ? undefined : current);
+    return renamed;
+  };
+  const modelRows = useMemo<Array<{ key: string; cells: string[]; spanning?: boolean }>>(() => {
+    // Order belongs to public-model groups in the routes table. Here the rows
+    // are grouped by credential and display the upstream, public name, and rate.
     const modelCells = (item: UnknownRecord): string[] => {
       const multiplier = relaySourceForKey(modelProviderKeyState(item, provider ?? {}), relaySources)?.multiplier;
       return [
@@ -8654,55 +8510,20 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier),
       ];
     };
-    if (modelCredentials.length > 0) {
-      // One group per credential, and a model is listed exactly once: under the
-      // credential it answers with.  A route of an account-backed row serves
-      // exactly one credential — an account through its own adapter, or a key
-      // at the service address — and Core projects the account it resolves to,
-      // so every route lands in exactly one group and no group heading claims
-      // routes it does not serve.  A route no group can claim (a key slot that
-      // was deleted in another window) still has to be listed and acted on, so
-      // it comes first, ungrouped.  The header is a spanning row: a heading is
-      // not an entry, and a spanning row is one the native tables refuse to
-      // select, which is what keeps a click on the account or the key name
-      // inert.
-      if (ungrouped.length > 0) {
-        rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });
-        for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });
-      }
-      for (const credential of modelCredentials) {
-        const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);
-        // A heading with nothing under it is not a group, it is an empty row
-        // that claims the credential serves routes it does not serve.
-        if (own.length === 0) continue;
-        rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });
-        for (const item of own) rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });
-      }
-      return rows;
-    }
-    if (ungrouped.length > 0) {
-      rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });
-      for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
-    }
-    for (const keyID of orderedModelGroupIDs([...grouped.keys()], keyOrder)) {
-      const group = grouped.get(keyID);
-      if (!group) continue;
-      rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });
-      for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
-    }
-    return rows;
-  }, [modelCredentials, modelDisplayName, modelUpstreamDisplay, models, provider, providerId, relaySources, serviceRateRevision, translate, workspaceService]);
-  // A row key names the credential group it sits in for a login row, so every
-  // id that addresses a model row has to name that group too.  A route that
-  // names no credential sits outside the groups and is drawn once, under the
-  // empty group, so its key is the same shape every other model row uses.
-  const modelRowKeys = useCallback((modelIDs: string[]): string[] => (modelCredentials.length > 0
-    ? modelIDs.flatMap((modelID) => {
-      const record = models.find((item) => editorIdentifier(item) === modelID);
-      const credential = record ? modelCredential(record, provider ?? {}, modelCredentials) : undefined;
-      return [modelRowKey(credential ? credential.id : "", modelID)];
-    })
-    : modelIDs), [modelCredentials, models, provider]);
+    return modelGroups.flatMap(({ id, models: entries }) => {
+      const credential = modelCredentials.find((choice) => choice.id === id);
+      const label = id === "" ? translate("providers.undefinedKey")
+        : credential?.label ?? modelProviderKeyLabel(entries[0], provider ?? {}, translate, undefined, relaySources);
+      const headingKey = modelCredentials.length > 0 || id === "" ? modelGroupRowKey(id) : `key:${id}`;
+      return [{ key: headingKey, cells: [label], spanning: true }, ...entries.map((item) => {
+        const modelId = editorIdentifier(item);
+        return { key: modelCredentials.length > 0 ? modelRowKey(id, modelId) : modelId, cells: modelCells(item) };
+      })];
+    });
+  }, [modelCredentials, modelDisplayName, modelGroups, modelUpstreamDisplay, provider, providerId, relaySources, serviceRateRevision, translate, workspaceService]);
+  const modelRowKeyByID = useMemo(() => new Map(modelRows.filter((row) => !row.spanning)
+    .map((row) => [modelIDFromRowKey(row.key), row.key])), [modelRows]);
+  const modelRowKeys = useCallback((modelIDs: string[]): string[] => modelIDs.map((id) => modelRowKeyByID.get(id)!), [modelRowKeyByID]);
   // A route is off when either switch on its path is off: its own, or the
   // provider's.  A provider that is turned off serves no route of its own, so
   // its models read as disabled here — that is what the list already says by
@@ -8733,25 +8554,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     )).map(editorIdentifier)),
     [bindingIssueFor, modelRowKeys, models, provider, translate, validationIssues],
   );
-  // Where a model is listed more than once, the copy that was pressed is the
-  // one that reads as selected — the group's own listing when the user picked
-  // a row inside it, otherwise the group the model's key belongs to, and the
-  // first group only when neither answers.  The pressed row is trusted only
-  // while it is still a row of this list that addresses the selected model, so
-  // a selection made by ＋ or by a snapshot never inherits a row the user has
-  // since left, and a row from another provider never claims the highlight.
-  const selectedModelRowKey = useMemo(() => {
-    if (!selectedModel) return "";
-    if (modelCredentials.length === 0) return selectedModel;
-    if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {
-      return selectedModelRow;
-    }
-    // One model is one row now, so the list itself says which row that is: the
-    // first one that addresses the model.  A route that names no credential
-    // sits under the 未定义密钥 heading like any other row of its group.
-    const listed = modelRows.find((row) => !row.spanning && modelIDFromRowKey(row.key) === selectedModel);
-    return listed ? listed.key : "";
-  }, [modelRows, selectedModel, selectedModelRow]);
+  const selectedModelRowKey = modelRowKeyByID.get(selectedModel) ?? "";
   // An empty column is not a pane: the inspector is drawn when there is
   // something in it to inspect, and the middle column takes the room otherwise.
   const inspectorHasContent = viewMode === "routes"
@@ -8776,10 +8579,20 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // itself is subscribed to the domain, and this callback keeps its identity so
   // an unrelated re-render does not reach it.
   const selectProviderRow = useCallback((key: string): void => {
+    clearPendingSelection();
     setSelectedProvider(key);
     setSelectedModel(undefined);
     setProviderSourceModel(undefined);
-  }, []);
+    if (compactWeb) setCompactDetail(true);
+  }, [clearPendingSelection, compactWeb]);
+  const selectModelRow = (key: string): void => {
+    const modelId = key ? modelIDFromRowKey(key) : undefined;
+    if (key && (modelId === undefined || !modelKeys.includes(modelId))) return;
+    clearPendingSelection();
+    setSelectedModel(modelId);
+    setProviderSourceModel(undefined);
+    if (compactWeb && key) setCompactDetail(true);
+  };
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
     for (const group of routeGroups) {
@@ -8825,16 +8638,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [routes],
   );
   const selectRoute = useCallback((routeId: string): void => {
-    setPublicModelReturn(undefined);
     if (!routeId) return;
     const selected = routes.find((entry) => entry.key === routeId);
     if (!selected) return;
-    setSelectedRoute(routeId);
-    setSelectedPublicModel(undefined);
-    setSelectedProvider(editorIdentifier(selected.provider));
-    setSelectedModel(editorIdentifier(selected.model));
+    const selectedProviderId = editorIdentifier(selected.provider);
+    const selectedModelId = editorIdentifier(selected.model);
+    clearPendingSelection();
+    setPublicModelReturn(undefined);
+    setRouteSelection(routeId);
+    setPendingModelSelection({ providerId: selectedProviderId, id: selectedModelId });
+    setSelectedProvider(selectedProviderId);
+    setSelectedModel(selectedModelId);
     setProviderSourceModel(undefined);
-  }, [routes]);
+  }, [clearPendingSelection, routes]);
   // One routes table answers clicks for both row kinds: a public-model row
   // opens that group's own settings, a route row opens the model detail.
   const selectRouteTableRow = useCallback((rowKey: string): void => {
@@ -8846,43 +8662,29 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       // The group's own name is what the pane edits and what Core addresses:
       // the row key came from the table, so it is the same name, and the group
       // is read once more because a stale draft may have dropped it.
-      setSelectedPublicModel(group.name);
-      setSelectedRoute("");
+      clearPendingSelection();
+      setRouteSelection(rowKey);
       setProviderSourceModel(undefined);
       // A row click has no origin model to return to; only 设置 records one.
       setPublicModelReturn(undefined);
       const first = group.entries[0];
-      setSelectedProvider(editorIdentifier(first.provider));
-      setSelectedModel(editorIdentifier(first.model));
+      const selectedProviderId = editorIdentifier(first.provider);
+      const selectedModelId = editorIdentifier(first.model);
+      setPendingModelSelection({ providerId: selectedProviderId, id: selectedModelId });
+      setSelectedProvider(selectedProviderId);
+      setSelectedModel(selectedModelId);
       return;
     }
     selectRoute(rowKey);
-  }, [routeGroups, selectRoute]);
-  // A public model the draft no longer carries (renamed elsewhere, or its last
-  // route removed) drops its selection instead of leaving an empty pane.
-  useEffect(() => {
-    if (selectedPublicModel === undefined) return;
-    const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(selectedPublicModel));
-    if (group) {
-      // A group whose name moved (a rename landed) keeps the selection instead
-      // of dropping the pane.
-      if (group.name !== selectedPublicModel) setSelectedPublicModel(group.name);
-      return;
-    }
-    setSelectedPublicModel(undefined);
-    if (viewMode === "routes" && routes.length > 0) setSelectedRoute(routes[0].key);
-  }, [routeGroups, routes, selectedPublicModel, viewMode]);
+  }, [clearPendingSelection, routeGroups, selectRoute]);
   const returnToPublicModelOrigin = useCallback((): void => {
     if (!publicModelReturn) return;
     selectRoute(publicModelReturn.routeKey);
   }, [publicModelReturn, selectRoute]);
   const chooseViewMode = (value: "providers" | "routes"): void => {
     if (value === viewMode) return;
+    clearPendingSelection();
     setCompactDetail(false);
-    if (value === "routes" && selectedPublicModel === undefined) {
-      const first = routes[0];
-      if (first) selectRoute(first.key);
-    }
     setViewMode(value);
   };
   const providerDraftProjection = useMemo<ProviderWorkspaceDraftProjection>(() => ({
@@ -8924,14 +8726,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         <ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} onPress={onOpenWizard} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
-        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
+        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || activePublicGroup ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
           {/* Measured on a wrapper of the table rather than on the pane: React
               Native for Web observes an `onLayout` node once, when it mounts,
               and the routes pane reuses the node the provider pane drew — the
               first observation landed on a pane with no handler, so the width
               stayed 0 and the columns stayed at their floors.  This node only
               exists in the routes branch, so it is a new node every time. */}
-          <View style={styles.routeTableMeasure} onLayout={({ nativeEvent }) => setRouteTableWidth(nativeEvent.layout.width)}><NativeTable columns={routeTableColumns(routeTableWidth, translate)} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }} style={styles.nativeRouteTable} /></View>
+          <View style={styles.routeTableMeasure} onLayout={({ nativeEvent }) => setRouteTableWidth(nativeEvent.layout.width)}><NativeTable columns={routeTableColumns(routeTableWidth, translate)} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedRouteKey} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }} style={styles.nativeRouteTable} /></View>
           {/* The routes table is grouped by public model, so an empty Core and a
               Core whose every group is collapsed both draw a blank table.  Say
               which one this is and what creates the first row, rather than
@@ -8951,21 +8753,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View> : <View style={styles.providerWorkspace}>
         <View style={[styles.providerModelColumns, compactWeb && styles.providerModelColumnsCompact]}>
           <TablePane style={[styles.providerListPane, compactWeb && styles.providerListPaneCompact]} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteProvider} /> : null}</>}>
-            <ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />
+            <ProviderListTable providers={providers} bindingIssues={bindingIssues} translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteModel} /> : null}</>}>
-              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); if (compactWeb) setCompactDetail(true); }} style={styles.modelTable} /></View>
+              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={selectModelRow} style={styles.modelTable} /></View>
               {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) chooseFetchKey(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
       </View>}
     </View>}
-    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
+    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} onRename={renamePublicModel} /> : activeRoute ? (providerSourceModel === editorIdentifier(activeRoute.model) ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
-                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
+                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), destinationId, activeRoute.key)} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { clearPendingSelection(); setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(providerId, editorIdentifier(model), destinationId)} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
     : null}
     <RelayDialogHost />
   </View></ProviderWorkspaceDraftContext.Provider>;
@@ -9036,31 +8838,14 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       : boundProvidedRows[0] ? `provided:${boundProvidedRows[0].key}`
         : orphanSlots[0] ? `orphan:${orphanSlots[0].id}`
           : providedRows[0] ? `provided:${providedRows[0].key}` : "";
-  const [selectedKey, setSelectedKey] = useState<string>(firstSelectable);
-  // The key a staged edit is waiting for: a ＋ names the new key by the only
-  // identity it has before it exists, while a rename names the slot it edits
-  // and the name it asked for, so a refused rename can never select another
-  // key that already carries that name.
-  const pendingCustomKeyName = useRef<string | undefined>(undefined);
-  const pendingCustomKeyRename = useRef<{ id: string; name: string } | undefined>(undefined);
+  const [keySelection, setSelectedKey] = useState<string>();
+  const [pendingCustomKeyName, setPendingCustomKeyName] = useState<string>();
   const [providedNameDrafts, setProvidedNameDrafts] = useState<Record<string, string>>({});
   // The inline list's own width, measured once per layout: its one column is
   // what the editor column beside it leaves, not a number this panel invents.
   const [inlineKeysListWidth, setInlineKeysListWidth] = useState(KEYS_INLINE_LIST_WIDTH);
   const [formBusy, setFormBusy] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
-  const selectedCredential = selectedKey.startsWith("account:")
-    ? loginCredentials.find((credential) => `account:${credential.ref}` === selectedKey)
-    : undefined;
-  const selectedCustom = selectedKey.startsWith("custom:")
-    ? customKeys.find((key) => `custom:${key.id}` === selectedKey)
-    : undefined;
-  const selectedProvided = selectedKey.startsWith("provided:")
-    ? providedRows.find((row) => `provided:${row.key}` === selectedKey)
-    : undefined;
-  const selectedOrphan = selectedKey.startsWith("orphan:")
-    ? orphanSlots.find((slot) => `orphan:${slot.id}` === selectedKey)
-    : undefined;
   // A relay key is one row in this table and one slot in the provider: the
   // issue Core reported is keyed by the slot, so the row is matched back
   // through the relay source the slot carries, and the reason is stated
@@ -9073,7 +8858,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     if (!slot) return undefined;
     return bindingIssues.find((issue) => stringValue(issue.provider_key_id) === slot.id);
   }, [bindingIssues, provider]);
-  const selectedGroup: "custom" | "provided" = selectedProvided || selectedOrphan ? "provided" : "custom";
   const autoGrouping = stationAccounts.some((account) => account.autoGrouping);
   const controlsBusy = busy || formBusy;
   const tableRows = useMemo(() => {
@@ -9127,6 +8911,20 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     }
     return rows;
   }, [credentials, customKeys, loginCredentials, orphanSlots, providedNameDrafts, providedRows, stationAccounts, translate, variant]);
+  const rowKeys = useMemo(() => tableRows.filter((row) => !row.spanning).map((row) => row.key), [tableRows]);
+  const addedKey = pendingCustomKeyName === undefined ? undefined : customKeys.find((key) => key.name === pendingCustomKeyName);
+  const selectedKey = useRowSelection(rowKeys, keySelection, setSelectedKey, {
+    first: firstSelectable,
+    target: addedKey ? `custom:${addedKey.id}` : undefined,
+  }) ?? "";
+  React.useLayoutEffect(() => {
+    if (addedKey) setPendingCustomKeyName(undefined);
+  }, [addedKey]);
+  const selectedCredential = loginCredentials.find((credential) => `account:${credential.ref}` === selectedKey);
+  const selectedCustom = customKeys.find((key) => `custom:${key.id}` === selectedKey);
+  const selectedProvided = providedRows.find((row) => `provided:${row.key}` === selectedKey);
+  const selectedOrphan = orphanSlots.find((slot) => `orphan:${slot.id}` === selectedKey);
+  const selectedGroup = selectedProvided || selectedOrphan ? "provided" : "custom";
   const runProvidedAction = async (action: () => Promise<void>, feedbackKey: string): Promise<void> => {
     setFormBusy(true);
     try {
@@ -9150,32 +8948,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       setFormBusy(false);
     }
   };
-  const previousKeyRowKeys = useRef<string[]>([]);
-  useEffect(() => {
-    // tableRows keys already carry the custom:/provided: prefix; compare the
-    // selection verbatim or every click would snap back to the first row.
-    const rowKeys = tableRows.filter((row) => !row.spanning).map((row) => row.key);
-    const valid = new Set(rowKeys);
-    if (valid.has(selectedKey)) {
-      previousKeyRowKeys.current = rowKeys;
-      return;
-    }
-    // The row that is gone takes its own place: the key that slid up into it,
-    // or the one above.  A deleted key used to reselect the list's first row,
-    // so the table scrolled back to the top and the editor filled with a
-    // credential nobody had asked for.
-    const adjacent = adjacentSelectionAfterRemoval(previousKeyRowKeys.current, rowKeys, selectedKey);
-    previousKeyRowKeys.current = rowKeys;
-    // An account is a row of this same list, so an empty repair has to fall
-    // back to one too: the sign-in it lands on is the list's first credential,
-    // and a repair that only knew about keys and station rows kept re-selecting
-    // a key the moment the panel opened on an account — the account stayed
-    // listed and never selected, and its editor column stayed empty.
-    setSelectedKey(adjacent
-      ?? (loginCredentials[0]
-        ? `account:${loginCredentials[0].ref}`
-        : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : ""));
-  }, [customKeys, loginCredentials, orphanSlots, providedRows, selectedKey, tableRows]);
   const addKey = (): void => {
     if (selectedGroup === "provided" && isRelay) {
       if (autoGrouping || stationAccounts.length === 0) return;
@@ -9183,32 +8955,11 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       return;
     }
     const name = uniqueKeyName(customKeyNames);
-    pendingCustomKeyName.current = name;
-    void dispatch("provider.key_add", { provider_id: providerId, name });
+    setPendingCustomKeyName(name);
+    void dispatch("provider.key_add", { provider_id: providerId, name }).then((added) => {
+      if (!added) setPendingCustomKeyName((current) => current === name ? undefined : current);
+    });
   };
-  React.useLayoutEffect(() => {
-    const pending = pendingCustomKeyName.current;
-    if (pending) {
-      const added = customKeys.find((key) => key.name === pending);
-      if (added) {
-        pendingCustomKeyName.current = undefined;
-        setSelectedKey(`custom:${added.id}`);
-      }
-    }
-    const rename = pendingCustomKeyRename.current;
-    if (rename) {
-      const renamed = customKeys.find((key) => key.id === rename.id);
-      // The renamed slot either carries the new name now (accepted) or is
-      // gone; a namesake that already held the requested name is not this key
-      // and must not become the selection.
-      if (!renamed) {
-        pendingCustomKeyRename.current = undefined;
-      } else if (renamed.name === rename.name) {
-        pendingCustomKeyRename.current = undefined;
-        setSelectedKey(`custom:${renamed.id}`);
-      }
-    }
-  }, [customKeys]);
   const deleteSelected = (): void => {
     if (selectedProvided) {
       if (autoGrouping) return;
@@ -9308,7 +9059,8 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         // selection where it was.  A sign-in *is* a credential of this row, so
         // it selects like any key — ignoring it left the account listed, never
         // selectable, and its editor column permanently empty.
-        if (key.startsWith("group:")) return;
+        if (!rowKeys.includes(key)) return;
+        setPendingCustomKeyName(undefined);
         setSelectedKey(key);
       }}
       style={variant === "inline" ? styles.keysTableInline : styles.keysTable}
@@ -9349,14 +9101,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           onDraftChange={(value) => drafts?.setProviderKeyNameDraft(providerId, selectedCustom.id, value)}
           onCommit={(name) => {
             if (!name || name === selectedCustom.name) return;
-            pendingCustomKeyRename.current = { id: selectedCustom.id, name };
-            void dispatch("provider.key_patch", { provider_id: providerId, old_name: selectedCustom.name, name }).then(() => {
-              // A rename Core refused leaves the key under its old name: the
-              // marker has no pending selection left to make.
-              if (pendingCustomKeyRename.current?.id === selectedCustom.id && pendingCustomKeyRename.current?.name === name) {
-                pendingCustomKeyRename.current = undefined;
-              }
-            });
+            return dispatch("provider.key_patch", { provider_id: providerId, old_name: selectedCustom.name, name });
           }}
         />)}
         {keysEditorField("key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
@@ -9595,7 +9340,7 @@ type RouteGroupEntry = {
   model: UnknownRecord;
 };
 
-function PublicModelInspector({ group, modelContexts, backLabel, busy, translate, dispatch, dispatchSnapshot, onBackToModel, onRenamed }: { group: { name: string; entries: RouteGroupEntry[] }; modelContexts: UnknownRecord; backLabel?: string; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onBackToModel?: () => void; onRenamed: (next: string) => void }): React.JSX.Element {
+function PublicModelInspector({ group, modelContexts, backLabel, busy, translate, dispatch, onBackToModel, onRename }: { group: { name: string; entries: RouteGroupEntry[] }; modelContexts: UnknownRecord; backLabel?: string; busy: boolean; translate: Translate; dispatch: Dispatch; onBackToModel?: () => void; onRename: (from: string, to: string) => Promise<boolean> }): React.JSX.Element {
   const providers = useMemo(() => group.entries.map((entry) => entry.provider), [group.entries]);
   // The table beside the field is keyed by the name the document serves, not by
   // the draft the field shows while a rename is being typed: looking a draft up
@@ -9640,7 +9385,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
       <TextField label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={group.name} disabled={busy} onCommit={(next) => {
         const renamed = next.trim();
         if (!renamed || renamed === group.name) return undefined;
-        return dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } }).then((snapshot) => { if (snapshot) onRenamed(renamed); });
+        return onRename(group.name, renamed);
       }} />
       <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })} accessory={<ContextWindowHelp recommended={defaultContext} translate={translate} />} />
     </View>
@@ -10479,7 +10224,7 @@ function publicModelTokensText(value: number | null | undefined, translate: Tran
   // Zero is not a missing number: it is the answer a generator's catalog
   // states (``limit.context: 0``) because the model holds no conversation to
   // size.  Reading it as absent is what made the field fall back to the
-  // unknown-model placeholder and print 272,000 for a model that never reads
+  // unknown-model placeholder and print 500,000 for a model that never reads
   // a prompt.
   if (value === 0) return translate("common.notAvailable");
   if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return translate("common.none");
@@ -10540,30 +10285,6 @@ function identifier(record: UnknownRecord): string {
 
 function editorIdentifier(record: UnknownRecord): string {
   return stringValue(record.editor_id, identifier(record));
-}
-
-/**
- * The row that takes a deleted row's place: its next sibling, or the one above
- * it when it was the last.
- *
- * Every list in this pane used to answer a vanished selection with its *first*
- * row.  Deleting the third model therefore selected a row the person had not
- * touched, the inspector rebuilt against it and the table scrolled back to the
- * top -- so the row they were working next to jumped out of view for a reason
- * nothing on screen stated.  A deletion leaves one obvious place to stand: the
- * row that slid up into the gap, and failing that the row it had been under.
- * The first row is what an *empty* selection means, not what a removed one
- * means.
- */
-function adjacentSelectionAfterRemoval(
-  previousKeys: readonly string[],
-  remainingKeys: readonly string[],
-  removedKey: string,
-): string | undefined {
-  if (remainingKeys.length === 0) return undefined;
-  const index = previousKeys.indexOf(removedKey);
-  if (index < 0) return remainingKeys[0];
-  return remainingKeys[index] ?? remainingKeys[index - 1] ?? remainingKeys[0];
 }
 
 function providerNameExists(providers: UnknownRecord[], name: string, excludeID = ""): boolean {
@@ -15799,6 +15520,10 @@ function LogSidebar<Item>({ data, keyExtractor, describe, selectedKey, onSelect,
 
 function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelect }: { requests: RouteTraceRequest[]; selectedKey: string; native: NativeLeafAdapter; translate: Translate; onSelect: (key: string) => void }): React.JSX.Element {
   const [visibleRequests, setVisibleRequests] = useState(requests);
+  const requestKeys = useMemo(() => visibleRequests.map((request) => request.key), [visibleRequests]);
+  const activeRequestKey = useRowSelection(requestKeys, selectedKey || undefined, (key) => onSelect(key ?? ""), {
+    first: requestKeys[0], list: "route-trace",
+  });
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
   const [timelineContentWidth, setTimelineContentWidth] = useState(0);
   const [timelineHorizontalOffset, setTimelineHorizontalOffset] = useState(0);
@@ -15807,7 +15532,7 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
   const pendingRequests = useRef<RouteTraceRequest[] | undefined>(undefined);
   const scrollIdleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const timelineScrollRef = useRef<ScrollView>(null);
-  const selected = visibleRequests.find((request) => request.key === selectedKey) ?? visibleRequests[0];
+  const selected = visibleRequests.find((request) => request.key === activeRequestKey);
   const hasTimelineHorizontalOverflow = timelineContentWidth > timelineViewportWidth + 1;
   const timelineMaximumHorizontalOffset = Math.max(0, timelineContentWidth - timelineViewportWidth);
   const timelineScrollbarThumbWidth = hasTimelineHorizontalOverflow && timelineScrollbarTrackWidth > 0
@@ -16374,14 +16099,6 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     () => selected === "route-trace" ? groupRouteTraceRequests(rows) : [],
     [rows, selected],
   );
-  useEffect(() => {
-    if (selected !== "route-trace" || routeTraceRequests.length === 0) return;
-    setSelectedKeys((current) => {
-      const currentKey = current["route-trace"];
-      if (currentKey && routeTraceRequests.some((request) => request.key === currentKey)) return current;
-      return { ...current, "route-trace": routeTraceRequests[0].key };
-    });
-  }, [routeTraceRequests, selected]);
   const paused = pauseIntent?.tab === selected ? pauseIntent.paused : active?.paused ?? false;
   const togglePaused = (): void => {
     const tab = selected;

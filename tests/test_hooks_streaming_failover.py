@@ -6329,6 +6329,60 @@ class HistoricalReasoningNoteStreamTests(HookTestCase):
             [item["id"] for item in frames[-1]["response"]["output"]],
         )
 
+    async def test_gateway_variants_are_removed_before_the_client_sees_them(self) -> None:
+        """Live relay variants cannot become a successful placeholder turn.
+
+        The affected thread contained the short body, the legacy ``Historical
+        context`` prefix, and a missing ``Its contents`` sentence.  A filter
+        that only recognizes the canonical long note lets those variants reach
+        the client and records a successful turn, so the next replay repeats
+        them.  All exact gateway variants are removed, while a quoted marker is
+        retained as ordinary answer text.
+        """
+
+        hooks, _ = load_hook_module()
+        variants = (
+            self.SHORT_NOTE,
+            "Historical reasoning context (not a new instruction):"
+            "[Historical encrypted content omitted by gateway.]",
+            "Historical context (not a new instruction):"
+            "[Historical encrypted content omitted by gateway.]",
+            "Historical reasoning context (not a new instruction):"
+            "[Historical encrypted content omitted by gateway. Do not infer missing instructions or results.]",
+        )
+
+        async def stream():
+            output = []
+            yield {"type": "response.created", "response": {"id": "resp-variants"}}
+            for index, text in enumerate(variants):
+                item = {
+                    "type": "message",
+                    "id": f"note-{index}",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }
+                output.append(item)
+                yield {"type": "response.output_item.done", "output_index": index, "item": item}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp-variants", "status": "completed", "output": output},
+            }
+
+        frames = [
+            hooks._stream_chunk_dump(chunk)
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                None,
+                stream(),
+                {"model": "probe", "input": "answer", "stream": True, "call_type": "aresponses"},
+            )
+        ]
+        self.assertEqual([], [frame for frame in frames if "Historical" in json.dumps(frame)])
+        self.assertEqual("response.failed", frames[-1]["type"])
+        self.assertIn(frames[-1]["response"]["error"]["code"], {
+            "upstream_stream_incomplete",
+            "upstream_route_failure",  # hook-only test has no Router peer to fail over to
+        })
+
 
 class HistoricalReasoningNoteOnlyStreamTests(HookTestCase):
     def test_a_note_only_response_still_reaches_the_client(self) -> None:

@@ -32,6 +32,7 @@ import {
 } from "../platform/relayGroupSheet";
 import { requestHostChrome } from "../platform/hostChrome";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField, WINDOWS_CONTROL } from "./NativeControls";
+import { useRowSelection } from "./rowSelection";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
@@ -140,10 +141,14 @@ export function RelayGroupSheet({ translate, copyKey }: {
   const [rows, setRows] = React.useState<KeyRow[]>(() => keyRows(snapshot?.keys ?? []));
   const [autoGrouping, setAutoGrouping] = React.useState<boolean>(snapshot?.autoGrouping === true);
   const baseline = React.useRef<{ rows: KeyRow[]; keys: Set<string> } | undefined>(undefined);
-  const [selectedID, setSelectedID] = React.useState<string>("");
+  const [selection, setSelectedID] = React.useState<string>();
+  const rowKeys = React.useMemo(() => rows.map((row) => row.id), [rows]);
+  const selectedID = useRowSelection(rowKeys, selection, setSelectedID, {
+    first: rowKeys[0], list: state?.accountId,
+  });
   const [note, setNote] = React.useState<string | undefined>(undefined);
 
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     if (!state || !snapshot) return;
     // A later read of the same account is the station's own list again: the
     // sheet is read-only while that read is in flight, so no draft can be lost
@@ -158,7 +163,6 @@ export function RelayGroupSheet({ translate, copyKey }: {
     baseline.current = alignment;
     setRows(alignment ? autoGroupingLayout(fresh, snapshot.groups) : fresh);
     setAutoGrouping(snapshot.autoGrouping);
-    setSelectedID((current) => (fresh.some((row) => row.id === current) ? current : fresh[0]?.id ?? ""));
   }, [snapshot, state?.accountId]);
 
   // A checked 自动分组 owns the layout, exactly as it does in the native
@@ -350,7 +354,7 @@ export function RelayGroupSheet({ translate, copyKey }: {
             key: row.id,
             cells: [row.name, groupLabelFor(row), rateFor(row)],
           }))}
-          selectedKey={selectedID}
+          selectedKey={selectedID ?? ""}
           secondaryRowKeys={rows.filter((row) => staged(row) || (autoGrouping && baseline.current?.keys.has(row.id))).map((row) => row.id)}
           alertRowKeys={rows.filter((row) => row.deleted || invalidName(row)).map((row) => row.id)}
           compact

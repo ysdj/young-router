@@ -31,12 +31,16 @@ from __future__ import annotations
 
 import json
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+
+import yaml
 
 from young_router import runtime_store
 from young_router.core import CoreIPCServer, CoreStore
@@ -46,30 +50,35 @@ BUILT_PAGE = ROOT / "rn" / "apps" / "web" / "dist"
 DRIVER = Path(__file__).resolve().with_name("test_browser_edit_path.mjs")
 
 
-def _provider_document() -> str:
+def _provider_document(catalog_url: str | None = None, relay_origin: str | None = None) -> str:
     """A document shaped like an installation someone actually runs."""
 
     lines = ["providers:"]
     for provider in range(3):
         name = f"provider{provider}"
+        endpoint = relay_origin if provider == 0 and relay_origin else catalog_url if provider == 0 and catalog_url else f"https://relay{provider}.example.test/v1"
         lines.extend(
             [
                 f"  {name}:",
-                f'    api_base: "https://relay{provider}.example.test/v1"',
+                f'    api_base: "{endpoint}"',
                 "    api_keys:",
                 f'      - name: key\n        value: "sk-replace-{provider}"',
             ]
         )
+        if provider == 0 and catalog_url:
+            lines.extend(['      - name: second-key', '        value: "sk-synthetic-second"'])
     lines.append("model_list:")
     for provider in range(3):
+        endpoint = relay_origin if provider == 0 and relay_origin else catalog_url if provider == 0 and catalog_url else f"https://relay{provider}.example.test/v1"
         for route in range(4):
+            key = "sk-synthetic-second" if provider == 0 and catalog_url and route >= 2 else f"sk-replace-{provider}"
             lines.extend(
                 [
                     f"  - model_name: public-{provider}-{route}",
                     "    litellm_params:",
                     f"      model: openai/upstream-{provider}-{route}",
-                    f'      api_base: "https://relay{provider}.example.test/v1"',
-                    f'      api_key: "sk-replace-{provider}"',
+                    f'      api_base: "{endpoint}"',
+                    f'      api_key: "{key}"',
                     "    model_info:",
                     f"      id: {provider:02x}{route:02x}abcd",
                     f"      provider: provider{provider}",
@@ -100,12 +109,14 @@ class BrowserEditCostTests(unittest.TestCase):
     def setUp(self) -> None:
         if not (BUILT_PAGE / "index.html").exists():
             self.skipTest(f"no built page at {BUILT_PAGE}; run `pnpm run build:web` first")
+
+    def _start_core(self, document: str) -> None:
         self._directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
         root = Path(self._directory.name)
         self.config_path = root / ".litellm-runtime" / "config.yaml"
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(_provider_document(), encoding="utf-8")
+        self.config_path.write_text(document, encoding="utf-8")
         self.settings_path = root / "runtime-settings.env"
         self.settings_path.write_text("", encoding="utf-8")
         codex_home = root / "codex"
@@ -150,6 +161,7 @@ class BrowserEditCostTests(unittest.TestCase):
                 os.environ[key] = value
 
     def test_table_columns_resize_at_their_edges_and_survive_log_updates(self) -> None:
+        self._start_core(_provider_document())
         log_path = Path(self._directory.name) / "recent-requests.jsonl"
         runtime_store.append_record(
             log_path,
@@ -171,7 +183,32 @@ class BrowserEditCostTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
 
+    def test_route_trace_keeps_its_selection_while_scrolling_through_a_refresh(self) -> None:
+        self._start_core(_provider_document())
+        log_path = Path(self._directory.name) / "server.log"
+        next_log_path = log_path.with_name("server-after.log")
+
+        def record(index: int) -> str:
+            payload = {
+                "timestamp": f"2026-11-21T09:00:{index:02d}Z",
+                "request_id": f"trace-request-{index:02d}",
+                "event": "selected_deployment",
+                "model_group": f"trace-model-{index:02d}",
+                "route_key": f"model=trace-model-{index:02d} / provider=provider0 / upstream=openai/upstream-{index:02d}",
+            }
+            return f"litellm_route_trace {json.dumps(payload)}\n"
+
+        log_path.write_text("".join(record(index) for index in range(30)), encoding="utf-8")
+        next_log_path.write_text("".join(record(index) for index in range(30) if index != 28), encoding="utf-8")
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--trace-selection", str(next_log_path), str(log_path)],
+            capture_output=True, text=True, timeout=60, cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
     def test_one_settled_edit_asks_for_the_plan_not_the_projection(self) -> None:
+        self._start_core(_provider_document())
         endpoint = self.server.endpoint
         url = f"http://{endpoint.address}:{endpoint.port}/ui/"
         completed = subprocess.run(
@@ -211,6 +248,256 @@ class BrowserEditCostTests(unittest.TestCase):
             f"the press on a slow link went back to its old value after {slow['paintedMs']} ms: {slow}",
         )
         self.assertIn("已保存", slow["strip"], f"the slow link's edit never stated the save: {slow}")
+
+    def test_model_import_keeps_the_selection_until_the_new_row_arrives(self) -> None:
+        self._check_model_import("answer-first")
+
+    def test_model_import_selects_the_new_row_when_it_arrives_before_the_answer(self) -> None:
+        self._check_model_import("event-first")
+
+    def test_model_import_answer_does_not_override_a_later_row_choice(self) -> None:
+        self._check_model_import("answer-first-user-change")
+
+    def test_row_change_delete_provider(self) -> None:
+        saved = self._check_row_change("delete-provider")
+        self.assertNotIn("provider1", saved["providers"])
+
+    def test_row_change_delete_model(self) -> None:
+        doc = yaml.safe_load(_provider_document(catalog_url="http://127.0.0.1:9/v1"))
+        rows = doc["model_list"]
+        # Config order crosses a credential boundary where the display order
+        # does not. After removing row 2, the visible neighbor is row 3.
+        rows[1], rows[2] = rows[2], rows[1]
+        saved = self._check_row_change("delete-model", yaml.safe_dump(doc, sort_keys=False))
+        self.assertNotIn("public-0-2", [row["model_name"] for row in saved["model_list"]])
+
+    def test_row_change_delete_relay_account(self) -> None:
+        origin = "http://127.0.0.1:9"
+        self._start_core(_provider_document(relay_origin=origin))
+        for index in range(3):
+            name = f"fixture-account-{index}"
+            self.core.dispatch({
+                "domain": "relay_accounts", "type": "account.add",
+                "payload": {"type": "newapi", "label": name, "username": name, "origin": origin},
+            })
+        self.core.apply(domains=["relay_accounts"], revision=self.core.revision)
+        self._drive_row_change("delete-account")
+        relay = self.core._domains["relay_accounts"]
+        saved = json.loads(relay.storage_path.read_bytes())["accounts"]
+        self.assertEqual([row["username"] for row in saved], ["fixture-account-0", "fixture-account-2"])
+
+    def test_auto_grouping_keeps_the_adjacent_key_selected(self) -> None:
+        tokens = [
+            {"id": 1, "name": "first-key", "group": "default", "status": 1, "key": "fixture-first"},
+            {"id": 2, "name": "duplicate-key", "group": "default", "status": 1, "key": "fixture-duplicate"},
+            {"id": 3, "name": "last-key", "group": "premium", "status": 1, "key": "fixture-last"},
+        ]
+
+        class RelayStation(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/api/user/self":
+                    data = {"id": 7, "username": "fixture"}
+                elif self.path == "/api/user/self/groups":
+                    data = {"default": {"ratio": 1}, "premium": {"ratio": 2}}
+                elif self.path == "/api/token/?p=1&size=100":
+                    data = {"items": tokens}
+                elif self.path.startswith("/api/user/models"):
+                    data = ["fixture-model"]
+                else:
+                    self.send_error(404)
+                    return
+                body = json.dumps({"success": True, "data": data}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                pass
+
+        station = ThreadingHTTPServer(("127.0.0.1", 0), RelayStation)
+        self.addCleanup(station.server_close)
+        threading.Thread(target=station.serve_forever, daemon=True).start()
+        self.addCleanup(station.shutdown)
+        origin = f"http://127.0.0.1:{station.server_port}"
+        self._start_core(_provider_document(relay_origin=origin))
+        self.core.accept_relay_login(
+            account_id="fixture-account", account_type="newapi", label="Relay", origin=origin,
+            pending_account=True, username="fixture", access_token="fixture-session", user_id="7",
+        )
+        refreshed = self.core.refresh_relay_resources("fixture-account", revision=None, force=True)
+        self.assertEqual("ready", refreshed["resource_status"])
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--group-selection"],
+            capture_output=True, text=True, timeout=60, cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
+    def test_row_change_move_model(self) -> None:
+        self._assert_model_moved(self._check_row_change("move-model"))
+
+    def test_row_change_move_route(self) -> None:
+        self._assert_model_moved(self._check_row_change("move-route"))
+
+    def test_row_change_rename_public_model(self) -> None:
+        saved = self._check_row_change("rename-group")
+        self.assertIn("renamed-model", [row["model_name"] for row in saved["model_list"]])
+
+    def test_row_change_add_route(self) -> None:
+        self._check_row_change("add-route")
+
+    def test_route_navigation_keeps_the_selected_model_across_providers(self) -> None:
+        self._check_route_navigation("route")
+
+    def test_public_model_navigation_keeps_the_selected_model_across_providers(self) -> None:
+        self._check_route_navigation("group")
+
+    def _check_route_navigation(self, kind: str) -> None:
+        self._start_core(_provider_document())
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--route-navigation", kind],
+            capture_output=True, text=True, timeout=60, cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
+    def _check_row_change(self, change: str, document: str | None = None) -> dict:
+        self._start_core(document or _provider_document())
+        self._drive_row_change(change)
+        return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+
+    def _drive_row_change(self, change: str) -> None:
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--row-change", change],
+            capture_output=True, text=True, timeout=60, cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
+    def _assert_model_moved(self, saved: dict) -> None:
+        moved, = [row for row in saved["model_list"] if row["model_name"] == "public-0-2"]
+        self.assertEqual(moved["model_info"]["provider"], "provider1")
+
+    def test_session_limit_retry_is_a_real_page_action(self) -> None:
+        state = {"full": False}
+        requests: list[tuple[str, str, int]] = []
+        profile_tokens: list[str | None] = []
+
+        class RelayStation(BaseHTTPRequestHandler):
+            def answer(self, status: int, body: object) -> None:
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                requests.append(("GET", self.path, 0))
+                profile_tokens.append(self.headers.get("Authorization"))
+                if self.path != "/api/user/self" or self.headers.get("Authorization") != "Bearer fixture-retried":
+                    self.answer(401, {"success": False, "message": "unauthorized"})
+                    return
+                self.answer(200, {"success": True, "data": {"id": 7, "username": "fixture"}})
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path != "/api/user/login":
+                    self.answer(404, {})
+                    return
+                status = 409 if state["full"] else 200
+                requests.append(("POST", self.path, status))
+                if status == 409:
+                    self.answer(409, {"code": "AUTH_SESSION_LIMIT", "success": False})
+                else:
+                    self.answer(200, {"success": True, "data": {
+                        "username": "fixture", "id": 7, "access_token": "fixture-retried",
+                    }})
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                pass
+
+        station = ThreadingHTTPServer(("127.0.0.1", 0), RelayStation)
+        self.addCleanup(station.server_close)
+        threading.Thread(target=station.serve_forever, daemon=True).start()
+        self.addCleanup(station.shutdown)
+        origin = f"http://127.0.0.1:{station.server_port}"
+        self._start_core(_provider_document(relay_origin=origin))
+        account = {
+            "account_id": "fixture-account", "account_type": "newapi", "label": "Relay", "origin": origin,
+        }
+        self.core.accept_relay_login(
+            **account, pending_account=True, username="fixture", access_token="fixture-old",
+            password="fixture-password", remember_password=True, user_id="7",
+        )
+        relay = self.core._domains["relay_accounts"]
+        relay._session_recheck_seconds = lambda: 0
+        state["full"] = True
+        self.core.restore_relay_session(**account, login_status="unknown")
+        self.assertEqual([("POST", "/api/user/login", 409)], [item for item in requests if item[0] == "POST"])
+        self.assertEqual("session_limit", relay.snapshot()["accounts"][0]["login_failure"])
+        state["full"] = False
+
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--session-limit-retry"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        measured = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertTrue(measured["ok"], measured)
+        self.assertEqual({"refusal": True, "retry": True}, measured["measured"]["before"])
+        self.assertEqual({"signedIn": True, "retry": False}, measured["measured"]["after"])
+        self.assertEqual(
+            [("POST", "/api/user/login", 409), ("POST", "/api/user/login", 200)],
+            [item for item in requests if item[0] == "POST"],
+        )
+        saved = json.loads(relay.storage_path.read_bytes())["accounts"][0]
+        self.assertEqual("fixture-retried", saved["session"]["access_token"])
+        self.assertEqual("signed_in", saved["login_status"], (requests, profile_tokens))
+
+    def _check_model_import(self, delivery_order: str) -> None:
+        requested = []
+
+        class ModelCatalog(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                requested.append((self.path, self.headers.get("Authorization")))
+                body = b'{"object":"list","data":[{"id":"added-model"}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                pass
+
+        catalog = ThreadingHTTPServer(("127.0.0.1", 0), ModelCatalog)
+        self.addCleanup(catalog.server_close)
+        threading.Thread(target=catalog.serve_forever, daemon=True).start()
+        self.addCleanup(catalog.shutdown)
+        self._start_core(_provider_document(f"http://127.0.0.1:{catalog.server_port}/v1"))
+        endpoint = self.server.endpoint
+        url = f"http://{endpoint.address}:{endpoint.port}/ui/"
+        completed = subprocess.run(
+            ["node", str(DRIVER), url, "--json", "--model-selection", delivery_order],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        self.assertEqual(requested, [("/v1/models", "Bearer sk-synthetic-second")])
+        saved = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))["model_list"]
+        self.assertEqual(
+            ["sk-synthetic-second"],
+            [row["litellm_params"]["api_key"] for row in saved if row["model_name"] == "added-model"],
+        )
 
 
 if __name__ == "__main__":

@@ -253,7 +253,7 @@ class CoreEmitTests(unittest.TestCase):
             self.assertEqual("patch", event["event"])
             fields = event["domain_fields"]["providers_models"]
             self.assertEqual({"added-route"}, set(fields["model_contexts"]))
-            self.assertEqual(272000, fields["model_contexts"]["added-route"]["context_window"])
+            self.assertEqual(500000, fields["model_contexts"]["added-route"]["context_window"])
             self.assertLess(
                 len(json.dumps(fields["model_contexts"], separators=(",", ":")).encode("utf-8")),
                 512,

@@ -152,14 +152,15 @@ def _repaired_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return repaired
 
 
-def _repaired_message(message: Any) -> Optional[Dict[str, Any]]:
+def _repaired_message(message: Any, *, include_text_turns: bool) -> Optional[Dict[str, Any]]:
     """The same assistant turn with the thinking field present, on the Chat wire."""
 
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
-    tool_calls = message.get("tool_calls")
-    if not isinstance(tool_calls, list) or not tool_calls:
-        return None
+    if not include_text_turns:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return None
     if "reasoning_content" in message:
         return None
     return dict(message, reasoning_content=REASONING_CONTENT_PLACEHOLDER)
@@ -168,9 +169,8 @@ def _repaired_message(message: Any) -> Optional[Dict[str, Any]]:
 def _synthesized_reasoning_item(seed: Any) -> Dict[str, Any]:
     """A thinking item for a turn whose own thinking the client never kept.
 
-    ``id`` is derived from the tool call that turn ends in, so a replay repaired
-    twice says the same thing both times -- two different ids for one turn read
-    as two thinking steps that never happened.
+    The caller supplies a stable tool-call id or input position so that a replay
+    repaired twice identifies the same turn.
     """
 
     text = seed if isinstance(seed, str) and seed.strip() else "replay"
@@ -187,24 +187,25 @@ def _synthesized_reasoning_item(seed: Any) -> Dict[str, Any]:
 def _is_segment_boundary(item: Any) -> bool:
     """Whether this item closes the assistant segment before it.
 
-    A user turn and a tool result both open what the model answers next; what
-    came before either of them belongs to a turn that has already been answered.
+    A new instruction, user turn, or tool result opens what the model answers
+    next; what came before it belongs to a completed segment.
     """
 
     if not isinstance(item, dict):
         return False
     if item.get("type") == "function_call_output":
         return True
-    return item.get("type") == "message" and item.get("role") == "user"
+    return item.get("type") in (None, "message") and item.get("role") in (
+        "system", "developer", "user"
+    )
 
 
-def _resign_tool_turns(items: List[Any]) -> Optional[List[Any]]:
-    """Give every tool-calling turn the thinking item it is missing.
+def _resign_assistant_turns(items: List[Any], *, include_text_turns: bool) -> Optional[List[Any]]:
+    """Give each assistant segment the thinking item it is missing.
 
     A thinking-mode wire reads the whole history as one chain of turns, and each
-    turn that ends in a tool call has to still carry the thinking that produced
-    it.  An item the client dropped -- or never had, for a turn it restored from
-    a summary -- leaves that turn empty, and the wire refuses the entire replay.
+    tool-calling segment has to still carry the thinking that produced it.
+    DeepSeek also requires it for segments containing only assistant messages.
 
     The item goes at the **start** of the turn, not beside the tool call.  With
     a ``tools`` declaration in the request the upstream is strict about that:
@@ -215,14 +216,13 @@ def _resign_tool_turns(items: List[Any]) -> Optional[List[Any]]:
 
     repaired: List[Any] = []
     segment: List[Any] = []
-    segment_has_call = False
+    segment_needs_text = False
     segment_has_text = False
+    segment_start = 0
 
     def flush() -> None:
-        nonlocal segment, segment_has_call, segment_has_text
-        if segment and segment_has_call and not segment_has_text:
-            # Named after the call this turn ends in, not after whatever item
-            # happened to open it.
+        nonlocal segment, segment_needs_text, segment_has_text
+        if segment_needs_text and not segment_has_text:
             seed = next(
                 (
                     item.get("call_id") or item.get("id")
@@ -230,24 +230,27 @@ def _resign_tool_turns(items: List[Any]) -> Optional[List[Any]]:
                     if isinstance(item, dict) and item.get("type") == "function_call"
                 ),
                 None,
-            )
+            ) or f"replay_{segment_start}"
             repaired.append(_synthesized_reasoning_item(seed))
         repaired.extend(segment)
         segment = []
-        segment_has_call = False
+        segment_needs_text = False
         segment_has_text = False
 
-    for item in items:
+    for index, item in enumerate(items):
         if _is_segment_boundary(item):
             flush()
             repaired.append(item)
+            segment_start = index + 1
             continue
         if not isinstance(item, dict):
             segment.append(item)
             continue
         kind = item.get("type")
-        if kind == "function_call":
-            segment_has_call = True
+        if kind == "function_call" or (
+            include_text_turns and kind in (None, "message") and item.get("role") == "assistant"
+        ):
+            segment_needs_text = True
         elif kind == "reasoning" and _readable_reasoning_text(item) is not None:
             segment_has_text = True
         segment.append(item)
@@ -261,16 +264,19 @@ def with_reasoning_text_replay(request_kwargs: Dict[str, Any]) -> Optional[Dict[
     Both wires of one thinking-mode route refuse the same absence under their
     own spelling, so both shapes are read here: a Responses replay through its
     ``reasoning`` items, a Chat replay through the ``reasoning_content`` of the
-    assistant turn that made the tool calls.  A thinking item that is present but
-    unreadable is rewritten, and a turn that carries a tool call with no thinking
-    item at all gets one inserted -- both were measured against
-    ``api.deepseek.com`` and both are answered while the original body is refused.
+    assistant turn.  A thinking item that is present but unreadable is rewritten,
+    and an assistant segment with no thinking item gets one inserted.  Both were
+    measured against ``api.deepseek.com`` and answered while the original body
+    was refused.
 
     Only what is missing is written; everything else is left byte-for-byte
     alone.  ``None`` means there was nothing to repair, so a caller never
     resends a body it did not change.
     """
 
+    from . import codex_contract
+
+    include_text_turns = codex_contract._request_targets_official_deepseek(request_kwargs)
     items = request_kwargs.get("input")
     if isinstance(items, list) and items:
         repaired_items: List[Any] = []
@@ -283,7 +289,7 @@ def with_reasoning_text_replay(request_kwargs: Dict[str, Any]) -> Optional[Dict[
                     changed = True
                     continue
             repaired_items.append(item)
-        filled = _resign_tool_turns(repaired_items)
+        filled = _resign_assistant_turns(repaired_items, include_text_turns=include_text_turns)
         if filled is not None:
             repaired_items = filled
             changed = True
@@ -295,7 +301,7 @@ def with_reasoning_text_replay(request_kwargs: Dict[str, Any]) -> Optional[Dict[
         repaired_messages: List[Any] = []
         changed = False
         for message in messages:
-            repaired = _repaired_message(message)
+            repaired = _repaired_message(message, include_text_turns=include_text_turns)
             if repaired is not None:
                 repaired_messages.append(repaired)
                 changed = True

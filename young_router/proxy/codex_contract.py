@@ -25,8 +25,19 @@ adaptation, so the ordered step lists in :mod:`young_router.proxy.hook` and
 
 from __future__ import annotations
 
+import os
+import sys
+from urllib.parse import SplitResult, urlsplit
+
 from . import request_context as _request_context_module
-from .base import Any, Optional
+from .base import (
+    Any,
+    Optional,
+    _CURRENT_UPSTREAM_URL_SURFACE_KEY,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+    _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+)
 
 from . import routing as _routing_module
 
@@ -53,6 +64,7 @@ def _tool_definition_name(tool: Any) -> Optional[str]:
 
 _CODEX_DESCENDANT_CLEANUP_ENV = "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP"
 _CODEX_COMMENTARY_DISCIPLINE_ENV = "YOUNG_ROUTER_CODEX_COMMENTARY_DISCIPLINE"
+_INJECTED_TOOL_CHOICE_KEY = "codex_contract_injected_tool_choice"
 
 #: How many trailing tool-free progress messages make a replay a loop rather
 #: than a continuation.  One is the ordinary shape: the client recorded the
@@ -115,6 +127,265 @@ def with_tool_registry_contract(
     return None
 
 
+def _request_targets_official_deepseek(request_kwargs: dict) -> bool:
+    params = request_kwargs.get("litellm_params")
+    api_base = params.get("api_base") if isinstance(params, dict) else None
+    if not isinstance(api_base, str):
+        api_base = _responses_request_module._request_api_base(request_kwargs)
+    if api_base:
+        return _responses_request_module._api_base_host(api_base) == "api.deepseek.com"
+    params = params if isinstance(params, dict) else {}
+    model = params.get("model") or request_kwargs.get("model")
+    provider = params.get("custom_llm_provider") or request_kwargs.get("custom_llm_provider")
+    if not (provider == "deepseek" or isinstance(model, str) and model.startswith("deepseek/")):
+        return False
+    configured_base = (
+        getattr(sys.modules.get("litellm"), "api_base", None)
+        or os.getenv("DEEPSEEK_API_BASE", "")
+    )
+    if configured_base:
+        return _responses_request_module._api_base_host(configured_base) == "api.deepseek.com"
+    return True
+
+
+def _tool_choice_upstream_surface(request_kwargs: dict, call_type: Any = None) -> str:
+    surface = _routing_module._request_current_upstream_surface(request_kwargs)
+    if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return surface
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return _UPSTREAM_URL_SURFACE_OPENAI_CHAT
+    if surface:
+        return surface
+    if call_type is not None:
+        request_kwargs = {
+            **request_kwargs,
+            "call_type": getattr(call_type, "value", call_type),
+        }
+    return _routing_module._request_client_surface(request_kwargs)
+
+
+def _deepseek_thinking_rejects_forced_choice(request_kwargs: dict) -> bool:
+    """Whether the selected official DeepSeek wire rejects a forced choice."""
+
+    if not _request_targets_official_deepseek(request_kwargs):
+        return False
+    params = request_kwargs.get("litellm_params")
+    for container in (request_kwargs.get("extra_body"), request_kwargs, params):
+        if not isinstance(container, dict):
+            continue
+        thinking = container.get("thinking")
+        if isinstance(thinking, dict):
+            if thinking.get("type") == "enabled":
+                return True
+            if thinking.get("type") == "disabled":
+                return False
+    # Chat uses the native thinking switch. A Responses effort of none only
+    # disables thinking when the selected call is actually sent as Responses.
+    if _tool_choice_upstream_surface(request_kwargs) == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        reasoning = request_kwargs.get("reasoning")
+        if isinstance(reasoning, dict) and reasoning.get("effort") == "none":
+            return False
+    return True
+
+
+def _deepseek_forced_tool_choice(request_kwargs: dict) -> Any:
+    # OpenAI's extra body is merged into the provider body last. It can also
+    # supply the choice when the client SDK leaves the top-level field empty.
+    extra = request_kwargs.get("extra_body")
+    params = request_kwargs.get("litellm_params")
+    for container in (extra, request_kwargs, params):
+        if not isinstance(container, dict) or container.get("tool_choice") is None:
+            continue
+        choice = container["tool_choice"]
+        kind = choice.get("type") if isinstance(choice, dict) else choice
+        if kind in ("required", "any") or (
+            kind in ("function", "tool", "custom")
+            and _responses_request_module._codex_tool_choice_name(choice)
+        ):
+            return choice
+        break
+    return None
+
+
+def _with_deepseek_thinking_passthrough(request_kwargs: dict, surface: str) -> dict:
+    """Keep the native Chat thinking switch through LiteLLM's OpenAI adapter."""
+
+    thinking = request_kwargs.get("thinking")
+    if surface != _UPSTREAM_URL_SURFACE_OPENAI_CHAT or not isinstance(thinking, dict):
+        return request_kwargs
+    extra = request_kwargs.get("extra_body")
+    if isinstance(extra, dict) and "thinking" in extra:
+        return request_kwargs
+    updated = request_kwargs.copy()
+    updated["extra_body"] = {**(extra if isinstance(extra, dict) else {}), "thinking": thinking}
+    return updated
+
+
+def _with_deepseek_automatic_tool_choice(request_kwargs: dict, surface: str) -> dict:
+    """Adapt a forced choice without altering the request's thinking settings."""
+
+    updated = request_kwargs.copy()
+    updated["tool_choice"] = (
+        {"type": "auto"} if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC else "auto"
+    )
+    updated.pop("function_call", None)
+    for key in ("litellm_params", "extra_body"):
+        nested = updated.get(key)
+        if isinstance(nested, dict) and ("tool_choice" in nested or "function_call" in nested):
+            updated[key] = {
+                name: value
+                for name, value in nested.items()
+                if name not in ("tool_choice", "function_call")
+            }
+    return _with_deepseek_thinking_passthrough(updated, surface)
+
+
+def _tool_choice_refusal_endpoint(exception: Exception) -> Optional[SplitResult]:
+    # LiteLLM's Responses error wrapper uses an OpenAI base URL as a stub. The
+    # original HTTP failure can still carry the endpoint in the exception chain.
+    seen = set()
+    error = exception
+    while isinstance(error, Exception) and id(error) not in seen:
+        seen.add(id(error))
+        request = getattr(error, "request", None)
+        url = getattr(request, "url", None)
+        if url is not None and getattr(request, "method", None) == "POST":
+            endpoint = urlsplit(str(url))
+            stub = (endpoint.hostname, endpoint.path.rstrip("/"))
+            if stub not in {("api.openai.com", "/v1"), ("docs.litellm.ai", "/docs")}:
+                return endpoint
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def _deepseek_tool_choice_retry_kwargs(
+    exception: Exception, request_kwargs: dict, call_type: Any
+) -> Optional[dict]:
+    if not _routing_module._is_thinking_tool_choice_unsupported_error(exception):
+        return None
+    if _deepseek_forced_tool_choice(request_kwargs) is None:
+        return None
+
+    endpoint = _tool_choice_refusal_endpoint(exception)
+    if endpoint and endpoint.hostname != "api.deepseek.com":
+        return None
+    if endpoint is None and not _request_targets_official_deepseek(request_kwargs):
+        return None
+
+    expected_surface = _tool_choice_upstream_surface(request_kwargs, call_type)
+    surface = expected_surface
+    path = endpoint.path.rstrip("/") if endpoint else ""
+    if path.endswith("/responses"):
+        surface = _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+    elif path.endswith("/chat/completions"):
+        surface = _UPSTREAM_URL_SURFACE_OPENAI_CHAT
+    elif path.endswith("/messages"):
+        surface = _UPSTREAM_URL_SURFACE_ANTHROPIC
+    updated = _with_deepseek_automatic_tool_choice(request_kwargs, surface)
+    if surface and surface != expected_surface:
+        updated[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
+    return updated
+
+
+async def _call_with_deepseek_tool_choice(
+    call: Any, request_kwargs: dict, call_type: Any = None, *, prepare_retry: Any = None
+) -> Any:
+    """Repair a rejected combination before any upstream response is delivered."""
+
+    if _request_targets_official_deepseek(request_kwargs):
+        request_kwargs = _with_deepseek_thinking_passthrough(
+            request_kwargs, _tool_choice_upstream_surface(request_kwargs, call_type)
+        )
+    if (
+        _deepseek_forced_tool_choice(request_kwargs) is not None
+        and _deepseek_thinking_rejects_forced_choice(request_kwargs)
+    ):
+        request_kwargs = _with_deepseek_automatic_tool_choice(
+            request_kwargs, _tool_choice_upstream_surface(request_kwargs, call_type)
+        )
+        from . import trace as _trace_module
+
+        _trace_module._request_route_trace(
+            "deepseek_forced_tool_choice_adapted", request_kwargs, automatic=True
+        )
+
+    try:
+        return await call(**request_kwargs)
+    except Exception as exc:
+        failed_request = prepare_retry(request_kwargs) if prepare_retry is not None else request_kwargs
+        if failed_request is None:
+            raise
+        retry = _deepseek_tool_choice_retry_kwargs(exc, failed_request, call_type)
+        if retry is None:
+            raise
+        from . import trace as _trace_module
+
+        _trace_module._request_route_trace(
+            "deepseek_forced_tool_choice_repaired", retry, automatic=True
+        )
+        return await call(**retry)
+
+
+def _with_injected_tool_choice(request_kwargs: dict, choice: Any) -> dict:
+    """Remember the caller's choice when a Codex contract replaces it."""
+
+    modified = request_kwargs.copy()
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    metadata = metadata.copy()
+    previous = metadata.get(_INJECTED_TOOL_CHOICE_KEY)
+    if not isinstance(previous, dict):
+        metadata[_INJECTED_TOOL_CHOICE_KEY] = {
+            "present": "tool_choice" in request_kwargs,
+            "original": request_kwargs.get("tool_choice"),
+            "injected": choice,
+        }
+    else:
+        metadata[_INJECTED_TOOL_CHOICE_KEY] = {**previous, "injected": choice}
+    modified["litellm_metadata"] = metadata
+    modified["tool_choice"] = choice
+    return modified
+
+
+def _has_injected_tool_choice(request_kwargs: dict) -> bool:
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    injected = metadata.get(_INJECTED_TOOL_CHOICE_KEY)
+    if not isinstance(injected, dict) or injected.get("original") not in (None, "auto"):
+        return False
+    current = request_kwargs.get("tool_choice")
+    original_injection = injected.get("injected")
+    current_name = _responses_request_module._codex_tool_choice_name(current)
+    injected_name = _responses_request_module._codex_tool_choice_name(original_injection)
+    return current == original_injection or bool(
+        current_name and current_name == injected_name
+    )
+
+
+def _restore_unsupported_injected_tool_choice(request_kwargs: dict) -> Optional[dict]:
+    """Undo an earlier contract injection after selecting an incompatible wire."""
+
+    if not _deepseek_thinking_rejects_forced_choice(request_kwargs):
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    if not _has_injected_tool_choice(request_kwargs):
+        return None
+    injected = metadata[_INJECTED_TOOL_CHOICE_KEY]
+    modified = request_kwargs.copy()
+    if injected.get("present"):
+        modified["tool_choice"] = injected.get("original")
+    else:
+        modified.pop("tool_choice", None)
+    metadata = metadata.copy()
+    metadata.pop(_INJECTED_TOOL_CHOICE_KEY, None)
+    modified["litellm_metadata"] = metadata
+    return modified
+
+
 def with_descendant_cleanup_barrier(
     request_kwargs: dict,
 ) -> Optional[dict]:
@@ -158,7 +429,8 @@ def with_descendant_cleanup_barrier(
     # keeps its state but does not re-inject the refused choice.
     if (
         not _routing_module._protocol_fallback_relax_tool_choice(request_kwargs)
-        and _responses_request_module._codex_tool_choice_name(request_kwargs.get("tool_choice")) is None
+        and not _deepseek_thinking_rejects_forced_choice(request_kwargs)
+        and request_kwargs.get("tool_choice") in (None, "auto")
     ):
         # Snapshot recovery has one valid action; a generic ``required`` lets
         # the model pick an unrelated tool and repeat the same turn.
@@ -166,7 +438,7 @@ def with_descendant_cleanup_barrier(
         if runtime_state in {"snapshot_missing", "snapshot_invalidated"}:
             required_tool_choice = {"type": "function", "name": "list_agents"}
         if request_kwargs.get("tool_choice") != required_tool_choice:
-            modified_kwargs["tool_choice"] = required_tool_choice
+            modified_kwargs = _with_injected_tool_choice(modified_kwargs, required_tool_choice)
             changed = True
 
     return modified_kwargs if changed else None
@@ -212,14 +484,9 @@ def with_progress_message_contract(
     ``tool_choice`` is the half that still holds: it makes the next response a
     call, which is a continuation by the client's own protocol.
 
-    A thinking wire refuses every forced choice (measured on the official
-    DeepSeek endpoint: ``tool_choice: required`` answers 400 "thinking mode
-    does not support this tool_choice", the same body with ``auto`` answers
-    200), so one trailing progress message is left to ``auto`` there.  Two or
-    more is the loop, and it cannot end while the model is allowed to answer
-    with prose; the barrier is spent there even on a thinking wire.  A wire
-    that still refuses it is answered by the same 400-to-``auto`` retry that
-    covers a client's own forced choice.
+    The official DeepSeek thinking API accepts automatic choice but rejects
+    required or named choices. On that route the model chooses whether to call
+    a tool, so this request-side barrier cannot enforce a call.
     """
 
     if not _routing_module._env_bool(_CODEX_COMMENTARY_DISCIPLINE_ENV, True):
@@ -238,14 +505,15 @@ def with_progress_message_contract(
         return None
     if _routing_module._protocol_fallback_relax_tool_choice(request_kwargs):
         return None
+    if _deepseek_thinking_rejects_forced_choice(request_kwargs):
+        return None
     if request_kwargs.get("tool_choice") not in (None, "auto"):
         return None
     thinking = _request_thinks(request_kwargs)
     if thinking and trailing_progress < _CODEX_PROGRESS_LOOP_MESSAGES:
         return None
 
-    modified_kwargs = request_kwargs.copy()
-    modified_kwargs["tool_choice"] = "required"
+    modified_kwargs = _with_injected_tool_choice(request_kwargs, "required")
     # The request summary is taken before the deployment pre-call hook runs, so
     # a metadata flag written here would never appear in a trace.  The event is
     # what makes an injected ``required`` tell itself apart from a client's own
@@ -266,6 +534,7 @@ def with_progress_message_contract(
 # The protocol-layer replacements for the three former prompt steps, in the
 # order the request passes through them.
 CODEX_CONTRACT_REQUEST_STEPS = (
+    _restore_unsupported_injected_tool_choice,
     with_tool_registry_contract,
     with_descendant_cleanup_barrier,
     with_progress_message_contract,

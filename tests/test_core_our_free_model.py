@@ -1302,7 +1302,7 @@ class ChannelProviderSplitTests(unittest.TestCase):
             # downloaded cache, so the registry's own answer is the
             # unknown-model placeholder.  What the rows' upstreams stated then
             # becomes the window, in preference to the placeholder: these are
-            # models no profile resolves, and a client handed 272,000 against an
+            # models no profile resolves, and a client handed 500,000 against an
             # upstream that accepts 200,000 is compacted too late.  A row's own
             # number still never becomes a *declaration* — ``max_input_tokens``
             # stays absent below, so the public-model pane still writes one.

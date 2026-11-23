@@ -287,6 +287,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "client_metadata": {"request": "kept"},
             },
             "litellm_params": {
+                "api_base": "https://api.deepseek.com/v1",
                 "tool_choice": {"type": "function", "name": "inspect"},
                 "function_call": {"name": "inspect"},
                 "reasoning_effort": "max",
@@ -295,6 +296,11 @@ class HookResponsesToolBridgeTests(HookTestCase):
         error = RuntimeError("请求参数组合无效")
         error.status_code = 400
 
+        # Only a choice introduced by the contract may be relaxed.
+        self.assertIsNone(hooks._forced_tool_choice_auto_retry_kwargs(error, request))
+        request = hooks._codex_contract_module._with_injected_tool_choice(
+            {**request, "tool_choice": "auto"}, request["tool_choice"]
+        )
         retry = hooks._forced_tool_choice_auto_retry_kwargs(error, request)
 
         self.assertIsNotNone(retry)
@@ -387,7 +393,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
     def test_bridge_carries_relaxed_choice_marker_into_metadata(self) -> None:
         hooks, _ = load_hook_module()
-        request = {
+        request = hooks._codex_contract_module._with_injected_tool_choice({
             "call_type": "aresponses",
             "input": "Use the tool.",
             "tools": [
@@ -399,9 +405,9 @@ class HookResponsesToolBridgeTests(HookTestCase):
                     ],
                 }
             ],
-            "tool_choice": {"type": "function", "name": "list_agents"},
+            "tool_choice": "auto",
             hooks._PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY: True,
-        }
+        }, {"type": "function", "name": "list_agents"})
 
         metadata = {}
         hooks._with_responses_tool_adapter_compatible_tools(

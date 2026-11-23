@@ -2306,6 +2306,9 @@ def _synthesized_failed_response_event(
                 else "server_error"
             )
             error_code = "upstream_compaction_failure"
+    elif isinstance(exception, _historical_note_module.MissingAnswer):
+        message = str(exception)
+        error_type, error_code = "server_error", "upstream_stream_incomplete"
     elif _routing_module._is_sanitized_upstream_route_failure_error(exception):
         # The sentence was already decided where the turn ended; choosing a new
         # one from this wrapper replaces its cause with the wrapper's own status.
@@ -4316,7 +4319,7 @@ def _should_repair_heavy_replay_request(
         return False
     if _routing_module._is_upstream_unreachable_error(exception):
         return False
-    if _routing_module._is_upstream_input_item_limit_error(exception):
+    if _routing_module._is_upstream_input_item_limit_error(exception) or getattr(exception, "item_cap_cut", False):
         return True
     return (
         _routing_module._is_network_recovery_exception(exception)
@@ -4964,11 +4967,60 @@ async def _stream_with_idle_timeout(
         iterator_box, request_data, initial_chunk_count=initial_chunk_count
     )
     try:
-        async for chunk in reader:
-            yield chunk
+        if _request_is_responses_stream(request_data) and not _responses_request_module._request_has_structured_codex_compaction(request_data):
+            async for chunk in _without_historical_note_frames(reader):
+                yield chunk
+        else:
+            async for chunk in reader:
+                yield chunk
     finally:
         await _close_async_iterator_safely(reader)
         await _close_async_iterator_safely(iterator_box[0])
+
+
+async def _without_historical_note_frames(source: AsyncIterator[Any]) -> AsyncIterator[Any]:
+    # Filter the upstream attempt before any start buffer, recovery, or output
+    # limit compatibility path can count a placeholder as a delivered answer.
+    notes = _historical_note_module.StreamNotes()
+    try:
+        async for chunk in source:
+            frames = _stream_chunk_dumps(chunk)
+            if not frames:
+                yield chunk
+                continue
+            for event in frames:
+                frame = chunk if len(frames) == 1 else _json_stream_event(event)
+                response = event.get("response")
+                if isinstance(response, dict) and (
+                    _responses_stream_chunk_is_completed(event) or _responses_stream_chunk_is_incomplete_terminal(event)
+                ):
+                    output = response.get("output")
+                    for released in notes.finish(output if isinstance(output, list) else ()):
+                        yield released
+                    clean = _historical_note_module.clean_response(response)
+                    if clean is not response or notes.saw_note:
+                        item_cap = _responses_incomplete_terminal_reason(event) in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
+                        if (_responses_stream_chunk_is_completed(event) or item_cap) and not notes.has_answer():
+                            # An explicit commentary item is progress, not the
+                            # final answer. Its text mirror is not a second answer.
+                            remaining = clean.get("output") or []
+                            has_result = any(
+                                isinstance(item, dict) and item.get("phase") != "commentary"
+                                and (_response_item_has_assistant_text(item) or _stream_output_item_is_tool_call(item.get("type")))
+                                for item in remaining
+                            ) or (not remaining and bool((clean.get("output_text") or "").strip()))
+                            if not has_result:
+                                raise _historical_note_module.MissingAnswer(item_cap_cut=item_cap)
+                    if clean is not response:
+                        frame = _json_stream_event({**event, "response": clean})
+                for released in notes.feed(frame, event):
+                    yield released
+    except Exception:
+        for released in notes.finish():
+            yield released
+        raise
+    for released in notes.finish():
+        yield released
 
 
 async def _stream_with_idle_timeout_reader(
@@ -5807,7 +5859,8 @@ async def _streaming_error_fallback_response(
         # The same heavy body that spent an item budget on thinking can also
         # lose the connection before it produces a head.  Repair the request
         # and give the same route the smaller body before moving on.
-        _repair_heavy_replay_request(request_data, exception, trigger="network")
+        trigger = "item_cap" if getattr(exception, "item_cap_cut", False) else "network"
+        _repair_heavy_replay_request(request_data, exception, trigger=trigger)
     request_repaired = getattr(exception, _REQUEST_REPAIRED_ATTR, False)
     if (
         not allow_repeated_attempt
@@ -6396,15 +6449,8 @@ class _ResponsesStreamCompletionState:
         self._identity_aliases: dict[str, set[str]] = {}
         self.synthetic_text = ""
         self.synthetic_done_text: Optional[str] = None
-        # The backend's historical-reasoning note is context, not an answer.
-        # A note that streams through here is dropped before delivery, and an
-        # input replay of one is removed by the request step, so neither the
-        # client nor the next request keeps a copy to imitate.
-        self.suppressed_note_item_ids: set[str] = set()
-        self.note_parts_by_item_id: dict[str, Optional[dict[int, str]]] = {}
-        self.pending_note_chunks: dict[str, list[Any]] = {}
-        self.pending_note_chunk_ids: set[int] = set()
-        self.released_note_chunks: list[Any] = []
+        self._note_text_by_item: dict[str, str] = {}
+        self._suppressed_note_item_ids: set[str] = set()
         self.model = (
             request_data.get("model")
             if isinstance((request_data or {}).get("model"), str)
@@ -6445,113 +6491,21 @@ class _ResponsesStreamCompletionState:
             if isinstance(response, dict):
                 self.completed_response = copy.deepcopy(response)
 
-        self._remember_note_chunk(chunk, dumped, chunk_type)
-        if not self._suppresses_note_chunk(chunk, dumped):
-            self._remember_synthetic_text(dumped)
+        item_id = dumped.get("item_id") or _stream_output_item_key(dumped.get("item"))
+        if isinstance(item_id, str):
+            if chunk_type == "response.output_text.delta":
+                self._note_text_by_item[item_id] = self._note_text_by_item.get(item_id, "") + str(dumped.get("delta") or "")
+            elif chunk_type == "response.output_item.done":
+                if (_historical_note_module.is_note_item(dumped.get("item"))
+                        or _historical_note_module.is_note_text(self._note_text_by_item.get(item_id))):
+                    self._suppressed_note_item_ids.add(item_id)
 
-    def _remember_synthetic_text(self, dumped: dict[str, Any]) -> None:
         text_fragment, is_done_text = _stream_chunk_text_fragment(dumped)
         if text_fragment:
             if is_done_text:
                 self.synthetic_done_text = text_fragment
             else:
                 self._append_synthetic_text(text_fragment)
-
-    def _settle_note(self, item_id: str, *, is_note: bool) -> None:
-        pending = self.pending_note_chunks.pop(item_id, [])
-        self.note_parts_by_item_id[item_id] = None
-        for frame in pending:
-            self.pending_note_chunk_ids.discard(id(frame))
-        if is_note:
-            self.suppressed_note_item_ids.add(item_id)
-        else:
-            self.released_note_chunks.extend(pending)
-            for frame in pending:
-                self._remember_synthetic_text(_stream_chunk_dump(frame))
-
-    @staticmethod
-    def _note_parts_text(parts: dict[int, str]) -> str:
-        return "\n".join(text for _index, text in sorted(parts.items()))
-
-    def _remember_note_chunk(
-        self, chunk: Any, dumped: dict[str, Any], chunk_type: str
-    ) -> None:
-        if self.pending_note_chunks and (
-            _responses_stream_chunk_is_completed(dumped)
-            or _responses_stream_chunk_is_incomplete_terminal(dumped)
-        ):
-            response = dumped.get("response")
-            output = response.get("output") if isinstance(response, dict) else None
-            items = (
-                {_stream_output_item_key(item): item for item in output}
-                if isinstance(output, list)
-                else {}
-            )
-            for item_id in list(self.pending_note_chunks):
-                item = items.get(item_id)
-                is_note = (
-                    _historical_note_module.is_note_item(item) if item is not None
-                    else _historical_note_module.is_note_text(
-                        self._note_parts_text(self.note_parts_by_item_id[item_id] or {})
-                    )
-                )
-                self._settle_note(item_id, is_note=is_note)
-            return
-        item = dumped.get("item")
-        item_id = dumped.get("item_id") or _stream_output_item_key(item) or dumped.get("id")
-        if not isinstance(item_id, str):
-            return
-        if chunk_type == "response.output_item.done":
-            is_note = _historical_note_module.is_note_item(item)
-            if item_id in self.pending_note_chunks or is_note:
-                self._settle_note(item_id, is_note=is_note)
-            return
-
-        parts = self.note_parts_by_item_id.get(item_id, {})
-        if parts is None:
-            return
-        index = dumped.get("content_index")
-        if not isinstance(index, int):
-            index = 0
-        if chunk_type == "response.output_item.added":
-            # Hold the opening frames, too: emitting an item start without
-            # its end leaves an unfinished message in the client.
-            text = _historical_note_module._item_text(item)
-            if text is None:
-                return
-            if text:
-                parts[0] = text
-        elif chunk_type == "response.output_text.delta":
-            delta = dumped.get("delta")
-            if not isinstance(delta, str):
-                return
-            parts[index] = parts.get(index, "") + delta
-        elif chunk_type == "response.output_text.done":
-            text = dumped.get("text")
-            if isinstance(text, str):
-                parts[index] = text
-        elif chunk_type in {"response.content_part.added", "response.content_part.done"}:
-            part = dumped.get("part")
-            if not isinstance(part, dict) or part.get("type") != "output_text":
-                if item_id in self.pending_note_chunks:
-                    self._settle_note(item_id, is_note=False)
-                return
-            text = part.get("text")
-            if isinstance(text, str):
-                parts[index] = text
-        elif chunk_type == "response.output_text.annotation.added" and item_id in self.pending_note_chunks:
-            pass
-        else:
-            return
-        # Even an exact marker could be followed by real text in the next
-        # delta. Decide at the end of the whole item, not at a token boundary.
-        candidate = self._note_parts_text(parts)
-        if not candidate.strip() or _historical_note_module.is_possible_note_prefix(candidate):
-            self.note_parts_by_item_id[item_id] = parts
-            self.pending_note_chunks.setdefault(item_id, []).append(chunk)
-            self.pending_note_chunk_ids.add(id(chunk))
-        else:
-            self._settle_note(item_id, is_note=False)
 
     def _remember_output_item(self, dumped: dict[str, Any], chunk_type: str) -> None:
         item = dumped.get("item")
@@ -6750,42 +6704,6 @@ class _ResponsesStreamCompletionState:
                 response["output_text"] = text
         return _completed_response_payload(response, request_data)
 
-    def suppresses(self, chunk: Any) -> bool:
-        """Whether to withhold this frame until the item can be classified."""
-
-        return self._suppresses_note_chunk(chunk, _stream_chunk_dump(chunk))
-
-    def _suppresses_note_chunk(self, chunk: Any, dumped: dict[str, Any]) -> bool:
-        if id(chunk) in self.pending_note_chunk_ids:
-            return True
-        item_id = dumped.get("item_id") or _stream_output_item_key(dumped.get("item")) or dumped.get("id")
-        return isinstance(item_id, str) and item_id in self.suppressed_note_item_ids
-
-    def take_released_note_chunks(self) -> list[Any]:
-        chunks, self.released_note_chunks = self.released_note_chunks, []
-        return chunks
-
-    def _drop_note_output_items(self, response: Any) -> bool:
-        if not isinstance(response, dict):
-            return False
-        output = response.get("output")
-        if not isinstance(output, list):
-            return False
-        filtered = [
-            item for item in output if not _historical_note_module.is_note_item(item)
-        ]
-        if len(filtered) == len(output):
-            return False
-        if not filtered:
-            # A response that is *only* the note must still arrive: dropping
-            # every item leaves the client a completion with no output, which
-            # it reads as a failed turn and reconnects over.  The request step
-            # keeps the replay clean; this frame is the one case where the
-            # note is all the model produced.
-            return False
-        response["output"] = filtered
-        return True
-
     def chunk_for_delivery(
         self,
         chunk: Any,
@@ -6839,14 +6757,22 @@ class _ResponsesStreamCompletionState:
                     item for item in response_output if isinstance(item, dict)
                 )
             if not any(item.get("type") == "function_call" for item in known_output):
-                if self._drop_note_output_items(response):
-                    return _JSONStreamEvent(dumped)
+                if isinstance(response, dict) and isinstance(response.get("output"), list):
+                    filtered = [item for item in response["output"] if not _historical_note_module.is_note_item(item)]
+                    if filtered and len(filtered) != len(response["output"]):
+                        copied = copy.deepcopy(dumped)
+                        copied["response"] = {**response, "output": filtered}
+                        return _JSONStreamEvent(copied)
                 return chunk
             dumped["response"] = self.completed_payload(request_data)
-            self._drop_note_output_items(dumped.get("response"))
             return _JSONStreamEvent(dumped)
 
         return chunk
+
+    def suppresses(self, chunk: Any) -> bool:
+        dumped = _stream_chunk_dump(chunk)
+        item_id = dumped.get("item_id") or _stream_output_item_key(dumped.get("item"))
+        return isinstance(item_id, str) and item_id in self._suppressed_note_item_ids
 
 def _codex_compaction_done_item_completed_compat(
     completion_state: _ResponsesStreamCompletionState,
@@ -6931,6 +6857,10 @@ async def _non_streaming_response_as_stream(
     _raise_if_synthetic_timeout_notice(response, request_data)
     _raise_if_leaked_tool_call_markup(response, request_data)
     if _request_is_responses_stream(request_data):
+        dumped = _stream_chunk_dump(response)
+        clean = _historical_note_module.clean_response(dumped)
+        if clean is not dumped:
+            response = clean
         if not _responses_non_streaming_response_has_usable_output(
             response,
             request_data,
@@ -7537,6 +7467,7 @@ async def _yield_guarded_original_stream(
     saw_responses_completed: bool = False,
     stream_started_at: Optional[float] = None,
     saw_visible_output: bool = False,
+    reading_upstream_stream: bool = False,
     synthesize_completed_on_clean_eof_after_visible_output: bool = False,
     on_responses_completed: Optional[Callable[[], None]] = None,
 ) -> AsyncIterator[Any]:
@@ -7592,7 +7523,6 @@ async def _yield_guarded_original_stream(
         on_responses_completed()
 
     completion_state = _ResponsesStreamCompletionState(request_data)
-    counted_released_note_chunk_ids: set[int] = set()
     saw_image_generation_activity = False
     namespace_by_name = _responses_output_module._responses_namespace_tool_map(
         request_data.get("input"),
@@ -7623,21 +7553,11 @@ async def _yield_guarded_original_stream(
             request_data,
         )
 
-    def deliver_client_chunk(chunk: Any) -> Any:
-        if completion_state.suppresses(chunk):
-            return None
-        return _responses_stream_chunk_for_delivery(
+    def deliverable_client_chunks(chunk: Any):
+        delivered = _responses_stream_chunk_for_delivery(
             completion_state.chunk_for_delivery(chunk, request_data),
             request_data,
         )
-
-    def deliverable_client_chunks(chunk: Any):
-        """Deliver one upstream frame unless this router withholds it."""
-        for released in completion_state.take_released_note_chunks():
-            delivered = deliver_client_chunk(released)
-            if delivered is not None:
-                yield delivered
-        delivered = deliver_client_chunk(chunk)
         if delivered is not None:
             yield delivered
 
@@ -7686,11 +7606,6 @@ async def _yield_guarded_original_stream(
         if len(event_tail) > _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS:
             del event_tail[0]
         completion_state.remember(chunk)
-        for released in completion_state.released_note_chunks:
-            released_id = id(released)
-            if released_id not in counted_released_note_chunk_ids:
-                counted_released_note_chunk_ids.add(released_id)
-                remember_deliverable_output(released)
         generated_output_seen = (
             generated_output_seen
             or _responses_stream_chunk_has_generated_output(chunk)
@@ -7706,7 +7621,7 @@ async def _yield_guarded_original_stream(
             completed_output_items,
         )
         dumped = _stream_chunk_dump(chunk)
-        if not completion_state.suppresses(chunk) and not _responses_stream_chunk_is_incomplete_terminal(dumped):
+        if not _responses_stream_chunk_is_incomplete_terminal(dumped):
             remember_deliverable_output(chunk)
         if _stream_chunk_type(dumped) == "response.custom_tool_call_input.done":
             item_id = dumped.get("item_id") or dumped.get("id")
@@ -8220,11 +8135,12 @@ async def _yield_guarded_original_stream(
             yield delivered_chunk
 
     try:
-        async for chunk in _stream_with_idle_timeout(
-            response,
-            request_data,
-            initial_chunk_count=len(buffer),
-        ):
+        # The start buffer hands over its live upstream reader. Opening a new
+        # filter halfway through an item loses its phase and first text parts.
+        remaining = response if reading_upstream_stream else _stream_with_idle_timeout(
+            response, request_data, initial_chunk_count=len(buffer)
+        )
+        async for chunk in remaining:
             _web_search_native_module._mark_provider_native_web_search_event(
                 request_data, chunk
             )
@@ -8514,6 +8430,13 @@ async def _yield_guarded_original_stream(
             remember(synthetic_chunk)
             yield synthetic_chunk
         if terminal_events:
+            await _close_async_iterator_safely(response)
+            return
+        if isinstance(exc, _historical_note_module.MissingAnswer) and not answer_output_seen:
+            if _responses_request_module._request_already_attempted_streaming_error_fallback(request_data):
+                raise  # The outer fallback round owns any remaining peers.
+            async for chunk in _yield_streaming_error_fallback_or_raise(request_data, exc):
+                yield chunk
             await _close_async_iterator_safely(response)
             return
         if visible_output_seen and not saw_responses_completed:
@@ -9074,17 +8997,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     generated_output_seen
                     or _responses_stream_chunk_has_generated_output(chunk)
                 )
-                # Notes are held until their item closes.  Counting their
-                # deltas as visible output here would release the start buffer
-                # before the guard has a chance to discard them.
-                if not completion_state.suppresses(chunk):
-                    saw_visible_output = saw_visible_output or (
-                        _stream_chunk_has_visible_output(chunk)
-                    )
-            else:
-                saw_visible_output = saw_visible_output or (
-                    _stream_chunk_has_visible_output(chunk)
-                )
+            saw_visible_output = saw_visible_output or _stream_chunk_has_visible_output(chunk)
             # The start buffer exists so a route that fails before showing
             # anything can be replaced without the reader noticing.  Thinking is
             # shown, so it ends that window: holding it back until the first
@@ -9135,11 +9048,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         buffer=buffer,
                         request_data=request_data,
                         delivered_output=generated_output,
-                    )
-                    _mark_generated_output_item_cap(
-                        incomplete_exception,
-                        chunk,
-                        delivered=generated_output,
                     )
                     _mark_generated_output_item_cap(
                         incomplete_exception,
@@ -9280,8 +9188,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
             request_data,
             saw_responses_completed=saw_responses_completed,
             stream_started_at=stream_started_at,
-            # The Responses buffer was inspected for output but not delivered.
-            # Its guard counts the deliverable frames after filtering notes.
+            reading_upstream_stream=True,
             saw_visible_output=saw_visible_output and not is_responses_stream,
             on_responses_completed=(
                 lambda: _routing_module._record_deployment_success_for_cooldown(

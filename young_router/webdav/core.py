@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree
 
 from ..atomic_io import atomic_write_bytes
@@ -101,6 +102,18 @@ class SyncError(RuntimeError):
         super().__init__(message)
         if code is not None:
             self.code = code
+
+
+class WebDAVLoginLeaseError(SyncError):
+    """The shared WebDAV login lease could not be acquired."""
+
+    code = "webdav_login_lease_unavailable"
+
+
+class WebDAVLoginLeaseBusy(WebDAVLoginLeaseError):
+    """Another machine currently owns this account's login lease."""
+
+    code = "webdav_login_lease_busy"
 
 
 class WebDAVHTTPError(SyncError):
@@ -535,7 +548,15 @@ def _atomic_write(path: pathlib.Path, data: bytes) -> None:
 #: The fields that are the account's login rather than a reading of it.  They
 #: travel together: a status is only true of the session that proved it, and
 #: the station's own account id belongs to that session.
-LOGIN_FIELDS = ("login_status", "login_observed_at", "session", "user_id", "auto_login_unconfirmed")
+LOGIN_FIELDS = (
+    "login_status",
+    "login_observed_at",
+    "session",
+    "session_issued_at",
+    "session_limit_at",
+    "user_id",
+    "auto_login_unconfirmed",
+)
 
 
 def _stamp(value: object) -> float | None:
@@ -649,12 +670,15 @@ def _merge_relay_readings(
         for field in ("balance", "balance_observed_at"):
             if field not in local:
                 row.pop(field, None)
-    local_at = _login_observation_at(local)
-    incoming_at = _login_observation_at(incoming)
+    # An expiry probe of an old credential can finish after its replacement
+    # was issued elsewhere. Order credentials by issuance before observations.
+    local_issued = _stamp(local.get("session_issued_at")) or 0
+    incoming_issued = _stamp(incoming.get("session_issued_at")) or 0
+    local_at = _login_observation_at(local) or 0
+    incoming_at = _login_observation_at(incoming) or 0
     if (
         incoming.get("remember_session") is not False
-        and local_at is not None
-        and (incoming_at is None or local_at > incoming_at)
+        and (local_issued, local_at) > (incoming_issued, incoming_at)
     ):
         for field in LOGIN_FIELDS:
             if field in local:
@@ -1037,6 +1061,8 @@ def _durable_relay_bytes(data: bytes) -> bytes | None:
     accounts = []
     for account in _relay_rows(document.get("accounts"), "id"):
         row = {key: value for key, value in account.items() if key not in RELAY_OBSERVATION_FIELDS}
+        if not row.get("session_issued_at"):
+            row.pop("session_issued_at", None)
         # A login status is content only when the station (or a host's own
         # probe) determined it, and the stamp is what says so.  Without this a
         # row that merely has no credential to try -- a placeholder, or an
@@ -2291,6 +2317,15 @@ def remote_sibling_url(settings: Settings, name: str) -> str:
     return _remote_with_path(url, f"{directory}/{urllib.parse.quote(name)}")
 
 
+def login_lease_url(settings: Settings, account_id: str) -> str:
+    """A lock namespace shared by every spelling of the same bundle URL."""
+
+    bundle_path = urllib.parse.unquote(urllib.parse.urlsplit(bundle_url(settings)).path)
+    name = bundle_path.rsplit("/", 1)[-1]
+    digest = hashlib.sha256(f"{name}\0{account_id}".encode()).hexdigest()
+    return remote_sibling_url(settings, f".young-router-login-{digest}.json")
+
+
 def collection_url(settings: Settings) -> str:
     url = settings.url.strip()
     parsed = urllib.parse.urlsplit(url)
@@ -2319,6 +2354,72 @@ def _collection_privilege_access(body: bytes) -> str:
     if not granted:
         return "unknown"
     return "writable" if granted & _WRITE_PRIVILEGES else "read_only"
+
+
+@dataclass
+class WebDAVLoginLease:
+    """One server-issued exclusive lock for an automatic relay login."""
+
+    client: "WebDAVClient"
+    url: str
+    token: str
+
+    def read_relay_document(self) -> dict[str, Any]:
+        try:
+            bundle = self.client.get(bundle_url(self.client.settings), max_bytes=CONFIG_BUNDLE_MAX_BYTES)
+        except WebDAVHTTPError as exc:
+            if exc.code == 404:
+                return {}
+            raise
+        _manifest, files = read_config_bundle(bundle)
+        data = files.get(RELAY_ACCOUNTS_FILE)
+        if data is None:
+            return {}
+        try:
+            document = json.loads(data, object_pairs_hook=_reject_duplicate_json_keys)
+        except (ValueError, UnicodeError):
+            raise WebDAVLoginLeaseError("WebDAV relay accounts are invalid") from None
+        if not isinstance(document, dict) or not isinstance(document.get("accounts"), list):
+            raise WebDAVLoginLeaseError("WebDAV relay accounts are invalid")
+        return document
+
+    # The record contains only coordination metadata, never a station secret.
+    def read_attempt(self) -> dict[str, Any] | None:
+        data = self.client.get(self.url, max_bytes=1024)
+        if not data:
+            return None
+        try:
+            row = json.loads(data, object_pairs_hook=_reject_duplicate_json_keys)
+            if (
+                isinstance(row, dict) and set(row) == {"at", "state", "retry_at"}
+                and _stamp(row["at"]) is not None
+                and row["state"] in ("pending", "session_limit", "retry")
+                and type(row["retry_at"]) is int and row["retry_at"] >= 0
+            ):
+                return row
+        except (ValueError, UnicodeError):
+            pass
+        raise WebDAVLoginLeaseError("WebDAV returned an invalid login coordination record")
+
+    def write_attempt(self, at: str, state: str, *, retry_at: int = 0) -> None:
+        self.client.request(
+            "PUT", self.url,
+            data=json.dumps({"at": at, "state": state, "retry_at": retry_at}).encode(),
+            headers={"Content-Type": "application/json", "If": f"({self.token})"},
+        )
+
+    def release(self) -> None:
+        try:
+            self.client.request("UNLOCK", self.url, headers={"Lock-Token": self.token})
+        except (SyncError, OSError):
+            # A failed unlock leaves the server to expire the lease.
+            pass
+
+    def __enter__(self) -> "WebDAVLoginLease":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
 
 
 class WebDAVClient:
@@ -2540,3 +2641,53 @@ class WebDAVClient:
 
     def delete(self, url: str) -> None:
         self.request("DELETE", url)
+
+    def acquire_login_lease(
+        self,
+        account_id: str,
+        *,
+        timeout_seconds: int = 120,
+    ) -> WebDAVLoginLease:
+        """Acquire an exclusive, expiring lease for one relay account.
+
+        WebDAV ``LOCK`` is the only operation here that gives two machines an
+        atomic answer.  A synced JSON claim would still race: both clients can
+        read the same old bundle and POST a password before either upload is
+        visible.  Servers that do not implement ``LOCK`` fail closed for
+        automatic login; a user can still complete a manual browser login.
+        """
+
+        url = login_lease_url(self.settings, account_id)
+        timeout = max(30, min(int(timeout_seconds), 600))
+        owner = f"young-router:{uuid.uuid4().hex}"
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<D:lockinfo xmlns:D="DAV:">'
+            '<D:lockscope><D:exclusive/></D:lockscope>'
+            '<D:locktype><D:write/></D:locktype>'
+            f"<D:owner><D:href>{owner}</D:href></D:owner>"
+            "</D:lockinfo>"
+        ).encode("utf-8")
+        try:
+            _status, headers, _body = self.request(
+                "LOCK",
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/xml; charset=utf-8",
+                    "Depth": "0",
+                    "Timeout": f"Second-{timeout}",
+                },
+            )
+        except WebDAVHTTPError as exc:
+            if exc.code == 423:
+                raise WebDAVLoginLeaseBusy("Another machine is signing in to this relay account") from None
+            if exc.code in {403, 405, 409, 501}:
+                raise WebDAVLoginLeaseError("WebDAV does not provide an exclusive login lease") from None
+            raise WebDAVLoginLeaseError("WebDAV login coordination is unavailable") from None
+        except SyncError:
+            raise WebDAVLoginLeaseError("WebDAV login coordination is unavailable") from None
+        token = next((value.strip() for key, value in headers.items() if key.lower() == "lock-token"), "")
+        if not re.fullmatch(r"<[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+>", token):
+            raise WebDAVLoginLeaseError("WebDAV did not return a login lease token")
+        return WebDAVLoginLease(self, url, token)

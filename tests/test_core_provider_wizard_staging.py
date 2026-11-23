@@ -99,6 +99,44 @@ class ProviderWizardStagingTests(unittest.TestCase):
             self.assertEqual(["renamed"], [key["name"] for key in provider["key_states"]])
             self.assertTrue(provider["key_states"][0]["configured"])
 
+    def test_finishing_a_wizard_reuses_a_provider_that_appeared_at_the_same_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            target = wizard_target("wizard-reuse", "initial")
+            domain.stage_secret("api_key", target, "fixture-wizard-key")
+            existing = domain.dispatch("provider.add", {"provider": {
+                "name": "Gateway", "api_base": "https://gateway.example/v1",
+                "api_keys": [{"name": "older", "value": "fixture-original-key"}],
+            }})["operation_summary"]["provider_id"]
+            proposed = {
+                "name": "gateway", "api_base": "other.example", "auth_kind": "api_key",
+                "create_default_api_key": True, "initial_api_key_name": "new-key", "models": [],
+            }
+            action = {"provider": proposed, "pending_api_key": "wizard-reuse", "reuse_same_provider": True}
+            with self.assertRaisesRegex(DomainError, "already exists"):
+                domain.dispatch("provider.add", action)
+            self.assertTrue(domain.secret_present("api_key", target))
+
+            proposed["api_base"] = "gateway.example"
+            finished = domain.dispatch("provider.add", action)
+            self.assertEqual(existing, finished["operation_summary"]["provider_id"])
+            self.assertEqual(1, len(finished["providers"]))
+            keys = [(row["name"], row["configured"]) for row in finished["providers"][0]["key_states"]]
+            self.assertEqual([("older", True), ("new-key", True)], keys)
+            self.assertFalse(domain.secret_present("api_key", target))
+            self.assertNotIn("fixture-wizard-key", json.dumps(finished))
+
+            domain.apply()
+            loaded = ProvidersModelsDomain(path)
+            self.assertEqual("fixture-original-key", loaded.trusted_secret_value("api_key", "Gateway\x1folder"))
+            self.assertEqual("fixture-wizard-key", loaded.trusted_secret_value("api_key", "Gateway\x1fnew-key"))
+
+    def test_the_model_lookup_uses_the_same_address_spelling_as_saved_providers(self) -> None:
+        self.assertEqual("https://gateway.example/v1/models", ProvidersModelsDomain._model_endpoint("gateway.example"))
+        self.assertEqual("https://gateway.example/prefix/v1/models", ProvidersModelsDomain._model_endpoint("gateway.example/prefix/v1"))
+
     def test_a_create_without_its_staged_key_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"

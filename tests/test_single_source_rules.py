@@ -91,6 +91,11 @@ class OneDerivedValueOneProducerTests(unittest.TestCase):
             UI_DIR / "RelayAccountManager.tsx",
             r"translate\((?:LOGIN_FAILURE_MESSAGES\[|[\"']relay\.autoSignIn(?:Rejected|SessionLimit|SessionUnconfirmed|Unavailable))",
         ),
+        Producer(
+            "the surviving neighbor when a selected row is removed",
+            UI_DIR / "rowSelection.ts",
+            r"function adjacentSelectionAfterRemoval\(",
+        ),
     )
 
     def test_no_ui_surface_recomputes_a_derived_name(self) -> None:

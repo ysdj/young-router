@@ -303,18 +303,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # read as a route whose key the pane had simply forgotten to print --
         # an orphan row nobody could name.  The heading's credential id is the
         # empty one, which no slot can carry, so it is not an invented key.
-        self.assert_ui_has("const key = modelProviderKeyState(item, provider ?? {});")
-        self.assert_ui_has("if (!key) {")
-        self.assert_ui_has("ungrouped.push(item);")
-        self.assert_ui_has('rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });')
-        self.assert_ui_has('for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
+        self.assert_ui_has('const id = credential?.id ?? "";')
+        self.assert_ui_has('const label = id === "" ? translate("providers.undefinedKey")')
+        self.assert_ui_has('return modelGroups.flatMap(({ id, models: entries }) => {')
+        self.assert_ui_has('...entries.map((item) => {')
         # One group row is one provider key, addressed by its slot id, so the
         # station's key and a custom key that read the same stay two groups and
         # a model is filed under the key it names.
-        self.assert_ui_has('const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();')
-        self.assert_ui_has('const list = grouped.get(key.id);')
-        self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
-        self.assert_ui_not_has('rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });')
+        self.assert_ui_has('const entries = groups.get(id);')
         self.assert_ui_has('const byName = keyStates.filter((entry) => entry.name === keyName && keyName !== "");')
         self.assert_ui_has('return byName.length === 1 ? byName[0] : undefined;')
         # The new row states what is left where its own fields are, and says
@@ -1581,8 +1577,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", provider_only)
         self.assertNotIn("importProvidedKey", provider_only)
         self.assertNotIn("model.add_many", provider_only)
-        self.assertIn('const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: station.id });', provider_only)
-        self.assertIn('if (!bound) return;', provider_only)
+        self.assertIn('if (!await bindWizardStation(targetProviderID)) return;', provider_only)
         self.assertIn('focusProviderAfterWizard(targetProviderID);', provider_only)
         self.assertIn('setValidation(errorMessage(reason, translate));', provider_only)
         # The pane behind the wizard opens the row that was just created,
@@ -1601,7 +1596,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("export function providerWizardFocusID(): string {", gate)
         # It is offered only at the step that has a station to associate, and
         # only while no sign-in or read is holding the window.
-        self.assert_ui_has('step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"')
+        self.assert_ui_has('step === "keys" && finishingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"')
         self.assert_ui_has('stationForProvider || selectedProvidedChoice || selectedStationAccount')
         self.assert_ui_has('title={translate("providers.wizard.saveProviderOnly")}')
         zh = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
@@ -1624,13 +1619,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         provider_only = wizard.split("const finishProviderOnly = async (): Promise<void> => {", 1)[1].split("const goBack", 1)[0]
         self.assertIn("const creatingProvider = providerMode === \"new\" && !providerID;", wizard)
-        self.assertIn("if (!creatingProvider) return;", provider_only)
+        self.assertIn("if (!finishingProvider) return;", provider_only)
         finish_without = wizard.split("const finishWithoutModels = async (): Promise<void> => {", 1)[1].split("const finishProviderOnly", 1)[0]
-        self.assertIn("if (!creatingProvider) return;", finish_without)
-        self.assert_ui_has('step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"')
+        self.assertIn("if (!finishingProvider) return;", finish_without)
+        self.assert_ui_has('step === "keys" && finishingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"')
         # The other create-only finish already had the same guard; the two
         # must not drift apart again.
-        self.assert_ui_has('step === "model" && creatingProvider && genericModelStep')
+        self.assert_ui_has('step === "model" && finishingProvider && genericModelStep')
 
     def test_the_wizard_has_no_relay_station_type(self) -> None:
         """A station is an association of an API provider, not a sibling type.
@@ -1932,7 +1927,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         commit = wizard.split("const commitWizardProvider = async (importNameCase?: ImportNameCase): Promise<string | undefined> => {", 1)[1]
         commit = commit.split("const createKey", 1)[0]
         self.assertLess(
-            commit.index("if (!providerStepValid()) return undefined;"),
+            commit.index("if (!providerStepValid(true)) return undefined;"),
             commit.index("const name = providerName.trim();"),
         )
 
@@ -1979,7 +1974,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const genericModelStep = !isServiceCatalogType && !(isOfficialLoginType && keyPath === "login");', wizard)
         self.assertIn("const modelPicksEmpty = selectedModels.length === 0", wizard)
         self.assertIn("const finishWithoutModels = async (): Promise<void> => {", wizard)
-        self.assertIn('{step === "model" && creatingProvider && genericModelStep', wizard)
+        self.assertIn('{step === "model" && finishingProvider && genericModelStep', wizard)
         self.assertIn('title={translate("providers.wizard.finishWithoutModels")}', wizard)
         # It runs the same one create as 完成, and the key the user signed in
         # for is kept even when no route names it yet.
@@ -2108,7 +2103,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # ends -- the new key could not be listed before the old one finished.
         for marker in (
             "const fetchModelsGeneration = useRef(0);",
-            "if (id === fetchKeyIDRef.current) return;",
+            "if (identity === fetchIdentityRef.current) return;",
             "if (request !== fetchModelsGeneration.current) return;",
             "if (request === fetchModelsGeneration.current) setFetchModelsBusy(false);",
         ):
@@ -2161,9 +2156,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_provider_selection_and_new_models_keep_independent_stable_state(self) -> None:
         self.assert_ui_has('onSelectionChange={(key) => { if (key) onSelect(key); }}')
-        self.assert_ui_has('const selectProviderRow = useCallback((key: string): void => {\n    setSelectedProvider(key);\n    setSelectedModel(undefined);\n    setProviderSourceModel(undefined);\n  }, []);')
+        self.assert_ui_has('setSelectedProvider(key);\n    setSelectedModel(undefined);')
         self.assert_ui_has('selectedKey={selectedProviderId}')
-        self.assert_ui_has('const pendingModelIds = useRef<({ providerId: string } & ({ ids: Set<string> } | { id: string })) | undefined>(undefined);')
         self.assertNotIn('knownModelIdsByProvider', self.ui)
         self.assertNotIn('Promise.all(added.map(', self.ui)
         self.assert_ui_has('disabled={busy && !probing}')
@@ -2278,19 +2272,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('compact firstColumnHorizontalPadding={0} preserveColumnWidths')
         self.assertNotIn('label: translate("common.order"), width: 60', self.ui)
         self.assertNotIn("modelOrderText(providerId, item)", self.ui)
-        self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
         # One cell builder for both row kinds, so an ungrouped row and a grouped
         # one cannot disagree about the rate or the name they state.
         self.assert_ui_has('const modelCells = (item: UnknownRecord): string[] => {')
         self.assert_ui_has('const multiplier = relaySourceForKey(modelProviderKeyState(item, provider ?? {}), relaySources)?.multiplier;')
         self.assert_ui_has('modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier),')
-        self.assert_ui_has('for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
-        self.assert_ui_has('for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
+        model_rows = self.ui.split("const modelRows = useMemo<Array<", 1)[1].split("}, [modelCredentials", 1)[0]
+        self.assertIn("return modelGroups.flatMap", model_rows)
+        self.assertIn("...entries.map((item) => {", model_rows)
         # A key's group sits where the key table puts it, not where its first
         # route happens to fall in the document: deleting the first route of a
         # key used to move that key's whole group to the end of the list.
-        self.assert_ui_has('const keyOrder = providerKeyStates(provider ?? {}).map((key) => key.id);')
-        self.assert_ui_has('for (const keyID of orderedModelGroupIDs([...grouped.keys()], keyOrder)) {')
+        model_groups = self.ui.split("const modelGroups = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        self.assertIn("orderedModelGroupIDs([...groups.keys()], order)", model_groups)
         self.assert_ui_has('columns={variant === "inline"')
         self.assert_ui_has('cellHorizontalPadding={6}')
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
@@ -2340,19 +2334,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('key: routePublicModelRowKey(group.name)')
         self.assert_ui_has('spanning: true')
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
-        self.assert_ui_has('rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }}')
-        self.assert_ui_has('<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />')
+        self.assert_ui_has('rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedRouteKey} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys}')
+        self.assert_ui_has('<ProviderListTable providers={providers} bindingIssues={bindingIssues} translate={translate} selectedProviderId={providerId}')
         provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         self.assertIn('rows={rows} secondaryRowKeys={secondaryRowKeys} alertRowKeys={alertRowKeys} selectedKey={selectedProviderId} compact firstColumnHorizontalPadding={0} onSelectionChange=', provider_list)
         self.assert_ui_has('rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
         self.assert_ui_has('rows={tableRows}')
         select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
-        self.assertLess(select_route.index('if (!selected) return;'), select_route.index('setSelectedRoute(routeId);'))
-        self.assert_ui_has('providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider}')
+        self.assertLess(select_route.index('if (!selected) return;'), select_route.index('setRouteSelection(routeId);'))
+        self.assert_ui_has('providerSourceModel === editorIdentifier(activeRoute.model) ? <ProviderEditor')
         self.assert_ui_has('model={activeRoute.model}')
         self.assert_ui_has('onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))}')
-        self.assert_ui_has('setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`)')
         self.assert_ui_has('secondaryRowKeys={offModelKeys}')
         self.assert_ui_has('secondaryRowKeys={offRouteKeys}')
         self.assertNotIn('secondaryCellKeys={routeSecondaryCellKeys}', self.ui)
@@ -2378,8 +2371,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the name itself, so every control in the pane addresses one group.
         self.assert_ui_has('return `${ROUTE_PUBLIC_MODEL_PREFIX}${publicModelKey(publicModel)}`;')
         self.assert_ui_has('const activeRouteGroup = activeRoute ? routes.filter((entry) => publicModelKey(entry.publicModel) === publicModelKey(activeRoute.publicModel)) : [];')
-        self.assert_ui_has('const activePublicGroup = selectedPublicModel === undefined')
-        self.assert_ui_has('? undefined\n    : routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel));')
+        self.assert_ui_has('const activePublicGroup = routeGroups.find((group) => routePublicModelRowKey(group.name) === selectedRouteKey);')
         self.assert_ui_has('if (publicModelKey(stringValue(model.model_name, stringValue(model.name))) !== key) continue;')
 
         # The grouping itself is executed by tests/test_rn_public_model_names.mjs;
@@ -2482,13 +2474,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the pane edits -- a group is one name, and the import already stated
         # the spelling every route of it carries.
         self.assertIn('const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(publicModel));', select_public)
-        self.assertIn('setSelectedPublicModel(group.name);', select_public)
-        self.assertIn('setSelectedRoute("");', select_public)
+        self.assertIn('setRouteSelection(rowKey);', select_public)
 
         inspector = self.ui.split("function PublicModelInspector(", 1)[1].split("function ModelInspector(", 1)[0]
         # One surface owns the rename and the context window; the route order
         # list lives in the routes table, not here.
-        self.assertIn('dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } })', inspector)
+        self.assertIn('return onRename(group.name, renamed);', inspector)
+        self.assert_ui_has('dispatch("public.model_patch", { public_model: from, changes: { name: to } })')
         self.assertIn('translate("providers.contextWindow")', inspector)
         self.assertNotIn("routes.reorder_group", inspector)
         self.assertNotIn("publicModelRouteRow", inspector)
@@ -2751,20 +2743,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         account projection was never read at all.
         """
 
-        rows = self.ui.split("const modelRows = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
-        # The two cases are decided by whether the row has credentials to file
-        # under, not by whether one of them happens to be a key.
-        self.assertIn("if (modelCredentials.length === 0) {", rows)
-        self.assertIn("const key = modelProviderKeyState(item, provider ?? {});", rows)
-        self.assertIn("if (!modelCredential(item, provider ?? {}, modelCredentials)) {", rows)
-        # A route the row cannot file is still listed, so it can be repaired or
-        # deleted instead of silently disappearing from the pane.
-        self.assertIn("ungrouped.push(item);", rows)
-        # The group a route lands in is the credential it names.
-        self.assertIn(
-            "const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);",
-            rows,
-        )
+        groups = self.ui.split("const modelGroups = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        self.assertIn("? modelCredential(model, provider ?? {}, modelCredentials)", groups)
+        self.assertIn(": modelProviderKeyState(model, provider ?? {})", groups)
+        self.assertIn('const id = credential?.id ?? "";', groups)
         # The groups are every credential the row owns, an account included.
         self.assert_ui_has("function providerCredentials(provider: UnknownRecord | undefined, translate: Translate): ProviderCredential[] {")
         self.assertIn('id: `account:${stringValue(account.ref)}`', self.ui)
@@ -2794,8 +2776,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";')
         # A group header is a spanning row, which the native table refuses to
         # select, so clicking 账号 or 密钥 cannot move the selection at all.
-        self.assert_ui_has("rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });")
-        self.assert_ui_has("rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });")
         # One route is one row.  A route that names no credential belongs to
         # the provider's own default, which is not one of these groups: listing
         # it under every group put the same route on screen once per credential,
@@ -2803,28 +2783,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # flipping the others.  It is drawn under its own 未定义密钥 heading
         # instead of above every heading, so a route with no key is stated as
         # such rather than looking like a row the pane forgot to file.
-        self.assert_ui_has('rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });')
-        self.assert_ui_has('for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });')
-        grouped_rows = self.ui.split("if (modelCredentials.length > 0) {", 1)[1].split("return rows;", 1)[0]
-        # A route answers with exactly one credential — an account or a key —
-        # and Core projects the account it resolves to, so the group a route
-        # lands in is decided by that one answer rather than by whichever
-        # groups happen to end with its key slot's id.
-        self.assertIn("const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);", grouped_rows)
-        # A heading with nothing under it claims the credential serves routes it
-        # does not serve, so an empty group draws no heading at all.
-        self.assertIn("if (own.length === 0) continue;", grouped_rows)
-        # The clicked row is what the table highlights: a model listed under
-        # several credentials keeps the highlight on the copy that was pressed.
-        self.assert_ui_has("const [selectedModelRow, setSelectedModelRow] = useState<string>();")
-        self.assert_ui_has('if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {')
-        # The list says which row a model sits in.  A route that names no
-        # credential sits in the 未定义密钥 heading's group, which is a real row
-        # of the list -- so the highlight is found the same way as any other.
-        self.assert_ui_has("const listed = modelRows.find((row) => !row.spanning && modelIDFromRowKey(row.key) === selectedModel);")
+        self.assert_ui_has('const label = id === "" ? translate("providers.undefinedKey")')
+        self.assert_ui_has('return [{ key: headingKey, cells: [label], spanning: true }, ...entries.map((item) => {')
+        self.assert_ui_has('return { key: modelCredentials.length > 0 ? modelRowKey(id, modelId) : modelId, cells: modelCells(item) };')
         model_table = self.ui.split("<NativeTable columns={modelTableColumns(", 1)[1].split("/></View>", 1)[0]
-        self.assertIn("const modelID = modelIDFromRowKey(key);", model_table)
-        self.assertIn("setSelectedModel(modelID); setSelectedModelRow(key);", model_table)
+        self.assertIn("onSelectionChange={selectModelRow}", model_table)
 
     def test_a_key_group_sits_where_its_key_sits_not_where_its_first_route_falls(
         self,
@@ -2840,12 +2803,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         key table's own order, which is the list the groups are headings of.
         """
 
-        rows = self.ui.split("const modelRows = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        groups = self.ui.split("const modelGroups = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
         # The order is read off the key table, once, and the groups are drawn
         # in it.  Sorting by the order a route was met is the bug itself.
-        self.assertIn("const keyOrder = providerKeyStates(provider ?? {}).map((key) => key.id);", rows)
-        self.assertIn("for (const keyID of orderedModelGroupIDs([...grouped.keys()], keyOrder)) {", rows)
-        self.assertNotIn("for (const [keyID, group] of grouped) {", rows)
+        self.assertIn("const credentials = modelCredentials.length > 0 ? modelCredentials : providerKeyStates(provider ?? {});", groups)
+        self.assertIn("orderedModelGroupIDs([...groups.keys()], order)", groups)
         # The rule itself has one producer, and its own executed test:
         # tests/test_rn_model_group_order.mjs.
         order = (ROOT / "rn/packages/shared/src/ui/modelGroupOrder.ts").read_text(encoding="utf-8")
@@ -2868,23 +2830,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         and the pane never presents a group the document does not name.
         """
 
-        rows = self.ui.split("const modelRows = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        rows = self.ui.split("const modelRows = useMemo<Array<", 1)[1].split("}, [modelCredentials", 1)[0]
         # The heading is drawn only when there is something under it: an empty
         # heading claims a group the pane has no route for.
-        self.assertIn("if (ungrouped.length > 0) {", rows)
-        self.assertIn(
-            'rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });',
-            rows,
-        )
+        self.assertIn('return modelGroups.flatMap', rows)
+        self.assertIn('const label = id === "" ? translate("providers.undefinedKey")', rows)
         # The word is the picker's own, not a second spelling of the same fact.
         self.assertIn('"providers.undefinedKey": "未定义密钥"', self.zh)
         self.assert_ui_has('{ value: "", label: translate("providers.undefinedKey") }')
         # A heading is a spanning row, so clicking it cannot select anything:
         # it is not an entry and has no model behind it.
         self.assertIn("spanning: true", rows)
-        # Both list shapes draw it: an account-backed row's list and an
-        # ordinary provider's.
-        self.assertEqual(rows.count('rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });'), 2)
 
     def test_provider_empty_state_keeps_the_native_table_frames(self) -> None:
         provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
@@ -3836,9 +3792,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const clearTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);')
         self.assert_ui_has('if (clearTabRef.current) return;')
         self.assert_ui_has('const [selectedKeys, setSelectedKeys] = useState<Partial<Record<LogTab, string>>>({});')
-        self.assert_ui_has('const currentKey = current["route-trace"];')
-        self.assert_ui_has('if (currentKey && routeTraceRequests.some((request) => request.key === currentKey)) return current;')
-        self.assert_ui_has('return { ...current, "route-trace": routeTraceRequests[0].key };')
+        self.assert_ui_has('const activeRequestKey = useRowSelection(requestKeys, selectedKey || undefined, (key) => onSelect(key ?? ""), {')
+        self.assert_ui_has('const selected = visibleRequests.find((request) => request.key === activeRequestKey);')
         self.assert_ui_has('type PauseIntent = { tab: typeof LOG_TABS[number]; paused: boolean; token: number };')
         self.assert_ui_has('type ClearIntent = { tab: typeof LOG_TABS[number]; token: number };')
         self.assert_ui_has('const paused = pauseIntent?.tab === selected ? pauseIntent.paused : active?.paused ?? false;')
@@ -4187,7 +4142,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # enabled button — the sidebar's current pane, the selected provider,
         # and a switched-off entry all read alike, and the row's `selected`
         # argument reached the DOM nowhere.
-        self.assertIn("aria-selected={spanning ? undefined : selected}", self.native_controls)
+        self.assertIn("aria-selected={spanning && !selectableSpanning ? undefined : selected}", self.native_controls)
         self.assertIn(
             "aria-disabled={spanning ? (disabled || !selectableSpanning) || undefined : disabled || undefined}",
             self.native_controls,
@@ -5783,8 +5738,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const providerKeyOptions = [...keyStates.map((key) => ({',
             'value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey}',
             'cells: (credentials ?? []).length > 0 && variant !== "inline"',
-            'const pendingCustomKeyName = useRef<string | undefined>(undefined);',
-            'pendingCustomKeyName.current = undefined; // selection lands after the snapshot refresh' if False else 'setSelectedKey(`custom:${added.id}`);',
             'return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });',
             'const accountLabel = relayAccountLabel(account);',
         ):
@@ -5881,7 +5834,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Core names the rows this action created, so a new pick can remove
         # unchecked additions and Cancel can discard the remaining draft rows.
         self.assert_ui_has("asRecords(result.action_summary?.added_rows)")
-        self.assert_ui_has("pendingModelIds.current = { providerId, id };")
         self.assert_ui_has("await removeChooserRows(picked);")
         self.assert_ui_has("await removeChooserRows([]);")
 
@@ -5926,7 +5878,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_fetch_models_reports_empty_or_unavailable_results_and_does_not_open_stale_chooser(self) -> None:
         for marker in (
-            'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined>',
+            'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false, reportFailure?: (message: string) => void): Promise<CoreSnapshot | undefined>',
             'const actionSummary = staged.action_summary;',
             'operation_summary: actionSummary,',
             'const handleFetchedModels = (summary: UnknownRecord, requested?: ProviderKeyChoice): void => {',
@@ -5943,7 +5895,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The picker follows the route the user selected, so 获取模型 asks
             # the key that route answers with instead of whichever key is first.
             'const selectedModelKeyID = model ? (modelProviderKeyState(model, provider ?? {})?.id ?? "") : "";',
-            'if (followedModelKey.current === selectedModel) return;',
+            'const selectedFetchKey = overrideKey ?? preferredFetchKeyID;',
             'summaryProviderId !== providerId && summaryProviderId !== providerIdentity',
             'if (summary.available === false)',
             'translate("providers.fetchFailed"',
@@ -5980,14 +5932,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("relayStationForBaseUrl(baseURL, relayStations)", workspace)
         self.assertIn("providerNameExists(providers, station.name, providerID)", workspace)
         self.assertIn('dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })', workspace)
-        self.assertIn(
-            'const selectProviderRow = useCallback((key: string): void => {\n    setSelectedProvider(key);\n    setSelectedModel(undefined);\n    setProviderSourceModel(undefined);\n  }, []);',
-            workspace,
-        )
-        self.assertIn(
-            '<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />',
-            workspace,
-        )
+        select_provider = workspace.split('const selectProviderRow = useCallback', 1)[1].split('const selectModelRow', 1)[0]
+        self.assertIn('setSelectedProvider(key);', select_provider)
+        self.assertNotIn('dispatch(', select_provider)
 
     def test_provider_source_picker_is_removed_with_automatic_station_binding(self) -> None:
         """There is no 供应商来源 switcher; base-URL matches bind automatically."""
@@ -6873,7 +6820,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {",
             "function providerKindLabel(kind: ProviderKind, translate: Translate): string {",
             "const providers = useMemo(() => snapshotProviderRecords(snapshot), [snapshot?.providers_models.providers, state.providers]);",
-            "const providers = useMemo(() => asRecords(state?.providers), [state]);",
+            "<ProviderListTable providers={providers}",
             "const name = providerNameDrafts[id] !== undefined",
             "return { key: id, cells: [name] };",
         ):
@@ -7979,7 +7926,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'function RouteTraceWorkspace(',
             'const routeTraceRequests = useMemo(',
             '() => selected === "route-trace" ? groupRouteTraceRequests(rows) : []',
-            'if (currentKey && routeTraceRequests.some((request) => request.key === currentKey)) return current;',
+            'const activeRequestKey = useRowSelection(requestKeys, selectedKey || undefined, (key) => onSelect(key ?? ""), {',
             '<RouteTraceWorkspace requests={routeTraceRequests}',
             '<FlatList',
             'initialNumToRender={12}',
@@ -8970,16 +8917,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         the first row is what an *empty* list means.
         """
 
-        self.assertIn('function adjacentSelectionAfterRemoval(', self.ui)
-        self.assertIn('return remainingKeys[index] ?? remainingKeys[index - 1] ?? remainingKeys[0];', self.ui)
-        # Providers, models, routes and the key table all repair through it.
-        self.assertIn('adjacentSelectionAfterRemoval(previousProviderKeys.current, keys, selectedProvider ?? "")', self.ui)
-        self.assertIn('adjacentSelectionAfterRemoval(previousModelKeys.current.ids, ids, selectedModel)', self.ui)
-        self.assertIn('adjacentSelectionAfterRemoval(previousRouteKeys.current, keys, selectedRoute ?? "")', self.ui)
-        self.assertIn('adjacentSelectionAfterRemoval(previousKeyRowKeys.current, rowKeys, selectedKey)', self.ui)
-        # And none of them still jumps to the first row on a removal.
-        self.assertNotIn('setSelectedProvider(editorIdentifier(providers[0]));\n    }\n  }, [providers, selectedProvider]);', self.ui)
-        self.assertNotIn('    if (routes.some((entry) => entry.key === selectedRoute)) return;\n    setSelectedRoute(routes[0].key);', self.ui)
+        # The browser regression covers the observed selection sequence.
+        for keys in ("providerKeys", "modelKeys", "routeKeys", "rowKeys"):
+            self.assertIn(f"useRowSelection({keys},", self.ui)
+        self.assertIn("useRowSelection(accountKeys,", self.relay)
 
     def test_a_dropped_station_key_is_still_named_by_its_account(self) -> None:
         """An orphan slot is a key of that account, and it reads like one.
@@ -9037,7 +8978,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # An account is not a key, so the same column names it before it ever
         # reaches a key lookup: an account-backed route reads as its account.
         self.assertIn('const credential = modelCredential(model, provider, credentials);', self.ui)
-        self.assertIn('grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });', self.ui)
+        self.assertIn('modelProviderKeyLabel(entries[0], provider ?? {}, translate, undefined, relaySources)', self.ui)
         self.assertIn('modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],', self.ui)
         self.assertIn('const sourceName = relaySourceName(choice.source) || ownName;', self.provider_key_labels)
         self.assertIn('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}${ungrouped}`}', self.ui)
@@ -9090,8 +9031,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('row = {"code": code, "provider_key_id": target_key, "model_id": target}', providers)
         service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
         self.assertIn('recorder(materialized.get("issues") if isinstance(materialized, Mapping) else ())', service)
-        self.assertIn("const bindingIssues = asRecords(state.binding_issues);", self.ui)
-        # The lookup is shared by the provider list (subscribed to the domain)
+        self.assertIn("asRecords(state.binding_issues)", self.ui)
+        # The lookup is shared by the provider list
         # and the inspector, so both mark the same row; the callback still
         # exists for the inspector's own consumers.
         self.assertIn("const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => bindingIssueRow(bindingIssues, model), [bindingIssues]);", self.ui)
@@ -9588,10 +9529,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # The staged-import result keeps the same choose-file control beside it.
         self.assert_ui_has('{sectionListHeader(statuses.import ?? translate("dataManagement.selectedCount", { count: stagedSections.length }), <ActionButton title={translate("dataManagement.changeImportFile")} busy={pendingAction === "inspect"} disabled={controlsBusy("inspect")} onPress={() => { void chooseImportFile(); }} />)}')
-        # A rename answers the slot it edits, so a namesake is never selected.
-        self.assert_ui_has('const pendingCustomKeyRename = useRef<{ id: string; name: string } | undefined>(undefined);')
-        self.assert_ui_has('const renamed = customKeys.find((key) => key.id === rename.id);')
-        self.assert_ui_has('pendingCustomKeyRename.current = { id: selectedCustom.id, name };')
+        # A key rename preserves its slot ID, so it makes no selection change.
+        self.assert_ui_has('return dispatch("provider.key_patch", { provider_id: providerId, old_name: selectedCustom.name, name });')
         # A commit is not undone by the snapshot read that follows it.
         self.assert_ui_has('// The commit is the result the user asked for; the refresh that repaints')
         self.assert_ui_has('// The subscription, or the next pane action, repaints the staged row.')
@@ -9746,8 +9685,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split("function ProviderKeysPanel(", 1)[0]
-        self.assertIn('runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));', workspace)
-        self.assertIn('runMutationOnce(`model.add:${providerId}`, () => dispatch("model.add", {', workspace)
+        self.assertIn('dispatch("provider.add", { provider: { name, models: [], enabled: true } })', workspace)
+        self.assertIn('dispatch("model.add", { provider_id: providerId, model:', workspace)
         self.assertIn('runMutationOnce(`model.duplicate:${providerId}:${editorIdentifier(model)}`, () => dispatch("model.duplicate", {', workspace)
         self.assertIn('model: { name, upstream_model: name, enabled: true, order: 0,', workspace)
         self.assertNotIn('enabled: false, order: 0', workspace)
@@ -10188,7 +10127,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("key={`model:${providerId}:${editorIdentifier(model)}`}", self.ui)
         self.assertIn('const name = providerNameDrafts[id] !== undefined\n        ? providerNameDrafts[id]\n        : displayLabel(item.display_name, displayLabel(item.name, translate("providers.newProvider")));', self.ui)
         self.assertIn('return { key: id, cells: [name] };', self.ui)
-        self.assertIn('const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();', self.ui)
         self.assertIn(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)', self.ui)
         self.assertIn("modelUpstreamDisplay", self.ui)
         self.assertIn("providerKeyDisplayName", self.ui)
@@ -10416,21 +10354,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # selection: every list keeps the row it had.  Following the cleared
         # state emptied the pane beside the list instead — no highlighted row, no
         # editor, and nothing on screen saying which click would bring it back.
-        self.assertIn(
-            'const provider = useMemo(\n    () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],\n    [providers, selectedProvider],\n  );',
-            self.ui,
-        )
-        self.assertNotIn('if (selectedProvider === "") return;', self.ui)
+        self.assertIn('if (key) onSelect(key);', self.ui)
         # The keys panel keeps its key: an empty key clears nothing, the repair
         # below puts a row back.
         self.assertNotIn('selectionCleared', self.ui)
-        # The station's account list falls back to the first account instead of
-        # keeping a cleared selection.
-        self.assertIn(
-            'const selected = stationAccounts.find((account) => account.id === selectedID)\n    ?? stationAccounts[0];',
-            self.relay,
-        )
-        self.assertNotIn('if (selectedID === "") return;', self.relay)
+        self.assertIn('if (!accountKeys.includes(key)) return;', self.relay)
         # The routes table is two levels deep, so a public-model row is a
         # selection of its own; a list that names no route takes the first row
         # rather than emptying the inspector beside it.
@@ -10476,8 +10404,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const addProvider = (): void => {', self.ui)
         self.assertIn('const base = translate("providers.newProvider");', self.ui)
         self.assertIn('const name = uniquePlaceholderName(providers.map((item) => providerDisplayName(item)), base);', self.ui)
-        self.assertIn('runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));', self.ui)
-        self.assertIn('const pendingProviderIds = useRef<Set<string> | undefined>(undefined);', self.ui)
+        self.assertIn('dispatch("provider.add", { provider: { name, models: [], enabled: true } })', self.ui)
         self.assertIn(
             '<ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} onPress={onOpenWizard} />',
             self.ui,
@@ -10608,16 +10535,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('<IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />', self.ui)
         self.assertIn('<IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteRoute} />', self.ui)
         self.assertIn("const addRoute = (): void => {", self.ui)
-        self.assertIn('runMutationOnce(`route.add:${targetProviderID}:${publicModel}`, () => dispatchWithOutcome("model.add", {', self.ui)
+        self.assertIn('const next = await dispatchWithOutcome("model.add_many", {', self.ui)
         self.assertIn("const confirmDeleteRoute = (): void => {", self.ui)
         self.assertIn('runMutationOnce(`route.delete-group:${selectedGroup.name}`, () => native.showConfirmation({', self.ui)
         self.assertIn('runMutationOnce(`route.delete:${activeRoute.key}`, () => native.showConfirmation({', self.ui)
         self.assertIn('dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID })', self.ui)
         # A selected public model deletes its whole group in one action.
-        self.assertIn("const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel)) : undefined;", self.ui)
         self.assertIn('dispatch("public.model_delete", { public_model: selectedGroup.name })', self.ui)
         self.assertIn('translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length })', self.ui)
-        self.assertIn('{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−"', self.ui)
+        self.assertIn('{activeRoute || activePublicGroup ? <IconButton label="−"', self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"providers.deletePublicModel"', locale)
             self.assertIn('"providers.deletePublicModelMessage"', locale)
@@ -10626,13 +10552,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"public_model_delete", "public_models_delete", "delete_public_model"', domain)
         # The new row joins the group the user is looking at, as a disabled draft,
         # and states the group's own name rather than a second spelling of it.
-        self.assertIn("const publicModel = (selectedPublicModel ?? activePublicGroupName).trim();", self.ui)
-        self.assertIn("const knownModelIds = new Set(targetModels.map(editorIdentifier));", self.ui)
-        # The new row is selected through the pending key, never by a key the
-        # routes list does not carry yet (that would be repaired to row one).
-        self.assertIn("const pendingRouteKey = useRef<string | undefined>(undefined);", self.ui)
-        self.assertIn("pendingRouteKey.current = `${targetProviderID}:${stringValue(added.editor_id, stringValue(added.deployment_id, identifier(added))).trim()}`;", self.ui)
-        self.assertIn("name,\n        upstream_model: publicModel || \"\",\n        enabled: false,\n        order: 0,", self.ui)
+        self.assertIn("name,\n          upstream_model: publicModel || \"\",\n          enabled: false,\n          order: 0,", self.ui)
 
         for locale in (self.zh, self.en):
             for key in (

@@ -1141,6 +1141,30 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             )
         )
 
+    def test_a_newer_login_observation_clears_a_stale_session_limit(self) -> None:
+        local = self._relay_store("2026-01-02T00:00:00Z", "session=old")
+        local["accounts"][0].update(
+            login_status="expired",
+            login_observed_at="2026-01-02T00:00:00Z",
+            session_limit_at="2026-01-02T00:00:00Z",
+        )
+        peer = self._relay_store("2026-01-03T00:00:00Z", "")
+        peer["accounts"][0].update(
+            login_status="signed_out",
+            login_observed_at="2026-01-03T00:00:00Z",
+            session={},
+            session_limit_at="",
+        )
+
+        merged = webdav_core._merge_relay_accounts(
+            json.dumps(local).encode("utf-8"), json.dumps(peer).encode("utf-8")
+        )
+
+        assert merged is not None
+        account = json.loads(merged)["accounts"][0]
+        self.assertEqual("signed_out", account["login_status"])
+        self.assertEqual("", account["session_limit_at"])
+
     def test_shared_account_observations_stay_with_the_identity_that_produced_them(self) -> None:
         local = self._relay_store("2026-11-08T04:00:00Z", "session=local")
         local_account = local["accounts"][0]

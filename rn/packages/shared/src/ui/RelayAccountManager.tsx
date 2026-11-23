@@ -5,6 +5,7 @@ import { AccountsTable } from "./AccountsTable";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTextField, nativeControlTextWidth } from "./NativeControls";
 import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import { usePendingAction } from "./pendingAction";
+import { useRowSelection } from "./rowSelection";
 import { setGroupManagerOpen } from "./providerWizardGate";
 import { normalizeRelayOrigin, stationOriginKey, stationSurfaceAddress, stationSurfacePath, type StationSurfaces } from "./relayOrigin";
 import { multiplierSpelling } from "./rateSpelling";
@@ -20,6 +21,8 @@ const LOGIN_FAILURE_MESSAGES = {
   rejected: "relay.autoSignInRejected",
   session_limit: "relay.autoSignInSessionLimit",
   session_unconfirmed: "relay.autoSignInSessionUnconfirmed",
+  sync_waiting: "relay.sharedSignInWaiting",
+  sync_unavailable: "relay.sharedSignInUnavailable",
   unavailable: "relay.autoSignInUnavailable",
 } as const;
 
@@ -59,6 +62,7 @@ export type RelayAccount = {
   username: string;
   loginStatus: string;
   loginFailure?: keyof typeof LOGIN_FAILURE_MESSAGES;
+  loginFailureAt?: string;
   /**
    * How long ago Core's login observation for this account was made, or null
    * when it cannot say.  The pane compares it with the station's re-check
@@ -194,6 +198,7 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
       username: text(item.username),
       loginStatus: text(item.login_status) || "unknown",
       loginFailure: isLoginFailure(failure) ? failure : undefined,
+      loginFailureAt: text(item.login_failure_at) || undefined,
       loginObservedSecondsAgo: typeof item.login_observed_seconds_ago === "number" && Number.isFinite(item.login_observed_seconds_ago) ? item.login_observed_seconds_ago : null,
       rememberPassword: item.remember_password === true,
       passwordSaved: item.password_saved === true,
@@ -669,7 +674,15 @@ export function StationAccountsPanel({
   const stationAccounts = useMemo(() => station.accountIDs
     .map((id) => accounts.find((account) => account.id === id))
     .filter((account): account is RelayAccount => Boolean(account)), [accounts, station.accountIDs]);
-  const [selectedID, setSelectedID] = useState<string>();
+  const [accountSelection, setSelectedID] = useState<string>();
+  const [pendingAccountSelection, setPendingAccountSelection] = useState<string>();
+  const accountKeys = useMemo(() => stationAccounts.map((account) => account.id), [stationAccounts]);
+  const selectedID = useRowSelection(accountKeys, accountSelection, setSelectedID, {
+    first: accountKeys[0], target: pendingAccountSelection, list: station.id,
+  });
+  React.useLayoutEffect(() => {
+    if (pendingAccountSelection && selectedID === pendingAccountSelection) setPendingAccountSelection(undefined);
+  }, [pendingAccountSelection, selectedID]);
   const [loading, setLoading] = useState<Record<string, AccountLoading>>({});
   const loadingRef = useRef(loading);
   loadingRef.current = loading;
@@ -689,7 +702,7 @@ export function StationAccountsPanel({
   };
   // Which account action is running: the button that started one keeps its own
   // inline spinner instead of graying out.
-  const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove" | "refresh">();
+  const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "retry" | "remove" | "refresh">();
   // What a sign-in may save is asked by the native login flow after the
   // webview login succeeds; adding an account goes straight to sign-in.
   const beginAddLogin = async (): Promise<void> => {
@@ -707,13 +720,7 @@ export function StationAccountsPanel({
   const [stationBusy, setStationBusy] = useState(false);
   const accountsRef = useRef(stationAccounts);
   accountsRef.current = stationAccounts;
-  // The account list owns the selection, and it always names an account: a row
-  // the station no longer lists (nothing chosen yet, or the account was removed)
-  // falls back to the first one.  An empty selection is not a state this window
-  // has — it would leave the editor and its − standing on nothing, with no row
-  // highlighted to say why.
-  const selected = stationAccounts.find((account) => account.id === selectedID)
-    ?? stationAccounts[0];
+  const selected = stationAccounts.find((account) => account.id === selectedID);
   // The window's own busy flag describes work another surface started — an
   // Apply of the pane the user just left, an official sign-in, a data-management
   // read.  Every control here acts on this station account and stages through
@@ -771,10 +778,6 @@ export function StationAccountsPanel({
     const state = loadingRef.current[accountID];
     return Boolean(state?.session || state?.checking || state?.resources);
   };
-  useEffect(() => {
-    if (selected && selected.id === selectedID) return;
-    setSelectedID(selected?.id);
-  }, [selected, selectedID]);
   const refreshAccountResources = async (target: ResourceRefreshTarget, options: { silent?: boolean; force?: boolean } = {}): Promise<"ready" | "unavailable"> => {
     const { silent = false, force = false } = options;
     if (loadingRef.current[target.id]?.resources) {
@@ -951,8 +954,8 @@ export function StationAccountsPanel({
         stationOrigin: station.origin,
       });
       if (!result) return;
+      setPendingAccountSelection(pendingID);
       await refreshAccounts();
-      setSelectedID(pendingID);
     } catch {
       // A failed pending login leaves nothing behind and stays silent.
     } finally {
@@ -990,6 +993,19 @@ export function StationAccountsPanel({
     if (pendingAction === "login") return;
     const account = selected;
     await runPendingAction("login", () => loginAccount(account));
+  };
+  const retryAfterSessionLimit = async (account: RelayAccount): Promise<void> => {
+    await runPendingAction("retry", async () => {
+      setFormBusy(true);
+      try {
+        await commit("session.retry", { id: account.id, type: account.type, label: account.label, origin: account.origin, refused_at: account.loginFailureAt });
+        await refreshAccounts();
+      } catch {
+        publish(translate("relay.autoSignInUnavailable"));
+      } finally {
+        setFormBusy(false);
+      }
+    });
   };
   // The account row's name is the way into the station's own dashboard.
   //
@@ -1054,7 +1070,6 @@ export function StationAccountsPanel({
       setFormBusy(true);
       try {
         await commit("account.delete", { id: account.id, dependency_policy: "detach" });
-        setSelectedID(undefined);
         try {
           await native.clearRelayCredentials(account.id);
           await commit("credential_cleanup_confirm", { id: account.id, kind: "credentials" });
@@ -1496,7 +1511,11 @@ export function StationAccountsPanel({
       columns={[{ label: translate("relay.accounts"), width: accountColumnWidth }, { label: translate("providers.authStatus"), width: statusColumnWidth }, { label: translate("relay.balance"), width: balanceColumnWidth }]}
       rows={accountRows}
       selectedKey={selected?.id ?? ""}
-      onSelectionChange={setSelectedID}
+      onSelectionChange={(key) => {
+        if (!accountKeys.includes(key)) return;
+        setPendingAccountSelection(undefined);
+        setSelectedID(key);
+      }}
       alertRowKeys={alertAccountRows}
       emptyText={translate("relay.stationNoAccounts")}
     />
@@ -1542,6 +1561,7 @@ export function StationAccountsPanel({
         />
         {/* Offer manual sign-in after the current check or sign-in settles. */}
         {canSignIn ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
+        {canSignIn && selected.loginFailure === "session_limit" && selected.loginFailureAt ? <NativeButton title={translate("relay.retrySignIn")} compact busy={pendingAction === "retry"} disabled={controlsBusy && pendingAction !== "retry"} onPress={() => { void retryAfterSessionLimit(selected); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact accessibilityLabel={native.showGroupManager ? translate("relay.groupManager") : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>

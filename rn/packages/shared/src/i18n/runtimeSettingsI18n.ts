@@ -72,7 +72,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED: { label: "启用本地 Ollama", help: "在配置的 HTTP 提供方之前尝试本地 Ollama。快捷控件与高级 JSON 的 localOllama.enabled 双向同步；地址和模型仍在 JSON 中设置。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED: { label: "启用本地 LM Studio", help: "在配置的 HTTP 提供方之前尝试本地 LM Studio。快捷控件与高级 JSON 的 localLmStudio.enabled 双向同步；地址和模型仍在 JSON 中设置。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON: { label: "视觉回退配置", help: "视觉回退链的高级 JSON：backend、providers / httpProviders、apiKeyEnv、prompt、顺序、超时与令牌上限、本地提供方。上方快捷控件与对应字段双向同步。仅在所选模型拒绝图像输入时运行；声明支持视觉的模型直接收到原图。" },
-  YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW: { label: "未知模型原始上下文", help: "当内置配置、实际路由、漾路由与上游元数据都无法识别模型时，供 Codex 使用的原始上下文窗口。默认 272000，按 Codex 95% 的有效窗口策略会显示约 258k。" },
+  YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW: { label: "未知模型原始上下文", help: "当内置配置、实际路由、漾路由与上游元数据都无法识别模型时，供 Codex 使用的原始上下文窗口。默认 500000，按 Codex 95% 的有效窗口策略会显示约 475k。" },
   YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS: { label: "模型上下文刷新间隔", help: "托管 Codex 模型目录刷新公开上下文元数据的间隔。设为 0 后仅使用内置配置与已有缓存，不访问上游。" },
   YOUNG_ROUTER_CATALOG_BASE_PROFILE: { label: "模型目录基础配置", help: "内部记录：第三方 Codex 模型别名继承的原生配置。由 Core 写入，仅当已安装客户端不再提供该配置时才会更新；请勿手动修改。" },
   YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT: { label: "模型并发上限", help: "同一条路由最多同时服务多少个请求，超过后由同一公开模型的下一条路由接手，和路由冷却一样被跳过。某个模型的每条路由都满时，这一轮会排队等待（客户端流保持开启），名额空出来后给等待最久的那一轮，而不是改用别的模型或直接报错。模型详情里可以给单条路由单独设置数字；没有单独设置的路由都会跟随这里的值，所以修改它会改变所有没单独设置的路由。设为 0 可完全关闭该限制。" },

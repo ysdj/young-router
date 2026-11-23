@@ -170,6 +170,10 @@ class WebDAVSettingsDomain:
             raise DomainError("WebDAV is not configured")
         return settings
 
+    def login_coordination_settings(self) -> Any:
+        """Draft settings never authorize an automatic login on a different server."""
+        return self.sync_settings(committed=True) if self._enabled() else None
+
     def snapshot(self) -> dict[str, Any]:
         settings = self._settings()
         sanitized = settings.sanitized()

@@ -17,6 +17,7 @@ from . import responses_surfaces as _responses_surfaces_module
 from . import responses_tools as _responses_tools_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning_replay as _reasoning_replay_module
+from . import codex_contract as _codex_contract_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
@@ -126,6 +127,10 @@ def _forced_tool_choice_auto_retry_kwargs(
         exception,
         request_kwargs,
         outer_request_kwargs,
+    ):
+        return None
+    if not _routing_module._can_relax_tool_choice(
+        request_kwargs, outer_request_kwargs
     ):
         return None
     if not isinstance(request_kwargs, dict):
@@ -1583,8 +1588,8 @@ def _wrap_generic_function_for_deployment_failover(
                 call_kwargs
             )
 
-            async def call_deployment() -> Any:
-                response = original_function(**dispatch_kwargs)
+            async def call_deployment(**payload: Any) -> Any:
+                response = original_function(**payload)
                 if inspect.isawaitable(response):
                     return await response
                 return response
@@ -1598,7 +1603,9 @@ def _wrap_generic_function_for_deployment_failover(
             # turn instead of handing it to whichever sibling accepts the
             # history.
             return await _reasoning_replay_module.call_with_replay_repair(
-                call_deployment,
+                lambda: _codex_contract_module._call_with_deepseek_tool_choice(
+                    call_deployment, dispatch_kwargs
+                ),
                 dispatch_kwargs,
             )
 
@@ -1660,6 +1667,9 @@ def _wrap_generic_function_for_deployment_failover(
                             exc,
                             responses_tool_adapter_kwargs,
                             decision_kwargs,
+                        )
+                        and _routing_module._can_relax_tool_choice(
+                            responses_tool_adapter_kwargs, decision_kwargs
                         )
                     )
                     _routing_module._clear_protocol_fallback_cache_for_request(

@@ -101,6 +101,7 @@ class WebDAVSyncScheduler:
         self._settle_grace = max(0.0, float(settle_grace))
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._session_changed = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_attempt: float | None = None
         self._started_at: float | None = None
@@ -145,6 +146,11 @@ class WebDAVSyncScheduler:
         self._wake.set()
 
     # -- scheduling --------------------------------------------------------
+    def session_changed(self) -> None:
+        """An issued credential should travel on the next allowed sync."""
+        self._session_changed.set()
+        self._wake.set()
+
     def next_run(self) -> tuple[float | None, bool]:
         """Return ``(seconds_to_wait, fire_now)`` for the current settings.
 
@@ -164,7 +170,7 @@ class WebDAVSyncScheduler:
         if state is None or interval is None:
             self._plan(None, None)
             return (None, False)
-        due = self._due_in(interval, state.get("last_sync_at"))
+        due = 0.0 if self._session_changed.is_set() else self._due_in(interval, state.get("last_sync_at"))
         if self._failures:
             # An ordinary failure keeps its own interval, stretched: doubling
             # per failure up to the cap.  A server that is down is worth asking
@@ -263,6 +269,7 @@ class WebDAVSyncScheduler:
         # Stamp the attempt before running so the next pass measures from here
         # whatever the sync does, then let the sync's own status file carry the
         # outcome.
+        self._session_changed.clear()
         self._last_attempt = self._clock()
         self._due_since = None
         if self._tasks is not None:

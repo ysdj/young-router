@@ -2204,14 +2204,14 @@ class HookPatchTests(HookTestCase):
 
         transform_module.LiteLLMCompletionResponsesConfig = LiteLLMCompletionResponsesConfig
         streaming_module.LiteLLMCompletionStreamingIterator = LiteLLMCompletionStreamingIterator
-        sys.modules["litellm.responses"] = responses_module
-        sys.modules["litellm.responses.litellm_completion_transformation"] = bridge_module
-        sys.modules[
-            "litellm.responses.litellm_completion_transformation.transformation"
-        ] = transform_module
-        sys.modules[
-            "litellm.responses.litellm_completion_transformation.streaming_iterator"
-        ] = streaming_module
+        modules = mock.patch.dict(sys.modules, {
+            "litellm.responses": responses_module,
+            "litellm.responses.litellm_completion_transformation": bridge_module,
+            "litellm.responses.litellm_completion_transformation.transformation": transform_module,
+            "litellm.responses.litellm_completion_transformation.streaming_iterator": streaming_module,
+        })
+        modules.start()
+        self.addCleanup(modules.stop)
 
         hooks._install_responses_tool_search_bridge_patch()
 
@@ -2235,6 +2235,58 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(dumped[0]["name"], "apply_patch")
         self.assertEqual(dumped[0]["input"], "*** Begin Patch")
         self.assertNotIn("arguments", dumped[0])
+
+    async def test_legacy_chat_repairs_an_unknown_official_route_on_the_same_deployment(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {"model": "deepseek/fixture"},
+            "model_info": {"id": "official-route"},
+        }
+        calls = []
+
+        class ProviderBadRequest(Exception):
+            status_code = 400
+
+        class Router:
+            def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                kwargs["model_info"] = deployment["model_info"].copy()
+
+            async def make_call(self, original_function, *args, **kwargs):
+                return await original_function(*args, **kwargs)
+
+            async def _acompletion(self, **kwargs):
+                calls.append(kwargs.copy())
+                self._update_kwargs_with_deployment(deployment, kwargs)
+                if len(calls) == 1:
+                    error = ProviderBadRequest("thinking mode does not support tool_choice")
+                    error.request = types.SimpleNamespace(
+                        method="POST", url="https://api.deepseek.com/v1/chat/completions"
+                    )
+                    raise error
+                return {"ok": True}
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        router = Router()
+
+        result = await router.make_call(
+            router._acompletion,
+            model="fixture",
+            messages=[{"role": "user", "content": "check"}],
+            tool_choice="required",
+            thinking={"type": "enabled"},
+        )
+
+        self.assertEqual({"ok": True}, result)
+        self.assertEqual(2, len(calls))
+        self.assertEqual("official-route", calls[1]["model"])
+        self.assertEqual("auto", calls[1]["tool_choice"])
+        self.assertEqual({"type": "enabled"}, calls[1]["thinking"])
+        self.assertEqual(
+            "official-route", hooks._request_surface_target_deployment_id(calls[1])
+        )
 
     async def test_selected_deployment_marker_patch_marks_failed_deployment_order(self) -> None:
         hooks, _ = load_hook_module()
@@ -2892,6 +2944,45 @@ class HookPatchTests(HookTestCase):
                 )
             )
 
+            # A replay can contain progress messages without a tool call or
+            # a saved reasoning item. The official Responses wire refuses it
+            # when tools are declared, and accepts one item opening the segment.
+            calls.clear()
+            progress_replay = [
+                {"role": "user", "content": "start"},
+                {"type": "message", "role": "assistant", "content": "checking"},
+                {"type": "message", "role": "assistant", "content": "continuing"},
+                {"role": "user", "content": "continue"},
+                {"role": "assistant", "content": "checking again"},
+            ]
+
+            async def progress_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                items = kwargs["input"]
+                for index, item in enumerate(items):
+                    if item.get("role") == "assistant" and index in (1, 4):
+                        raise ThinkingReplayRefused()
+                return {"ok": True}
+
+            response = await router.make_call(
+                progress_original_function,
+                model="deepseek-v4.1-flash",
+                model_info={"id": "progress-route"},
+                api_base="https://api.deepseek.com/v1",
+                input=progress_replay,
+            )
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(2, len(calls))
+            self.assertEqual(progress_replay, calls[0]["input"])
+            repaired = calls[1]["input"]
+            self.assertEqual(["reasoning", "reasoning"], [
+                item["type"] for item in repaired if item.get("type") == "reasoning"
+            ])
+            self.assertNotEqual(repaired[1]["id"], repaired[5]["id"])
+            self.assertIs(progress_replay[1], repaired[2])
+            self.assertIs(progress_replay[4], repaired[6])
+            self.assertIsNone(replay_module.with_reasoning_text_replay({"input": repaired}))
+
             # The Chat wire of the same route refuses the same absence under
             # its own spelling, and ``reasoning_content: ""`` answers there.
             calls.clear()
@@ -2902,7 +2993,6 @@ class HookPatchTests(HookTestCase):
                     if (
                         isinstance(message, dict)
                         and message.get("role") == "assistant"
-                        and message.get("tool_calls")
                         and "reasoning_content" not in message
                     ):
                         raise ThinkingReplayRefused()
@@ -2910,6 +3000,7 @@ class HookPatchTests(HookTestCase):
 
             chat_replay = [
                 {"role": "user", "content": "ls"},
+                {"role": "assistant", "content": "checking"},
                 {
                     "role": "assistant",
                     "content": "",
@@ -2927,12 +3018,14 @@ class HookPatchTests(HookTestCase):
                 chat_original_function,
                 model="deepseek-v4.1-flash",
                 model_info={"id": "chat-route"},
+                api_base="https://api.deepseek.com/v1",
                 messages=chat_replay,
             )
             self.assertEqual({"ok": True}, response)
             self.assertEqual(2, len(calls))
             self.assertNotIn("reasoning_content", calls[0]["messages"][1])
             self.assertEqual("", calls[1]["messages"][1]["reasoning_content"])
+            self.assertEqual("", calls[1]["messages"][2]["reasoning_content"])
             self.assertEqual("ls", calls[1]["messages"][0]["content"])
 
             # An ordinary 400 is not the thinking-replay contract and keeps its
@@ -3395,6 +3488,85 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(
             error.failed_deployment_route_key,
             "compat_provider / openai/default-chat / key=x-pro / order=3",
+        )
+
+    def test_existing_failure_identity_wins_over_stale_selected_marker(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "default-chat",
+            "model_info": {
+                "id": "route-a",
+                "order": 0,
+                "route_key": "provider-a / openai/default-chat / key=a / order=0",
+            },
+        }
+        # This is the stale marker LiteLLM can leave on the request copy after
+        # it has already selected the next route.
+        hooks._remember_selected_deployment_for_request(
+            request_kwargs,
+            {
+                "litellm_params": {"order": 0, "model": "openai/default-chat"},
+                "model_info": {
+                    "id": "route-a",
+                    "route_key": "provider-a / openai/default-chat / key=a / order=0",
+                },
+            },
+        )
+        error = RuntimeError("upstream 503")
+        error.status_code = 503
+        error.failed_deployment_id = "route-b"
+        error.failed_deployment_route_key = (
+            "provider-b / openai/default-chat / key=b / order=1"
+        )
+        hooks._mark_same_deployment_retry_exhausted(error)
+
+        hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+
+        self.assertEqual(error.failed_deployment_id, "route-b")
+        self.assertEqual(error.failed_deployment_order, 1)
+        self.assertEqual(
+            error.failed_deployment_route_key,
+            "provider-b / openai/default-chat / key=b / order=1",
+        )
+        self.assertEqual(request_kwargs["model_info"]["id"], "route-a")
+        self.assertEqual(request_kwargs["_excluded_deployment_ids"], ["route-b"])
+
+    def test_existing_failure_identity_advances_to_the_next_route_order(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "runtime-model-alias",
+            "model_info": {"id": "route-a", "order": 0},
+        }
+        hooks._remember_selected_deployment_for_request(
+            request_kwargs,
+            {
+                "litellm_params": {"order": 0},
+                "model_info": {"id": "route-a"},
+            },
+        )
+        error = RuntimeError("upstream 503")
+        error.status_code = 503
+        error.failed_deployment_id = "route-b"
+        error.failed_deployment_route_key = "provider-b / model / order=1"
+
+        hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {"litellm_params": {"order": 0}, "model_info": {"id": "route-a"}},
+                    {"litellm_params": {"order": 1}, "model_info": {"id": "route-b"}},
+                    {"litellm_params": {"order": 2}, "model_info": {"id": "route-c"}},
+                ]
+
+        entry = hooks._ordered_deployment_fallback_entry(
+            Router(), error, request_kwargs
+        )
+
+        self.assertEqual(entry["_target_order"], 2)
+        self.assertEqual(entry["_excluded_deployment_ids"], ["route-b"])
+        self.assertEqual(
+            entry[hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY], ["route-c"]
         )
 
     async def test_same_order_peer_fallback_entry_excludes_failed_deployment(self) -> None:

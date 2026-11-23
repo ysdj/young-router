@@ -499,8 +499,8 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual({"delegation": "native"}, model["future_native_policy"])
         self.assertEqual("Native process words and delegation instructions", model["base_instructions"])
         self.assertEqual(["v5-reasoning"], [item["effort"] for item in model["supported_reasoning_levels"]])
-        self.assertEqual(272_000, model["context_window"])
-        self.assertEqual(272_000, model["max_context_window"])
+        self.assertEqual(500_000, model["context_window"])
+        self.assertEqual(500_000, model["max_context_window"])
         self.assertEqual(1, model["priority"])
 
     def test_exact_native_profile_keeps_codex_only_delegation_mode(self) -> None:
@@ -645,17 +645,17 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(95, model["effective_context_window_percent"])
         self.assertNotIn("auto_compact_token_limit", model)
 
-    def test_catalog_unknown_model_defaults_to_codex_258k_effective_window(self) -> None:
+    def test_catalog_unknown_model_defaults_to_codex_475k_effective_window(self) -> None:
         with mock.patch(
             "litellm.model_cost",
             {},
         ):
             model = catalog_payload(["custom-public-model"])["models"][0]
 
-        self.assertEqual(272_000, model["context_window"])
-        self.assertEqual(272_000, model["max_context_window"])
+        self.assertEqual(500_000, model["context_window"])
+        self.assertEqual(500_000, model["max_context_window"])
         self.assertEqual(95, model["effective_context_window_percent"])
-        self.assertEqual(258_400, model["context_window"] * model["effective_context_window_percent"] // 100)
+        self.assertEqual(475_000, model["context_window"] * model["effective_context_window_percent"] // 100)
 
     def test_unknown_model_default_is_runtime_adjustable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1596,7 +1596,7 @@ class PublicModelLimitTests(unittest.TestCase):
             )
             record = registry.record_for("gpt-5.6-sol")
 
-        self.assertEqual(272_000, record.context_window)
+        self.assertEqual(500_000, record.context_window)
 
 
 class SharedContextCacheTests(unittest.TestCase):
@@ -1629,7 +1629,7 @@ class SharedContextCacheTests(unittest.TestCase):
             cache = root / "model-contexts.json"
             cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
             reader = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
-            self.assertEqual(272_000, reader.record_for("gemini-4-argon").context_window)
+            self.assertEqual(500_000, reader.record_for("gemini-4-argon").context_window)
 
             # The refreshing registry publishes the profile pi.dev states, and
             # the model only exists after that: the window a public model added
@@ -2224,12 +2224,12 @@ class SharedContextCacheTests(unittest.TestCase):
                 self.assertFalse(route_serves_only_images("openai/text-route"))
 
     def test_a_generator_whose_catalog_states_no_window_has_no_window(self) -> None:
-        """A generator holds no conversation, so 272,000 is not its window.
+        """A generator holds no conversation, so 500,000 is not its window.
 
         pi.dev and models.dev state ``limit.context: 0`` for
         ``gpt-image-2.5-flare`` and its siblings.  That zero is the whole
         statement, and the record must keep it: folding it into the
-        unknown-model placeholder published 272,000 as if the catalog had said
+        unknown-model placeholder published 500,000 as if the catalog had said
         so, on the pane's 公开上下文 and in the catalog Codex compacts against.
         """
 
@@ -2262,7 +2262,7 @@ class SharedContextCacheTests(unittest.TestCase):
         ``gpt-image-2.5-flare`` is stated as ``image_generation`` by the cost
         map bundled with this install, while the registry holds no profile for
         it.  The pane and the managed catalog both read ``record_for``, so both
-        must answer "no window" instead of 272,000.
+        must answer "no window" instead of 500,000.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2275,7 +2275,7 @@ class SharedContextCacheTests(unittest.TestCase):
             # A text route the registry cannot resolve keeps the placeholder:
             # the rule is the modality, not the absence of a profile.
             self.assertEqual(
-                272_000, registry.record_for("totally-unknown-text-route").context_window
+                500_000, registry.record_for("totally-unknown-text-route").context_window
             )
 
     def test_a_probe_result_reaches_the_window_and_survives_a_restart(self) -> None:
@@ -2297,7 +2297,7 @@ class SharedContextCacheTests(unittest.TestCase):
             ):
                 # No table knows it: the placeholder would be published.
                 self.assertEqual(
-                    272_000, first.default_record_for("vendor/new-generator").context_window
+                    500_000, first.default_record_for("vendor/new-generator").context_window
                 )
                 first.remember_image_generator(["vendor/new-generator"])
                 self.assertEqual(
@@ -2339,7 +2339,7 @@ class SharedContextCacheTests(unittest.TestCase):
 
         LiteLLM's cost map is where a name no public catalog has listed yet
         gets its modality, and that map is what keeps the Codex catalog from
-        carrying a 272,000-token window for a model that never reads a prompt.
+        carrying a 500,000-token window for a model that never reads a prompt.
         """
 
         with tempfile.TemporaryDirectory() as directory:

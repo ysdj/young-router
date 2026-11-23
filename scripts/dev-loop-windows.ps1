@@ -213,7 +213,7 @@ $DependencyFiles = @(
 )
 $JsRoots = @('rn\packages\shared\src')
 $JsFiles = @('rn\apps\windows\index.js', 'rn\apps\windows\babel.config.js', 'rn\apps\windows\metro.config.js')
-$WindowsBuildFiles = @('rn\scripts\build-windows.ps1', 'rn\scripts\patch-react-native-windows.mjs')
+$WindowsBuildFiles = @('rn\scripts\build-windows.ps1', 'rn\scripts\patch-react-native-windows.mjs', 'scripts\update_litellm.py')
 
 function Get-ChangedFiles {
   param([string]$Left, [string]$Right, [string[]]$ExcludeDirectories = @())

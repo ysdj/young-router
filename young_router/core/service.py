@@ -2474,6 +2474,42 @@ class CoreStore:
         bind_recovery = getattr(relay, "bind_session_write_gate", None)
         if callable(bind_recovery):
             bind_recovery(lambda: self._domain_scope("relay_accounts"))
+        bind_shared = getattr(relay, "bind_shared_recovery", None)
+        if callable(bind_shared):
+            bind_shared(self._relay_shared_recovery, self._queue_relay_sync)
+
+    @contextlib.contextmanager
+    def _relay_shared_recovery(self, identity: str):
+        """Keep the relay writer through issuance; no sync or other domain lock is taken here."""
+        from ..webdav import core as dav
+        from .domains._shared import DomainError
+        from .domains.relay_accounts import RelayLoginCoordinationError
+
+        webdav = self._domains.get("webdav")
+        if webdav is None:
+            yield None
+            return
+        get_settings = getattr(webdav, "login_coordination_settings", None)
+        if not callable(get_settings):
+            raise RelayLoginCoordinationError()
+        try:
+            settings = get_settings()
+        except (DomainError, dav.SyncError, OSError):
+            raise RelayLoginCoordinationError() from None
+        if settings is None:
+            yield None
+            return
+        try:
+            with dav.WebDAVClient(settings).acquire_login_lease(identity) as lease:
+                yield lease
+        except dav.WebDAVLoginLeaseBusy:
+            raise RelayLoginCoordinationError(waiting=True) from None
+        except (dav.SyncError, OSError):
+            raise RelayLoginCoordinationError() from None
+
+    def _queue_relay_sync(self) -> None:
+        if self._webdav_scheduler is not None:
+            self._webdav_scheduler.session_changed()
 
     def register_domain(self, adapter: DomainAdapter) -> str:
         name_value = getattr(adapter, "name", None)
@@ -5026,6 +5062,7 @@ class CoreStore:
         access_token: object = "",
         refresh_token: object = "",
         user_id: object = "",
+        retry_limit_at: str = "",
     ) -> dict[str, Any]:
         """Restore or update one locally validated native relay session.
 
@@ -5053,14 +5090,14 @@ class CoreStore:
         with self._domain_scope("relay_accounts"):
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
-            session_restorer = getattr(relay, "restore_saved_session", None) if relay is not None else None
-            password_restorer = getattr(relay, "_submit_saved_password", None) if relay is not None else None
+            session_restorer = getattr(relay, "probe_saved_session", None)
+            recover = getattr(relay, "recover_rejected_login", None)
             status_settler = getattr(relay, "settle_login_status", None) if relay is not None else None
             recent_login_answer = getattr(relay, "recent_login_check_answer", None) if relay is not None else None
             if (
                 not callable(accepter)
                 or not callable(session_restorer)
-                or not callable(password_restorer)
+                or not callable(recover)
                 or not callable(status_settler)
                 or not callable(recent_login_answer)
             ):
@@ -5100,7 +5137,11 @@ class CoreStore:
                 ):
                     from .domains.relay_accounts import RelayAccountsError, RelayLoginSaveError
 
-                    public = recent_login_answer(str(account_id))
+                    retry_limit = bool(retry_limit_at and retry_limit_at == matching.get("login_failure_at"))
+                    if retry_limit_at:
+                        public = None if retry_limit else matching
+                    else:
+                        public = recent_login_answer(str(account_id))
                     if public is None:
                         try:
                             public = session_restorer(str(account_id))
@@ -5109,7 +5150,7 @@ class CoreStore:
                         except RelayAccountsError:
                             # An unanswered probe cannot retire the current
                             # session or authorize a password POST.
-                            if login_status == "signed_out":
+                            if login_status == "signed_out" or retry_limit:
                                 raise CoreError(
                                     "relay_restore_unavailable",
                                     "The saved session could not be verified",
@@ -5117,17 +5158,13 @@ class CoreStore:
                             public = matching
                         else:
                             if public is None:
-                                if login_status in {"signed_out", "expired"}:
-                                    status_settler(str(account_id), str(login_status))
-                                if matching.get("password_saved") is True:
-                                    try:
-                                        public = password_restorer(str(account_id))
-                                    except RelayLoginSaveError:
-                                        raise
-                                    except RelayAccountsError:
-                                        # The projection reports the POST's outcome.
-                                        # A backoff leaves the previous outcome in place.
-                                        pass
+                                try:
+                                    public = recover(str(account_id), observed_status=str(login_status), retry_limit_at=retry_limit_at if retry_limit else "")
+                                except RelayLoginSaveError:
+                                    raise
+                                except RelayAccountsError:
+                                    # A rejection, hold, or failed POST is reported by the account.
+                                    pass
                 elif login_status in {"signed_out", "expired"}:
                     # A host observation of an account that holds no session,
                     # and every explicit ``expired``, are recorded as they are;
@@ -6036,8 +6073,11 @@ class CoreStore:
         incoming = None
         outcome = operation
         action_summary: dict[str, Any] = {}
+        flush_logins = getattr(relay, "flush_pending_login_saves", None)
         try:
             with self._domain_scope(*names):
+                if callable(flush_logins):
+                    flush_logins()
                 # Capture the inputs to the decision before talking to the server.
                 if operation != "pull":
                     local = webdav_core.local_snapshot(config_path)
@@ -6112,6 +6152,8 @@ class CoreStore:
                 if settings_getter(committed=automatic) != settings:
                     raise CoreError("webdav_sync_unsaved", "WebDAV settings changed during synchronization")
                 if pulled:
+                    if callable(flush_logins):
+                        flush_logins()
                     local_changed = (
                         any(read_bytes(path) != before for path, before in pull_inputs)
                         if operation == "pull" else
@@ -6653,6 +6695,16 @@ class CoreStore:
             )
         if domain_value is not None and _canonical_domain(domain_value) == "providers_models" and normalized_action == "provider_fetch_relay_resource_models":
             return self._dispatch_relay_model_list(data.get("payload"), expected_revision if expected_revision is not None else data.get("expected_revision"))
+        if domain_value == "relay_accounts" and normalized_action == "session_retry":
+            retry = _as_mapping(data.get("payload"))
+            if set(retry) != {"id", "type", "label", "origin", "refused_at"} or not isinstance(retry["refused_at"], str) or not retry["refused_at"]:
+                raise CoreError("invalid_action", "A session limit refusal is required")
+            # The refusal the person saw scopes this one attempt. Replaying the
+            # click after success or a new refusal cannot spend another slot.
+            return _relay_transient_dispatch_result(self.restore_relay_session(
+                account_id=retry["id"], account_type=retry["type"], label=retry["label"], origin=retry["origin"],
+                login_status="unknown", retry_limit_at=retry["refused_at"],
+            ))
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "relay_accounts"
@@ -6951,6 +7003,9 @@ class CoreStore:
                         # catalog then reads the shared slot another window's
                         # read has already replaced.
                         expected_operation = {
+                            "provider_add": "provider_add",
+                            "add_provider": "provider_add",
+                            "provider_import_relay_key": "provider_relay_key_import",
                             "service_provider_add": "service_provider_add",
                             "service_add_provider": "service_provider_add",
                             "provider_auth_start": "provider_auth_start",

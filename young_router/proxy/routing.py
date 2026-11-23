@@ -21,6 +21,7 @@ from . import tools as _tools_module
 from . import concurrency as _concurrency_module
 from . import trace as _trace_module
 from . import relay_balance as _relay_balance_module
+from .historical_reasoning_note import MissingAnswer as _HistoricalNotesWithoutAnswer
 
 
 from .base import (
@@ -1206,30 +1207,14 @@ def _same_deployment_retries() -> int:
 
 
 def _same_deployment_retry_budget(exception: Exception) -> int:
-    """How many extra attempts this failure may spend on its own route.
+    """How many extra attempts this failure may spend on its own route."""
 
-    The configured budget (``YOUNG_ROUTER_SAME_DEPLOYMENT_RETRIES``, zero by
-    default) assumes a failure is either the connection's or the body's.  One
-    class is neither: a thinking route that answers ``400 thinking mode does
-    not support this tool_choice`` to a payload carrying no ``tool_choice`` at
-    all, and serves the same payload signature outright about half the time
-    (measured live: 160 of 305 attempts on one deployment).  Measured again
-    through this proxy: the request that failed carried
-    ``tool_choice: null`` -- there was nothing to relax -- so the only remedy
-    is asking again.
-
-    Left at zero, a single-route group turns a coin flip into a failed turn,
-    because there is no sibling to advance to and the cooldown wait has nothing
-    to wait for.  Two extra attempts bring it from a coin flip to roughly one
-    failure in nine, and after that the ordinary failure accounting takes over.
-    """
-
-    if _is_upstream_model_unavailable_error(exception):
+    if (
+        _is_upstream_model_unavailable_error(exception)
+        or _is_thinking_tool_choice_unsupported_error(exception)
+    ):
         return 0
-    configured = _same_deployment_retries()
-    if _is_thinking_tool_choice_unsupported_error(exception):
-        return max(configured, _THINKING_TOOL_CHOICE_RETRY_ATTEMPTS)
-    return configured
+    return _same_deployment_retries()
 
 
 def _allow_the_failed_deployment_again(
@@ -1359,6 +1344,10 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     """
     if _is_image_generation_all_deployments_unsupported_error(exception):
         return _RECOVERY_POLICY_ERROR
+    if _is_thinking_tool_choice_unsupported_error(exception):
+        # A rejected parameter combination does not make the route unhealthy,
+        # even when the upstream takes a long time to return the error.
+        return _RECOVERY_POLICY_ERROR
     if _is_model_concurrency_rejection_error(exception):
         # A route at its cap is not broken and nothing upstream refused: it is
         # busy for as long as its requests run.  The attempt still advances (a
@@ -1483,17 +1472,6 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     ):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
-            _RECOVERY_POLICY_COOLDOWN,
-        )
-    if _is_thinking_tool_choice_unsupported_error(exception):
-        # One Codex task paid this refusal on every turn -- ~10 s and one full
-        # upload of a 60 MB replay, 178 times in three hours -- because a 4xx was
-        # read as ``error``, the turn ended on the first route, and no cooldown
-        # was ever counted.  The group's sibling serves the same bytes, so the
-        # refusal parks the route (ordinary failure threshold, ordinary window)
-        # and the turn advances exactly as it did.
-        return _recovery_policy_setting(
-            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
             _RECOVERY_POLICY_COOLDOWN,
         )
     # A server that refuses this route by policy or region answers the same way
@@ -1774,6 +1752,10 @@ def _is_route_recovery_poll_payload(request_kwargs: Optional[dict]) -> bool:
 
 
 def _is_route_recovery_poll_error(exception: Exception) -> bool:
+    # A reachable route gave a definite, unusable answer. The ordinary
+    # failover may try a peer; polling the same history for hours cannot help.
+    if isinstance(exception, _HistoricalNotesWithoutAnswer):
+        return False
     return _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
 
 
@@ -4099,10 +4081,36 @@ def _mark_protocol_fallback_relax_tool_choice(
     request_kwargs["litellm_metadata"] = updated_metadata
 
 
+def _can_relax_tool_choice(*requests: Optional[dict]) -> bool:
+    """Keep explicit choices out of the generic downgrade on official DeepSeek."""
+
+    from . import codex_contract
+
+    if not any(
+        codex_contract._request_targets_official_deepseek(request)
+        for request in requests
+        if isinstance(request, dict)
+    ):
+        return True
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        choice = request.get("tool_choice")
+        if choice in (None, "auto"):
+            continue
+        if isinstance(choice, dict) and choice.get("type") == "auto":
+            continue
+        if not codex_contract._has_injected_tool_choice(request):
+            return False
+    return True
+
+
 def _protocol_fallback_relax_tool_choice(
     request_kwargs: Optional[dict],
 ) -> bool:
     if not isinstance(request_kwargs, dict):
+        return False
+    if not _can_relax_tool_choice(request_kwargs):
         return False
     if request_kwargs.get(_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY) is True:
         return True
@@ -7609,26 +7617,12 @@ def _exception_retry_after_seconds(exception: Exception) -> Optional[float]:
     return _parse_retry_after_seconds(_exception_text(exception))
 
 
-_THINKING_TOOL_CHOICE_RETRY_DELAY_SECONDS = 0.2
-# Measured at 160 served of 305 attempts (0.52). One extra attempt leaves a
-# failure every fourth occurrence, two leave it near one in nine -- and each
-# attempt is cheap next to a failed turn on a group with nowhere else to go.
-_THINKING_TOOL_CHOICE_RETRY_ATTEMPTS = 2
-
-
 def _route_exhaustion_retry_delay_for_exception(
     exception: Exception,
     configured_delay_seconds: float,
 ) -> float:
     if configured_delay_seconds <= 0:
         return 0.0
-    if _is_thinking_tool_choice_unsupported_error(exception):
-        # Asking a coin flip again is worth a fraction of a second; the
-        # recovery interval is for a route that has to recover something, and
-        # nothing here does.
-        return min(
-            configured_delay_seconds, _THINKING_TOOL_CHOICE_RETRY_DELAY_SECONDS
-        )
     if _exception_status_code(exception) != 429:
         return configured_delay_seconds
     retry_after = _exception_retry_after_seconds(exception)
@@ -7841,6 +7835,8 @@ def _is_upstream_incomplete_terminal_error(exception: Exception) -> bool:
     terminal that names an error is deliberately not this shape.
     """
 
+    if isinstance(exception, _HistoricalNotesWithoutAnswer):
+        return True
     if not (
         getattr(exception, "responses_stream_incomplete", False)
         or getattr(exception, "stream_incomplete", False)
@@ -8630,7 +8626,29 @@ def _mark_exception_for_deployment_failover(
     except Exception:
         pass
     _remember_request_body_size_rejection(exception, request_kwargs)
-    _apply_current_selected_deployment_to_request(request_kwargs)
+    # LiteLLM can invoke this hook with a request copy from the previous
+    # deployment while the exception already carries the route that actually
+    # failed.  Applying that stale marker here used to overwrite the request
+    # with route A, then exclude route A even though route B had returned the
+    # error; the next ordered fallback consequently selected A again.  A
+    # marker may update the request only when it names the same route as an
+    # existing failure identity.  When the exception has no identity yet, the
+    # marker remains the authoritative selected route as before.
+    failed_id_from_exception = _responses_execution_module._failed_deployment_id(
+        exception
+    )
+    selected_marker = _selected_deployment_marker_from_box()
+    selected_marker_id = None
+    if isinstance(selected_marker, dict):
+        selected_marker_info = selected_marker.get("model_info")
+        if isinstance(selected_marker_info, dict):
+            selected_marker_id = selected_marker_info.get("id")
+    if (
+        not failed_id_from_exception
+        or not selected_marker_id
+        or selected_marker_id == failed_id_from_exception
+    ):
+        _apply_current_selected_deployment_to_request(request_kwargs)
     # The attempt that held this route's slot is over, whatever comes next: the
     # hop this exception starts claims again (and asking for a slot this turn
     # already holds refreshes it), so releasing here cannot under-count. Without
@@ -8639,21 +8657,34 @@ def _mark_exception_for_deployment_failover(
     # refused on one route and were served by a sibling left three leases behind,
     # and that is exactly the traffic a refusing route produces.
     _release_request_concurrency_slots(request_kwargs, deployment_only=True)
-    deployment_id = _deployment_id_from_request(request_kwargs)
-    route_key = _deployment_route_key_from_request(request_kwargs)
-    remembered_route = None
+    pool_answered = _is_no_deployments_available_error(exception)
+    # An exception identity is stronger than every request copy.  In
+    # particular, do not let a stale request's id or route key replace a
+    # failure id supplied by LiteLLM's selected-deployment callback.
+    deployment_id = None if pool_answered else failed_id_from_exception
+    request_deployment_id = _deployment_id_from_request(request_kwargs)
+    route_key = _responses_execution_module._failed_deployment_route_key(exception)
     if not deployment_id:
+        deployment_id = request_deployment_id
+    if not route_key and (
+        not failed_id_from_exception or request_deployment_id == failed_id_from_exception
+    ):
+        route_key = _deployment_route_key_from_request(request_kwargs)
+    remembered_route = None
+    if not deployment_id or not route_key:
         remembered_route = _remembered_attempt_route(request_kwargs)
         if remembered_route:
-            deployment_id = remembered_route.get("deployment_id")
-            route_key = route_key or remembered_route.get("route_key")
+            remembered_id = remembered_route.get("deployment_id")
+            if not deployment_id:
+                deployment_id = remembered_id
+            if not route_key and remembered_id == deployment_id:
+                route_key = remembered_route.get("route_key")
     # The pool answering "nothing available" is not a route failure: the
     # deployment the request was last pointed at was never contacted, so naming
     # it here would exclude the only route of a single-route group on every
     # round -- the poll then answers locally for its whole window while the
     # router's own cooldown is the only thing keeping the route out (live
     # 2026-11-12: two rounds, five seconds, no upstream contact at all).
-    pool_answered = _is_no_deployments_available_error(exception)
     _record_image_generation_tool_unsupported(exception, request_kwargs)
     _record_web_search_tool_unsupported(exception, request_kwargs)
     if deployment_id and not pool_answered and not getattr(exception, "failed_deployment_id", None):
@@ -8666,11 +8697,31 @@ def _mark_exception_for_deployment_failover(
             exception.failed_deployment_route_key = route_key  # type: ignore[attr-defined]
         except Exception:
             pass
-    deployment_order = _deployment_order_from_request(request_kwargs)
-    if isinstance(remembered_route, dict) and remembered_route.get("order") is not None:
+    deployment_order = _responses_execution_module._failed_deployment_order(exception)
+    if deployment_order is None and isinstance(selected_marker, dict):
+        marker_info = selected_marker.get("model_info")
+        marker_params = selected_marker.get("litellm_params")
+        marker_id = marker_info.get("id") if isinstance(marker_info, dict) else None
+        if marker_id == deployment_id:
+            marker_order = (
+                marker_info.get("order") if isinstance(marker_info, dict) else None
+            )
+            if marker_order is None and isinstance(marker_params, dict):
+                marker_order = marker_params.get("order")
+            deployment_order = _coerce_order(marker_order)
+            if deployment_order is None and isinstance(marker_info, dict):
+                deployment_order = _order_from_route_key(marker_info.get("route_key"))
+    if deployment_order is None and isinstance(remembered_route, dict) and remembered_route.get("order") is not None:
         # The rebuilt request carries no deployment context, so the order read
         # above is this proxy's default rather than the route's own.
-        deployment_order = _coerce_order(remembered_route.get("order"))
+        if remembered_route.get("deployment_id") == deployment_id:
+            deployment_order = _coerce_order(remembered_route.get("order"))
+    if deployment_order is None and (
+        not failed_id_from_exception or request_deployment_id == deployment_id
+    ) and _request_allows_failed_deployment_order(request_kwargs):
+        deployment_order = _deployment_order_from_request(request_kwargs)
+    if deployment_order is None:
+        deployment_order = _order_from_route_key(route_key)
     deployment_surface = _request_current_upstream_surface(request_kwargs) or (
         remembered_route.get("surface") if isinstance(remembered_route, dict) else None
     )
@@ -8683,7 +8734,10 @@ def _mark_exception_for_deployment_failover(
             pass
     if (
         deployment_order is not None
-        and _request_allows_failed_deployment_order(request_kwargs)
+        and (
+            _request_allows_failed_deployment_order(request_kwargs)
+            or bool(failed_id_from_exception or route_key)
+        )
         and getattr(exception, "failed_deployment_order", None) is None
     ):
         try:
@@ -8739,7 +8793,10 @@ def _mark_exception_for_upstream_surface_failover(
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> None:
-    if _is_forced_tool_choice_unsupported_error(exception, request_kwargs):
+    if (
+        _is_forced_tool_choice_unsupported_error(exception, request_kwargs)
+        and _can_relax_tool_choice(request_kwargs)
+    ):
         _mark_protocol_fallback_relax_tool_choice(request_kwargs)
     try:
         exception.upstream_surface_unsupported = True  # type: ignore[attr-defined]
@@ -10931,21 +10988,11 @@ def _is_forced_tool_choice_auto_retry_error(
 
 
 def _is_thinking_tool_choice_unsupported_error(exception: Exception) -> bool:
-    """Whether the upstream refuses *any* ``tool_choice`` in thinking mode.
+    """Recognize an upstream refusal of a tool choice in thinking mode.
 
-    DeepSeek answers ``400 thinking mode does not support this tool_choice`` to a
-    payload that carries ``tool_choice`` -- including ``auto`` -- whenever the
-    request also asks for reasoning.  The refusal is not the field: measured
-    live 2026-11-04, the identical replay with ``tool_choice`` removed is refused
-    the same way, and the same payload signature is served outright about half
-    the time (160 of 305 attempts on one deployment).  So it is the route
-    answering about this turn, and what it must not do is keep its place in
-    front of a sibling that can answer.
-
-    Read on the wording plus the status, never on the status alone: a 400 that
-    names ``tool_choice`` for a *validation* reason (a tool that does not exist)
-    is the caller's body, and a route that would have answered it keeps its
-    place.
+    The official DeepSeek API accepts ``auto`` but rejects forced choices in
+    thinking mode. The proxy's deployment hook can inject a forced choice
+    after the request summary, so the summary alone does not show the wire body.
     """
 
     if _exception_status_code(exception) not in {400, 422}:

@@ -1429,7 +1429,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     // was announced as an unselected, enabled button on every page: the
     // sidebar's current pane, the selected provider and a switched-off entry
     // all read alike.  The hosts keep the state they do honour.
-    aria-selected={spanning ? undefined : selected}
+    aria-selected={spanning && !selectableSpanning ? undefined : selected}
     aria-disabled={spanning ? (disabled || !selectableSpanning) || undefined : disabled || undefined}
     style={rowStyle}
   >

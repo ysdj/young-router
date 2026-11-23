@@ -22,6 +22,115 @@ class RustDispatchTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_deepseek_forced_choice_keeps_thinking_at_rust_dispatch(self) -> None:
+        self.run_router_probe('''
+            import asyncio
+            from unittest.mock import patch
+
+            import litellm
+            from litellm import Router
+            from litellm.proxy import proxy_server
+            from young_router.proxy import patches
+
+            patches.install_all()
+            router = Router(model_list=[
+                {
+                    "model_name": "probe",
+                    "litellm_params": {"model": "openai/fixture", "api_base": url, "order": order, "api_key": "sk-fake"},
+                    "model_info": {"id": route},
+                }
+                for order, (route, url) in enumerate([
+                    ("primary", "https://api.deepseek.com/v1"),
+                    ("peer", "https://peer.example/v1"),
+                ])
+            ], num_retries=2, disable_cooldowns=True)
+            proxy_server.llm_router = router
+
+            async def main():
+                calls = []
+
+                async def provider(**kwargs):
+                    route = kwargs["model_info"]["id"]
+                    calls.append((route, kwargs.get("tool_choice"), kwargs.get("reasoning")))
+                    return {"output": [], "status": "completed"}
+
+                tools = [{"type": "function", "name": "fixture_tool", "parameters": {"type": "object"}}]
+                async def request(choice):
+                    return await router.aresponses(
+                        model="probe", input="test", tools=tools, tool_choice=choice,
+                        reasoning={"effort": "low"},
+                    )
+
+                with patch.object(litellm, "aresponses", provider):
+                    named = {"type": "function", "name": "fixture_tool"}
+                    await request("required")
+                    await request(named)
+                    await request("auto")
+                    assert calls == [
+                        ("primary", "auto", {"effort": "low"}),
+                        ("primary", "auto", {"effort": "low"}),
+                        ("primary", "auto", {"effort": "low"}),
+                    ], calls
+
+            asyncio.run(main())
+            ''')
+
+    def test_deepseek_refusal_repairs_unknown_route_at_rust_dispatch(self) -> None:
+        self.run_router_probe('''
+            import asyncio
+            from types import SimpleNamespace
+            from unittest.mock import patch
+
+            import litellm
+            from litellm import Router
+            from litellm.proxy import proxy_server
+            from young_router.proxy import patches
+
+            patches.install_all()
+            router = Router(model_list=[{
+                "model_name": "probe",
+                "litellm_params": {"model": "openai/fixture", "api_key": "sk-fake"},
+                "model_info": {"id": "primary"},
+            }], num_retries=0, disable_cooldowns=True)
+            proxy_server.llm_router = router
+
+            class Refusal(Exception):
+                status_code = 400
+                request = SimpleNamespace(
+                    method="POST", url="https://api.openai.com/v1"
+                )
+
+            class TransportRefusal(Exception):
+                request = SimpleNamespace(
+                    method="POST", url="https://api.deepseek.com/v1/responses"
+                )
+
+            async def main():
+                calls = []
+
+                async def provider(**kwargs):
+                    calls.append((kwargs["model_info"]["id"], kwargs.get("tool_choice"), kwargs.get("reasoning")))
+                    if len(calls) == 1:
+                        try:
+                            raise TransportRefusal()
+                        except TransportRefusal:
+                            raise Refusal("thinking mode does not support this tool_choice") from None
+                    return {"output": [], "status": "completed"}
+
+                with patch.object(litellm, "aresponses", provider):
+                    await router.aresponses(
+                        model="probe", input="test",
+                        tools=[{"type": "function", "name": "fixture_tool", "parameters": {"type": "object"}}],
+                        tool_choice="required", reasoning={"effort": "high"},
+                    )
+                assert calls == [
+                    ("primary", "required", {"effort": "high"}),
+                    ("primary", "auto", {"effort": "high"}),
+                ], calls
+
+            asyncio.run(main())
+            ''')
+
     def test_responses_wait_through_an_all_route_network_outage(self) -> None:
         self.run_router_probe('''
             import asyncio

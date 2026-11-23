@@ -659,7 +659,7 @@ def _catalog_model(
     # compact, and the catalogs that describe one state its limit as ``0``.  The
     # entry is still published -- ``/v1/models`` serves every route this app
     # serves -- but it is published without a number rather than with the
-    # unknown-model placeholder, which would claim 272,000 tokens of memory for
+    # unknown-model placeholder, which would claim 500,000 tokens of memory for
     # a model that never reads a prompt.
     if context.context_window > 0:
         model["context_window"] = context.context_window
