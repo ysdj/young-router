@@ -1,6 +1,6 @@
 services:
   young-router:
-    image: ${YOUNG_ROUTER_IMAGE:-ghcr.io/ysdj/young-router:latest}
+    image: ${YOUNG_ROUTER_IMAGE:-ghcr.io/ysdj/young-router:main}
     init: true
     restart: unless-stopped
     ports:
