@@ -10,6 +10,10 @@ services:
     volumes:
       - router-data:/data
     shm_size: 256m
+    # Chromium keeps its own sandbox; this profile permits only the namespace
+    # syscalls that Docker's default profile blocks for that sandbox.
+    security_opt:
+      - seccomp:./chromium-seccomp.json
     stop_grace_period: 45s
 
 volumes:
