@@ -50,7 +50,6 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "opencode_config",
                     "opencode_auth",
                     "codex_agents",
-                    "codex_model_catalog",
                 },
                 set(files),
             )
@@ -74,13 +73,6 @@ class ClientFilesDomainTests(unittest.TestCase):
                 files["opencode_auth"]["path"],
             )
             self.assertEqual("json", files["opencode_auth"]["language"])
-            # The model catalog the Codex pane's switch installs is listed with
-            # the file name Core itself writes, under the same Codex home.
-            self.assertEqual("model-catalog.json", files["codex_model_catalog"]["name"])
-            self.assertEqual(
-                str(Path(directory) / "codex" / "model-catalog.json"),
-                files["codex_model_catalog"]["path"],
-            )
             self.assertFalse(files["pi_settings"]["exists"])
             self.assertTrue(all(row["domain"] == "clients" for row in files.values()))
             # The listing is display-only: it never carries file text.
@@ -199,7 +191,6 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "opencode_config",
                     "opencode_auth",
                     "codex_agents",
-                    "codex_model_catalog",
                 ],
                 [row["document"] for row in result["files"]],
             )
@@ -211,7 +202,7 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "claude", "claude", "claude",
                     "pi", "pi", "pi",
                     "dsh", "dsh", "opencode", "opencode",
-                    "codex", "codex",
+                    "codex",
                 ],
                 [row["client"] for row in result["files"]],
             )
@@ -220,7 +211,7 @@ class ClientFilesDomainTests(unittest.TestCase):
                 [row["app"] for row in result["files"] if row["client"] == "claude"],
             )
             self.assertEqual(
-                {"codex": 2, "claude": 3, "clients": 9},
+                {"codex": 2, "claude": 3, "clients": 8},
                 {
                     name: sum(1 for row in result["files"] if row["domain"] == name)
                     for name in ("codex", "claude", "clients")
@@ -290,25 +281,24 @@ class ClientFilesDomainTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 client.call("editor", {"domain": "clients", "document": "unregistered"})
 
-    def test_the_managed_catalog_opens_past_the_old_two_megabyte_ceiling(self) -> None:
-        """A registered file this app generates must stay openable.
+    def test_a_large_registered_document_opens_past_the_old_two_megabyte_ceiling(self) -> None:
+        """A large registered file must stay openable.
 
-        The managed Codex catalog already exceeds 2 MB for a 26-model list,
-        and the pane offers it to the raw editor, so the read has to hand over
-        the whole document and the stage has to accept it back.
+        A client's registered JSON can exceed 2 MB, so the read has to hand
+        over the whole document and the stage has to accept it back.
         """
 
         with tempfile.TemporaryDirectory() as directory:
             environment = _client_environment(directory)
-            catalog = Path(environment["CODEX_HOME"]) / "model-catalog.json"
-            catalog.parent.mkdir(parents=True, exist_ok=True)
+            models = Path(environment["PI_CODING_AGENT_DIR"]) / "models.json"
+            models.parent.mkdir(parents=True, exist_ok=True)
             document = json.dumps(
                 {"models": [{"slug": f"model-{index}", "base_instructions": "x" * 8192} for index in range(300)]},
                 indent=2,
             )
             self.assertGreater(len(document.encode("utf-8")), 2 * 1024 * 1024)
             self.assertLess(len(document.encode("utf-8")), MAX_EDITOR_DOCUMENT_BYTES)
-            catalog.write_text(document, encoding="utf-8")
+            models.write_text(document, encoding="utf-8")
 
             with mock.patch.dict(os.environ, environment):
                 clients = ClientSettingsDomain()
@@ -319,7 +309,7 @@ class ClientFilesDomainTests(unittest.TestCase):
             client = CoreIPCClient(endpoint, server.bootstrap_token)
             self.addCleanup(client.close)
 
-            editor = client.call("editor", {"domain": "clients", "document": "codex_model_catalog"})
+            editor = client.call("editor", {"domain": "clients", "document": "pi_models"})
             self.assertEqual(document, editor["text"])
             self.assertEqual(document, editor["baseline"])
 
@@ -334,22 +324,22 @@ class ClientFilesDomainTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             environment = _client_environment(directory)
-            catalog = Path(environment["CODEX_HOME"]) / "model-catalog.json"
-            catalog.parent.mkdir(parents=True, exist_ok=True)
-            catalog.write_text(json.dumps({"models": [], "padding": "x" * (MAX_EDITOR_DOCUMENT_BYTES + 1)}), encoding="utf-8")
+            models = Path(environment["PI_CODING_AGENT_DIR"]) / "models.json"
+            models.parent.mkdir(parents=True, exist_ok=True)
+            models.write_text(json.dumps({"models": [], "padding": "x" * (MAX_EDITOR_DOCUMENT_BYTES + 1)}), encoding="utf-8")
 
             with mock.patch.dict(os.environ, environment):
                 clients = ClientSettingsDomain()
             core = CoreStore(domains=[clients])
 
             with self.assertRaises(CoreError) as caught:
-                core.editor_document("clients", "codex_model_catalog")
+                core.editor_document("clients", "pi_models")
             self.assertEqual("editor_too_large", caught.exception.code)
 
             with self.assertRaises(CoreError) as caught:
                 core.stage_editor_text(
                     "clients",
-                    "codex_model_catalog",
+                    "pi_models",
                     "x" * (MAX_EDITOR_DOCUMENT_BYTES + 1),
                     revision=core.snapshot()["revision"],
                 )

@@ -475,6 +475,15 @@ private enum NativeRelayOriginPolicy {
             // app locked until it closes, exactly like the model chooser. A
             // window that is already up is only brought forward, never given a
             // second modal session.
+            if ["codex-api-settings", "claude-api-settings"].contains(windowRoute) {
+                // A warmed form booted while hidden; its root must read the
+                // live connection again when the window is presented instead
+                // of showing the values it captured at startup.  This is not
+                // an `open-*` action: every React root answers those, and the
+                // window manager root would re-open this child, which made the
+                // form order itself to the front in a loop.
+                emitAction("present-\(windowRoute)")
+            }
             if isChildPanel(window) {
                 NSApp.activate(ignoringOtherApps: true)
                 configureImmediatePresentation(window)
@@ -499,6 +508,16 @@ private enum NativeRelayOriginPolicy {
     /// accessor below; the host never parses its contents.
     func pendingFileEditorTarget() -> String {
         pendingFileEditorTargetValue ?? ""
+    }
+
+    /// Create both API edit windows without presenting them, so their React
+    /// roots boot before the user asks for one. Safe to call repeatedly.
+    func prepareDirectApiWindows() {
+        for route in ["codex-api-settings", "claude-api-settings"] where routeWindows[route] == nil {
+            guard let title = routeWindowTitle(route) else { continue }
+            open(route: route, title: title, warmOnly: true)
+        }
+        updateActivationPolicy()
     }
 
     /// Create the editor window without presenting it, so its embedded editor
@@ -542,6 +561,7 @@ private enum NativeRelayOriginPolicy {
         let selectedRoute = route.map(canonicalRoute)
             ?? NSApp.keyWindow.flatMap(routeForWindow)
         guard let selectedRoute, let window = routeWindows[selectedRoute] else { return }
+        let reWarmDirectApi = ["codex-api-settings", "claude-api-settings"].contains(selectedRoute)
         approvedCloseRoutes.insert(selectedRoute)
         defer { approvedCloseRoutes.remove(selectedRoute) }
         let restoreProviderModels = selectedRoute == "provider-wizard"
@@ -560,6 +580,13 @@ private enum NativeRelayOriginPolicy {
             restoreProviderModels.makeKeyAndOrderFront(nil)
         }
         updateActivationPolicy()
+        if reWarmDirectApi {
+            // The next click should present a booted form, not pay for this
+            // close's discarded root. Warm it again behind the workspace.
+            DispatchQueue.main.async { [weak self] in
+                self?.prepareDirectApiWindows()
+            }
+        }
     }
 
     func setWindowContentSize(route: String, width: Double, height: Double) -> Bool {

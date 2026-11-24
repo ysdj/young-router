@@ -1300,6 +1300,24 @@ _CACHE_WRITE_LOCK = threading.Lock()
 class ModelContextRegistry:
     """Resolve model context policy and periodically refresh its metadata."""
 
+    def cache_identity(self) -> tuple[object, ...]:
+        """What a memo of this registry's answers must be invalidated on.
+
+        Records can arrive from three places -- the cache file, a refresh, and
+        the caller's own stated windows -- so the identity is the file's stat
+        plus the record count: a same-size rewrite still moves the count when a
+        model is added, and the object identity of the map moves on every load.
+        """
+
+        identity: object = id(self._records)
+        if self.cache_path is not None:
+            try:
+                details = self.cache_path.stat()
+                identity = (identity, details.st_mtime_ns, details.st_size)
+            except OSError:
+                pass
+        return (identity, len(self._records))
+
     def __init__(
         self,
         *,

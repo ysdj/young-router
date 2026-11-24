@@ -54,6 +54,7 @@ from .protocol import (
 from .protocol import _encode_json
 from .security import safe_error_message
 from .service import ConfirmationNeeded, CoreError, CoreStore, PreparedImport, RevisionConflict
+from .model_catalog import SERVED_CATALOG_ROUTE
 
 
 def _failure_response(request_id: str, code: object, message: object, *, retryable: bool = False) -> ResponseEnvelope:
@@ -1312,8 +1313,44 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send(200 if response.ok else 400, response.to_mapping())
 
+    def _catalog_request_authorized(self) -> bool:
+        """Whether this request carries the proxy's own master key.
+
+        The catalog is fetched by the *client*, not by the page: Codex sends the
+        provider's credential, which on this route is the router key.  Only that
+        key is accepted -- a page session is a browser credential and has no
+        business reading the client's catalog.
+        """
+
+        expected = ""
+        try:
+            expected = self._owner.core.local_master_key()
+        except Exception:
+            return False
+        if not expected:
+            return False
+        presented = ""
+        authorization = self.headers.get("Authorization", "")
+        if authorization[:7].lower() == "bearer ":
+            presented = authorization[7:].strip()
+        if not presented:
+            presented = (self.headers.get("X-Api-Key", "") or "").strip()
+        if not presented:
+            return False
+        return hmac.compare_digest(presented, expected)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler hook
         route = urlsplit(self.path)
+        if route.path.rstrip("/") == SERVED_CATALOG_ROUTE:
+            if not self._catalog_request_authorized():
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            # A client's discovery names its own version; a person typing the
+            # address does not, and gets the indented form to read.
+            pretty = "client_version" not in parse_qs(route.query, keep_blank_values=True)
+            status, body = self._owner.core.codex_catalog_response(pretty=pretty)
+            self._send_encoded(status, body)
+            return
         if route.path.rstrip("/") != "/ipc/events":
             if self._owner.serve_web_host(self, route.path):
                 return

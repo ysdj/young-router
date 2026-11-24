@@ -274,6 +274,21 @@ def _cache_key(executable: Path) -> tuple[str, int, int] | None:
     return (str(executable), int(details.st_mtime_ns), int(details.st_size))
 
 
+def native_catalog_identity() -> tuple[str, int, int] | None:
+    """The installed catalog's own identity: executable, mtime and size.
+
+    A catalog memo keyed on this rebuilds exactly when the client it was read
+    from changes, which is the only way its prompts can change underneath a
+    caller that is holding the parsed answer.
+    """
+
+    for executable in native_codex_executable_candidates():
+        key = _cache_key(executable)
+        if key is not None:
+            return key
+    return None
+
+
 def load_native_catalog() -> list[dict[str, Any]]:
     """Load and cache the native catalog, invalidating when the binary changes."""
 
@@ -296,6 +311,7 @@ def load_native_catalog() -> list[dict[str, Any]]:
 
 __all__ = [
     "NATIVE_CATALOG_MAX_BYTES",
+    "native_catalog_identity",
     "NATIVE_CATALOG_TIMEOUT_SECONDS",
     "load_native_catalog",
     "native_codex_client_version",

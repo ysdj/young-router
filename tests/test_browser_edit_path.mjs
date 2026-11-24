@@ -27,6 +27,10 @@ import path from "node:path";
 const pageUrl = process.argv[2];
 const jsonOnly = process.argv.includes("--json");
 const sessionLimitRetry = process.argv.includes("--session-limit-retry");
+const confirmedLogoutIndex = process.argv.indexOf("--confirmed-logout");
+const confirmedLogout = confirmedLogoutIndex >= 0 ? process.argv[confirmedLogoutIndex + 1] : undefined;
+const automaticLoginProgressIndex = process.argv.indexOf("--automatic-login-progress");
+const automaticLoginRelease = automaticLoginProgressIndex >= 0 ? process.argv[automaticLoginProgressIndex + 1] : undefined;
 const resizeColumnsIndex = process.argv.indexOf("--resize-columns");
 const modelSelectionIndex = process.argv.indexOf("--model-selection");
 const modelSelection = modelSelectionIndex >= 0 ? process.argv[modelSelectionIndex + 1] : undefined;
@@ -111,10 +115,38 @@ async function openTarget(port, url, shaping) {
   await cdp.send("Network.enable");
   await cdp.send("Runtime.enable");
   await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 950, deviceScaleFactor: 1, mobile: false });
-  if (resizeColumnsIndex >= 0 || modelSelection || sessionLimitRetry || rowChange || routeNavigation || groupSelection || traceSelectionIndex >= 0) {
+  if (resizeColumnsIndex >= 0 || modelSelection || sessionLimitRetry || confirmedLogout || automaticLoginRelease || rowChange || routeNavigation || groupSelection || traceSelectionIndex >= 0) {
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
       source: `Object.defineProperty(navigator, "languages", { get: () => [${modelSelection || rowChange || routeNavigation || groupSelection || traceSelectionIndex >= 0 ? '"en"' : '"zh-CN"'}] });`,
     });
+  }
+  if (confirmedLogout) {
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      const fetchCore = window.fetch.bind(window);
+      window.relayChecks = 0;
+      window.fetch = async (url, init) => {
+        const response = await fetchCore(url, init);
+        if (new URL(url, location.href).pathname === "/ipc/host/relay/restore") window.relayChecks += 1;
+        return response;
+      };` });
+  }
+  if (automaticLoginRelease) {
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      window.relayLoginStatusHistory = [];
+      const readRelayLoginStatus = () => {
+        const row = [...document.querySelectorAll('[role="button"][aria-label]')]
+          .find((node) => node.getAttribute('aria-label').startsWith('fixture, '));
+        const status = row?.getAttribute('aria-label').split(',')[1]?.trim();
+        if (status && window.relayLoginStatusHistory.at(-1) !== status) window.relayLoginStatusHistory.push(status);
+      };
+      const watchRelayLoginStatus = () => {
+        if (!document.documentElement) { requestAnimationFrame(watchRelayLoginStatus); return; }
+        new MutationObserver(readRelayLoginStatus).observe(document.documentElement, {
+          subtree: true, childList: true, attributes: true, attributeFilter: ['aria-label'],
+        });
+        readRelayLoginStatus();
+      };
+      watchRelayLoginStatus();` });
   }
   if (traceSelectionIndex >= 0) {
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
@@ -179,11 +211,12 @@ async function openTarget(port, url, shaping) {
         const mutation = request?.method === 'dispatch' && request.params.action.type === ${JSON.stringify(action)};
         if (mutation) actionStarted = true;
         const response = await fetchCore(url, init);
+        if (${rowChange === "delete-account"} && path === '/ipc/host/relay/restore' && response.ok) {
+          const body = init?.body ? JSON.parse(init.body) : {};
+          if (body.account_id) window.accountRefreshes.add(body.account_id);
+        }
         if (${rowChange === "delete-account"} && (request?.method === 'dispatch' || request?.method === 'apply')) {
           const body = await response.clone().json();
-          if (body.ok && request?.params?.action?.type === 'resources.refresh') {
-            window.accountRefreshes.add(request.params.action.payload.account_id);
-          }
           if (body.ok && request?.params?.action?.type === 'provider.select_relay_station') window.accountProviderLinked = true;
           if (body.ok && request?.method === 'apply' && window.accountProviderLinked) window.accountBootstrapApplied = true;
         }
@@ -326,8 +359,8 @@ async function checkRowChange(cdp, name) {
   const { action, before, after, answerFirst, routes } = rowChanges[name];
   if (routes) await clickControl(cdp, '[aria-label="Routes"]');
   if (name === "delete-account") {
-    // The fixture starts three account probes and an automatic provider bind.
-    // Let their writes finish before exercising the account deletion itself.
+    // The fixture checks each of its three saved accounts and automatically
+    // binds their station before exercising the account deletion itself.
     await waitForValue(cdp, "window.accountRefreshes.size === 3 && window.accountBootstrapApplied");
   }
   const beforeLabel = before.split("/").at(-1);
@@ -742,6 +775,28 @@ async function main() {
       }
     }
     if (!ready) throw new Error("the browser did not open its debugging port");
+
+    if (confirmedLogout) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      await waitForValue(cdp, `window.relayChecks === 1 && document.body.innerText.includes("未确认")`);
+      assert.equal((await fetch(confirmedLogout, { method: "POST" })).status, 204);
+      await waitForValue(cdp, `window.relayChecks === 2 && document.body.innerText.includes("已登录")`);
+      result.ok = true;
+      return;
+    }
+
+    if (automaticLoginRelease) {
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      await waitForValue(cdp, `window.relayLoginStatusHistory.includes("登录中")`);
+      const duringLogin = await evaluate(cdp, `window.relayLoginStatusHistory.slice()`);
+      assert.deepEqual(duringLogin, ["检测中", "登录中"]);
+      assert.equal((await fetch(automaticLoginRelease, { method: "POST" })).status, 204);
+      await waitForValue(cdp, `window.relayLoginStatusHistory.at(-1) === "已登录"`);
+      result.measured.loginStatusHistory = await evaluate(cdp, `window.relayLoginStatusHistory.slice()`);
+      assert.deepEqual(result.measured.loginStatusHistory, ["检测中", "登录中", "已登录"]);
+      result.ok = true;
+      return;
+    }
 
     if (sessionLimitRetry) {
       cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);

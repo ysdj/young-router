@@ -1957,10 +1957,6 @@ function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): 
   return Object.keys(state).length > 0 ? state : record;
 }
 
-function codexModelCatalogState(snapshot: CoreSnapshot | undefined): UnknownRecord {
-  return asRecord(domainState(snapshot, "codex").model_catalog);
-}
-
 function domainForRoute(route: AppRoute): ConfigDomain | undefined {
   switch (route) {
     case "providers-models": return "providers_models";
@@ -2797,7 +2793,12 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   // defer (no concurrent root), this is the value itself and nothing changes.
   const drawnPane = useDeferredValue(pane);
   useEffect(() => {
-    if (!nativeAction?.id.startsWith("request-close-") || closing.current) return;
+    // The native host broadcasts a close request to every React root.  Only
+    // the request naming this settings window may close it: a child's title
+    // bar close is answered by the child's own root, and closing the shell on
+    // it left the app with nothing on screen.
+    const closeAction = `request-close-${windowRoute}`;
+    if (nativeAction?.id !== closeAction || closing.current) return;
     closing.current = true;
     void (async () => {
       let canClose = true;
@@ -3207,9 +3208,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // in a native child window of its own, which needs the host to show it.
   const [inlineEditorFile, setInlineEditorFile] = useState<ClientFile>();
   useEffect(() => {
-    // Warm the host's editor window while the pane is open: creating the window
-    // boots the embedded editor, so opening a file only presents the window.
+    // Warm the host's editor and API-form windows while the pane is open:
+    // creating a window boots its React root, so opening it only presents the
+    // warm surface instead of paying that boot on the click.
     native.prepareFileEditor?.();
+    native.prepareDirectApiWindows?.();
   }, [native]);
   const [dataManagementStatuses, setDataManagementStatuses] = useState<Partial<Record<DataManagementTab, string>>>({});
   // Which backup & sync tab is showing, so the window's one status strip
@@ -4650,6 +4653,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   }), [applyStagedQuietly, commitRelayMetadata, detectRelayType, refresh, refreshRelayResources, relayApiKeyActions]);
   const codexState = asRecord(domainState(snapshot, "codex"));
   const codexUsesLocalApi = booleanValue(codexState.uses_local_api);
+  const codexUsesYrapiApi = booleanValue(codexState.uses_yrapi_api);
   // Codex's Responses Lite lane never carries the hosted web_search tool, so the
   // provider row's standalone opt-in is the only thing that gives these routes a
   // real search executor. The pane shows the row's own state, not a Codex default.
@@ -4658,7 +4662,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // The pane's Codex switch mirrors the managed catalog the macOS status menu
   // toggles: checked installs this app's public model list as Codex's own
   // catalog, unchecked removes the pointer so Codex keeps its built-in list.
-  const codexModelCatalogEnabled = booleanValue(codexModelCatalogState(snapshot).enabled);
   const claudeState = asRecord(domainState(snapshot, "claude"));
   const claudeClients = asRecord(claudeState.clients);
   // One strip per window. Backup & sync reports per tab, so the strip shows the
@@ -4685,7 +4688,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   }, [route]);
 
   if (directApiClient) return <View style={[styles.windowSurface, styles.childRouteContent]}>
-    <DirectApiSettings key={directApiClient} client={directApiClient} native={native} ipc={ipc} translate={translate} onClose={closeRoute} />
+    <DirectApiSettings key={directApiClient} client={directApiClient} native={native} ipc={ipc} translate={translate} nativeAction={nativeAction} onClose={closeRoute} />
   </View>;
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
@@ -4695,14 +4698,16 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} applyStagedQuietly={applyStagedQuietly} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace
-      initialClient={initialClient} busy={busy} native={native} codexModelCatalogEnabled={codexModelCatalogEnabled}
+      initialClient={initialClient} busy={busy} native={native}
       standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")}
-      codexFeatures={asRecord(codexStructured.features)} localApiActive={codexUsesLocalApi}
+      codexFeatures={asRecord(codexStructured.features)} localApiActive={codexUsesLocalApi} yrapiActive={codexUsesYrapiApi}
       onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")}
       onApplyClientSettings={applyStagedQuietly} onUseLocalApi={() => dispatch("use_local_api", {}, "codex")}
+      onLeaveLocalApi={() => dispatch("leave_local_api", {}, "codex")}
       claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }}
       claudeDesktopAvailable={asRecord(claudeState.desktop).available !== false}
       onClaudeUseLocalApi={(app) => dispatch("use_local_api", { client: app }, "claude")}
+      onClaudeLeaveLocalApi={(app) => dispatch("leave_local_api", { client: app }, "claude")}
       onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")}
       onToggleClaudeAutoMode={(enabled) => dispatch("claude.auto_mode.set", { enabled }, "claude")}
       onToggleClaudeAutoMemory={(enabled) => dispatch("claude.auto_memory.set", { enabled }, "claude")}
@@ -8764,10 +8769,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </View>
       </View>}
     </View>}
-    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} onRename={renamePublicModel} /> : activeRoute ? (providerSourceModel === editorIdentifier(activeRoute.model) ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
+    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} onRename={renamePublicModel} /> : activeRoute ? (providerSourceModel === editorIdentifier(activeRoute.model) ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
-                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), destinationId, activeRoute.key)} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { clearPendingSelection(); setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(providerId, editorIdentifier(model), destinationId)} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
+                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), destinationId, activeRoute.key)} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { clearPendingSelection(); setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(providerId, editorIdentifier(model), destinationId)} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
     : null}
     <RelayDialogHost />
   </View></ProviderWorkspaceDraftContext.Provider>;
@@ -10526,7 +10531,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
   </View>;
 }
 
-function ProviderEditor({ provider, relayStations, native, busy, translate, dispatch, dispatchWithOutcome, onSecretState, onNameDraftChange, sourceModel, onReturnToModel, station, stationAccounts, relay, onStatus, language, bindingIssues, snapshotForCleanups }: { provider: UnknownRecord; relayStations: RelayStationOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onNameDraftChange?: (name: string) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void; station?: RelayStation; stationAccounts: RelayAccount[]; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot }): React.JSX.Element {
+function ProviderEditor({ provider, relayStations, ipc, native, busy, translate, dispatch, dispatchWithOutcome, onSecretState, onNameDraftChange, sourceModel, onReturnToModel, station, stationAccounts, relay, onStatus, language, bindingIssues, snapshotForCleanups }: { provider: UnknownRecord; relayStations: RelayStationOption[]; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onNameDraftChange?: (name: string) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void; station?: RelayStation; stationAccounts: RelayAccount[]; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot }): React.JSX.Element {
   const id = editorIdentifier(provider);
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const kind = providerKind(provider);
@@ -11067,6 +11072,7 @@ function ProviderEditor({ provider, relayStations, native, busy, translate, disp
       key={`station-accounts:${station.id}`}
       station={station}
       accounts={stationAccounts}
+      ipc={ipc}
       native={native}
       language={language}
       cleanups={pendingCredentialCleanups(snapshotForCleanups)}
@@ -11149,13 +11155,6 @@ const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey
 
 /** The apps inside the one Claude rail entry. */
 type ClaudeClientApp = "claudeCode" | "claudeDesktop";
-
-/**
- * The managed model catalog row Core registers for Codex.  This app rewrites
- * that one file from its public model list, so the pane asks before opening
- * it while the switch is on; every other listed file opens directly.
- */
-const CODEX_MODEL_CATALOG_FILE_ID = "codex_model_catalog";
 
 /**
  * The Claude Code document Core writes a generated picker into.  Claude Code
@@ -11485,12 +11484,15 @@ function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
 
 type DirectApiClient = "codex" | "claude";
 
-function ClientBackendFields({ client, native, localApiActive, busy, onUseLocalApi, translate }: {
+function ClientBackendFields({ client, native, apiActive, busy, onUseLocalApi, onLeaveLocalApi, translate }: {
   client: DirectApiClient;
   native: NativeLeafAdapter;
-  localApiActive: boolean;
+  /** True only while the client carries this app's whole API identity. */
+  apiActive: boolean;
   busy: boolean;
   onUseLocalApi: () => Promise<unknown>;
+  /** Restores a remembered direct connection before the form opens. */
+  onLeaveLocalApi: () => Promise<unknown>;
   translate: Translate;
 }): React.JSX.Element {
   const [clientActionBusy, setClientActionBusy] = useState(false);
@@ -11503,15 +11505,19 @@ function ClientBackendFields({ client, native, localApiActive, busy, onUseLocalA
   };
   const toggleLocalApi = async (enabled: boolean): Promise<void> => {
     if (clientActionBusy) return;
-    if (!enabled) {
-      // The switch reflects the file until the child saves a replacement.
-      setSwitchGeneration((current) => current + 1);
-      openDirectApi();
-      return;
-    }
     setClientActionBusy(true);
     try {
-      if (await onUseLocalApi() === false) setSwitchGeneration((current) => current + 1);
+      // On replaces the connection with this app's own API identity.  Off
+      // restores the remembered direct triplet (when there is one) and opens
+      // the form that edits it; the form's saved values decide whether the
+      // switch comes back on, so editing and the switch stay one state.
+      if (enabled) {
+        if (await onUseLocalApi() === false) setSwitchGeneration((current) => current + 1);
+      } else {
+        const answer = await onLeaveLocalApi();
+        if (answer === false) setSwitchGeneration((current) => current + 1);
+        else openDirectApi();
+      }
     } finally {
       setClientActionBusy(false);
     }
@@ -11523,7 +11529,7 @@ function ClientBackendFields({ client, native, localApiActive, busy, onUseLocalA
           <NativeToggle
             key={`use-local-api-${switchGeneration}`}
             accessibilityLabel={label}
-            value={localApiActive}
+            value={apiActive}
             disabled={busy || clientActionBusy}
             onValueChange={toggleLocalApi}
             style={SETTINGS_FIELD_SWITCH_SLOT}
@@ -11541,25 +11547,60 @@ type DirectApiSettingsProps = {
   native: NativeLeafAdapter;
   ipc: IpcClient;
   translate: Translate;
+  nativeAction?: { id: string; sequence: number };
   onClose: () => void;
 };
 
+function directApiConnectionFingerprint(connection: UnknownRecord | undefined): string {
+  if (!connection) return "";
+  // The fields the form initializes from.  The key itself is never part of the
+  // snapshot; key_configured tells the key row whether it has a value to read.
+  return JSON.stringify([
+    connection.base_url,
+    connection.model,
+    connection.model_catalog_url,
+    connection.auth_mode,
+    connection.key_configured,
+  ]);
+}
+
 function DirectApiSettings(props: DirectApiSettingsProps): React.JSX.Element {
-  const { client, ipc, translate, onClose } = props;
+  const { client, ipc, translate, nativeAction, onClose } = props;
   const [connection, setConnection] = useState<UnknownRecord>();
+  const [generation, setGeneration] = useState(0);
   const [error, setError] = useState<string>();
+  const loadedConnection = useRef<UnknownRecord | undefined>(undefined);
+  // Only the window's own presentation event re-reads the form.  The child
+  // root hears every menu action too; remounting on one of those would throw
+  // away an edit the person is still typing.  It is deliberately not named
+  // `open-*`: every root also answers a native open, and re-opening this child
+  // from the window manager host made the window order itself front forever.
+  const presented = nativeAction?.id === `present-${client}-api-settings` ? nativeAction.sequence : 0;
   useEffect(() => {
     let active = true;
     // A child window may mount from the shell's cached snapshot immediately
     // after a save. Read the committed connection before initializing fields.
+    // A warmed window keeps its root alive while hidden, so presenting it sends
+    // a native action: read again instead of showing the values it booted with.
+    // Rebuilding the form is only for a connection that actually changed:
+    // remounting an unchanged one dropped the focus the newly presented field
+    // had just received, which read as the field flashing and resetting.
     void ipc.snapshot().then((current) => {
-      if (active) setConnection(asRecord(domainState(current, client).direct_api));
+      if (!active) return;
+      const next = asRecord(domainState(current, client).direct_api);
+      if (loadedConnection.current
+          && directApiConnectionFingerprint(loadedConnection.current) === directApiConnectionFingerprint(next)) {
+        return;
+      }
+      loadedConnection.current = next;
+      setConnection(next);
+      setGeneration((value) => value + 1);
     }, (reason: unknown) => {
       if (active) setError(errorMessage(reason, translate));
     });
     return () => { active = false; };
-  }, [client, ipc, translate]);
-  if (connection) return <DirectApiForm {...props} connection={connection} />;
+  }, [client, ipc, translate, presented]);
+  if (connection) return <DirectApiForm key={`${client}-${generation}`} {...props} connection={connection} />;
   return <>
     <View style={assistantFileSurfaceStyles.editorLoading}>
       <Text style={assistantFileSurfaceStyles.filesStatus}>{error ?? translate("common.loading")}</Text>
@@ -11796,23 +11837,28 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
   return <>{files.map(row)}</>;
 }
 
-function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCatalogEnabled, standaloneSearch, onToggleStandaloneSearch, codexFeatures, localApiActive, onToggleCodexFeature, onApplyClientSettings, onUseLocalApi, claudeClients, claudeDesktopAvailable, onClaudeUseLocalApi, onToggleClaudeNonstreamFallback, onToggleClaudeAutoMode, onToggleClaudeAutoMemory, translate, ipc, claudeRevision, filesToken, onOpenFile, onStatus }: {
+function AssistantSettingsWorkspace({ initialClient, busy, native, standaloneSearch, onToggleStandaloneSearch, codexFeatures, localApiActive, yrapiActive, onToggleCodexFeature, onApplyClientSettings, onUseLocalApi, onLeaveLocalApi, claudeClients, claudeDesktopAvailable, onClaudeUseLocalApi, onClaudeLeaveLocalApi, onToggleClaudeNonstreamFallback, onToggleClaudeAutoMode, onToggleClaudeAutoMemory, translate, ipc, claudeRevision, filesToken, onOpenFile, onStatus }: {
   /** The client the route named, when it named one (`claude-settings`). */
   initialClient?: ClientFile["client"];
   busy: boolean;
   native: NativeLeafAdapter;
-  codexModelCatalogEnabled: boolean;
   standaloneSearch: boolean;
   onToggleStandaloneSearch: (enabled: boolean) => Promise<unknown>;
   codexFeatures?: UnknownRecord;
+  /** The proxy URL is live; search and catalog controls belong to it. */
   localApiActive: boolean;
+  /** The client carries this app's whole API identity (the switch's on side). */
+  yrapiActive: boolean;
   onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<unknown>;
   onApplyClientSettings: () => Promise<void>;
   onUseLocalApi: () => Promise<unknown>;
+  /** The off position of the client switch. */
+  onLeaveLocalApi: () => Promise<unknown>;
   /** One entry per Claude app. */
   claudeClients: Record<ClaudeClientApp, UnknownRecord>;
   claudeDesktopAvailable: boolean;
   onClaudeUseLocalApi: (app: ClaudeClientApp) => Promise<unknown>;
+  onClaudeLeaveLocalApi: (app: ClaudeClientApp) => Promise<unknown>;
   onToggleClaudeNonstreamFallback: (enabled: boolean) => Promise<unknown>;
   onToggleClaudeAutoMode: (enabled: boolean) => Promise<unknown>;
   onToggleClaudeAutoMemory: (enabled: boolean) => Promise<unknown>;
@@ -11924,9 +11970,13 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
   const claudeApps: ReadonlyArray<{ app: ClaudeClientApp; state: UnknownRecord }> = claudeDesktopAvailable
     ? [{ app: "claudeCode", state: claudeCode }, { app: "claudeDesktop", state: claudeDesktop }]
     : [{ app: "claudeCode", state: claudeCode }];
-  const claudeLocalApiActive = claudeApps.every(({ state }) => booleanValue(state.uses_local_api));
+  const claudeYrapiActive = claudeApps.every(({ state }) => booleanValue(state.uses_yrapi_api));
   const useClaudeLocalApi = async (): Promise<boolean> => {
     for (const { app } of claudeApps) if (await onClaudeUseLocalApi(app) === false) return false;
+    return true;
+  };
+  const leaveClaudeLocalApi = async (): Promise<boolean> => {
+    for (const { app } of claudeApps) if (await onClaudeLeaveLocalApi(app) === false) return false;
     return true;
   };
   const useClaudeApiAndOfferPlugin = async (): Promise<boolean> => {
@@ -11967,9 +12017,8 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
     }).then((confirmed) => { if (confirmed) onOpenFile(file); });
   };
   const openClientFile = (file: ClientFile): void => {
-    // The two documents Core generates model lists into: Codex's own catalog
-    // file, and Claude Code's settings document, which holds its picker.
-    if (file.id === CODEX_MODEL_CATALOG_FILE_ID) { generatedFileOpen(file, codexModelCatalogEnabled); return; }
+    // Claude Code keeps its picker in its own settings document, so that
+    // generated file needs the overwrite warning before it opens.
     if (file.id === CLAUDE_CODE_SETTINGS_FILE_ID) { generatedFileOpen(file, booleanValue(claudeCode.model_list_enabled)); return; }
     onOpenFile(file);
   };
@@ -12000,9 +12049,10 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
           <ClientBackendFields
             client="codex"
             native={native}
-            localApiActive={localApiActive}
+            apiActive={yrapiActive}
             busy={busy}
             onUseLocalApi={() => saveLocalApi(onUseLocalApi)}
+            onLeaveLocalApi={() => saveLocalApi(onLeaveLocalApi)}
             translate={translate}
           />
           {/* The opt-in aims Codex at this proxy's own ``/alpha/search``. */}
@@ -12059,9 +12109,10 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModelCat
         {selectedClient === "claude" && files !== undefined ? <ClientBackendFields
             client="claude"
             native={native}
-            localApiActive={claudeLocalApiActive}
+            apiActive={claudeYrapiActive}
             busy={busy}
             onUseLocalApi={useClaudeApiAndOfferPlugin}
+            onLeaveLocalApi={() => saveLocalApi(leaveClaudeLocalApi)}
             translate={translate}
           /> : null}
         {selectedClient === "claude" ? <ModelListPluginFields

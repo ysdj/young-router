@@ -19,6 +19,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(SetTrayActions, L"setTrayActions");
   REACT_METHOD(OpenFileEditor, L"openFileEditor");
   REACT_METHOD(PrepareFileEditor, L"prepareFileEditor");
+  REACT_METHOD(PrepareDirectApiWindows, L"prepareDirectApiWindows");
   // Registered beside its sibling: the method was declared and implemented,
   // but without this line RNW never exposed it, so the shared bridge's
   // `leaf.openFilePicker?.(...)` resolved to undefined and Data Management
@@ -69,6 +70,7 @@ struct WinUI3NativeLeafModule {
   void SetTrayActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) noexcept;
   void OpenFileEditor(std::wstring const& target) noexcept;
   void PrepareFileEditor() noexcept;
+  void PrepareDirectApiWindows() noexcept;
   void OpenFilePicker(std::string const& purpose, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
   void SaveFilePicker(std::wstring const& suggested_name, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
   void ShowConfirmation(

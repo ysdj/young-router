@@ -281,6 +281,11 @@ void WinUI3NativeLeafModule::PrepareFileEditor() noexcept {
   // RNW host that would own a stale document.
 }
 
+void WinUI3NativeLeafModule::PrepareDirectApiWindows() noexcept {
+  // Windows keeps one React host; the API form is a plain route and needs no
+  // warm native window.  The shared bridge still asks so macOS can prewarm.
+}
+
 void WinUI3NativeLeafModule::OpenFilePicker(
     std::string const& purpose,
     winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept {

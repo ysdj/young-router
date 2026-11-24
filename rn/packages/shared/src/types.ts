@@ -79,7 +79,6 @@ export type EditorDocument =
   | "opencode_config"
   | "opencode_auth"
   | "codex_agents"
-  | "codex_model_catalog"
   | "disabled_models"
   | "relay_accounts";
 
@@ -113,8 +112,7 @@ export interface ClientFile {
     | "dsh_desktop_settings"
     | "opencode_config"
     | "opencode_auth"
-    | "codex_agents"
-    | "codex_model_catalog";
+    | "codex_agents";
   name: string;
   path: string;
   display_path: string;
@@ -563,7 +561,6 @@ export interface IpcParams {
         | "opencode_config"
         | "opencode_auth"
         | "codex_agents"
-        | "codex_model_catalog"
         | "disabled_models"
         | "relay_accounts";
     }
@@ -602,7 +599,6 @@ export interface IpcResults {
       | "opencode_config"
       | "opencode_auth"
       | "codex_agents"
-      | "codex_model_catalog"
       | "disabled_models"
       | "relay_accounts";
     editor_token: string;
@@ -1276,6 +1272,8 @@ export interface NativeLeafAdapter {
   openFileEditor?(target: string): void;
   /** Create the editor sheet's window (and boot its editor) ahead of time. */
   prepareFileEditor?(): void;
+  /** Create both API edit windows and boot their roots ahead of time. */
+  prepareDirectApiWindows?(): void;
   /** The document the host currently asks the editor sheet to show, as JSON. */
   pendingFileEditorTarget?(): string;
   setLocalization(strings: NativeLocalization): void;

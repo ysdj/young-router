@@ -5,6 +5,7 @@ import sys
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import urlsplit
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,33 +86,43 @@ class LoginLeaseTests(unittest.TestCase):
         with patch.object(
             client,
             "request",
-            return_value=(200, {"Lock-Token": "<opaquelocktoken:fixture>"}, b""),
+            side_effect=[
+                (200, {"Lock-Token": "<opaquelocktoken:fixture>"}, b""),
+                webdav_core.WebDAVHTTPError("LOCK", "https://example.com/lock", 423, "Locked"),
+                (204, {}, b""),
+            ],
         ) as request:
             lease = client.acquire_login_lease("account-a")
             self.assertEqual("<opaquelocktoken:fixture>", lease.token)
             lease.release()
 
-        self.assertEqual(2, request.call_count)
+        self.assertEqual(3, request.call_count)
         lock_call = request.call_args_list[0]
         self.assertEqual("LOCK", lock_call.args[0])
         self.assertEqual(webdav_core.login_lease_url(self.settings, "account-a"), lock_call.args[1])
         self.assertEqual("0", lock_call.kwargs["headers"]["Depth"])
         self.assertIn(b"<D:exclusive/>", lock_call.kwargs["data"])
-        self.assertEqual("UNLOCK", request.call_args_list[1].args[0])
-        self.assertEqual("<opaquelocktoken:fixture>", request.call_args_list[1].kwargs["headers"]["Lock-Token"])
+        self.assertEqual("LOCK", request.call_args_list[1].args[0])
+        self.assertEqual("UNLOCK", request.call_args_list[2].args[0])
+        self.assertEqual("<opaquelocktoken:fixture>", request.call_args_list[2].kwargs["headers"]["Lock-Token"])
 
     def test_attempt_write_is_conditioned_on_still_owning_the_lock(self) -> None:
         client = webdav_core.WebDAVClient(self.settings)
         with patch.object(
             client,
             "request",
-            return_value=(200, {"Lock-Token": "<opaquelocktoken:fixture>"}, b""),
+            side_effect=[
+                (200, {"Lock-Token": "<opaquelocktoken:fixture>"}, b""),
+                webdav_core.WebDAVHTTPError("LOCK", "https://example.com/lock", 423, "Locked"),
+                (200, {}, b""),
+                (204, {}, b""),
+            ],
         ) as request:
             with client.acquire_login_lease("account-a") as lease:
                 lease.write_attempt("2026-01-01T00:00:00.000000Z", "pending")
 
-        self.assertEqual(["LOCK", "PUT", "UNLOCK"], [call.args[0] for call in request.call_args_list])
-        self.assertEqual("(<opaquelocktoken:fixture>)", request.call_args_list[1].kwargs["headers"]["If"])
+        self.assertEqual(["LOCK", "LOCK", "PUT", "UNLOCK"], [call.args[0] for call in request.call_args_list])
+        self.assertEqual("(<opaquelocktoken:fixture>)", request.call_args_list[2].kwargs["headers"]["If"])
 
     def test_busy_lock_is_distinguished_from_unavailable_coordination(self) -> None:
         client = webdav_core.WebDAVClient(self.settings)
@@ -131,3 +142,14 @@ class LoginLeaseTests(unittest.TestCase):
         with patch.object(client, "request", side_effect=error):
             with self.assertRaises(webdav_core.WebDAVLoginLeaseBusy):
                 client.acquire_login_lease("account-a")
+
+    def test_claim_url_suffix_stays_in_the_path_before_a_query(self) -> None:
+        settings = webdav_core.Settings(url="https://example.com/dav/config.json?ticket=fixture")
+
+        lease_url = webdav_core.login_lease_url(settings, "account-a")
+        claim_url = webdav_core.login_lease_claim_url(settings, "account-a")
+        lease_parts = urlsplit(lease_url)
+        claim_parts = urlsplit(claim_url)
+
+        self.assertEqual(lease_parts.path.removesuffix(".json") + ".claim.json", claim_parts.path)
+        self.assertEqual(lease_parts.query, claim_parts.query)

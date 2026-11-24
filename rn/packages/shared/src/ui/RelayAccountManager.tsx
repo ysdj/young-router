@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";
-import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
+import type { CoreSnapshot, IpcClient, IpcEvent, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
 import { AccountsTable } from "./AccountsTable";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTextField, nativeControlTextWidth } from "./NativeControls";
 import { pushPresentation, trapWithin } from "../platform/presentationStack";
@@ -25,6 +25,7 @@ const LOGIN_FAILURE_MESSAGES = {
   sync_unavailable: "relay.sharedSignInUnavailable",
   unavailable: "relay.autoSignInUnavailable",
 } as const;
+const RELAY_AUTO_LOGIN_JOB_PREFIX = "relay-auto-login:";
 
 function isLoginFailure(value: unknown): value is keyof typeof LOGIN_FAILURE_MESSAGES {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(LOGIN_FAILURE_MESSAGES, value);
@@ -596,11 +597,11 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
  * The lanes one account's work is reported in.
  *
  * ``session`` is a sign-in the user started (去登录, or the ＋ account flow);
- * ``checking`` is the session check the pane runs on mount.  Both are statements
- * about the login, but they are not the same statement: a sign-in of the user's
- * own is 登录中, while a check is only asking the station what a session already
- * on hand is worth, so it reads 检测中.  ``resources`` is the key-list read,
- * which says nothing about the login and so must not repaint the login column.
+ * ``checking`` is the session check the pane runs on mount.  Core also reports
+ * the automatic password POST as a short-lived job, so a confirmed logout
+ * paints 检测中 -> 登录中 -> 已登录 without exposing the intermediate row as
+ * 未登录.  ``resources`` is the key-list read, which says nothing about the
+ * login and so must not repaint the login column.
  */
 type AccountLoading = { session: boolean; checking: boolean; resources: boolean };
 
@@ -612,6 +613,7 @@ type AccountLoading = { session: boolean; checking: boolean; resources: boolean 
 export function StationAccountsPanel({
   station,
   accounts,
+  ipc,
   native,
   busy,
   translate,
@@ -633,6 +635,7 @@ export function StationAccountsPanel({
 }: {
   station: RelayStation;
   accounts: RelayAccount[];
+  ipc: IpcClient;
   native: NativeLeafAdapter;
   language: "system" | "en" | "zh-Hans";
   cleanups?: PendingCredentialCleanup[];
@@ -674,6 +677,16 @@ export function StationAccountsPanel({
   const stationAccounts = useMemo(() => station.accountIDs
     .map((id) => accounts.find((account) => account.id === id))
     .filter((account): account is RelayAccount => Boolean(account)), [accounts, station.accountIDs]);
+  const loginObservationIsFresh = (account: RelayAccount): boolean => {
+    const observed = account.loginObservedSecondsAgo;
+    const recoveryNeeded = account.passwordSaved && observed !== null
+      && (account.loginStatus === "signed_out" || account.loginStatus === "expired");
+    return (account.loginStatus === "signed_in" || (account.loginStatus === "signed_out" && !recoveryNeeded))
+      && observed !== null
+      && typeof sessionRecheckSeconds === "number"
+      && sessionRecheckSeconds > 0
+      && observed < sessionRecheckSeconds;
+  };
   const [accountSelection, setSelectedID] = useState<string>();
   const [pendingAccountSelection, setPendingAccountSelection] = useState<string>();
   const accountKeys = useMemo(() => stationAccounts.map((account) => account.id), [stationAccounts]);
@@ -683,9 +696,14 @@ export function StationAccountsPanel({
   React.useLayoutEffect(() => {
     if (pendingAccountSelection && selectedID === pendingAccountSelection) setPendingAccountSelection(undefined);
   }, [pendingAccountSelection, selectedID]);
-  const [loading, setLoading] = useState<Record<string, AccountLoading>>({});
+  const [loading, setLoading] = useState<Record<string, AccountLoading>>(() => Object.fromEntries(
+    stationAccounts
+      .filter((account) => !loginObservationIsFresh(account))
+      .map((account) => [account.id, { session: false, checking: true, resources: false }]),
+  ));
   const loadingRef = useRef(loading);
   loadingRef.current = loading;
+  const [automaticLoginStatus, setAutomaticLoginStatus] = useState<Record<string, "signing_in" | "signed_in" | "signed_out">>({});
   // The account whose sign-in this pane started, while that wait is in flight.
   // The session lane is cleared against *this* id, so the lane and the account
   // it belongs to can never drift apart.
@@ -731,10 +749,58 @@ export function StationAccountsPanel({
   const publish = (message: string): void => {
     onStatus?.(message);
   };
+  useEffect(() => ipc.subscribe((event: IpcEvent) => {
+    if (event.event !== "job" || !event.job_id.startsWith(RELAY_AUTO_LOGIN_JOB_PREFIX)) return;
+    const accountID = event.job_id.slice(RELAY_AUTO_LOGIN_JOB_PREFIX.length);
+    if (!accountID) return;
+    if (event.state === "running") {
+      setAutomaticLoginStatus((current) => ({ ...current, [accountID]: "signing_in" }));
+      return;
+    }
+    if (event.result?.login_status === "signed_in" || event.result?.login_status === "signed_out" || event.result?.login_status === "expired") {
+      setAutomaticLoginStatus((current) => ({
+        ...current,
+        [accountID]: event.result?.login_status === "signed_in" ? "signed_in" : "signed_out",
+      }));
+      return;
+    }
+    setAutomaticLoginStatus((current) => {
+      if (!(accountID in current)) return current;
+      const next = { ...current };
+      delete next[accountID];
+      return next;
+    });
+  }), [ipc]);
+  useEffect(() => {
+    const settled = new Map<string, "signed_in" | "signed_out">();
+    for (const account of stationAccounts) {
+      if (account.loginStatus === "signed_in") settled.set(account.id, "signed_in");
+      else if (account.loginStatus === "signed_out" || account.loginStatus === "expired") settled.set(account.id, "signed_out");
+    }
+    const present = new Set(stationAccounts.map((account) => account.id));
+    setAutomaticLoginStatus((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const accountID of Object.keys(next)) {
+        if (!present.has(accountID) || (next[accountID] !== "signing_in" && settled.get(accountID) === next[accountID])) {
+          delete next[accountID];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [stationAccounts]);
   // The pane owns only progress for actions it started. Core owns the result,
   // including the distinction between a definite logout and an untested row.
   const relayLoginState = (account: RelayAccount): "signed_in" | "checking_login" | "signing_in" | "signed_out" | "unknown" => {
     if (loading[account.id]?.session) return "signing_in";
+    if (automaticLoginStatus[account.id] === "signing_in") return "signing_in";
+    if (automaticLoginStatus[account.id] === "signed_in") return "signed_in";
+    if (automaticLoginStatus[account.id] === "signed_out") return "signed_out";
+    // A newly arrived snapshot can render one frame before the mount effect
+    // installs its checking lane. Reserve that first frame for 检测中 so a
+    // confirmed logout never flashes 未登录 before the automatic recovery.
+    if (checkedAccounts.current.get(account.id) === undefined && !loginObservationIsFresh(account)) return "checking_login";
     if (account.loginStatus === "signed_in") return "signed_in";
     if (loading[account.id]?.checking) return "checking_login";
     if (account.loginStatus === "expired" || (account.loginStatus === "signed_out" && account.loginObservedSecondsAgo !== null)) return "signed_out";
@@ -819,10 +885,10 @@ export function StationAccountsPanel({
       updateLoading(target.id, "resources", false);
     }
   };
-  const restoreSavedSession = async (account: RelayAccount): Promise<void> => {
+  const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {
     updateLoading(account.id, "checking", true);
     try {
-      await native.restoreRelaySession({
+      const result = await native.restoreRelaySession({
         accountId: account.id,
         type: account.type,
         label: account.label,
@@ -832,8 +898,10 @@ export function StationAccountsPanel({
       // Core owns the observation. A local override would still be on screen
       // after a background check or sync supplied a newer answer.
       await refreshAccounts();
+      return result?.loginStatus === "signed_in";
     } catch {
       // The published account state remains authoritative.
+      return false;
     } finally {
       updateLoading(account.id, "checking", false);
     }
@@ -905,19 +973,25 @@ export function StationAccountsPanel({
       const recoveryNeeded = account.passwordSaved && observed !== null
         && (account.loginStatus === "signed_out" || account.loginStatus === "expired");
       const checked = checkedAccounts.current.get(account.id);
-      if (checked !== undefined && (checked || !recoveryNeeded)) continue;
-      if (isAccountLoading(account.id)) continue;
+      if (checked !== undefined) {
+        if (!recoveryNeeded) {
+          // A check on entry or a later sign-in doesn't spend the next logout's check.
+          checkedAccounts.current.set(account.id, false);
+          continue;
+        }
+        if (checked) continue;
+      }
+      const accountLoading = loadingRef.current[account.id];
+      if (accountLoading?.session || accountLoading?.resources || (accountLoading?.checking && checked !== undefined)) continue;
       checkedAccounts.current.set(account.id, recoveryNeeded);
+      // A failure from Core already answers this recovery. Its own retry rules apply.
+      if (checked !== undefined && account.loginFailure) continue;
       // A recent 未登录 with a password still has work for Core to do. Core
       // probes any saved session and decides whether another POST is needed.
-      const fresh = (account.loginStatus === "signed_in" || (account.loginStatus === "signed_out" && !recoveryNeeded))
-        && observed !== null
-        && typeof sessionRecheckSeconds === "number"
-        && sessionRecheckSeconds > 0
-        && observed < sessionRecheckSeconds;
+      const fresh = loginObservationIsFresh(account);
       void (async () => {
-        if (!fresh) await restoreSavedSession(account);
-        if (mounted.current) await refreshAccountResources(account, { silent: true });
+        const signedIn = fresh ? account.loginStatus === "signed_in" : await restoreSavedSession(account);
+        if (signedIn && mounted.current) await refreshAccountResources(account, { silent: true });
       })();
     }
   }, [busy, loading, sessionRecheckSeconds, mountProbeKey]);

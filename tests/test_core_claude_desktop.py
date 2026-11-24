@@ -311,15 +311,21 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             self.assertTrue(snapshot["clients"]["claudeCode"]["uses_local_api"])
             self.assertFalse(snapshot["clients"]["claudeDesktop"]["uses_local_api"])
 
-    def test_the_edit_api_form_reports_the_gateway_claude_code_uses(self) -> None:
-        # One form, both modes: with this app's API switched on, Claude Code's
-        # own env names the proxy, and that connection is what the dialog
-        # shows.  Saving it back stays on the local route rather than writing
-        # the same address as a hand-managed gateway.
+    def test_the_edit_api_form_reports_the_live_connection(self) -> None:
+        # The dialog opens on the live Code pair; saving a different
+        # endpoint-and-key pair moves the client off yrapi, and saving this
+        # app's own pair moves it back on.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
             _write_desktop_config(desktop_root, {})
+            (root / "settings.json").write_text(json.dumps({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://relay.example.test",
+                    "ANTHROPIC_AUTH_TOKEN": "direct-key",
+                },
+                "model": "claude-direct",
+            }), encoding="utf-8")
             domain = ClaudeSettingsDomain(
                 root / "settings.json",
                 desktop_config_library_path=desktop_root,
@@ -332,6 +338,7 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 return_value=("http://127.0.0.1:4100/v1", "sk-local"),
             ):
                 domain.dispatch("use_local_api", {"client": "claudeCode", "model": "public-a"})
+                self.assertTrue(domain.snapshot()["clients"]["claudeCode"]["uses_yrapi_api"])
                 form = domain.snapshot()["direct_api"]
                 self.assertEqual("http://127.0.0.1:4100", form["base_url"])
                 self.assertEqual("public-a", form["model"])
@@ -340,17 +347,126 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 self.assertEqual("sk-local", domain.trusted_secret_value("direct_api_key", "edit-api"))
 
                 saved = domain.dispatch("use_direct_api", {
-                    "base_url": form["base_url"],
-                    "model": form["model"],
+                    "base_url": "https://direct.example.test",
+                    "model": "claude-next",
+                    "api_key": "next-direct-key",
+                    "auth_mode": "bearer",
+                })
+            self.assertFalse(saved["clients"]["claudeCode"]["uses_yrapi_api"])
+            code = json.loads(domain.raw_text(include_sensitive=True))
+            self.assertEqual("https://direct.example.test", code["env"]["ANTHROPIC_BASE_URL"])
+            self.assertEqual("next-direct-key", code["env"]["ANTHROPIC_AUTH_TOKEN"])
+
+            # URL and key alone are Claude's whole yrapi pair; the model is
+            # not part of it.
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain.dispatch("use_direct_api", {
+                    "base_url": "http://127.0.0.1:4100",
+                    "model": "claude-next",
                     "api_key": "sk-local",
                     "auth_mode": "bearer",
                 })
+            self.assertTrue(domain.snapshot()["clients"]["claudeCode"]["uses_yrapi_api"])
+            # The form follows the live connection onto the proxy.
+            self.assertEqual("http://127.0.0.1:4100", domain.snapshot()["direct_api"]["base_url"])
+            self.assertEqual("sk-local", domain.trusted_secret_value("direct_api_key", "edit-api"))
 
-            self.assertTrue(saved["clients"]["claudeCode"]["uses_local_api"])
+    def test_leaving_the_local_api_restores_both_claude_apps(self) -> None:
+        # Claude Code and Claude Desktop keep one connection each; off returns
+        # both to what they used before the proxy was adopted.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": "https://desktop.example.test",
+                "inferenceGatewayAuthScheme": "x-api-key",
+                "inferenceGatewayApiKey": "desktop-direct-key",
+            })
+            (root / "settings.json").write_text(json.dumps({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://code.example.test/v1",
+                    "ANTHROPIC_API_KEY": "code-direct-key",
+                },
+                "model": "claude-code-direct",
+            }), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                desktop_loader=None,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain.dispatch("use_local_api", {"client": "claudeCode"})
+                domain.dispatch("use_local_api", {"client": "claudeDesktop"})
+
+            domain.dispatch("leave_local_api", {"client": "claudeCode"})
+            domain.dispatch("leave_local_api", {"client": "claudeDesktop"})
+            self.assertFalse(domain.snapshot()["clients"]["claudeCode"]["uses_local_api"])
+            self.assertFalse(domain.snapshot()["clients"]["claudeDesktop"]["uses_local_api"])
+            code = json.loads(domain.raw_text(include_sensitive=True))
+            self.assertEqual("https://code.example.test", code["env"]["ANTHROPIC_BASE_URL"])
+            self.assertEqual("code-direct-key", code["env"]["ANTHROPIC_API_KEY"])
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", code["env"])
+            desktop = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertEqual("https://desktop.example.test", desktop["inferenceGatewayBaseUrl"])
+            self.assertEqual("x-api-key", desktop["inferenceGatewayAuthScheme"])
+            self.assertEqual("desktop-direct-key", desktop["inferenceGatewayApiKey"])
+
+    def test_leaving_without_a_backup_keeps_the_client_until_the_form_is_saved(self) -> None:
+        # A client already on the proxy when this build starts has no backup;
+        # opening the form does not silently clear the working connection.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                "inferenceGatewayAuthScheme": "bearer",
+                "inferenceGatewayApiKey": "sk-local",
+            })
+            (root / "settings.json").write_text(json.dumps({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-local",
+                },
+            }), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                desktop_loader=None,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain.refresh_local_api_endpoint()
+                self.assertTrue(domain.snapshot()["clients"]["claudeCode"]["uses_yrapi_api"])
+                self.assertTrue(domain.snapshot()["clients"]["claudeDesktop"]["uses_yrapi_api"])
+                domain.dispatch("leave_local_api", {"client": "claudeCode"})
+                domain.dispatch("leave_local_api", {"client": "claudeDesktop"})
+
+            self.assertTrue(domain.snapshot()["clients"]["claudeCode"]["uses_yrapi_api"])
+            self.assertTrue(domain.snapshot()["clients"]["claudeDesktop"]["uses_yrapi_api"])
             code = json.loads(domain.raw_text(include_sensitive=True))
             self.assertEqual("http://127.0.0.1:4100", code["env"]["ANTHROPIC_BASE_URL"])
             self.assertEqual("sk-local", code["env"]["ANTHROPIC_AUTH_TOKEN"])
-            self.assertEqual("public-a", code["model"])
+            # The form starts from the live pair, so it can be edited into a
+            # direct one.
+            form = domain.snapshot()["direct_api"]
+            self.assertEqual("http://127.0.0.1:4100", form["base_url"])
+            self.assertEqual(
+                "sk-local", domain.trusted_secret_value("direct_api_key", "edit-api")
+            )
 
     def test_desktop_adopts_the_local_api_as_its_third_party_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

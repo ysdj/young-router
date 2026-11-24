@@ -1723,6 +1723,11 @@ def _apply_provider_patch(text: str, value: object) -> str:
             "name",
             "base_url",
             "wire_api",
+            # The catalog address this app serves lives on the provider row, so
+            # a patch that rebuilds the row from the projection must carry it;
+            # dropping it here left the client on the file pointer after any
+            # unrelated edit and made the served address invisible to the form.
+            "model_catalog_url",
             "env_key",
             "requires_openai_auth",
             "supports_standalone_web_search",

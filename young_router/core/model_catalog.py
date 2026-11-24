@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
+import json
 import os
 from pathlib import Path
 import threading
@@ -34,6 +35,65 @@ PREVIOUS_CATALOG_FILE_NAME = "young-router-model-catalog.json"
 # at that path, so it stays recognised as a managed catalog target and is
 # migrated (never treated as a foreign, user-owned path).
 LEGACY_CATALOG_FILE_NAME = "litellm-menu-model-catalog.json"
+# The model-list-plugin writes its own catalog under this name and points Codex
+# at it.  This app does not write it; the name is recognised so the URL delivery
+# below can tell a machine-managed pointer (which URL delivery supersedes) from
+# a catalog a person wrote by hand (which it must leave alone).
+PLUGIN_CATALOG_FILE_NAME = "model-list-plugin-catalog.json"
+#: Where Core serves the catalog for a client that fetches it itself.
+#:
+#: ``/codex/models`` is OpenAI's own Codex backend spelling -- that backend
+#: answers ``https://chatgpt.com/backend-api/codex/models``, which is the same
+#: leaf this app's own ``providers_models._CHATGPT_MODELS_ENDPOINT`` reads -- and
+#: it stays out of ``/v1``, which belongs to LiteLLM.
+#:
+#: The data plane's ``/v1/models?client_version=`` is *not* used for this: it
+#: translates the route table on its own terms, so an alias loses
+#: ``model_messages`` entirely, 6 of 11 routes came back with no reasoning
+#: level and 4 with no context window, and ``base_instructions`` was the
+#: release tag's generic prompt instead of the installed client's inherited
+#: one.  A catalog is prompt-bearing: the installed client and this app's
+#: registry are the only producers whose fields the client would have used.
+SERVED_CATALOG_ROUTE = "/codex/models"
+#: Codex bounds an explicitly configured catalog response at 1 MiB and fails the
+#: whole fetch above it -- and an explicit catalog replaces its bundled list
+#: instead of falling back to it, so an oversized body leaves that client with
+#: no models at all.  This body therefore stays under the bound.
+MAX_SERVED_CATALOG_BYTES = 1024 * 1024
+#: Room for JSON framing the byte count above is checked against.
+SERVED_CATALOG_RESERVE_BYTES = 8 * 1024
+#: Fields that make an entry large without making it selectable: the client's
+#: own prompt text.  Only a catalog that would otherwise exceed the bound is
+#: reduced to this shape, where the client falls back to its bundled text.
+SERVED_CATALOG_OMIT_FIELDS = ("model_messages", "base_instructions")
+#: The deprecated top-level instruction field.  Clients from 0.163 on read
+#: ``model_messages.instructions_template``; ``ModelsResponse`` still accepts
+#: this field only to *promote* it into that template when the template is
+#: absent, and re-emits it when serializing.  This app writes no legacy form at
+#: all: every entry it generates carries the template, because the mirror was
+#: 242 KB of the same text twice.  The name stays here because a native
+#: profile read back from a client may still carry it.
+LEGACY_INSTRUCTIONS_FIELD = "base_instructions"
+#: The instructions of this app's own minimal profile, used when no client is
+#: installed.  It is a value, not a shape, so a file built from it stays
+#: distinguishable from one built from a client's own prompt -- the guard that
+#: keeps a temporary client-update failure from downgrading the good file.
+FALLBACK_INSTRUCTIONS: Final = "You are Codex, a coding agent."
+
+#: Spellings this app pointed a client at before the current one.  A document
+#: that still names one is *this app's* catalog, not an operator's own URL: the
+#: next refresh rewrites it rather than treating it as a foreign row, because an
+#: address that stopped answering drops the client back to its bundled list.
+#:
+#: The rewrite is the migration -- no redirect is served for a retired path.
+#: Codex builds its catalog client with ``ClientRedirectPolicy::Reject`` whenever
+#: ``model_catalog_url`` is set, so a 301/302 would be refused and the client
+#: would lose its list anyway; a redirect route would only look like a fix.
+#:
+#: ``/v1/models`` is handled beside this list rather than inside it: it is a
+#: generic path every gateway serves, so it only counts as this app's address
+#: when it is the same origin as that provider row's inference endpoint.
+RETIRED_SERVED_CATALOG_ROUTES = ("/codex/catalog",)
 CATALOG_DESCRIPTION = "Young Router exposed model"
 _REASONING_LEVELS = (
     {"effort": "low", "description": "Fast responses with lighter reasoning"},
@@ -149,7 +209,7 @@ def _fallback_catalog_model(name: str, priority: int) -> dict[str, Any]:
         "visibility": "list",
         "supported_in_api": True,
         "priority": priority,
-        "base_instructions": "You are Codex, a coding agent.",
+        "model_messages": {"instructions_template": FALLBACK_INSTRUCTIONS},
         "support_verbosity": True,
         "truncation_policy": {"mode": "tokens", "limit": 10_000},
         "supports_parallel_tool_calls": True,
@@ -716,17 +776,116 @@ def catalog_payload(
     # reproduces that order rather than inventing a second one.
     return {
         "models": [
-            _catalog_model(
-                name,
-                index + 1,
-                context_registry,
-                resolved_native,
-                base_slug,
-                native_profiles,
+            _with_required_messages_only(
+                _without_duplicated_instructions(
+                        _catalog_model(
+                        name,
+                        index + 1,
+                        context_registry,
+                        resolved_native,
+                        base_slug,
+                        native_profiles,
+                    )
+                )
             )
             for index, name in enumerate(names)
         ]
     }
+
+
+#: The one message family a catalog entry must state.
+#:
+#: ``render_model_instructions`` reads only ``model_messages.instructions_template``
+#: and answers an *empty* system prompt when it is absent (it logs a warning and
+#: returns "").  Every other family -- approvals, permissions, collaboration
+#: modes, auto review, multi agent, persistent instructions, token budget,
+#: confirmation policies, apps, plugins -- resolves through
+#: ``ResolvedMessage::new(catalog, bundled)`` or an ``unwrap_or`` default, so
+#: leaving it out hands the client its own version-matched text.  Carrying those
+#: 40 KB per entry only pins an older client's wording into every alias.
+REQUIRED_MESSAGE_FIELD = "instructions_template"
+
+
+def _with_required_messages_only(model: dict[str, Any]) -> dict[str, Any]:
+    """Keep the one message family the client cannot default."""
+
+    messages = model.get("model_messages")
+    if not isinstance(messages, Mapping):
+        return model
+    template = messages.get(REQUIRED_MESSAGE_FIELD)
+    if not isinstance(template, str) or not template.strip():
+        # Nothing to keep and nothing to default: leave the entry as it came, so
+        # an intentional override (or a diagnostic) is not silently removed.
+        return model
+    model["model_messages"] = {REQUIRED_MESSAGE_FIELD: template}
+    return model
+
+
+def _without_duplicated_instructions(model: dict[str, Any]) -> dict[str, Any]:
+    """Drop the legacy mirror whenever the canonical template carries the text.
+
+    No client this app supports needs the mirror: from 0.163 on the template is
+    the carrier, and the server-side compat shim is what re-creates the mirror
+    for anything older.  A model whose template is somehow absent keeps the
+    field, so a hand-written entry still states its instructions once.
+    """
+
+    messages = model.get("model_messages")
+    template = messages.get("instructions_template") if isinstance(messages, Mapping) else None
+    if isinstance(template, str) and template.strip():
+        model.pop(LEGACY_INSTRUCTIONS_FIELD, None)
+    return model
+
+
+def _served_catalog_limits() -> int:
+    return MAX_SERVED_CATALOG_BYTES - SERVED_CATALOG_RESERVE_BYTES
+
+
+def _slim_catalog_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop the fields that only carry the client's own prompt text."""
+
+    models = payload.get("models")
+    if not isinstance(models, Sequence) or isinstance(models, (str, bytes, bytearray)):
+        return dict(payload)
+    slimmed: list[Any] = []
+    for model in models:
+        if not isinstance(model, Mapping):
+            slimmed.append(model)
+            continue
+        slimmed.append({key: value for key, value in model.items() if key not in SERVED_CATALOG_OMIT_FIELDS})
+    return {**payload, "models": slimmed}
+
+
+def served_catalog_body(payload: Mapping[str, Any], *, pretty: bool = False) -> bytes:
+    """Encode a catalog for HTTP delivery, inside the bound the client enforces.
+
+    Codex rejects an explicitly configured catalog response above 1 MiB and
+    then holds no models at all, because an explicit catalog replaces its
+    bundled list instead of falling back to it.  The full entries are served
+    while they fit; only a catalog that would be rejected loses
+    ``model_messages``/``base_instructions``, where Codex uses its own bundled
+    text.  A body that still does not fit is answered with ``b""`` so the
+    caller can refuse the request rather than publish something the client
+    will discard.
+    """
+
+    limit = _served_catalog_limits()
+
+    def encode(value: Mapping[str, Any]) -> bytes:
+        # ``pretty`` is for the person reading the address in a browser: the
+        # client asks with ``client_version`` and gets the compact wire form,
+        # where indentation would only spend the byte budget it is held to.
+        if pretty:
+            text = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+        else:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return text.encode("utf-8")
+
+    body = encode(payload)
+    if len(body) <= limit:
+        return body
+    body = encode(_slim_catalog_payload(payload))
+    return body if len(body) <= limit else b""
 
 
 def catalog_is_usable(path: Path | str) -> bool:
@@ -769,10 +928,12 @@ def catalog_carries_native_profile(path: Path | str) -> bool:
     """Whether the managed catalog holds an installed client's own profile.
 
     A file generated while no Codex client was installed carries this app's
-    minimal fallback profile; one generated from a client carries that
-    client's instructions (``model_messages.instructions_template``).  The
+    minimal fallback profile, whose instructions are ``FALLBACK_INSTRUCTIONS``;
+    one generated from a client carries that client's own prompt.  The
     distinction lets a refresh keep the better file when the client's bundled
-    catalog is temporarily unreadable, for example while Codex is updating.
+    catalog is temporarily unreadable, for example while Codex is updating --
+    so it is made on the prompt's *value*: both shapes are identical now that
+    the legacy mirror is never written.
     """
 
     try:
@@ -786,7 +947,8 @@ def catalog_carries_native_profile(path: Path | str) -> bool:
         if not isinstance(model, Mapping):
             continue
         messages = model.get("model_messages")
-        if isinstance(messages, Mapping) and str(messages.get("instructions_template") or "").strip():
+        template = messages.get("instructions_template") if isinstance(messages, Mapping) else None
+        if isinstance(template, str) and template.strip() and template.strip() != FALLBACK_INSTRUCTIONS:
             return True
     return False
 

@@ -10,6 +10,7 @@ import stat
 import sys
 import inspect
 import tempfile
+import tomllib
 import textwrap
 import yaml
 import threading
@@ -3201,15 +3202,13 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual(documents, domain.export(include_sensitive=True))
             self.assertTrue(domain.snapshot()["uses_local_api"])
 
-    def test_the_edit_api_form_reports_the_connection_the_client_is_on(self) -> None:
-        """The dialog prefills what the client is actually connected to.
+    def test_the_edit_api_form_reports_the_live_connection(self) -> None:
+        """The dialog opens on what the client is using now.
 
-        With this app's API switched on, the selected provider names the proxy;
-        a form that read only its own direct provider row showed every field
-        empty beside a switch that said the client was connected.  Saving the
-        values it showed has to stay on the proxy route instead of rewriting
-        the client onto a look-alike provider that drops the managed list and
-        the search opt-in.
+        The off toggle applies the remembered direct route before opening the
+        form, so that path still edits the route the switch returns to.  Opening
+        the form while the switch is on shows the live proxy URL, master key,
+        and catalog: an unchanged save keeps the switch on.
         """
 
         with tempfile.TemporaryDirectory() as directory, \
@@ -3234,7 +3233,6 @@ class CodexSettingsDomainTests(unittest.TestCase):
             )
             (home / "auth.json").write_text('{"OPENAI_API_KEY": "relay-secret"}\n', encoding="utf-8")
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            # A direct route is what the form already reports in that mode.
             self.assertEqual(
                 "https://relay.example.test/v1",
                 domain.snapshot()["direct_api"]["base_url"],
@@ -3247,27 +3245,206 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual(base_url, form["base_url"])
             self.assertEqual("default-chat", form["model"])
             self.assertTrue(form["key_configured"])
-            # The key field prefills the credential this route uses, which in
-            # local mode is this app's router key.
+            # The form prefills the credential the client currently sends.
             self.assertEqual(key, domain.trusted_secret_value("direct_api_key", "edit-api"))
 
+            self.assertTrue(domain.snapshot()["uses_yrapi_api"])
+
+            # Saving the form is the off direction: a different triplet moves
+            # the client and the switch follows it in the same commit.
+            domain.dispatch("use_direct_api", {
+                "base_url": "https://direct.example.test/v1",
+                "model": "direct-model",
+                "model_catalog_url": "https://direct.example.test/catalog",
+                "api_key": "direct-secret",
+                "clear_key": False,
+            })
+            domain.apply()
+            self.assertFalse(domain.snapshot()["uses_yrapi_api"])
+            self.assertFalse(domain.snapshot()["uses_local_api"])
+            self.assertEqual(
+                "direct-secret",
+                domain.trusted_secret_value("direct_api_key", "edit-api"),
+            )
+
+            # Saving the exact yrapi triplet turns the switch back on without
+            # the dialog.  The catalog switch is off here, so that third value
+            # is empty; URL and key are the two live ones.
             domain.dispatch("use_direct_api", {
                 "base_url": base_url,
-                "model": form["model"],
+                "model": "default-chat",
                 "model_catalog_url": "",
                 "api_key": key,
                 "clear_key": False,
             })
             domain.apply()
-            documents = domain.export(include_sensitive=True)
+            self.assertTrue(domain.snapshot()["uses_yrapi_api"])
             self.assertTrue(domain.snapshot()["uses_local_api"])
-            self.assertTrue(domain.snapshot()["standalone_search"])
-            self.assertIn('[model_providers.relay]', documents["config_text"])
-            self.assertNotIn('[model_providers.young-router-direct]', documents["config_text"])
-            self.assertIn(key, documents["config_text"] + documents["auth_text"])
+            # The form follows the live connection onto the proxy.
+            form = domain.snapshot()["direct_api"]
+            self.assertEqual(base_url, form["base_url"])
+            self.assertEqual(key, domain.trusted_secret_value("direct_api_key", "edit-api"))
 
-    def test_use_local_api_follows_a_built_in_openai_selection(self) -> None:
-        """A built-in OpenAI selection takes Codex's own base-url override."""
+            # URL and key can be yrapi while the catalog is the operator's;
+            # that is a direct connection with a local address, not yrapi.
+            domain.dispatch("use_direct_api", {
+                "base_url": base_url,
+                "model": "default-chat",
+                "model_catalog_url": "https://direct.example.test/catalog",
+                "api_key": key,
+                "clear_key": False,
+            })
+            domain.apply()
+            self.assertFalse(domain.snapshot()["uses_yrapi_api"])
+            self.assertTrue(domain.snapshot()["uses_local_api"])
+
+            # The on direction replaces the whole triplet, including that
+            # catalog URL.
+            domain.dispatch("use_local_api", {})
+            domain.apply()
+            self.assertTrue(domain.snapshot()["uses_yrapi_api"])
+            documents = domain.export(include_sensitive=True)
+            document = tomllib.loads(documents["config_text"])
+            active = document["model_providers"][document["model_provider"]]
+            self.assertEqual("", active.get("model_catalog_url", ""))
+            self.assertEqual(key, json.loads(documents["auth_text"])["OPENAI_API_KEY"])
+
+            # The remembered direct triplet is app-private state: mode 0600,
+            # and never in a snapshot the window can read.
+            state_path = root / "client-routes.json"
+            self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
+            remembered = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                key,
+                remembered["codex"]["direct_connection"]["api_key"],
+            )
+            self.assertNotIn("direct-secret", json.dumps(domain.snapshot()))
+
+    def test_leaving_the_local_api_restores_the_remembered_provider(self) -> None:
+        """Off returns to the same provider row, model, and credential."""
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "relay-model"\n'
+                'model_provider = "relay"\n'
+                '\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
+                'base_url = "https://relay.example.test/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "relay-secret"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            domain.dispatch("use_local_api", {})
+            domain.apply()
+            domain.dispatch("leave_local_api", {})
+            domain.apply()
+
+            self.assertFalse(domain.snapshot()["uses_local_api"])
+            documents = domain.export(include_sensitive=True)
+            self.assertIn('[model_providers.relay]', documents["config_text"])
+            self.assertIn('base_url = "https://relay.example.test/v1"', documents["config_text"])
+            self.assertIn('requires_openai_auth = true', documents["config_text"])
+            self.assertIn('model = "relay-model"', documents["config_text"])
+            self.assertEqual('{\n  "OPENAI_API_KEY": "relay-secret"\n}', documents["auth_text"].strip())
+            # The proxy's own search opt-in belongs to the row it was written
+            # for; the direct row does not serve ``/alpha/search``.
+            self.assertNotIn("supports_standalone_web_search", documents["config_text"])
+
+    def test_a_bearer_row_keeps_its_own_token_across_the_round_trip(self) -> None:
+        """The raw row, not the redacted projection, is where the token lives."""
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "direct-model"\n'
+                'model_provider = "direct"\n'
+                '\n'
+                '[model_providers.direct]\n'
+                'name = "direct"\n'
+                'base_url = "https://gateway.example.test/v1"\n'
+                'wire_api = "responses"\n'
+                'model_catalog_url = "https://gateway.example.test/catalog"\n'
+                'experimental_bearer_token = "direct-token"\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            domain.dispatch("use_local_api", {})
+            domain.apply()
+            remembered = json.loads((root / "client-routes.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                "direct-token", remembered["codex"]["direct_connection"]["api_key"]
+            )
+
+            domain.dispatch("leave_local_api", {})
+            domain.apply()
+            document = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+            self.assertEqual("direct", document["model_provider"])
+            provider = document["model_providers"]["direct"]
+            self.assertEqual("https://gateway.example.test/v1", provider["base_url"])
+            self.assertEqual("direct-token", provider["experimental_bearer_token"])
+            self.assertEqual({}, json.loads((home / "auth.json").read_text(encoding="utf-8")))
+
+    def test_leaving_without_a_backup_keeps_the_client_until_the_form_is_saved(self) -> None:
+        """The form is the off action; without a backup it starts from yrapi."""
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
+            from young_router.core.domains._shared import local_proxy_endpoint
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            base_url, key = local_proxy_endpoint(runtime)
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "public-a"\n'
+                'model_provider = "custom"\n'
+                '\n'
+                '[model_providers.custom]\n'
+                'name = "custom"\n'
+                f'base_url = "{base_url}"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": key}) + "\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+            self.assertTrue(domain.snapshot()["uses_yrapi_api"])
+
+            domain.dispatch("leave_local_api", {})
+            domain.apply()
+            # No remembered route: the client stays on yrapi, and the form
+            # opens on the values it can edit into a direct one.
+            self.assertTrue(domain.snapshot()["uses_yrapi_api"])
+            form = domain.snapshot()["direct_api"]
+            self.assertEqual(base_url, form["base_url"])
+            self.assertEqual(key, domain.trusted_secret_value("direct_api_key", "edit-api"))
+
+    def test_use_local_api_moves_a_built_in_openai_selection_to_the_proxy_row(self) -> None:
+        """A built-in OpenAI selection cannot hold this app's catalog URL.
+
+        The built-in row has no editable table, so adopting the proxy moves the
+        client to the app's own provider row; the catalog therefore stays a
+        provider address instead of a top-level file the desktop can rewrite.
+        """
 
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
@@ -3294,11 +3471,12 @@ class CodexSettingsDomainTests(unittest.TestCase):
             # whatever config the machine running the suite happens to have.
             base_url, key = local_proxy_endpoint(runtime)
             structured = domain.snapshot()["structured"]
-            self.assertEqual("openai", structured["model_provider"])
-            self.assertEqual(base_url, structured["openai_base_url"])
+            self.assertEqual("custom", structured["model_provider"])
+            custom = next(item for item in structured["providers"] if item["id"] == "custom")
+            self.assertEqual(base_url, custom["base_url"])
             documents = domain.export(include_sensitive=True)
-            self.assertIn(f'openai_base_url = "{base_url}"', documents["config_text"])
-            self.assertNotIn("[model_providers", documents["config_text"])
+            self.assertIn("[model_providers.custom]", documents["config_text"])
+            self.assertNotIn("openai_base_url", documents["config_text"])
             self.assertIn(key, documents["auth_text"])
             self.assertTrue(domain.snapshot()["uses_local_api"])
 

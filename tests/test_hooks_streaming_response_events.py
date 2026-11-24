@@ -3017,23 +3017,10 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         )
         self.assertFalse(hooks._is_upstream_incomplete_terminal_error(named))
 
-    async def test_a_cut_that_only_delivered_thinking_is_retried_inside_the_turn(self) -> None:
-        """The reader keeps the connection; a sibling route re-derives the thinking.
-
-        Live 2026-11-20 thread 01a1ee60: both relays ended long thinking turns
-        with ``response.incomplete`` + ``max_messages`` after the summary had
-        been streamed, and each of those became a ``response.failed`` -- which
-        Codex reads as a transport failure and retries as ``正在重新连接 1/5``.
-        Nothing of the answer existed yet, so the turn can be reopened on
-        another route instead of being handed back to the reader.
-        """
+    async def test_a_cut_after_thinking_keeps_the_task_open_for_codex(self) -> None:
+        """A reasoning-only item cap closes a step with continuation commentary."""
 
         hooks, proxy_server = load_hook_module()
-        routing = importlib.import_module("young_router.proxy.routing")
-        routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
-        self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
-        calls: list = []
-
         def thinking_then_capped():
             async def stream():
                 yield {"type": "response.created", "response": {"id": "resp-cut"}}
@@ -3055,21 +3042,9 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
             return stream()
 
-        def answered():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-ok"}}
-                yield {"type": "response.output_text.delta", "delta": "the answer"}
-                yield {
-                    "type": "response.completed",
-                    "response": {"id": "resp-ok", "status": "completed", "output": []},
-                }
-
-            return stream()
-
         class FakeRouter:
             async def aresponses(self, **payload):
-                calls.append(payload)
-                return answered()
+                raise AssertionError("delivered reasoning must not be replayed")
 
         proxy_server.llm_router = FakeRouter()
         request_data = {
@@ -3096,25 +3071,21 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         ]
         types = [chunk.get("type") for chunk in chunks]
 
-        self.assertEqual(1, len(calls))
-        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in chunks[-1]["response"]["output"]
+        ))
         self.assertNotIn("response.failed", types)
 
-    async def test_a_raw_reasoning_item_before_max_messages_is_retried(self) -> None:
-        """An item-only reasoning stream is output, even without summary text.
-
-        A few OpenAI-compatible relays emit ``response.reasoning_item`` and
-        raw reasoning frames while the request asks for no public summary.  A
-        following ``max_messages`` terminal is still the route's generated
-        item cap; it must take the same in-turn fallback as a public summary
-        delta instead of being remembered as an oversized replay.
-        """
+    async def test_a_raw_reasoning_item_before_max_messages_keeps_the_task_open(self) -> None:
+        """Raw reasoning is not replayed after its item-cap step closes."""
 
         hooks, proxy_server = load_hook_module()
         routing = importlib.import_module("young_router.proxy.routing")
         routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
         self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
-        calls: list = []
 
         def raw_reasoning_then_capped():
             async def stream():
@@ -3147,21 +3118,9 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
             return stream()
 
-        def answered():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-ok"}}
-                yield {"type": "response.output_text.delta", "delta": "the answer"}
-                yield {
-                    "type": "response.completed",
-                    "response": {"id": "resp-ok", "status": "completed", "output": []},
-                }
-
-            return stream()
-
         class FakeRouter:
             async def aresponses(self, **payload):
-                calls.append(payload)
-                return answered()
+                raise AssertionError("delivered reasoning must not be replayed")
 
         proxy_server.llm_router = FakeRouter()
         request_data = {
@@ -3184,22 +3143,18 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(1, len(calls))
-        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in chunks[-1]["response"]["output"]
+        ))
         self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
 
-    async def test_a_reasoning_heavy_replay_repairs_before_a_second_route_cap(
+    async def test_a_reasoning_progress_is_not_replayed_after_item_cap(
         self,
     ) -> None:
-        """A few hundred items can still carry too much reasoning to replay.
-
-        The previous gate only repaired histories with 2,000 items.  The live
-        interrupted turn had 239 items but 167 reasoning records; the first
-        route and its sibling both reached ``max_messages`` before the request
-        was finally returned as ``response.incomplete``.  Elide the older
-        reasoning on the first cap so the current turn does not spend its one
-        sibling hop on the same oversized body.
-        """
+        """The item cap closes a step and leaves Codex able to continue it."""
 
         hooks, proxy_server = load_hook_module()
         streaming = importlib.import_module("young_router.proxy.streaming")
@@ -3222,19 +3177,9 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                         "id": "resp-cap",
                         "status": "incomplete",
                         "incomplete_details": {"reason": "max_messages"},
+                        "usage": {"input_tokens": 11, "output_tokens": 99, "total_tokens": 110},
                         "output": [{"id": "rs-new", "type": "reasoning"}],
                     },
-                }
-
-            return stream()
-
-        def answered():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-ok"}}
-                yield {"type": "response.output_text.delta", "delta": "the answer"}
-                yield {
-                    "type": "response.completed",
-                    "response": {"id": "resp-ok", "status": "completed", "output": []},
                 }
 
             return stream()
@@ -3242,7 +3187,7 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         class FakeRouter:
             async def aresponses(self, **payload):
                 calls.append(payload)
-                return answered()
+                raise AssertionError("delivered reasoning must not be replayed")
 
         proxy_server.llm_router = FakeRouter()
         old_reasoning = [
@@ -3264,8 +3209,6 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             "model_info": {"id": "order-0", "order": 0, "route_key": "provider / default-chat / key=primary"},
         }
 
-        # The recovery poll permits repeated attempts and would conceal a
-        # one-shot fallback incorrectly blocked by the inherited marker.
         with mock.patch.object(streaming._routing_module, "_recovery_max_seconds", return_value=0):
             chunks = [
                 chunk
@@ -3276,11 +3219,17 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                 )
             ]
 
-        self.assertEqual(1, len(calls))
-        self.assertLess(len(calls[0]["input"]), len(original_input))
-        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
-        self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
-        self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
+        self.assertEqual([], calls)
+        self.assertIn("still thinking", [chunk.get("delta") for chunk in chunks])
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertEqual(chunks[0]["response"]["id"], chunks[-1]["response"]["id"])
+        continuation = [
+            item for item in chunks[-1]["response"]["output"]
+            if item.get("phase") == "commentary"
+        ]
+        self.assertEqual(1, len(continuation))
+        self.assertIn("Continue the original request", continuation[0]["content"][0]["text"])
+        self.assertEqual(11, chunks[-1]["response"]["usage"]["input_tokens"])
 
     async def test_a_replay_refusal_repairs_even_after_a_fallback_marker(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -3403,18 +3352,10 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
         self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
 
-    async def test_a_heavy_cut_is_answered_by_repairing_the_request_not_the_route(
+    async def test_a_heavy_reasoning_cut_is_not_replayed_after_delivery(
         self,
     ) -> None:
-        """A long replay that spent the item budget on thinking is the body's
-        problem: keep the route, drop the oldest reasoning, lower the effort.
-
-        Live 2026-11-20 thread 01a1ee60: 9,5xx items at ``effort: max`` were cut
-        with ``max_messages`` after ~100 reasoning items on the order-first
-        route; hopping the same body to a sibling paid another full prefill and
-        the siblings answered 524/500.  The repair makes the same route able to
-        finish: newest reasoning only; the client's effort is left as asked.
-        """
+        """A large history cannot justify replaying reasoning already delivered."""
 
         hooks, proxy_server = load_hook_module()
         streaming = importlib.import_module("young_router.proxy.streaming")
@@ -3443,21 +3384,10 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
             return stream()
 
-        def answered():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-ok"}}
-                yield {"type": "response.output_text.delta", "delta": "the answer"}
-                yield {
-                    "type": "response.completed",
-                    "response": {"id": "resp-ok", "status": "completed", "output": []},
-                }
-
-            return stream()
-
         class FakeRouter:
             async def aresponses(self, **payload):
                 calls.append(payload)
-                return answered()
+                raise AssertionError("delivered reasoning must not be replayed")
 
         proxy_server.llm_router = FakeRouter()
         reasoning_items = [
@@ -3491,30 +3421,23 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(1, len(calls))
-        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
-        # The oldest reasoning is gone; messages and the newest reasoning stay.
-        self.assertLess(len(calls[0]["input"]), 150)
-        # The repair is the replay, not the client's reasoning depth: only the
-        # body was too heavy, and what the answer costs is the caller's choice.
-        self.assertEqual("max", calls[0]["reasoning"]["effort"])
-        # The route did its job: it is not excluded from its own retry, and the
-        # retry is pinned to the same deployment.
-        self.assertNotIn("order-0", calls[0].get("_excluded_deployment_ids") or [])
-        self.assertEqual("order-0", (calls[0].get("model_info") or {}).get("id"))
+        self.assertEqual([], calls)
+        self.assertIn("weighing the two explanations", [chunk.get("delta") for chunk in chunks])
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertEqual(chunks[0]["response"]["id"], chunks[-1]["response"]["id"])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            for item in chunks[-1]["response"]["output"]
+        ))
 
-    async def test_a_cap_after_a_progress_line_still_continues_on_a_sibling(
+    async def test_a_cap_after_delivered_progress_closes_step_for_continuation(
         self,
     ) -> None:
-        """A cap that only produced narration is still not this turn's answer.
+        """Delivered assistant text is kept and the next sample can continue.
 
-        Live 2026-11-20: the capped turns had already emitted a short progress
-        message ("Sending now") when the relay stated ``max_messages``, so the
-        thinking-only branch above never saw them and the turn was handed to
-        the reader as an incomplete response -- 每轮停一下，而不是把活干完。
-        A cap is the route's budget, so a route that has said a line or two is
-        still one the turn can be moved off; only a finished tool call or a
-        real answer makes the stop the reader's.
+        The route states ``max_messages`` after Codex has received a completed
+        commentary item. Keep that item and close the step with a commentary
+        continuation marker instead of ending the overall task.
         """
 
         hooks, proxy_server = load_hook_module()
@@ -3522,57 +3445,50 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear()
         self.addCleanup(routing._THINKING_ONLY_CUT_RETRY_REQUESTS.clear)
         calls: list = []
+        commentary = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Sending now", "annotations": []}],
+        }
 
-        def progress_then_capped():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-cut"}}
-                yield {
-                    "type": "response.reasoning_summary_text.delta",
-                    "item_id": "rs_1",
-                    "output_index": 0,
-                    "delta": "weighing the two explanations",
-                }
-                yield {
-                    "type": "response.output_text.delta",
-                    "item_id": "msg_1",
-                    "output_index": 1,
-                    "delta": "Sending now",
-                }
-                yield {
-                    "type": "response.incomplete",
-                    "response": {
-                        "id": "resp-cut",
-                        "status": "incomplete",
-                        "incomplete_details": {"reason": "max_messages"},
-                        "output": [
-                            {"type": "reasoning", "id": "rs_1"},
-                            {
-                                "type": "message",
-                                "id": "msg_1",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": "Sending now"}],
-                            },
-                        ],
-                    },
-                }
-
-            return stream()
-
-        def answered():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-ok"}}
-                yield {"type": "response.output_text.delta", "delta": "the answer"}
-                yield {
-                    "type": "response.completed",
-                    "response": {"id": "resp-ok", "status": "completed", "output": []},
-                }
-
-            return stream()
+        async def progress_then_capped():
+            yield {"type": "response.created", "response": {"id": "resp-cut"}}
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "delta": "weighing the two explanations",
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": commentary | {"status": "in_progress", "content": []},
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "delta": "Sending now",
+            }
+            yield {"type": "response.output_item.done", "output_index": 1, "item": commentary}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-cut",
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "output": [{"type": "reasoning", "id": "rs_1"}, commentary],
+                },
+            }
 
         class FakeRouter:
             async def aresponses(self, **payload):
                 calls.append(payload)
-                return answered()
+                raise AssertionError("delivered text must not be replayed")
 
         proxy_server.llm_router = FakeRouter()
         request_data = {
@@ -3599,10 +3515,234 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         ]
         types = [chunk.get("type") for chunk in chunks]
 
-        self.assertEqual(1, len(calls))
-        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertEqual([], calls)
+        self.assertEqual(
+            ["Sending now"],
+            [chunk["delta"] for chunk in chunks if chunk["type"] == "response.output_text.delta"],
+        )
+        self.assertEqual(
+            [commentary],
+            [chunk["item"] for chunk in chunks if chunk["type"] == "response.output_item.done"],
+        )
         self.assertNotIn("response.failed", types)
-        self.assertNotIn("response.incomplete", types)
+        self.assertEqual("response.completed", types[-1])
+        terminal = chunks[-1]["response"]
+        self.assertEqual(chunks[0]["response"]["id"], terminal["id"])
+        self.assertEqual("completed", terminal["status"])
+        self.assertIn(commentary, terminal["output"])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in terminal["output"]
+        ))
+        message_texts = [
+            item["content"][0]["text"]
+            for item in terminal["output"]
+            if item.get("type") == "message"
+            and item.get("content")
+            and item["content"][0].get("type") == "output_text"
+        ]
+        self.assertEqual(1, message_texts.count("Sending now"))
+
+    async def test_a_cap_after_a_completed_tool_call_keeps_the_completed_step(self) -> None:
+        """A completed tool call is work the client must still be able to run."""
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("a completed tool call must not be replayed")
+
+        proxy_server.llm_router = FakeRouter()
+        commentary = {
+            "id": "msg-commentary",
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Checking the remaining item.", "annotations": []}],
+        }
+        call = {
+            "id": "call_exec",
+            "call_id": "call_exec",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd"}',
+            "status": "completed",
+        }
+
+        async def stream():
+            yield {"type": "response.created", "response": {"id": "resp-tool-cap"}}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": commentary | {"status": "in_progress", "content": []},
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": commentary["id"],
+                "output_index": 0,
+                "delta": "Checking the remaining item.",
+            }
+            yield {"type": "response.output_item.done", "output_index": 0, "item": commentary}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": call | {"status": "in_progress", "arguments": ""},
+            }
+            yield {
+                "type": "response.function_call_arguments.done",
+                "item_id": call["id"],
+                "output_index": 1,
+                "arguments": call["arguments"],
+            }
+            yield {"type": "response.output_item.done", "output_index": 1, "item": call}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-tool-cap",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+                    "output": [commentary, call],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Check the remaining item."}],
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order-0", "order": 0},
+        }
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertEqual("completed", chunks[-1]["response"]["status"])
+        output = chunks[-1]["response"]["output"]
+        self.assertEqual(commentary, output[0])
+        self.assertEqual(call, output[1])
+        self.assertFalse(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in output[2:]
+        ))
+        usage = chunks[-1]["response"]["usage"]
+        self.assertEqual(
+            (11, 7, 18),
+            (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]),
+        )
+
+    async def test_a_tool_call_only_in_the_incomplete_snapshot_is_kept(self) -> None:
+        """The terminal response snapshot can be the only completed tool event."""
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("a terminal completed tool call must not be replayed")
+
+        proxy_server.llm_router = FakeRouter()
+        commentary = {
+            "id": "msg-commentary",
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Checking the remaining item.", "annotations": []}],
+        }
+        call = {
+            "id": "call_exec",
+            "call_id": "call_exec",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd"}',
+            "status": "completed",
+        }
+
+        async def stream():
+            yield {"type": "response.created", "response": {"id": "resp-terminal-tool-cap"}}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": commentary | {"status": "in_progress", "content": []},
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": commentary["id"],
+                "output_index": 0,
+                "delta": "Checking the remaining item.",
+            }
+            yield {"type": "response.output_item.done", "output_index": 0, "item": commentary}
+            # The completed client tool call appears only in the terminal snapshot.
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-terminal-tool-cap",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "usage": {"input_tokens": 13, "output_tokens": 9, "total_tokens": 22},
+                    "output": [commentary, call],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Check the remaining item."}],
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order-0", "order": 0},
+        }
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=stream(),
+                request_data=request_data,
+            )
+        ]
+
+        terminal = chunks[-1]
+        self.assertEqual("response.completed", terminal["type"])
+        tool_added = next(
+            chunk
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.added"
+            and (chunk.get("item") or {}).get("type") == "function_call"
+        )
+        tool_done = next(
+            chunk
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.done"
+            and (chunk.get("item") or {}).get("type") == "function_call"
+        )
+        self.assertEqual("in_progress", tool_added["item"]["status"])
+        self.assertEqual("completed", tool_done["item"]["status"])
+        self.assertEqual("call_exec", tool_done["item"]["call_id"])
+        self.assertLess(chunks.index(tool_added), chunks.index(tool_done))
+        self.assertLess(chunks.index(tool_done), len(chunks) - 1)
+        output = terminal["response"]["output"]
+        self.assertEqual(commentary, output[0])
+        self.assertEqual(call, output[1])
+        self.assertFalse(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in output[2:]
+        ))
+        usage = terminal["response"]["usage"]
+        self.assertEqual(
+            (13, 9, 22),
+            (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]),
+        )
 
     async def test_a_second_cut_in_the_same_turn_ends_it(self) -> None:
         """One hop is the whole allowance; the second cut is the reader's.
@@ -3672,22 +3812,15 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             ]
         types = [chunk.get("type") for chunk in chunks]
 
-        # The reader is told the turn ended; no second answer is invented, and
-        # at most the one-shot fallback round a failure terminal already earns.
-        self.assertIn("response.failed", types)
+        # One model step ended; Codex can sample again from this completed
+        # commentary step, while the delivered reasoning stays put.
+        self.assertEqual("response.completed", chunks[-1]["type"])
         self.assertNotIn("the answer", [chunk.get("delta") for chunk in chunks])
-        self.assertLessEqual(len(calls), 1)
+        self.assertNotIn("response.incomplete", types)
+        self.assertEqual([], calls)
 
-    async def test_a_route_that_states_incomplete_is_not_reported_as_a_failure(self) -> None:
-        """Codex ends the turn on ``response.incomplete``; it reconnects on our failures.
-
-        The relay's own terminal is the truth about this response.  Codex maps
-        ``response.incomplete`` to a terminal sampling outcome (no retry, spend
-        recorded), while any ``response.failed`` code it does not know is
-        retried as transport -- which is why a capped turn read as
-        ``正在重新连接 1/5`` and replayed the same history (2026-11-20, thread
-        01a1ee60).
-        """
+    async def test_a_max_messages_terminal_closes_as_commentary_to_continue(self) -> None:
+        """A partial answer reaches the next Codex sample as unfinished work."""
 
         hooks, proxy_server = load_hook_module()
 
@@ -3697,8 +3830,8 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
 
-        # A cap that lands on a real answer -- not on a progress line -- is the
-        # reader's stop: the text is too long to say again on another route.
+        # The text is already visible. Do not replay it; close this step with
+        # commentary that tells Codex to continue the unfinished task.
         answered_text = "the answer, written out at length. " * 20
 
         async def incomplete_stream():
@@ -3736,13 +3869,202 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         ]
         types = [chunk.get("type") for chunk in chunks]
 
-        # A cap that lands after a real answer ends *this step*, not the turn:
-        # ``response.incomplete`` ends the agent's turn with "Incomplete
-        # response returned", while a completed step lets it ask for the next
-        # one -- and no failure code it might reconnect on.
+        # Preserve usage and the streamed partial text, while keeping the
+        # assistant message in the non-final commentary phase.
         self.assertNotIn("response.failed", types)
-        self.assertNotIn("response.incomplete", types)
         self.assertEqual("response.completed", types[-1])
+        response = chunks[-1]["response"]
+        self.assertEqual(chunks[0]["response"]["id"], response["id"])
+        self.assertEqual("completed", response["status"])
+        self.assertEqual(11, response["usage"]["input_tokens"])
+        self.assertEqual(7, response["usage"]["output_tokens"])
+        self.assertEqual(18, response["usage"]["total_tokens"])
+        self.assertIn(answered_text, [chunk.get("delta") for chunk in chunks])
+        messages = [item for item in response["output"] if item.get("type") == "message"]
+        self.assertTrue(messages)
+        self.assertTrue(all(item.get("phase") == "commentary" for item in messages))
+        self.assertTrue(any("Continue the original request" in item["content"][0]["text"] for item in messages))
+
+    async def test_a_bare_max_messages_terminal_returns_a_continuation_step(self) -> None:
+        """A second item cap with no output must not escape as incomplete."""
+
+        streaming = importlib.import_module("young_router.proxy.streaming")
+
+        async def incomplete_stream():
+            yield {"type": "response.created", "response": {"id": "resp-bare-cap"}}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-bare-cap",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "output": [],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Finish the task."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order-0", "order": 0},
+        }
+        chunks = [
+            chunk
+            async for chunk in streaming._yield_guarded_original_stream(
+                [],
+                incomplete_stream(),
+                request_data,
+                reading_upstream_stream=True,
+            )
+        ]
+
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
+        self.assertFalse(chunks[-1]["response"]["end_turn"])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in chunks[-1]["response"]["output"]
+        ))
+
+    async def test_a_short_bare_max_messages_terminal_returns_a_continuation_step(self) -> None:
+        """A short replay with no output continues without cooling its route."""
+
+        hooks, proxy_server = load_hook_module()
+        calls: list[dict] = []
+
+        def capped_stream():
+            async def stream():
+                yield {"type": "response.created", "response": {"id": "resp-bare-cap"}}
+                yield {
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp-bare-cap",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_messages"},
+                        "output": [],
+                    },
+                }
+
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return capped_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Finish the task."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order-0", "order": 0},
+        }
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=capped_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual([], calls)
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertNotIn("response.incomplete", [chunk.get("type") for chunk in chunks])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in chunks[-1]["response"]["output"]
+        ))
+
+    async def test_max_messages_survives_historical_note_filter_after_reasoning(self) -> None:
+        """Removing a gateway note must not replace an upstream cap terminal."""
+
+        hooks, proxy_server = load_hook_module()
+        note_module = importlib.import_module("young_router.proxy.historical_reasoning_note")
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("delivered reasoning must not be replayed")
+
+        proxy_server.llm_router = FakeRouter()
+        note_text = note_module.NOTE_PREFIX + "\n" + note_module.NOTE_BODY
+        note_item = {
+            "id": "msg-note",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": note_text, "annotations": []}],
+        }
+
+        async def incomplete_stream():
+            yield {"type": "response.created", "response": {"id": "resp-note-cap"}}
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs-1",
+                "output_index": 0,
+                "delta": "checking the input",
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": note_item | {"status": "in_progress", "content": []},
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": note_item["id"],
+                "output_index": 1,
+                "delta": note_text,
+            }
+            yield {"type": "response.output_item.done", "output_index": 1, "item": note_item}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-note-cap",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_messages"},
+                    "usage": {"input_tokens": 11, "output_tokens": 99, "total_tokens": 110},
+                    "output": [
+                        {"type": "reasoning", "id": "rs-1", "status": "incomplete"},
+                        note_item,
+                    ],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+            "reasoning": {"summary": "detailed"},
+            "proxy_server_request": {"path": "/v1/responses"},
+            "client_metadata": {"thread_id": "thread-note-cap"},
+            "litellm_call_id": "call-note-cap",
+            "model_info": {"id": "order-0", "order": 0},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=incomplete_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertNotIn("response.failed", [chunk.get("type") for chunk in chunks])
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        response = chunks[-1]["response"]
+        self.assertEqual("completed", response["status"])
+        self.assertEqual(11, response["usage"]["input_tokens"])
+        self.assertEqual(99, response["usage"]["output_tokens"])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in response["output"]
+        ))
 
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.

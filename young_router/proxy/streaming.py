@@ -1899,6 +1899,9 @@ def _synthesized_completed_response_event(
     model: Optional[str],
     *,
     fallback_text: Optional[str] = None,
+    fallback_phase: Optional[str] = None,
+    end_turn: Optional[bool] = None,
+    terminal: Any = None,
 ) -> Optional[_JSONStreamEvent]:
     text = fallback_text if isinstance(fallback_text, str) else ""
     if not completed_output_items and not text.strip():
@@ -1917,6 +1920,7 @@ def _synthesized_completed_response_event(
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
+                **({"phase": fallback_phase} if fallback_phase else {}),
                 "content": [
                     {
                         "type": "output_text",
@@ -1928,6 +1932,13 @@ def _synthesized_completed_response_event(
         ]
         response["output_text"] = text
     response["status"] = "completed"
+    if end_turn is not None:
+        response["end_turn"] = end_turn
+    terminal_dump = _stream_chunk_dump(terminal) if terminal is not None else {}
+    terminal_response = terminal_dump.get("response")
+    usage = terminal_response.get("usage") if isinstance(terminal_response, dict) else None
+    if isinstance(usage, dict):
+        response["usage"] = copy.deepcopy(usage)
     _image_generation_module._normalize_image_generation_result_status(response)
     response = _web_search_native_module._sanitize_response_web_search_call_items(response)
     completed_event: dict[str, Any] = {
@@ -1937,55 +1948,6 @@ def _synthesized_completed_response_event(
     if model:
         completed_event["model"] = model
     return _json_stream_event(completed_event)
-
-def _synthesized_incomplete_response_event(
-    created_response: Optional[dict[str, Any]],
-    model: Optional[str],
-    *,
-    terminal: Any,
-    output_items: Optional[dict[int, dict[str, Any]]] = None,
-) -> _JSONStreamEvent:
-    """Hand the client the outcome the route itself stated.
-
-    Codex's Responses reader maps ``response.incomplete`` to
-    ``ApiError::ResponseIncomplete`` and ``is_terminal_sampling_outcome`` keeps
-    it out of the retry loop: the turn ends, the partial output stays, and the
-    bytes are not sent again.  Every unrecognised ``response.failed`` code is
-    the opposite -- retried as a transport failure.  Turning a route's own
-    ``response.incomplete`` into a failure is what made every capped turn read
-    as ``正在重新连接 1/5`` (live 2026-11-20, thread ``01a1ee60``).
-    """
-
-    dumped = _stream_chunk_dump(terminal)
-    upstream_response = dumped.get("response") if isinstance(dumped, dict) else None
-    upstream_response = (
-        upstream_response if isinstance(upstream_response, dict) else {}
-    )
-    response = (
-        copy.deepcopy(created_response) if isinstance(created_response, dict) else {}
-    )
-    response.setdefault("id", upstream_response.get("id") or "resp_synthesized")
-    response.setdefault("object", "response")
-    if model and not response.get("model"):
-        response["model"] = model
-    response["status"] = "incomplete"
-    details = upstream_response.get("incomplete_details")
-    if not isinstance(details, dict) or not details.get("reason"):
-        details = {
-            "reason": _responses_incomplete_terminal_reason(dumped) or "incomplete"
-        }
-    response["incomplete_details"] = details
-    # The spend is real and the client records it from this frame.
-    usage = upstream_response.get("usage")
-    if isinstance(usage, dict):
-        response["usage"] = usage
-    if output_items:
-        response["output"] = [
-            item for _index, item in sorted(output_items.items(), key=lambda entry: entry[0])
-        ]
-    else:
-        response.setdefault("output", [])
-    return _json_stream_event({"type": "response.incomplete", "response": response})
 
 def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
     dumped = _stream_chunk_dump(chunk)
@@ -3206,13 +3168,6 @@ _UPSTREAM_INPUT_ITEM_LIMIT_REASONS = frozenset(
 )
 
 
-# How much answer text may already have reached the reader when a route's item
-# cap ends the turn and a sibling route takes it over.  Below this the cost is
-# a repeated progress line; above it the reader is reading an answer that must
-# not be written twice.
-_CAP_CUT_RESUMABLE_TEXT_CHARS = 400
-
-
 def _incomplete_terminal_capped_generated_output(
     buffer: Optional[List[Any]],
     request_data: Optional[dict] = None,
@@ -3351,10 +3306,11 @@ def _responses_incomplete_stream_exception(
                 # Codex must not be told to compact over a cap that a shorter
                 # replay clears.
                 setattr(exception, _UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
-                # Whatever this turn can still do about it, the thread is now
-                # known to be too large for this route -- and the client replays
-                # the same history on its next turn.
-                _routing_module._remember_replay_too_large(request_data)
+                # Record shortening only when this history actually has older
+                # content the gateway can elide. A bare empty max_messages turn
+                # with a short history has no content the repair can remove.
+                if _request_replay_is_heavy(request_data):
+                    _routing_module._remember_replay_too_large(request_data)
     except Exception:
         pass
     try:
@@ -4999,8 +4955,7 @@ async def _without_historical_note_frames(source: AsyncIterator[Any]) -> AsyncIt
                         yield released
                     clean = _historical_note_module.clean_response(response)
                     if clean is not response or notes.saw_note:
-                        item_cap = _responses_incomplete_terminal_reason(event) in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
-                        if (_responses_stream_chunk_is_completed(event) or item_cap) and not notes.has_answer():
+                        if _responses_stream_chunk_is_completed(event) and not notes.has_answer():
                             # An explicit commentary item is progress, not the
                             # final answer. Its text mirror is not a second answer.
                             remaining = clean.get("output") or []
@@ -5010,7 +4965,7 @@ async def _without_historical_note_frames(source: AsyncIterator[Any]) -> AsyncIt
                                 for item in remaining
                             ) or (not remaining and bool((clean.get("output_text") or "").strip()))
                             if not has_result:
-                                raise _historical_note_module.MissingAnswer(item_cap_cut=item_cap)
+                                raise _historical_note_module.MissingAnswer()
                     if clean is not response:
                         frame = _json_stream_event({**event, "response": clean})
                 for released in notes.feed(frame, event):
@@ -7495,16 +7450,10 @@ async def _yield_guarded_original_stream(
 
     event_tail: List[Any] = []
     visible_output_seen = saw_visible_output
-    # Whether this answer has *begun*, which is a different question from
-    # whether the client was shown anything: thinking is delivered the moment
-    # it arrives but it never answers the turn.  A bridged chat route that is
-    # cut while it is still thinking reports itself as ``response.completed``
-    # with a reasoning item and nothing else (LiteLLM's completion bridge
-    # fabricates that terminal from whatever it collected when the chat stream
-    # simply stops).  Handing that to the client is a finished turn that
-    # states no outcome at all, so the empty-completion check below reads this
-    # flag rather than the delivered-output one, whose thinking would waive it.
-    answer_output_seen = False
+    # Track assistant output separately from reasoning. Even a brief
+    # commentary message has reached the conversation and rules out replay;
+    # reasoning alone also cannot make an empty completion a usable result.
+    assistant_output_seen = False
     generated_output_seen = False
     seen_output_item_ids: set[str] = set()
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]] = {}
@@ -7594,11 +7543,11 @@ async def _yield_guarded_original_stream(
         return name
 
     def remember_deliverable_output(chunk: Any) -> None:
-        nonlocal visible_output_seen, answer_output_seen
+        nonlocal visible_output_seen, assistant_output_seen
         visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(
             chunk, request_data
         )
-        answer_output_seen = answer_output_seen or _stream_chunk_has_visible_output(chunk)
+        assistant_output_seen = assistant_output_seen or _stream_chunk_has_visible_output(chunk)
 
     def remember(chunk: Any) -> None:
         nonlocal generated_output_seen, saw_image_generation_activity
@@ -7771,19 +7720,11 @@ async def _yield_guarded_original_stream(
     # and every request in that window fell to a relay seven times slower.
     empty_completion_ended_stream = False
 
-    def reopen_the_turn_after_a_thinking_only_cut(failure: Exception) -> bool:
-        """Ask the route machinery for one more route instead of the reader.
+    def reopen_the_turn_after_an_unseen_cut(failure: Exception) -> bool:
+        """Retry an item-cap cut only if the client has received no output."""
 
-        Only thinking has reached the client: answer text and tool calls cannot
-        be sent twice, thinking can be derived again, and a sibling route is a
-        far cheaper answer than the reconnect Codex does when this terminal
-        reaches it (``stream disconnected before completion``, ``1/5``).  The
-        route is parked first so the hop that follows picks a different one.
-        This is offered to a turn once -- the same body reaching the same cap
-        twice is a stop the reader is owed, and the window this would otherwise
-        open is hours of thinking nobody can read.
-        """
-
+        if visible_output_seen or pending_tool_items or completion_state.finished_argument_item_ids:
+            return False
         if getattr(failure, "item_cap_cut", False) and _repair_heavy_replay_request(
             request_data, failure, trigger="item_cap"
         ):
@@ -7792,7 +7733,7 @@ async def _yield_guarded_original_stream(
             # route is not charged and not excluded, and the fallback round
             # stays on it (the repair already marked the failure).
             _trace_module._request_route_trace(
-                "responses_cut_after_thinking_only_retried", request_data,
+                "responses_cut_before_visible_output_retried", request_data,
                 exception=_routing_module._trace_exception(failure),
                 request_repaired=True,
             )
@@ -7808,60 +7749,37 @@ async def _yield_guarded_original_stream(
                 request_data,
             )
         _trace_module._request_route_trace(
-            "responses_cut_after_thinking_only_retried", request_data,
+            "responses_cut_before_visible_output_retried", request_data,
             exception=_routing_module._trace_exception(failure),
         )
         return True
 
-    def item_cap_leaves_the_turn_unanswered(chunk: Any) -> bool:
-        """Whether a route's item cap ended a turn that has not answered yet.
-
-        ``max_messages`` counts what one response may generate, so a route that
-        hits it mid-thinking has not answered anything -- the reader got a few
-        progress lines and a stop.  Measured 2026-11-20 on the tken relay: two
-        capped turns had produced 100 and 98 reasoning items when the terminal
-        arrived (1m49s and 3m45s in) while every turn that finished stayed
-        around ten, and the same model finished the same kind of turn on
-        flux/youyangai without ever stating this reason.  So this is a route
-        limit, and a sibling route continues the turn instead of the reader
-        being told to send it again.
-
-        A finished tool call is work that already happened and a long answer is
-        text the reader is reading; neither may be produced twice, so both keep
-        the stop.  What remains is the short-progress case, where the duplicate
-        is a line or two of narration.
-        """
-
-        if _responses_incomplete_terminal_reason(chunk) not in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
-            return False
-        if pending_tool_items:
-            return False
-        if completion_state.finished_argument_item_ids:
-            return False
-        return len(synthesized_text().strip()) < _CAP_CUT_RESUMABLE_TEXT_CHARS
-
-    def stated_incomplete_terminal_event(
+    def committed_incomplete_terminal_event(
         chunk: Any,
         failure: Exception,
-    ) -> Optional[_JSONStreamEvent]:
-        """The route's own ``response.incomplete``, as the outcome it is.
+    ) -> Optional[list[_JSONStreamEvent]]:
+        """Continue an item-capped Responses step without replaying delivered data.
 
-        Codex's Responses reader maps an incomplete response to a terminal
-        sampling outcome -- it records the spend, keeps what it already
-        rendered and does not re-send the bytes -- while a failure with a code
-        it does not know is retried as transport.  Handing it a failure instead
-        is what made every capped turn read as ``正在重新连接 1/5`` and replay
-        the same history (live 2026-11-20, thread ``01a1ee60``).
+        A completed client tool call is returned so Codex can execute it. If
+        the model was still thinking or writing, close the truncated response
+        as commentary and tell Codex to continue the same request on its next
+        sample. An incomplete terminal must never be forwarded as the end of
+        the caller's task.
         """
 
         if _stream_chunk_type(_stream_chunk_dump(chunk)) != "response.incomplete":
             return None
-        if pending_tool_items:
+        item_cap_terminal = (
+            _responses_incomplete_terminal_reason(chunk)
+            in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
+        )
+        if pending_tool_items and not item_cap_terminal:
             # A half-written tool call is not an outcome: the work it stands for
             # never started, so this turn has to be resent instead of accepted
-            # as a partial answer.
+            # as a partial answer. At an item cap, keep the stated stop and
+            # leave unfinished calls out of the terminal output.
             return None
-        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+        if not item_cap_terminal and _routing_module._is_request_scoped_priority_deployment_failover_error(
             failure,
             request_data,
         ):
@@ -7869,21 +7787,172 @@ async def _yield_guarded_original_stream(
                 failure,
                 request_data,
             )
-        if getattr(failure, "item_cap_cut", False):
-            _register_terminal_turn_failure(request_data, failure)
-        _trace_module._request_route_trace(
-            "responses_upstream_incomplete_delivered",
-            request_data,
-            reason=_responses_incomplete_terminal_reason(chunk),
-            exception=_routing_module._trace_exception(failure),
-            already_yielded_visible_output=True,
-        )
-        return _synthesized_incomplete_response_event(
-            completion_state.created_response,
-            completion_state.model,
-            terminal=chunk,
-            output_items=completed_output_items,
-        )
+        if item_cap_terminal:
+            # This is a completed continuation step, not a failed client turn;
+            # keep its route eligible while the client samples the task again.
+            terminal_dump = _stream_chunk_dump(chunk)
+            terminal_response = terminal_dump.get("response")
+            terminal_output = (
+                terminal_response.get("output")
+                if isinstance(terminal_response, dict)
+                else None
+            )
+            if isinstance(terminal_output, list):
+                for index, item in enumerate(terminal_output):
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if _stream_output_item_is_tool_call(item_type):
+                        # A call can only be handed to the client when the
+                        # upstream completed the item or explicitly finished
+                        # its argument stream. Never turn a truncated JSON
+                        # argument delta into an executable tool call.
+                        pending_key = _pending_tool_item_key_for_item(
+                            pending_tool_items, item
+                        )
+                        arguments_finished = any(
+                            key in completion_state.finished_argument_item_ids
+                            for key in _stream_output_item_identity_keys(item)
+                        )
+                        if item.get("status") != "completed" and not (
+                            pending_key is not None and arguments_finished
+                        ):
+                            continue
+                        item = copy.deepcopy(item)
+                        item["status"] = "completed"
+                        if pending_key is not None:
+                            pending_index, pending_item = pending_tool_items.pop(pending_key)
+                            item = _apply_stream_function_arguments(
+                                {**pending_item, **item},
+                                completion_state.arguments_by_item_id,
+                            )
+                            index = pending_index
+                    elif item.get("status") != "completed":
+                        item = copy.deepcopy(item)
+                        item["status"] = "completed"
+                    if item.get("type") == "message" and item.get("role") == "assistant":
+                        item = copy.deepcopy(item)
+                        item["phase"] = "commentary"
+                        item["status"] = "completed"
+                    completed_output_items.setdefault(index, copy.deepcopy(item))
+
+                for index, item in list(completed_output_items.items()):
+                    if item.get("type") == "message" and item.get("role") == "assistant":
+                        updated = copy.deepcopy(item)
+                        updated["phase"] = "commentary"
+                        updated["status"] = "completed"
+                        completed_output_items[index] = updated
+                    elif item.get("type") == "reasoning":
+                        updated = copy.deepcopy(item)
+                        updated["status"] = "completed"
+                        completed_output_items[index] = updated
+
+            # Reaching an upstream item cap is a finished *step*, not a
+            # finished agent turn. Return a completed commentary response so
+            # Codex samples the same task again with this progress in history.
+            # This also carries output streamed as deltas when the upstream
+            # omitted its partial message from the terminal snapshot.
+            has_completed_tool = not pending_tool_items and any(
+                item.get("status") == "completed"
+                and (
+                    item.get("type") in {"function_call", "custom_tool_call", "computer_call"}
+                    or (
+                        item.get("type") == "tool_search_call"
+                        and item.get("execution") == "client"
+                        and item.get("call_id")
+                    )
+                )
+                for item in completed_output_items.values()
+            )
+            assistant_messages = [
+                item
+                for item in completed_output_items.values()
+                if item.get("type") == "message"
+                and item.get("role") == "assistant"
+                and _response_item_has_assistant_text(item)
+            ]
+            if not has_completed_tool:
+                # Preserve streamed partial text only when the terminal output
+                # does not already contain it. Duplicating it in the completed
+                # response makes Codex render the same progress twice.
+                progress_text = "" if assistant_messages else synthesized_text().strip()
+                text = "\n\n".join(
+                    part
+                    for part in (
+                        progress_text,
+                        "The task is unfinished. Continue the original request from the progress so far without repeating completed work.",
+                    )
+                    if part
+                )
+                next_index = max(completed_output_items, default=-1) + 1
+                completed_output_items[next_index] = {
+                    "id": f"msg_continue_{os.getpid()}_{time.time_ns()}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    }],
+                }
+            # A hosted tool has already run upstream; it has no client result
+            # with which to continue this step.
+            if has_completed_tool:
+                _trace_module._request_route_trace(
+                    "responses_active_stream_synthesized_completed_event", request_data,
+                    reason="route item cap after completed client tool call",
+                    already_yielded_visible_output=visible_output_seen,
+                )
+                terminal_tool_snapshot = {
+                    "type": "response.completed",
+                    "response": {
+                        "output": [
+                            item
+                            for _, item in sorted(completed_output_items.items())
+                        ],
+                    },
+                }
+                completed_tool_events = _synthesized_missing_completed_tool_events(
+                    terminal_tool_snapshot,
+                    seen_output_item_ids,
+                    pending_tool_items,
+                )
+                completed = _synthesized_completed_response_event(
+                    completed_output_items,
+                    completion_state.created_response,
+                    completion_state.model,
+                    end_turn=False,
+                    terminal=chunk,
+                )
+                return [
+                    *(event for event in completed_tool_events if event.get("type") != "response.completed"),
+                    completed,
+                ] if completed is not None else None
+            _trace_module._request_route_trace(
+                "responses_active_stream_synthesized_completed_event",
+                request_data,
+                reason="route item cap; continuing unfinished agent turn",
+                already_yielded_visible_output=visible_output_seen,
+            )
+            completed = _synthesized_completed_response_event(
+                completed_output_items,
+                completion_state.created_response,
+                completion_state.model,
+                fallback_text=(
+                    "The task is unfinished. Continue the original request "
+                    "from the progress so far without repeating completed work."
+                ),
+                fallback_phase="commentary",
+                end_turn=False,
+                terminal=chunk,
+            )
+            return [completed] if completed is not None else None
+        # Other incomplete reasons are not a completed item-cap step. Let the
+        # caller retry/fail over or emit a retryable failure; never forward the
+        # incomplete terminal as if it ended the task.
+        return None
 
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
         failure = exception or _responses_incomplete_stream_exception(
@@ -7971,7 +8040,7 @@ async def _yield_guarded_original_stream(
                 await _close_async_iterator_safely(response)
                 return
             if empty_completed and completed_response_has_output_items(chunk):
-                if not answer_output_seen:
+                if not assistant_output_seen:
                     empty_completion_ended_stream = True
                     break
                 # Answer text was streamed, but the fabricated terminal carries
@@ -7987,7 +8056,7 @@ async def _yield_guarded_original_stream(
                     await _close_async_iterator_safely(response)
                     return
                 break
-            if empty_completed and not answer_output_seen:
+            if empty_completed and not assistant_output_seen:
                 empty_completion_ended_stream = True
                 break
             saw_responses_completed = True
@@ -8020,10 +8089,8 @@ async def _yield_guarded_original_stream(
             if terminal_events:
                 await _close_async_iterator_safely(response)
                 return
-            output_limit_terminal = (
-                _responses_incomplete_terminal_reason(chunk)
-                in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
-            )
+            incomplete_reason = _responses_incomplete_terminal_reason(chunk)
+            output_limit_terminal = incomplete_reason in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
             if output_limit_terminal:
                 if _incomplete_stopped_below_client_budget(chunk, request_data):
                     _trace_module._request_route_trace(
@@ -8061,7 +8128,8 @@ async def _yield_guarded_original_stream(
                 await _close_async_iterator_safely(response)
                 return
             if (
-                not completed_output_has_visible_assistant_text()
+                incomplete_reason not in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
+                and not completed_output_has_visible_assistant_text()
                 and not synthesized_text().strip()
             ):
                 completed = completed_terminal_event(
@@ -8085,14 +8153,12 @@ async def _yield_guarded_original_stream(
                     request_data=request_data,
                     delivered_output=generated_output,
                 )
-                if (
-                    not answer_output_seen
-                    and reopen_the_turn_after_a_thinking_only_cut(failure)
-                ):
+                if not getattr(failure, "item_cap_cut", False) and reopen_the_turn_after_an_unseen_cut(failure):
                     raise failure
-                stated_outcome = stated_incomplete_terminal_event(chunk, failure)
+                stated_outcome = committed_incomplete_terminal_event(chunk, failure)
                 if stated_outcome is not None:
-                    yield stated_outcome
+                    for outcome_event in stated_outcome:
+                        yield outcome_event
                     await _close_async_iterator_safely(response)
                     return
                 yield failed_terminal_event(
@@ -8207,7 +8273,7 @@ async def _yield_guarded_original_stream(
                     await _close_async_iterator_safely(response)
                     return
                 if empty_completed and completed_response_has_output_items(chunk):
-                    if not answer_output_seen:
+                    if not assistant_output_seen:
                         empty_completion_ended_stream = True
                         break
                     completed = completed_terminal_event(
@@ -8219,7 +8285,7 @@ async def _yield_guarded_original_stream(
                         await _close_async_iterator_safely(response)
                         return
                     break
-                if empty_completed and not answer_output_seen:
+                if empty_completed and not assistant_output_seen:
                     empty_completion_ended_stream = True
                     break
                 saw_responses_completed = True
@@ -8248,10 +8314,8 @@ async def _yield_guarded_original_stream(
                 if terminal_events:
                     await _close_async_iterator_safely(response)
                     return
-                output_limit_terminal = (
-                    _responses_incomplete_terminal_reason(chunk)
-                    in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
-                )
+                incomplete_reason = _responses_incomplete_terminal_reason(chunk)
+                output_limit_terminal = incomplete_reason in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
                 if output_limit_terminal:
                     if _incomplete_stopped_below_client_budget(chunk, request_data):
                         _trace_module._request_route_trace(
@@ -8288,8 +8352,10 @@ async def _yield_guarded_original_stream(
                     )
                     await _close_async_iterator_safely(response)
                     return
+                item_cap = incomplete_reason in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
                 if (
-                    not completed_output_has_visible_assistant_text()
+                    not item_cap
+                    and not completed_output_has_visible_assistant_text()
                     and not synthesized_text().strip()
                 ):
                     completed = completed_terminal_event(
@@ -8301,31 +8367,18 @@ async def _yield_guarded_original_stream(
                         yield completed
                         await _close_async_iterator_safely(response)
                         return
-                if visible_output_seen or (
-                    generated_output_seen
-                    and _responses_incomplete_terminal_reason(chunk) in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
-                ):
+                terminal_has_output = _responses_stream_chunk_has_generated_output(chunk)
+                if visible_output_seen or generated_output_seen or terminal_has_output:
                     failure = _responses_incomplete_stream_exception(
                         "terminal response event before response.completed",
                         buffer=event_tail,
                         request_data=request_data,
                         delivered_output=True,
                     )
-                    _mark_generated_output_item_cap(failure, chunk, delivered=True)
-                    if item_cap_leaves_the_turn_unanswered(chunk) and (
-                        reopen_the_turn_after_a_thinking_only_cut(failure)
-                    ):
-                        # The capped attempt closes its own body normally once
-                        # the hop starts, and that close would otherwise read as
-                        # a delivered answer and clear the count this cap just
-                        # earned.
+                    if item_cap and not getattr(failure, "item_cap_cut", False) and reopen_the_turn_after_an_unseen_cut(failure):
+                        # Charge the cut before the normal body close can be
+                        # mistaken for a success on the capped route.
                         _register_terminal_turn_failure(request_data, failure)
-                        # The route's cap is not this turn's answer: park it and
-                        # let the same turn continue on a sibling route, inside
-                        # this one client stream.  The capped attempt's body
-                        # closes normally once the hop starts, and that close
-                        # would otherwise read as a delivered answer and clear
-                        # the failure this cap just earned.
                         async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
                             request_data,
                             failure,
@@ -8333,48 +8386,29 @@ async def _yield_guarded_original_stream(
                             yield fallback_chunk
                         await _close_async_iterator_safely(response)
                         return
-                    if _responses_incomplete_terminal_reason(chunk) in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS:
-                        # The route ran out of its own item budget after real
-                        # work: a tool call it finished, or text the reader is
-                        # already reading.  Ending the response as completed
-                        # keeps the agent's loop going -- Codex runs the calls,
-                        # records the step and asks for the next one -- while
-                        # ``response.incomplete`` ends the whole turn with
-                        # "Incomplete response returned", which is the stop the
-                        # user is still seeing every few minutes.  Only items
-                        # the route had already completed go in; a half-written
-                        # tool call is excluded by ``pending_tool_items`` below.
-                        if not pending_tool_items:
-                            completed = completed_terminal_event(
-                                "route item cap after delivered work",
-                                allow_tool_call_only=True,
-                            )
-                            if completed is not None:
-                                # The reader gets a finished step, but the
-                                # route still spent its budget mid-turn: charge
-                                # it, so two such caps inside five minutes park
-                                # a route that cannot finish long turns.
-                                if _routing_module._is_request_scoped_priority_deployment_failover_error(
-                                    failure,
-                                    request_data,
-                                ):
-                                    _routing_module._mark_exception_for_deployment_failover(
-                                        failure,
-                                        request_data,
-                                    )
-                                remember(completed)
-                                yield completed
-                                await _close_async_iterator_safely(response)
-                                return
-                    stated_outcome = stated_incomplete_terminal_event(chunk, failure)
+                    stated_outcome = committed_incomplete_terminal_event(chunk, failure)
                     if stated_outcome is not None:
-                        yield stated_outcome
+                        for outcome_event in stated_outcome:
+                            yield outcome_event
                         await _close_async_iterator_safely(response)
                         return
                     yield failed_terminal_event(
                         "terminal response event before response.completed",
                         failure,
                     )
+                    await _close_async_iterator_safely(response)
+                    return
+                committed = committed_incomplete_terminal_event(
+                    chunk,
+                    _responses_incomplete_stream_exception(
+                        "terminal response event before response.completed",
+                        buffer=event_tail,
+                        request_data=request_data,
+                    ),
+                )
+                if committed is not None:
+                    for outcome_event in committed:
+                        yield outcome_event
                     await _close_async_iterator_safely(response)
                     return
                 raise _responses_incomplete_stream_exception(
@@ -8432,7 +8466,7 @@ async def _yield_guarded_original_stream(
         if terminal_events:
             await _close_async_iterator_safely(response)
             return
-        if isinstance(exc, _historical_note_module.MissingAnswer) and not answer_output_seen:
+        if isinstance(exc, _historical_note_module.MissingAnswer) and not visible_output_seen:
             if _responses_request_module._request_already_attempted_streaming_error_fallback(request_data):
                 raise  # The outer fallback round owns any remaining peers.
             async for chunk in _yield_streaming_error_fallback_or_raise(request_data, exc):
@@ -8523,10 +8557,7 @@ async def _yield_guarded_original_stream(
                 yield _synthesized_failed_response_event(request_data, incomplete_exception)
                 await _close_async_iterator_safely(response)
                 return
-            if (
-                not answer_output_seen
-                and reopen_the_turn_after_a_thinking_only_cut(incomplete_exception)
-            ):
+            if reopen_the_turn_after_an_unseen_cut(incomplete_exception):
                 raise incomplete_exception
             if synthesize_completed_on_clean_eof_after_visible_output:
                 terminal_items = terminal_completed_output_items()
@@ -9067,6 +9098,64 @@ async def _yield_start_buffered_stream_with_error_fallback(
                             yield fallback_chunk
                         await _close_async_iterator_safely(stream)
                         return
+                    if (
+                        _responses_incomplete_terminal_reason(chunk)
+                        in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
+                        and generated_output
+                    ):
+                        # This attempt already streamed part of the response.
+                        # Give the buffered response to the terminal handler so
+                        # it can close the capped step as commentary; do not
+                        # replay it on another route and duplicate its output.
+                        async for delivered_chunk in _yield_guarded_original_stream(
+                            buffer,
+                            stream,
+                            request_data,
+                            stream_started_at=stream_started_at,
+                            reading_upstream_stream=True,
+                        ):
+                            yield delivered_chunk
+                        await _close_async_iterator_safely(stream)
+                        return
+                    if (
+                        _responses_incomplete_terminal_reason(chunk)
+                        in _UPSTREAM_INPUT_ITEM_LIMIT_REASONS
+                        and not generated_output
+                    ):
+                        heavy_replay = _should_repair_heavy_replay_request(
+                            incomplete_exception,
+                            request_data,
+                        )
+                        _trace_module._request_route_trace(
+                            "responses_empty_item_cap_decision",
+                            request_data,
+                            reason=_responses_incomplete_terminal_reason(chunk),
+                            heavy_replay=heavy_replay,
+                            generated_output=generated_output,
+                            saw_visible_output=saw_visible_output,
+                            saw_delivered_output=saw_delivered_output,
+                            buffered_event_count=len(buffer),
+                        )
+                        if not heavy_replay:
+                            # A short replay that produced no item is still an
+                            # unfinished step. There is no history repair to try,
+                            # so let Codex sample the task again.
+                            completed = _synthesized_completed_response_event(
+                                {},
+                                completion_state.created_response,
+                                completion_state.model,
+                                fallback_text=(
+                                    "The task is unfinished. Continue the original request "
+                                    "from the progress so far without repeating completed work."
+                                ),
+                                fallback_phase="commentary",
+                                end_turn=False,
+                                terminal=chunk,
+                            )
+                            if completed is not None:
+                                yield completed
+                            await _close_async_iterator_safely(stream)
+                            return
                     async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
                         request_data,
                         incomplete_exception,

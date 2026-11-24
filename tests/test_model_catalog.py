@@ -402,11 +402,82 @@ class ModelCatalogTests(unittest.TestCase):
         }
         native = [next_generation, astra]
 
+        # The canonical carrier is the template: clients from 0.163 on read it,
+        # and the deprecated top-level mirror of the same text is not written.
         pinned = catalog_payload(["gemini-9-pro"], native_models=native, base_slug="gpt-6-astra")["models"][0]
-        self.assertEqual("Astra instructions", pinned["base_instructions"])
+        self.assertEqual("Astra instructions", pinned["model_messages"]["instructions_template"])
+        self.assertNotIn("base_instructions", pinned)
         # Without the pin the client's declared flagship wins the mapping.
         unpinned = catalog_payload(["gemini-9-pro"], native_models=native)["models"][0]
-        self.assertEqual("GPT-7 instructions", unpinned["base_instructions"])
+        self.assertEqual("GPT-7 instructions", unpinned["model_messages"]["instructions_template"])
+        self.assertNotIn("base_instructions", unpinned)
+
+    def test_only_the_message_family_the_client_cannot_default_is_carried(self) -> None:
+        """Everything else in ``model_messages`` has a bundled fallback."""
+
+        native = [
+            {
+                "slug": "gpt-mid",
+                "priority": 1,
+                "visibility": "list",
+                "model_messages": {
+                    "instructions_template": "Client prompt",
+                    "persistent_instructions": "P" * 5000,
+                    "confirmation_policies": {"browser_use": "B" * 20000},
+                    "approvals": {"x": "y"},
+                },
+            }
+        ]
+        with mock.patch("young_router.core.model_catalog.load_native_catalog", return_value=native), \
+                mock.patch("litellm.model_cost", {}):
+            model = catalog_payload(["alias-one"])["models"][0]
+        self.assertEqual(
+            {"instructions_template": "Client prompt"}, model["model_messages"]
+        )
+
+    def test_the_legacy_instruction_mirror_is_never_written(self) -> None:
+        """Nothing this app writes needs the deprecated top-level field."""
+
+        native = [
+            {
+                "slug": "gpt-mid",
+                "priority": 1,
+                "visibility": "list",
+                "base_instructions": "Client prompt",
+                "model_messages": {"instructions_template": "Client prompt"},
+            }
+        ]
+        with mock.patch("young_router.core.model_catalog.load_native_catalog", return_value=native), \
+                mock.patch("litellm.model_cost", {}):
+            from_native = catalog_payload(["alias-one"])["models"][0]
+        with mock.patch("litellm.model_cost", {}):
+            fallback = catalog_payload(["alias-two"], native_models=[])["models"][0]
+        for model in (from_native, fallback):
+            self.assertNotIn("base_instructions", model)
+            self.assertTrue(model["model_messages"]["instructions_template"].strip())
+
+    def test_the_fallback_file_is_told_apart_by_its_prompt_not_its_shape(self) -> None:
+        """A Codex update must not let the minimal profile overwrite a client's."""
+
+        from young_router.core.model_catalog import catalog_carries_native_profile, write_catalog
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch("litellm.model_cost", {}):
+            root = Path(directory)
+            fallback_path = root / "fallback.json"
+            write_catalog(fallback_path, ["a"], native_models=[])
+            self.assertFalse(catalog_carries_native_profile(fallback_path))
+
+            native = [
+                {
+                    "slug": "gpt-mid",
+                    "priority": 1,
+                    "visibility": "list",
+                    "model_messages": {"instructions_template": "The client's own prompt"},
+                }
+            ]
+            client_path = root / "client.json"
+            write_catalog(client_path, ["a"], native_models=native)
+            self.assertTrue(catalog_carries_native_profile(client_path))
 
     def test_unreadable_client_catalog_never_downgrades_native_instructions(self) -> None:
         """A Codex update must not replace the client's prompts with ours."""
@@ -497,7 +568,10 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual("v5", model["multi_agent_version"])
         self.assertEqual("code_mode_only", model["tool_mode"])
         self.assertEqual({"delegation": "native"}, model["future_native_policy"])
-        self.assertEqual("Native process words and delegation instructions", model["base_instructions"])
+        self.assertEqual(
+            "Native process words and delegation instructions",
+            model["model_messages"]["instructions_template"],
+        )
         self.assertEqual(["v5-reasoning"], [item["effort"] for item in model["supported_reasoning_levels"]])
         self.assertEqual(500_000, model["context_window"])
         self.assertEqual(500_000, model["max_context_window"])

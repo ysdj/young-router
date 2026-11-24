@@ -1502,6 +1502,9 @@ class CoreStore:
         # adapter state that mutation is rewriting; the adapter projections
         # are only consistent under the mutation that owns them.
         self._snapshot_view: dict[str, Any] | None = None
+        # The router key the served catalog endpoint accepts, with the file
+        # identity it was read from.  A client fetch asks for it every time.
+        self._master_key_cache: tuple[tuple[Path, int], str] | None = None
         # What the last published event left a window holding, and the revision
         # it carried: the next event is the patch that takes a window from here
         # to the store's current state.  It is the whole projection, not only
@@ -2477,39 +2480,37 @@ class CoreStore:
         bind_shared = getattr(relay, "bind_shared_recovery", None)
         if callable(bind_shared):
             bind_shared(self._relay_shared_recovery, self._queue_relay_sync)
+        bind_login_progress = getattr(relay, "bind_login_progress", None)
+        if callable(bind_login_progress):
+            bind_login_progress(self._relay_login_progress)
 
-    @contextlib.contextmanager
-    def _relay_shared_recovery(self, identity: str):
-        """Keep the relay writer through issuance; no sync or other domain lock is taken here."""
+    def _relay_shared_recovery(self):
+        """Use the saved connection for both peer reads and exclusive login writes."""
         from ..webdav import core as dav
         from .domains._shared import DomainError
         from .domains.relay_accounts import RelayLoginCoordinationError
 
         webdav = self._domains.get("webdav")
         if webdav is None:
-            yield None
-            return
+            return None
         get_settings = getattr(webdav, "login_coordination_settings", None)
         if not callable(get_settings):
             raise RelayLoginCoordinationError()
         try:
             settings = get_settings()
+            return dav.WebDAVClient(settings) if settings is not None else None
         except (DomainError, dav.SyncError, OSError):
-            raise RelayLoginCoordinationError() from None
-        if settings is None:
-            yield None
-            return
-        try:
-            with dav.WebDAVClient(settings).acquire_login_lease(identity) as lease:
-                yield lease
-        except dav.WebDAVLoginLeaseBusy:
-            raise RelayLoginCoordinationError(waiting=True) from None
-        except (dav.SyncError, OSError):
             raise RelayLoginCoordinationError() from None
 
     def _queue_relay_sync(self) -> None:
         if self._webdav_scheduler is not None:
             self._webdav_scheduler.session_changed()
+
+    def _relay_login_progress(self, account_id: str, state: str, login_status: str) -> None:
+        """Publish automatic login state without changing the settings revision chain."""
+
+        result = {"login_status": login_status} if login_status else None
+        self._publish_job_event(f"relay-auto-login:{account_id}", state, self._current_revision(), result)
 
     def register_domain(self, adapter: DomainAdapter) -> str:
         name_value = getattr(adapter, "name", None)
@@ -3001,6 +3002,57 @@ class CoreStore:
                 self._subscribers.pop(token, None)
 
         return unsubscribe
+
+    def local_master_key(self) -> str:
+        """The router key a client presents to this app's own endpoints.
+
+        Read from the document the codex domain manages rather than from the
+        installed machine's file, so an isolated Core answers its own key.  The
+        answer is memoized on the file's mtime: the catalog endpoint asks on
+        every client fetch, and parsing the runtime YAML there would cost more
+        than the body does.
+        """
+
+        domain = self._domains.get("codex")
+        config_path = getattr(domain, "runtime_config_path", None)
+        if not isinstance(config_path, (str, Path)):
+            return ""
+        target = Path(config_path).expanduser()
+        try:
+            stamp = target.stat().st_mtime_ns
+        except OSError:
+            return ""
+        cached = self._master_key_cache
+        if cached is not None and cached[0] == (target, stamp):
+            return cached[1]
+        try:
+            from . import codex_config
+
+            key = codex_config.local_api_key(codex_config.load_yaml(target))
+        except Exception:
+            key = ""
+        self._master_key_cache = ((target, stamp), key)
+        return key
+
+    def codex_catalog_response(self, *, pretty: bool = False) -> tuple[int, bytes]:
+        """Answer one fetch of the client catalog this app serves.
+
+        The body is projected from the codex domain's last observed view, off
+        both the mutation lane and the client-model lane: a client fetch must
+        not wait on a proxy reload, and a read here must not start one.
+        """
+
+        domain = self._domains.get("codex")
+        answer = getattr(domain, "_catalog_response", None)
+        if not callable(answer):
+            return 503, b'{"error":{"code":"catalog_unavailable","message":"This Core serves no catalog"}}'
+        try:
+            status, body = answer(pretty=pretty)
+        except Exception:
+            return 503, b'{"error":{"code":"catalog_unavailable","message":"The catalog could not be read"}}'
+        if not isinstance(status, int) or not isinstance(body, bytes):
+            return 503, b'{"error":{"code":"catalog_unavailable","message":"The catalog could not be read"}}'
+        return status, body
 
     def snapshot(self) -> dict[str, Any]:
         """Project the current state for every window that asks for one.
@@ -4950,9 +5002,16 @@ class CoreStore:
             self._relay_maintenance = RelayMaintenance(
                 tasks=self._scheduled_tasks,
                 accounts=self._relay_maintenance_accounts,
+                waiting_for_peer=self._relay_shared_login_waiters,
                 run=self._run_relay_maintenance,
             )
         return self._relay_maintenance
+
+    def _relay_shared_login_waiters(self) -> list[str]:
+        with self._domain_scope("relay_accounts"):
+            relay = self._domains.get("relay_accounts")
+            waiters = getattr(relay, "waiting_for_shared_login_ids", None)
+            return waiters() if callable(waiters) else []
 
     def _relay_maintenance_accounts(self) -> dict[str, list[str]]:
         with self._domain_scope("relay_accounts"):

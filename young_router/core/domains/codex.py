@@ -14,21 +14,28 @@ import sys
 import threading
 import time
 import tomllib
+import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any, Iterator
 
 from .. import model_catalog
 from ..model_catalog import (
+    MAX_SERVED_CATALOG_BYTES,
+    PLUGIN_CATALOG_FILE_NAME,
+    RETIRED_SERVED_CATALOG_ROUTES,
+    SERVED_CATALOG_ROUTE,
     catalog_carries_native_profile,
     catalog_is_current,
     catalog_model_names,
     catalog_names_from_editor,
     catalog_is_usable,
+    catalog_payload,
     legacy_managed_catalog_path,
     managed_catalog_path,
     previous_managed_catalog_path,
     profile_has_instructions,
     select_inherited_profile,
+    served_catalog_body,
     write_catalog,
 )
 from ..model_contexts import (
@@ -48,10 +55,25 @@ from ._shared import (
     _mapping,
     _safe_problem,
 )
-from ._shared_api import public_direct_api_url
+from ._shared_api import (
+    public_direct_api_url,
+    read_direct_connection,
+    store_direct_connection,
+)
 
 _CODEX_ENVIRONMENT_LOCK = threading.RLock()
 _CATALOG_SOURCE_REFRESH_SECONDS = 0.5
+#: How long one confirmed answer from the served catalog address is trusted.
+#: Resolution is a loopback round trip inside this process's own child; this
+#: only keeps a burst of refresh passes from repeating it.
+_CATALOG_URL_PROBE_SECONDS = 20.0
+#: The client bounds its own fetch of an explicit catalog; so does this probe.
+_CATALOG_URL_PROBE_TIMEOUT_SECONDS = 1.0
+#: A catalog body larger than Codex's own 1 MiB bound would be refused there too,
+#: so this never reads more than that from its own listener.
+_CATALOG_URL_PROBE_MAX_BYTES = 1024 * 1024
+#: The plugin id carries its name as a prefix (``<name>@<marketplace>``).
+PLUGIN_NAME_TOKEN = "model-list-plugin"
 _CODEX_APP_RESOURCES = (
     Path("/Applications/ChatGPT.app/Contents/Resources"),
     Path("/Applications/Codex.app/Contents/Resources"),
@@ -564,6 +586,40 @@ def _codex_environment(runtime_config_path: Path, codex_home: Path | None) -> It
                 os.environ["LITELLM_CONFIG_FILE"] = old_runtime
 
 
+def _is_loopback_address(value: str) -> bool:
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(value.strip()).hostname or "").lower() in {"127.0.0.1", "::1", "localhost"}
+    except ValueError:
+        return False
+
+
+def _same_origin(left: str, right: str) -> bool:
+    """Whether two addresses name the same scheme, host and port.
+
+    Used for the catalog address only: ``/v1/models`` is a path every gateway
+    serves, so "is this ours" is answered by the row's own inference endpoint
+    rather than by the path alone.  A stepped start moves both together, so an
+    address left on the previous port still compares equal to nothing and is
+    rewritten by the same rule that writes a new row.
+    """
+
+    from urllib.parse import urlsplit
+
+    def parts(value: str):
+        parsed = urlsplit(value.strip())
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if scheme == "https" else 80)
+        return scheme, host, port
+
+    try:
+        return parts(left) == parts(right)
+    except ValueError:
+        return False
+
+
 class CodexSettingsDomain:
     """Staged Codex TOML/JSON editor backed by ``codex_config``."""
 
@@ -632,6 +688,20 @@ class CodexSettingsDomain:
         # runtime configuration, while snapshots are polled while a window is
         # open.  `uses_local_api` then only compares strings.
         self._local_api_base_url: str | None = None
+        self._local_api_key = ""
+        # The catalog address this app serves on that same port, resolved with
+        # the endpoint so one document load answers both.
+        self._local_catalog_url: str | None = None
+        # When the served address was last confirmed to answer, so a refresh
+        # pass does not re-fetch a body it already holds.
+        self._catalog_url_checked_at = 0.0
+        self._catalog_url_answers = False
+        # The catalog this app serves, held as the payload rather than as a file.
+        # Building it costs ~0.3 ms once the process has warmed its model-context
+        # registry, so the served body needs no on-disk copy to be cheap; the
+        # client's own file is written only while that file is what it reads.
+        self._served_payload: dict[str, Any] | None = None
+        self._served_payload_key: tuple[Any, ...] | None = None
         self.revision = 0
         self.reload()
 
@@ -894,8 +964,9 @@ class CodexSettingsDomain:
     def _is_catalog_enabled(self, payload: Mapping[str, Any]) -> bool:
         # A historical managed path counts as enabled: a config still pointing
         # at an older spelling is this app's catalog, and the next repair or
-        # apply migrates the pointer to the current name.
-        return self._catalog_pointer_is_managed(payload)
+        # apply migrates the pointer to the current name.  Delivery by URL is
+        # the same switch: the menu entry is on while either carrier names it.
+        return self._catalog_delivery(payload) != "off"
 
     def _repair_catalog_pointer(self, value: str | None) -> bool:
         """Rewrite only ``model_catalog_json`` on disk, keeping Codex loadable.
@@ -906,14 +977,33 @@ class CodexSettingsDomain:
         write so an external edit made since the last reload is preserved.
         """
 
+        return self._write_catalog_delivery(value, url=None)
+
+    def _write_catalog_delivery(self, value: str | None, *, url: str | None) -> bool:
+        """Write one catalog decision -- pointer and provider URL -- to both documents.
+
+        ``value`` is the file pointer (``None`` removes it) and ``url`` is the
+        provider-level catalog address.  Codex treats a present
+        ``model_catalog_json`` as an authoritative static catalog, so the two
+        are never written separately: a URL without dropping the pointer would
+        never be fetched.
+        """
+
         from .. import codex_config
 
         if self._catalog_pointer_repairing:
             return False
         patch: dict[str, Any] = {"model_catalog_json": value}
         draft_before = copy.deepcopy(self._draft)
+        structured = self._raw.get("structured")
+        draft_structured = draft_before.get("structured")
         try:
             config_text, auth_text, _, _ = self._editor_documents_from_disk()
+            config_text = self._set_catalog_delivery(
+                config_text,
+                structured if isinstance(structured, Mapping) else {},
+                url=url,
+            )
             with _codex_environment(self.runtime_config_path, self.codex_home):
                 repaired = self._sync(config_text, auth_text, patch)
                 codex_config.apply_editor(
@@ -941,10 +1031,151 @@ class CodexSettingsDomain:
         draft_auth = draft_before.get("auth_text", "{}\n")
         if isinstance(draft_config, str) and isinstance(draft_auth, str):
             try:
+                draft_config = self._set_catalog_delivery(
+                    draft_config,
+                    draft_structured if isinstance(draft_structured, Mapping) else {},
+                    url=url,
+                )
                 self._draft = self._sync(draft_config, draft_auth, patch)
             except DomainError:
                 self._draft = draft_before
+        # The answer to "does this address serve these models" changed with the
+        # document; let the next pass ask again instead of trusting a stale yes.
+        self._catalog_url_checked_at = 0.0
         return True
+
+    def _catalog_payload_for(
+        self,
+        names: Sequence[str],
+        native_models: Sequence[Mapping[str, Any]] | None,
+        base_slug: str | None,
+    ) -> dict[str, Any]:
+        """This app's catalog payload for one model set, built once per input set."""
+
+        from ..native_codex_catalog import native_catalog_identity
+
+        key = (
+            tuple(names),
+            base_slug,
+            native_catalog_identity(),
+            self._context_registry.cache_identity(),
+        )
+        if self._served_payload is not None and self._served_payload_key == key:
+            return self._served_payload
+        payload = catalog_payload(
+            list(names),
+            registry=self._context_registry,
+            native_models=native_models,
+            base_slug=base_slug,
+        )
+        self._served_payload = payload
+        self._served_payload_key = key
+        return payload
+
+    def _materialized_names(self) -> list[str] | None:
+        """The model names the client is being served right now.
+
+        The generated file answers while that file is the carrier; otherwise the
+        payload this app serves by URL does.  Jitter protection compares against
+        this one answer, so it survives the carrier changing.
+        """
+
+        pointer = self._catalog_pointer(self._raw)
+        if pointer is not None and pointer in self._managed_catalog_paths():
+            return catalog_model_names(self.model_catalog_path)
+        payload = self._served_payload
+        if not isinstance(payload, Mapping):
+            return None
+        models = payload.get("models")
+        if not isinstance(models, Sequence) or isinstance(models, (str, bytes, bytearray)):
+            return None
+        return [
+            str(model.get("slug") or "").strip()
+            for model in models
+            if isinstance(model, Mapping)
+        ]
+
+    def _catalog_response(self, *, pretty: bool = False) -> tuple[int, bytes]:
+        """Answer one ``GET`` for the served catalog, without touching the store lock.
+
+        The body is the managed catalog filtered to the models that are
+        actually exposed and configured *now*: the file may lag an endpoint
+        apply by one refresh pass, and a catalog naming a model the router does
+        not serve is exactly what a picker must not offer.  A body Codex would
+        reject (empty, or over its 1 MiB bound) is answered as a failure rather
+        than as a valid empty list, so the client keeps its cached catalog
+        instead of dropping every model.
+        """
+
+        names = self._catalog_model_names(self._raw)
+        unavailable = b'{"error":{"code":"catalog_unavailable","message":"No exposed model is catalogued yet"}}'
+        if not names:
+            return 503, unavailable
+        payload = self._served_payload
+        if not isinstance(payload, Mapping):
+            # The refresh lane keeps this warm; a fetch before its first pass
+            # builds it here rather than answering nothing.
+            payload = self._catalog_payload_for(
+                names, self._catalog_native_models(), None
+            )
+        body = served_catalog_body(payload, pretty=pretty)
+        return (200, body) if body else (503, unavailable)
+
+    def _catalog_url_serves(self, names: Sequence[str]) -> bool:
+        """Whether the proxy's own catalog answers with exactly these models.
+
+        Codex fetches this address itself, with the provider's credentials, so
+        the answer has to be checked with the same credential a client sends.
+        A failure here is not an error: it sends the client back to the
+        generated file, which is the documented fallback.
+        """
+
+        served = self._served_catalog_url()
+        if not served or not names:
+            return False
+        now = time.monotonic()
+        if now - self._catalog_url_checked_at < _CATALOG_URL_PROBE_SECONDS:
+            return self._catalog_url_answers
+        # Only a confirmed answer is remembered.  A failure is usually this
+        # pass's own doing -- the proxy it asks may still be starting -- so
+        # caching it would keep the client on the file for no reason.
+        self._catalog_url_answers = False
+        try:
+            from ...api_base import isolated_http_opener
+            from .. import codex_config
+
+            key = codex_config.local_api_key(codex_config.load_yaml(self.runtime_config_path))
+        except Exception:
+            return False
+        request = urllib.request.Request(
+            served,
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with isolated_http_opener().open(request, timeout=_CATALOG_URL_PROBE_TIMEOUT_SECONDS) as response:
+                if getattr(response, "status", 0) != 200:
+                    return False
+                raw = response.read(_CATALOG_URL_PROBE_MAX_BYTES + 1)
+        except Exception:
+            return False
+        if len(raw) > _CATALOG_URL_PROBE_MAX_BYTES:
+            return False
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            return False
+        models = payload.get("models") if isinstance(payload, Mapping) else None
+        if not isinstance(models, Sequence) or isinstance(models, (str, bytes, bytearray)):
+            return False
+        served_names = {
+            str(model.get("slug") or "").strip()
+            for model in models
+            if isinstance(model, Mapping)
+        }
+        self._catalog_url_answers = served_names == set(names)
+        self._catalog_url_checked_at = now if self._catalog_url_answers else 0.0
+        return self._catalog_url_answers
 
     @staticmethod
     def _catalog_model_names(payload: Mapping[str, Any]) -> list[str]:
@@ -992,7 +1223,7 @@ class CodexSettingsDomain:
     def _catalog_model_ids_changed(self, names: list[str]) -> bool:
         """Return whether the Codex-visible model IDs changed, ignoring priority order."""
 
-        existing_names = catalog_model_names(self.model_catalog_path)
+        existing_names = self._materialized_names()
         return existing_names is not None and set(existing_names) != set(names)
 
     @staticmethod
@@ -1035,6 +1266,24 @@ class CodexSettingsDomain:
             native_models=native_models,
             base_slug=base_slug,
         )
+
+    def _discard_managed_catalog_file(self) -> None:
+        """Remove the generated catalog while the URL carries it.
+
+        The file exists for one reader: a client whose provider row names it.
+        While the row names this app's address instead, the body is served from
+        memory and the file is stale weight -- and a stale file next to a
+        client's documents is what made an earlier install keep loading a
+        catalog nobody updated.
+        """
+
+        for path in self._managed_catalog_paths():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
 
     def _remove_retired_catalog_copies(self) -> None:
         """Drop app-written catalogs the applied config no longer names.
@@ -1089,15 +1338,15 @@ class CodexSettingsDomain:
         force_source_refresh: bool = False,
         require_stable_repair: bool = False,
     ) -> bool:
-        from ..model_list_plugin import target_initialized
-
-        if target_initialized("codex"):
-            return False
-        pointer = self._catalog_pointer(self._raw)
-        if pointer is None or pointer not in self._managed_catalog_paths():
+        delivery = self._catalog_delivery(self._raw)
+        if delivery == "off":
+            # Nothing is switched on: an untouched client keeps its own list.
             self._reset_catalog_repair_observation()
             return False
-        dangling = not pointer.exists()
+        pointer = self._catalog_pointer(self._raw)
+        owned_pointer = pointer is not None and pointer in self._managed_catalog_paths()
+        plugin_pointer = pointer is not None and pointer.name == PLUGIN_CATALOG_FILE_NAME
+        dangling = owned_pointer and not pointer.exists()
         source_refreshed = self._refresh_live_catalog_source(force=force_source_refresh)
         if not self._catalog_source_is_available(self._raw):
             self._reset_catalog_repair_observation()
@@ -1123,7 +1372,7 @@ class CodexSettingsDomain:
             # load failure is not exchanged for another: the pointer is dropped
             # so Codex loads its own model list until a real one is observed.
             self._reset_catalog_repair_observation()
-            if not catalog_is_usable(pointer):
+            if owned_pointer and not catalog_is_usable(pointer):
                 if self._repair_catalog_pointer(None):
                     self.revision += 1
             return False
@@ -1152,12 +1401,44 @@ class CodexSettingsDomain:
             return False
         base_slug = self._catalog_base_profile(native_models)
         signature = self._catalog_candidate_signature(names, native_models, base_slug)
-        if signature == self._catalog_current_signature and pointer == self.model_catalog_path:
-            # Only a pointer that names the current file makes the other
-            # spellings dead: a retired copy the applied config still names is
-            # the file Codex is loading.
+        # The payload is the catalog: it is what the address answers with, and
+        # what the file is written from when the client has to read a file.
+        self._catalog_payload_for(names, native_models, base_slug)
+        changed = False
+        if self._catalog_url_serves(names):
+            # URL delivery: no file.  Deleting a leftover one is part of the
+            # switch -- a catalog next to the client's documents that nobody
+            # reads is how an earlier install kept serving a stale list.
+            if self.model_catalog_path.exists():
+                self._discard_managed_catalog_file()
+                changed = True
+            structured = self._raw.get("structured")
+            structured = structured if isinstance(structured, Mapping) else {}
+            # A row already naming this app's address still needs a write when it
+            # names a *retired* spelling: the route moved, and the old path no
+            # longer answers, so leaving it would drop the client to Codex's own
+            # list at its next fetch.
+            active_url = self._active_provider_catalog_url(structured).rstrip("/")
+            if active_url != self._served_catalog_url() or pointer is not None:
+                if self._write_catalog_delivery(None, url=self._served_catalog_url()):
+                    self._catalog_current_signature = self._catalog_candidate_signature(
+                        names, native_models, base_slug
+                    )
+                    self.revision += 1
+                    return True
+            self._catalog_current_signature = signature
             self._remove_retired_catalog_copies()
-            return False
+            return changed
+        # The address did not answer with this list, so this client falls back
+        # to a file.  While the plugin is the one maintaining it, its pointer is
+        # left exactly as it is -- installing a second writer here is what the
+        # retirement flag existed to prevent.  A plugin the *host* has switched
+        # off maintains nothing, so it cannot hold the client on a stale file.
+        structured = self._raw.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        if plugin_pointer and self._plugin_enabled_in_host(structured):
+            self._reset_catalog_repair_observation()
+            return changed
         catalog_current = catalog_is_current(
             self.model_catalog_path,
             names,
@@ -1165,13 +1446,14 @@ class CodexSettingsDomain:
             native_models=native_models,
             base_slug=base_slug,
         )
+        if not catalog_current:
+            self._write_managed_catalog(names, native_models, base_slug)
+            changed = True
         migrated = pointer != self.model_catalog_path
-        if catalog_current and not migrated:
+        if not migrated and not changed:
             self._catalog_current_signature = signature
             self._remove_retired_catalog_copies()
             return False
-        if not catalog_current:
-            self._write_managed_catalog(names, native_models, base_slug)
         if migrated:
             # Write the current file before moving the pointer so a failure in
             # between leaves Codex with a loadable config, never a dangling one.
@@ -1182,7 +1464,7 @@ class CodexSettingsDomain:
                 # deleted the very catalog the pointer names.  The move is
                 # retried on the next refresh; only a rewritten catalog is a
                 # change worth a revision until it succeeds.
-                if catalog_current:
+                if not changed:
                     return False
                 self.revision += 1
                 return True
@@ -1228,12 +1510,177 @@ class CodexSettingsDomain:
     def refresh_local_api_endpoint(self) -> None:
         """Resolve this app's proxy endpoint for the "use this API" action."""
 
-        try:
-            from ._shared import local_proxy_endpoint
+        from ._shared import local_catalog_url, local_proxy_endpoint
 
-            self._local_api_base_url = local_proxy_endpoint(self.runtime_config_path)[0]
+        try:
+            self._local_api_base_url, self._local_api_key = local_proxy_endpoint(
+                self.runtime_config_path
+            )
         except Exception:
             self._local_api_base_url = None
+            self._local_api_key = ""
+        # The catalog address follows the same port, so it is resolved here too:
+        # one document load answers both, and a snapshot never reads settings.
+        try:
+            self._local_catalog_url = local_catalog_url(self.runtime_config_path)
+        except Exception:
+            self._local_catalog_url = None
+        self._catalog_url_checked_at = 0.0
+        self._catalog_url_answers = False
+        # The catalog this app serves, held as the payload rather than as a file.
+        # Building it costs ~0.3 ms once the process has warmed its model-context
+        # registry, so the served body needs no on-disk copy to be cheap; the
+        # client's own file is written only while that file is what it reads.
+        self._served_payload: dict[str, Any] | None = None
+        self._served_payload_key: tuple[Any, ...] | None = None
+
+    def _served_catalog_url(self) -> str:
+        """The catalog address this app answers on the proxy's own port."""
+
+        return (self._local_catalog_url or "").rstrip("/")
+
+    @staticmethod
+    def _active_provider_row(structured: Mapping[str, Any], active: str) -> Mapping[str, Any]:
+        for item in structured.get("providers") or []:
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip() == active:
+                return item
+        return {}
+
+    def _active_provider_catalog_url(self, structured: Mapping[str, Any]) -> str:
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        if active in RESERVED_PROVIDER_IDS:
+            # A built-in row carries no catalog URL: Codex reads that key only
+            # from a provider table this app can edit.
+            return ""
+        value = self._active_provider_row(structured, active).get("model_catalog_url")
+        return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _plugin_enabled_in_host(structured: Mapping[str, Any]) -> bool:
+        """Whether the model-list-plugin is switched on *in the client's own file*.
+
+        The plugin's own configuration says which targets it manages, not
+        whether the client runs it: ``[plugins."model-list-plugin@..."]
+        enabled = false`` in Codex's document is the host's answer, and it is
+        the only one that decides whether that catalog is still being written.
+        """
+
+        for entry in structured.get("plugins") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            if PLUGIN_NAME_TOKEN not in str(entry.get("id") or ""):
+                continue
+            return entry.get("enabled") is True
+        return False
+
+    @staticmethod
+    def _is_served_catalog_address(value: str, base_url: str | None = None) -> bool:
+        """Whether one address is (or was) the catalog this app points a client at.
+
+        The address is the proxy's own ``/v1/models``, which is a generic path --
+        so a row is only ours when it is the *same origin* as that row's
+        inference endpoint, i.e. when the row already names this proxy.  A direct
+        or relay row keeps its own ``/v1/models`` untouched.
+
+        A retired spelling counts as ours at any port: it was this app's own
+        route, and the next pass moves it to the current spelling instead of
+        leaving a dead address in the client's document.
+        """
+
+        from urllib.parse import urlsplit
+
+        if not isinstance(value, str) or not value.strip():
+            return False
+        try:
+            parts = urlsplit(value.strip())
+        except ValueError:
+            return False
+        if parts.scheme not in {"http", "https"} or (parts.hostname or "") not in {
+            "127.0.0.1",
+            "::1",
+            "localhost",
+        }:
+            return False
+        path = parts.path.rstrip("/")
+        if path == SERVED_CATALOG_ROUTE or path in RETIRED_SERVED_CATALOG_ROUTES:
+            return True
+        if path != "/v1/models":
+            return False
+        # One released build pointed at the proxy's ``/v1/models``; that row is
+        # ours only when its own endpoint is this machine's, so a direct row on
+        # a remote gateway keeps the catalog URL its operator wrote.
+        return (
+            isinstance(base_url, str)
+            and _is_loopback_address(base_url)
+            and _same_origin(base_url, value)
+        )
+
+    @staticmethod
+    def _active_provider_base_url(structured: Mapping[str, Any]) -> str:
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        if active in RESERVED_PROVIDER_IDS:
+            return str(structured.get("openai_base_url") or "").strip()
+        value = CodexSettingsDomain._active_provider_row(structured, active).get("base_url")
+        return value.strip() if isinstance(value, str) else ""
+
+    def _catalog_delivery(self, payload: Mapping[str, Any]) -> str:
+        """How this client receives its catalog: ``url``, ``file``, ``plugin``, ``off``.
+
+        URL delivery is preferred because the client fetches it itself, so a
+        refreshed list needs no file rewrite and no client restart.  The file
+        this app generates is the fallback, and the model-list-plugin's own
+        catalog is the fallback of last resort -- only a pointer naming it is
+        recognised, and only while no URL answers.
+        """
+
+        structured = payload.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        if self._is_served_catalog_address(
+            self._active_provider_catalog_url(structured),
+            self._active_provider_base_url(structured),
+        ):
+            return "url"
+        pointer = self._catalog_pointer(payload)
+        if pointer is None:
+            return "off"
+        if pointer in self._managed_catalog_paths():
+            return "file"
+        if pointer.name == PLUGIN_CATALOG_FILE_NAME:
+            return "plugin"
+        return "off"
+
+    def _set_catalog_delivery(
+        self, config_text: str, structured: Mapping[str, Any], *, url: str | None
+    ) -> str:
+        """Move the provider catalog URL and the file pointer as one decision.
+
+        Codex reads ``model_catalog_json`` before it ever looks at a provider's
+        ``model_catalog_url``: a file pointer present anywhere replaces the
+        catalog manager outright, so writing the URL without dropping the
+        pointer would leave the URL dead.  Both halves are therefore written
+        here and nowhere else.
+
+        A built-in provider id (``openai`` and friends) has no table this app
+        may edit, so only the pointer half applies there; the caller's probe
+        keeps such a client on the file.  Removing the URL is limited to the
+        address this app serves -- a direct route's own catalog URL belongs to
+        the operator and is never rewritten here.
+        """
+
+        from .. import codex_config
+
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        if active in RESERVED_PROVIDER_IDS:
+            return config_text
+        path = ("model_providers", active)
+        if url:
+            return codex_config.set_table_value(config_text, path, "model_catalog_url", url)
+        if self._is_served_catalog_address(
+            self._active_provider_catalog_url(structured),
+            self._active_provider_base_url(structured),
+        ):
+            return codex_config.remove_table_value(config_text, path, "model_catalog_url")
+        return config_text
 
     def _names_local_api(self, configured: object) -> bool:
         """Whether one endpoint is this app's own proxy."""
@@ -1260,6 +1707,67 @@ class CodexSettingsDomain:
                 if isinstance(item, Mapping) and str(item.get("id") or "").strip() == direct:
                     candidates.append(str(item.get("base_url") or ""))
         return any(self._names_local_api(candidate) for candidate in candidates if candidate)
+
+    def _effective_api_key(self, structured: Mapping[str, Any], active: str) -> str:
+        """The credential this client would actually send to its provider."""
+
+        from .. import codex_config
+
+        if active == "openai":
+            value = structured.get("api_key")
+            return value.strip() if isinstance(value, str) else ""
+        raw = codex_config._provider_mapping(self._draft.get("config_text", ""), active)
+        auth_mode = codex_config._provider_auth_mode(raw)
+        if auth_mode == "bearer":
+            value = raw.get("experimental_bearer_token")
+            return value.strip() if isinstance(value, str) else ""
+        if auth_mode == "openai_auth":
+            value = structured.get("api_key")
+            return value.strip() if isinstance(value, str) else ""
+        if auth_mode == "env_key":
+            env_key = raw.get("env_key")
+            return os.environ.get(env_key, "").strip() if isinstance(env_key, str) else ""
+        return ""
+
+    def _yrapi_catalog_url(self, structured: Mapping[str, Any]) -> str:
+        """The catalog address this app's API would put in the active row.
+
+        The catalog switch is a separate decision: a client carrying the file
+        pointer (or with the catalog off) has no address of its own, so that
+        half of the identity is empty.  Only URL delivery names an address.
+        """
+
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        if active in RESERVED_PROVIDER_IDS:
+            return ""
+        if self._catalog_delivery(self._draft) != "url":
+            return ""
+        return self._served_catalog_url()
+
+    def uses_yrapi_api(self) -> bool:
+        """True when the client names this app's whole API, not just its port.
+
+        The switch is an identity, not a reachability test: the base URL, the
+        credential, and (for Codex) the catalog address all have to be the ones
+        this app writes.  A client pointed at the proxy with someone else's key,
+        or with a catalog of its own, is a direct connection whose address
+        merely happens to be local.
+        """
+
+        base_url = self._local_api_base_url
+        key = self._local_api_key
+        if not base_url or not key:
+            return False
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        if not self._names_local_api(self._active_provider_endpoint(structured, active)):
+            return False
+        if self._effective_api_key(structured, active) != key:
+            return False
+        current_catalog = self._active_provider_catalog_url(structured).rstrip("/")
+        expected_catalog = self._yrapi_catalog_url(structured).rstrip("/")
+        return current_catalog == expected_catalog
 
     def standalone_search_enabled(self) -> bool:
         """Whether the selected provider opts into Codex's own web search.
@@ -1296,14 +1804,14 @@ class CodexSettingsDomain:
             structured if isinstance(structured, Mapping) else {}
         )
 
-    def _direct_api_settings(self, structured: Mapping[str, Any], uses_local_api: bool) -> dict[str, Any]:
+    def _direct_api_settings(self, structured: Mapping[str, Any]) -> dict[str, Any]:
         """The connection the client is on, as the Edit API form prefills it.
 
-        The form edits one connection and shows whichever one the client runs.
-        With this app's API switched on the selected provider *is* the proxy,
-        so reading only the form's own direct row left every field empty beside
-        a switch that said the client was connected, and the dialog could not
-        round-trip what it showed.
+        The form edits the live connection.  The off toggle applies the
+        remembered direct route before it opens the form, so that path still
+        shows the route the switch returns to; a person who opens the form while
+        the switch is on sees this app's URL, key, and catalog, and an
+        unchanged save keeps the switch on.
         """
 
         active = str(structured.get("model_provider") or "openai").strip() or "openai"
@@ -1319,11 +1827,8 @@ class CodexSettingsDomain:
             "base_url": public_direct_api_url(self._active_provider_endpoint(structured, active)),
             "model_catalog_url": public_direct_api_url(provider.get("model_catalog_url")),
             "model": structured.get("model") or "",
-            # A client on the proxy carries this app's master key in Codex's own
-            # auth document; a direct row carries a bearer token of its own.
-            "key_configured": bool(structured.get("api_key"))
-            if uses_local_api
-            else active == DIRECT_API_PROVIDER_ID and provider.get("auth_mode") == "bearer",
+            "key_configured": bool(self._effective_api_key(structured, active)),
+            "auth_mode": "bearer",
         }
 
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
@@ -1331,7 +1836,8 @@ class CodexSettingsDomain:
         warnings = payload.get("warnings", [])
         if self._catalog_pointer_error:
             warnings = [*(warnings if isinstance(warnings, list) else []), self._catalog_pointer_error]
-        public_models = self._catalog_model_names(payload) if self._is_catalog_enabled(payload) else []
+        delivery = self._catalog_delivery(payload)
+        public_models = self._catalog_model_names(payload) if delivery != "off" else []
         structured = payload.get("structured") or {}
         uses_local_api = self.uses_local_api()
         return {
@@ -1340,17 +1846,23 @@ class CodexSettingsDomain:
             "config_exists": bool(payload.get("config_exists")),
             "auth_file_exists": bool(payload.get("auth_exists")),
             "uses_local_api": uses_local_api,
+            "uses_yrapi_api": self.uses_yrapi_api(),
             "standalone_search": self.standalone_search_enabled(),
             "image_context_mcp": self.image_context_mcp_enabled(),
             "structured": redact(structured),
-            "direct_api": redact(self._direct_api_settings(structured, uses_local_api)),
+            "direct_api": redact(self._direct_api_settings(structured)),
             "models": redact(payload.get("models", [])),
             "validation_errors": redact(errors if isinstance(errors, list) else []),
             "warnings": redact(warnings if isinstance(warnings, list) else []),
             "raw_editor_available": True,
             "model_catalog": {
-                "enabled": self._is_catalog_enabled(payload),
+                "enabled": delivery != "off",
                 "public_models": public_models or [],
+                # Which carrier the client is on. The generated file exists in
+                # every mode -- it is what the served body is read from, and
+                # what a fetch failure falls back to -- so a window cannot infer
+                # from its presence whether a client still loads it.
+                "delivery": delivery,
             },
         }
 
@@ -1444,39 +1956,28 @@ class CodexSettingsDomain:
                 self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"use_local_api", "uselocalapi"}:
             self._draft = self._adopt_local_api(config_text, auth_text, data)
+        elif name in {"leave_local_api", "leavelocalapi"}:
+            self._draft = self._leave_local_api(config_text, auth_text)
         elif name == "use_direct_api":
-            from .. import codex_config
-
             base_url = data["base_url"].rstrip("/")
-            if self._names_local_api(base_url):
-                # The form edits one connection, and saving this app's own
-                # proxy back is that connection: the local route owns its
-                # endpoint, its master key, the managed model list and the
-                # search opt-in.  Writing a look-alike direct provider here
-                # dropped the last two while the pane's switch still read
-                # "on", so the same endpoint took a different route.
+            form = self._form_direct_connection(data)
+            structured = self._draft.get("structured")
+            structured = structured if isinstance(structured, Mapping) else {}
+            if (
+                self._names_local_api(base_url)
+                and bool(self._local_api_key)
+                and form.get("api_key") == self._local_api_key
+                and str(form.get("model_catalog_url") or "").rstrip("/")
+                == self._yrapi_catalog_url(structured).rstrip("/")
+            ):
+                # The form is the off editor, but saving this app's own full
+                # triplet is how its other direction is reached: the row keeps
+                # its endpoint, master key, catalog address and search opt-in
+                # as one connection instead of becoming a look-alike direct one.
                 self._draft = self._adopt_local_api(config_text, auth_text, data)
             else:
-                catalog_url = data.get("model_catalog_url")
-                path = ("model_providers", DIRECT_API_PROVIDER_ID)
-                current = codex_config._provider_mapping(config_text, DIRECT_API_PROVIDER_ID)
-                key = data.get("api_key")
-                old_url = current.get("base_url")
-                if not key and not data.get("clear_key") and isinstance(old_url, str) and old_url.rstrip("/") == base_url:
-                    key = current.get("experimental_bearer_token")
-                for field, value in {
-                    "name": "Direct API",
-                    "base_url": base_url,
-                    "wire_api": "responses",
-                    "model_catalog_url": catalog_url,
-                    "experimental_bearer_token": key,
-                }.items():
-                    config_text = (codex_config.set_table_value(config_text, path, field, value)
-                                   if value else codex_config.remove_table_value(config_text, path, field))
-                patch = {"model_provider": DIRECT_API_PROVIDER_ID, "model": data.get("model") or None}
-                if self._catalog_pointer_is_managed(self._draft):
-                    patch["model_catalog_json"] = None
-                self._draft = self._sync(config_text, auth_text, patch)
+                self._draft = self._apply_direct_connection(config_text, auth_text, form)
+                store_direct_connection(self.app_state_root, "codex", form)
         elif name == "codex_feature_set":
             feature = data.get("feature")
             enabled_value = data.get("enabled")
@@ -1572,18 +2073,10 @@ class CodexSettingsDomain:
             from .. import codex_config
 
             structured = self._draft.get("structured") or {}
-            if self.uses_local_api():
-                # The form is available in both modes.  On this app's own
-                # route the client's credential is the router key, which is
-                # what re-saving that same endpoint keeps writing; reading the
-                # environment here would answer with whatever OPENAI_API_KEY
-                # the app happened to be started with.
-                from ._shared import local_proxy_endpoint
-
-                try:
-                    return local_proxy_endpoint(self.runtime_config_path)[1]
-                except Exception:
-                    return ""
+            # The form edits the connection the client is on.  After the off
+            # action has applied the remembered route, that route's own
+            # credential is what the field reads; while yrapi is on, it reads
+            # the master key the client actually sends.
             provider_id = str(structured.get("model_provider") or "openai").strip() or "openai"
             provider = codex_config._provider_mapping(self._draft.get("config_text", ""), provider_id)
             env_key = provider.get("env_key")
@@ -1624,6 +2117,69 @@ class CodexSettingsDomain:
                 return {"valid": False, "errors": ["Codex settings are invalid"]}
         errors = draft.get("validation_errors", [])
         return {"valid": not bool(errors), "errors": list(errors) if isinstance(errors, list) else ["Codex settings are invalid"]}
+
+    def _catalog_carrier(
+        self,
+        *,
+        structured: Mapping[str, Any] | None = None,
+        enabled: bool,
+        names: Sequence[str],
+    ) -> tuple[str | None, Path | None]:
+        """The (provider URL, file pointer) pair one catalog decision selects.
+
+        URL first: this app answers that address from the same model list the
+        file would hold, so a refreshed list reaches the client without a
+        rewrite it has to restart to read.  The generated file is the fallback
+        whenever the address does not answer with exactly this list, and it is
+        the only carrier for a built-in provider: ``openai`` and friends have
+        no provider table, so a URL written anywhere else would never be read.
+        """
+
+        if not enabled:
+            self._discard_managed_catalog_file()
+            return None, None
+        selected = structured if isinstance(structured, Mapping) else {}
+        active = str(selected.get("model_provider") or "openai").strip() or "openai"
+        if active in RESERVED_PROVIDER_IDS:
+            return None, self.model_catalog_path
+        served = self._served_catalog_url()
+        if served and names and self._catalog_url_serves(names):
+            # The client fetches the address, so a second copy next to its
+            # documents would be a file it never opens -- and exactly the kind
+            # of orphan this app already had to clean up once.
+            self._discard_managed_catalog_file()
+            return served, None
+        return None, self.model_catalog_path
+
+    def _with_catalog_carrier(
+        self, state: Mapping[str, Any], *, enabled: bool, names: Sequence[str]
+    ) -> dict[str, Any]:
+        """Return one staged document carrying the selected catalog carrier."""
+
+        config_text = state.get("config_text", "")
+        auth_text = state.get("auth_text", "{}\n")
+        structured = state.get("structured")
+        if not isinstance(config_text, str) or not isinstance(auth_text, str):
+            return dict(state)
+        url, pointer = self._catalog_carrier(
+            structured=structured if isinstance(structured, Mapping) else None,
+            enabled=enabled,
+            names=names,
+        )
+        updated = self._set_catalog_delivery(
+            config_text,
+            structured if isinstance(structured, Mapping) else {},
+            url=url,
+        )
+        try:
+            return self._sync(
+                updated, auth_text, {"model_catalog_json": str(pointer) if pointer else None}
+            )
+        except DomainError:
+            # A raw editor may hold an intentionally invalid draft.  Leaving it
+            # untouched is better than replacing the person's text with a
+            # document this action synthesised.
+            return dict(state)
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
         if payload is not None:
@@ -1667,6 +2223,14 @@ class CodexSettingsDomain:
                     )
         if catalog_changed and catalog_models is not None and native_models is not None:
             self._write_managed_catalog(catalog_models, native_models, base_slug)
+        # The carrier is one decision with the catalog switch: applying an
+        # unrelated edit must not leave the client on the other one, and a
+        # staged draft written before the URL existed would otherwise restore
+        # the pointer that makes Codex ignore it.
+        if will_be_enabled or self._catalog_delivery(self._draft) == "url":
+            self._draft = self._with_catalog_carrier(
+                self._draft, enabled=will_be_enabled, names=catalog_models or []
+            )
         try:
             self._write_documents(self._draft)
         except DomainError:
@@ -1725,10 +2289,10 @@ class CodexSettingsDomain:
         draft_auth = draft_before.get("auth_text", "{}\n")
         if isinstance(draft_config, str) and isinstance(draft_auth, str):
             try:
-                draft_next = self._sync(
-                    draft_config,
-                    draft_auth,
-                    {"model_catalog_json": str(self.model_catalog_path) if enabled else None},
+                # The staged copy moves with the applied one, or the next Apply
+                # would put the previous carrier back.
+                draft_next = self._with_catalog_carrier(
+                    draft_before, enabled=enabled, names=catalog_models or []
                 )
             except DomainError:
                 # A raw editor may intentionally contain an invalid draft. Keep
@@ -1737,11 +2301,14 @@ class CodexSettingsDomain:
                 draft_next = draft_before
         if catalog_changed and catalog_models is not None and native_models is not None:
             self._write_managed_catalog(catalog_models, native_models, base_slug)
-        disk_patch = {"model_catalog_json": str(self.model_catalog_path) if enabled else None}
-        next_disk = self._sync(
-            str(current.get("config_text", "")),
-            str(current.get("auth_text", "{}\n")),
-            disk_patch,
+        next_disk = self._with_catalog_carrier(
+            {
+                "config_text": str(current.get("config_text", "")),
+                "auth_text": str(current.get("auth_text", "{}\n")),
+                "structured": current.get("structured"),
+            },
+            enabled=enabled,
+            names=catalog_models or [],
         )
         try:
             with _codex_environment(self.runtime_config_path, self.codex_home):
@@ -1800,14 +2367,13 @@ class CodexSettingsDomain:
     ) -> dict[str, Any]:
         """Point the client's *current* provider at one endpoint.
 
-        Codex names its gateway in ``model_provider``, so both client actions
-        follow that field instead of adding a provider of their own: the row it
-        names keeps its identity and only its endpoint (plus the API surface a
-        direct route needs) changes.  A selection of the built-in OpenAI
-        provider has no editable table, so it takes Codex's own
-        ``openai_base_url``; a selection with no editable endpoint at all (an
-        empty or Bedrock-style built-in) falls back to the one provider row
-        this app owns, because there is nothing to follow.
+        A user provider row keeps its identity: only its endpoint (plus the API
+        surface a direct route needs) changes.  A built-in provider (``openai``
+        and friends) has no editable table at all, so adopting this proxy moves
+        the client to the row already naming this proxy -- or to this app's own
+        row -- because the built-in row cannot carry the catalog URL or the
+        gateway's credential shape.  That row is also what keeps Codex's picker
+        on the catalog instead of its own model family.
 
         ``standalone_web_search`` is for the local-proxy route only.  The flag
         makes Codex call ``{this provider's base_url}/alpha/search``, which only
@@ -1818,15 +2384,41 @@ class CodexSettingsDomain:
 
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
-        selected = str(structured.get("model_provider") or "").strip()
-        active = LOCAL_API_PROVIDER_ID if selected == DIRECT_API_PROVIDER_ID else selected
-        if active == "openai":
-            return {"api_key": key, "direct_connection": {"provider": "openai", "base_url": base_url}}
         providers = [
             copy.deepcopy(dict(item))
             for item in structured.get("providers") or []
             if isinstance(item, Mapping)
         ]
+        selected = str(structured.get("model_provider") or "").strip()
+        if selected == DIRECT_API_PROVIDER_ID:
+            active = LOCAL_API_PROVIDER_ID
+        elif not selected or selected.lower() in RESERVED_PROVIDER_IDS:
+            # A built-in selection cannot hold this app's catalog URL.  Reuse
+            # the row a previous adoption already pointed here, so repeated
+            # switches do not accumulate provider identities.
+            proxy_row = next(
+                (
+                    item
+                    for item in providers
+                    if str(item.get("id") or "").strip() != DIRECT_API_PROVIDER_ID
+                    and self._names_local_api(str(item.get("base_url") or ""))
+                    and (
+                        str(item.get("id") or "").strip() == LOCAL_API_PROVIDER_ID
+                        or self._is_served_catalog_address(
+                            str(item.get("model_catalog_url") or ""),
+                            str(item.get("base_url") or ""),
+                        )
+                    )
+                ),
+                None,
+            )
+            active = (
+                str(proxy_row.get("id") or "").strip()
+                if proxy_row is not None
+                else LOCAL_API_PROVIDER_ID
+            )
+        else:
+            active = selected
         entry = (
             next(
                 (item for item in providers if str(item.get("id") or "").strip() == active),
@@ -1904,6 +2496,7 @@ class CodexSettingsDomain:
 
         base_url, key = local_proxy_endpoint(self.runtime_config_path)
         self._local_api_base_url = base_url
+        self._local_api_key = key
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
         active = str(structured.get("model_provider") or "").strip()
@@ -1929,6 +2522,166 @@ class CodexSettingsDomain:
             patch["web_search"] = "live"
         return patch
 
+    def _active_provider(self, structured: Mapping[str, Any], provider_id: str) -> Mapping[str, Any]:
+        return next(
+            (
+                row
+                for row in structured.get("providers") or []
+                if isinstance(row, Mapping) and str(row.get("id") or "").strip() == provider_id
+            ),
+            {},
+        )
+
+    def _remember_direct_connection(self) -> None:
+        """Remember the connection this client leaves for this app's proxy.
+
+        The off position of the pane's switch has to put the client back on the
+        endpoint and credential it used before, and adopting the proxy overwrites
+        both.  A client already on the proxy (or on the app's own proxy row)
+        leaves nothing to remember: storing that row would make the switch's two
+        positions the same address.
+        """
+
+        if self.uses_yrapi_api():
+            return
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        provider = self._active_provider(structured, active)
+        base_url = self._active_provider_endpoint(structured, active)
+        auth_mode = str(provider.get("auth_mode") or "none") if active != "openai" else "openai_auth"
+        key = ""
+        if auth_mode == "bearer":
+            # The structured projection deliberately leaves the token out, so
+            # the raw row is the only place the credential still exists before
+            # adoption replaces it.
+            from .. import codex_config
+
+            raw_provider = codex_config._provider_mapping(
+                self._draft.get("config_text", ""), active
+            )
+            key = str(raw_provider.get("experimental_bearer_token") or "")
+        elif auth_mode in {"openai_auth", "command"}:
+            key = str(structured.get("api_key") or "")
+        connection: dict[str, Any] = {
+            "provider": active,
+            "base_url": base_url.rstrip("/"),
+            "model": str(structured.get("model") or ""),
+            "model_catalog_url": str(provider.get("model_catalog_url") or "").rstrip("/"),
+            "auth_mode": auth_mode,
+        }
+        if key:
+            connection["api_key"] = key
+        if auth_mode == "env_key":
+            env_key = str(provider.get("env_key") or "")
+            if env_key:
+                connection["env_key"] = env_key
+        supports_search = provider.get("supports_standalone_web_search")
+        if isinstance(supports_search, bool):
+            connection["supports_standalone_web_search"] = supports_search
+        web_search = structured.get("web_search")
+        if isinstance(web_search, str) and web_search.strip():
+            connection["web_search"] = web_search.strip()
+        store_direct_connection(self.app_state_root, "codex", connection)
+
+    def _form_direct_connection(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """The form's connection in the shape the state file remembers."""
+
+        connection: dict[str, Any] = {
+            "provider": DIRECT_API_PROVIDER_ID,
+            "base_url": str(data.get("base_url") or "").rstrip("/"),
+            "model": str(data.get("model") or "").strip(),
+            "model_catalog_url": str(data.get("model_catalog_url") or "").rstrip("/"),
+            "auth_mode": "bearer",
+        }
+        key = data.get("api_key")
+        if isinstance(key, str) and key.strip() and not data.get("clear_key"):
+            connection["api_key"] = key.strip()
+        if data.get("clear_key"):
+            connection["clear_key"] = True
+        return connection
+
+    def _apply_direct_connection(
+        self, config_text: str, auth_text: str, connection: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Stage one remembered or saved direct connection and select it."""
+
+        from .. import codex_config
+
+        provider_id = str(connection.get("provider") or DIRECT_API_PROVIDER_ID).strip()
+        base_url = str(connection.get("base_url") or "").rstrip("/")
+        model = str(connection.get("model") or "").strip()
+        auth_mode = str(connection.get("auth_mode") or "bearer").strip()
+        key = connection.get("api_key")
+        key = key.strip() if isinstance(key, str) else ""
+        patch: dict[str, Any] = {"model": model or None, "web_search": connection.get("web_search") or None}
+        if provider_id == "openai":
+            patch["model_provider"] = "openai"
+            patch["openai_base_url"] = base_url or None
+            patch["api_key"] = key or None
+            if self._catalog_pointer_is_managed(self._draft):
+                patch["model_catalog_json"] = None
+            return self._sync(config_text, auth_text, patch)
+        path = ("model_providers", provider_id)
+        current = codex_config._provider_mapping(config_text, provider_id)
+        old_url = current.get("base_url")
+        if not key and not connection.get("clear_key") and isinstance(old_url, str) and old_url.rstrip("/") == base_url and auth_mode == "bearer":
+            key = str(current.get("experimental_bearer_token") or "")
+        fields = {
+            "name": str(current.get("name") or "")
+            if current.get("name") else "Direct API",
+            "base_url": base_url,
+            "wire_api": "responses",
+            "model_catalog_url": str(connection.get("model_catalog_url") or "").rstrip("/"),
+        }
+        for field, value in fields.items():
+            config_text = (codex_config.set_table_value(config_text, path, field, value)
+                           if value else codex_config.remove_table_value(config_text, path, field))
+        # One auth carrier per row: Codex refuses a provider that states two.
+        for field in ("experimental_bearer_token", "requires_openai_auth", "env_key"):
+            config_text = codex_config.remove_table_value(config_text, path, field)
+        if auth_mode == "bearer" and key:
+            config_text = codex_config.set_table_value(config_text, path, "experimental_bearer_token", key)
+        elif auth_mode == "openai_auth":
+            config_text = codex_config.set_table_value(config_text, path, "requires_openai_auth", True)
+        elif auth_mode == "env_key":
+            env_key = str(connection.get("env_key") or "").strip()
+            if env_key:
+                config_text = codex_config.set_table_value(config_text, path, "env_key", env_key)
+        supports_search = connection.get("supports_standalone_web_search")
+        if isinstance(supports_search, bool):
+            config_text = codex_config.set_table_value(
+                config_text, path, "supports_standalone_web_search", supports_search
+            )
+        else:
+            config_text = codex_config.remove_table_value(
+                config_text, path, "supports_standalone_web_search"
+            )
+        patch["model_provider"] = provider_id
+        # The auth document holds the proxy's master key while this app's API
+        # is on.  Only an ``openai_auth`` row reads that document; a bearer
+        # token and an ``env_key`` credential belong elsewhere, so the proxy key
+        # is removed instead of being copied into a credential this row never
+        # sends.
+        patch["api_key"] = key or None if auth_mode == "openai_auth" else None
+        if self._catalog_pointer_is_managed(self._draft):
+            patch["model_catalog_json"] = None
+        return self._sync(config_text, auth_text, patch)
+
+    def _leave_local_api(self, config_text: str, auth_text: str) -> dict[str, Any]:
+        """Stage the off position: the remembered direct route, if one exists.
+
+        The Edit API form is the off action: it opens beside the pane and is
+        what the person edits.  A remembered direct route is restored first so
+        the switch really leaves this app's API; without one the dialog starts
+        from the current yrapi values and nothing changes until it is saved.
+        """
+
+        connection = read_direct_connection(self.app_state_root, "codex")
+        if connection is None:
+            return self._draft
+        return self._apply_direct_connection(config_text, auth_text, connection)
+
     def _adopt_local_api(
         self, config_text: str, auth_text: str, data: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -1938,15 +2691,64 @@ class CodexSettingsDomain:
         the Edit API form saved on the proxy's own endpoint.  The route, its
         master key, the model list and the search opt-in are one decision, so
         a second writer would only be able to fall out of step with this one.
+        The connection being replaced is remembered first, because the switch's
+        off position has to return to it.
         """
 
+        self._remember_direct_connection()
         patch = self._local_api_patch()
         patch.update(self._surface_sync_patch())
         config_text = _remove_legacy_computer_mcp(config_text)
         model = str(data.get("model") or "").strip()
         if model:
             patch["model"] = model
-        return self._sync(config_text, auth_text, patch)
+        staged = self._sync(config_text, auth_text, patch)
+        # This app's API carries its model catalog too: the picker has to see
+        # the same public names the proxy serves, or adopting the API leaves
+        # the client on its own two-model list.  Only a source that has
+        # actually answered may turn the switch on; when the proxy is down or
+        # exposes nothing, the previous catalog position is left alone.
+        names = self._catalog_model_names(self._draft)
+        if not names and self._draft.get("young_router_enabled") is True:
+            self._refresh_live_catalog_source(force=True)
+            names = self._catalog_model_names(self._draft)
+        if names:
+            staged = self._with_catalog_carrier(staged, enabled=True, names=names)
+        return self._with_yrapi_catalog(staged)
+
+    def _with_yrapi_catalog(self, staged: Mapping[str, Any]) -> dict[str, Any]:
+        """Make the adopted row's catalog half match what the switch compares.
+
+        The yrapi connection is one identity: base URL, credential, and (for
+        Codex) the catalog address.  The catalog switch decides which carrier
+        answers; the row must not keep a direct catalog URL beside a file
+        pointer, because that is a third state the switch cannot name.  A
+        built-in provider has no table to hold the address, so its catalog half
+        is the empty string and only the managed pointer moves.
+        """
+
+        from .. import codex_config
+
+        structured = staged.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        active = str(structured.get("model_provider") or "openai").strip() or "openai"
+        if active in RESERVED_PROVIDER_IDS:
+            return dict(staged)
+        config_text = staged.get("config_text", "")
+        auth_text = staged.get("auth_text", "{}\n")
+        if not isinstance(config_text, str) or not isinstance(auth_text, str):
+            return dict(staged)
+        path = ("model_providers", active)
+        served = self._served_catalog_url()
+        if self._catalog_delivery(staged) == "url":
+            config_text = codex_config.set_table_value(
+                config_text, path, "model_catalog_url", served
+            )
+        else:
+            config_text = codex_config.remove_table_value(
+                config_text, path, "model_catalog_url"
+            )
+        return self._sync(config_text, auth_text)
 
     def _surface_sync_patch(
         self,

@@ -215,6 +215,14 @@ class StreamNotes:
                     part_index = event.get("content_index", 0)
                     if kind == "response.output_item.added":
                         text = _item_text(item)
+                        # Responses opens message items with an empty content
+                        # list and sends the text in later deltas. Keep that
+                        # candidate undecided until the first delta or the
+                        # terminal snapshot can identify it.
+                        if text == "" and not item.get("content"):
+                            self.held.append((frame, candidate))
+                            yield from self._drain()
+                            return
                     elif kind == "response.output_text.delta":
                         text = candidate.parts.get(part_index, "") + (event.get("delta") or "")
                     elif kind == "response.output_text.done":

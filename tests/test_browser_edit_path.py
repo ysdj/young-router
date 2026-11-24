@@ -380,6 +380,119 @@ class BrowserEditCostTests(unittest.TestCase):
         moved, = [row for row in saved["model_list"] if row["model_name"] == "public-0-2"]
         self.assertEqual(moved["model_info"]["provider"], "provider1")
 
+    def test_open_pane_recovers_when_a_logout_is_later_confirmed(self) -> None:
+        fixture = self
+        account_id = "fixture-account"
+        posts = []
+
+        class RelayStation(BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                self.send_response(404)
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path == "/confirmed-logout":
+                    with fixture.core._domain_scope("relay_accounts"):
+                        fixture.core._domains["relay_accounts"].set_login_status(account_id, "signed_out")
+                        fixture.core._advance_projection_revision()
+                    fixture.core._request_emit()
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                posts.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success":true,"data":{"username":"fixture","id":7,"access_token":"fixture-live"}}')
+
+        station = ThreadingHTTPServer(("127.0.0.1", 0), RelayStation)
+        self.addCleanup(station.server_close)
+        threading.Thread(target=station.serve_forever, daemon=True).start()
+        self.addCleanup(station.shutdown)
+        origin = f"http://127.0.0.1:{station.server_port}"
+        self._start_core(_provider_document(relay_origin=origin))
+        self.core.accept_relay_login(
+            account_id=account_id, account_type="newapi", label="Relay", origin=origin, pending_account=True,
+            username="fixture", access_token="fixture-old", password="fixture-password", remember_password=True,
+        )
+        with self.core._domain_scope("relay_accounts"):
+            relay = self.core._domains["relay_accounts"]
+            saved = json.loads(relay.storage_path.read_bytes())
+            saved["accounts"][0].update(session={}, session_issued_at="", login_status="signed_out", login_observed_at="")
+            relay._store.write(saved)
+            relay.reload()
+            self.core._advance_projection_revision()
+
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--confirmed-logout", f"{origin}/confirmed-logout"],
+            capture_output=True, text=True, timeout=60, cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        self.assertEqual(["/api/user/login"], posts)
+        self.assertEqual("fixture-live", json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"])
+
+    def test_open_pane_paints_checking_signing_in_signed_in(self) -> None:
+        login_started = threading.Event()
+        release_login = threading.Event()
+        posts = []
+
+        class RelayStation(BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                self.send_response(404)
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path == "/automatic-login-release":
+                    release_login.set()
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                posts.append(self.path)
+                login_started.set()
+                release_login.wait(timeout=5)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success":true,"data":{"username":"fixture","id":7,"access_token":"fixture-live"}}')
+
+        station = ThreadingHTTPServer(("127.0.0.1", 0), RelayStation)
+        self.addCleanup(station.server_close)
+        threading.Thread(target=station.serve_forever, daemon=True).start()
+        self.addCleanup(station.shutdown)
+        origin = f"http://127.0.0.1:{station.server_port}"
+        self._start_core(_provider_document(relay_origin=origin))
+        self.core.accept_relay_login(
+            account_id="fixture-account", account_type="newapi", label="Relay", origin=origin,
+            pending_account=True, username="fixture", access_token="fixture-old",
+            password="fixture-password", remember_password=True,
+        )
+        with self.core._domain_scope("relay_accounts"):
+            relay = self.core._domains["relay_accounts"]
+            saved = json.loads(relay.storage_path.read_bytes())
+            saved["accounts"][0].update(session={}, session_issued_at="", login_status="signed_out", login_observed_at="2020-01-01T00:00:00Z")
+            relay._store.write(saved)
+            relay.reload()
+            self.core._advance_projection_revision()
+
+        endpoint = self.server.endpoint
+        completed = subprocess.run(
+            ["node", str(DRIVER), f"http://{endpoint.address}:{endpoint.port}/ui/", "--json", "--automatic-login-progress", f"{origin}/automatic-login-release"],
+            capture_output=True, text=True, timeout=60, cwd=ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        self.assertTrue(login_started.is_set())
+        self.assertEqual(["/api/user/login"], posts)
+        self.assertEqual("fixture-live", json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"])
+
     def test_session_limit_retry_is_a_real_page_action(self) -> None:
         state = {"full": False}
         requests: list[tuple[str, str, int]] = []

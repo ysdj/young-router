@@ -3,6 +3,8 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
+import time
+from urllib.parse import urlsplit
 from unittest import mock
 
 import pytest
@@ -12,6 +14,7 @@ from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.operations import OnlineUsageReader
 from young_router.core.persistence import PersistenceError
+from young_router.core import relay_maintenance
 from young_router.core.scheduled_tasks import RELAY_LOGIN
 from young_router.core.service import CoreError, CoreStore
 from young_router.webdav import core as webdav_core
@@ -105,11 +108,17 @@ def saved_account(root, origin, *, account_type="newapi", cookie="session=fixtur
 
 
 @contextmanager
-def dav_server(*, lock_status=200):
+def dav_server(*, lock_status=200, phantom_lock=False, bare_lock_token=False, before_lock=None, reject_claim=None, claim_write_pending=False, bundle_readable=None, conditional_writes=True, move_writes=True):
     files = {}
     tokens = {}
+    etags = {}
+    etag_counter = [0]
     guard = threading.Lock()
     calls = []
+
+    def next_etag():
+        etag_counter[0] += 1
+        return f'"fixture-{etag_counter[0]}"'
 
     class DAV(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -126,9 +135,15 @@ def dav_server(*, lock_status=200):
 
         def do_LOCK(self):
             self.rfile.read(int(self.headers["Content-Length"]))
+            if before_lock:
+                before_lock()
             with guard:
                 if lock_status != 200:
                     self.answer(lock_status)
+                elif phantom_lock:
+                    # Some sync servers return a token without excluding any other writer.
+                    token = f"opaquelocktoken:fixture-{len(calls)}"
+                    self.answer(200, **{"Lock-Token": token if bare_lock_token else f"<{token}>"})
                 elif self.path in tokens:
                     self.answer(423)
                 else:
@@ -139,24 +154,78 @@ def dav_server(*, lock_status=200):
 
         def do_UNLOCK(self):
             with guard:
-                assert tokens.pop(self.path) == self.headers["Lock-Token"]
+                if not phantom_lock:
+                    assert tokens.pop(self.path) == self.headers["Lock-Token"]
                 self.answer(204)
 
         def do_PUT(self):
             data = self.rfile.read(int(self.headers["Content-Length"]))
             with guard:
                 token = tokens.get(self.path)
-                if ".young-router-login-" in self.path and (not token or self.headers.get("If") != f"({token})"):
+                if "If-None-Match" in self.headers:
+                    if conditional_writes and (self.headers["If-None-Match"] != "*" or self.path in files):
+                        self.answer(412)
+                    else:
+                        files[self.path] = data
+                        etags[self.path] = next_etag()
+                        self.answer(201, **{"ETag": etags[self.path]})
+                elif "If-Match" in self.headers:
+                    if conditional_writes and (self.path not in files or self.headers["If-Match"] != etags.get(self.path)):
+                        self.answer(412)
+                    elif claim_write_pending and self.path.endswith(".claim.json"):
+                        self.answer(202)
+                    else:
+                        files[self.path] = data
+                        etags[self.path] = next_etag()
+                        self.answer(204, **{"ETag": etags[self.path]})
+                elif token and claim_write_pending:
+                    self.answer(202)
+                elif not phantom_lock and len(self.path.rsplit(".young-router-login-", 1)[-1].removesuffix(".json")) == 64 and ".young-router-login-" in self.path and (
+                    not token or self.headers.get("If") != f"({token})" or (reject_claim and reject_claim())
+                ):
                     self.answer(412)
                 else:
                     files[self.path] = data
                     self.answer(201)
 
+        def do_MOVE(self):
+            if not move_writes:
+                self.answer(405)
+                return
+            destination_parts = urlsplit(self.headers["Destination"])
+            destination = destination_parts.path + (f"?{destination_parts.query}" if destination_parts.query else "")
+            with guard:
+                if self.headers.get("Overwrite") == "F" and destination in files:
+                    self.answer(409)
+                elif self.path not in files:
+                    self.answer(404)
+                else:
+                    existed = destination in files
+                    files[destination] = files.pop(self.path)
+                    etags.pop(self.path, None)
+                    etags[destination] = next_etag()
+                    self.answer(204 if existed else 201)
+
         def do_GET(self):
             with guard:
-                self.answer(200, files[self.path]) if self.path in files else self.answer(404)
+                if bundle_readable and self.path.endswith("/fixture.json") and not bundle_readable():
+                    self.answer(403)
+                elif self.path in files:
+                    headers = {"ETag": etags[self.path]} if self.path in etags else {}
+                    self.answer(200, files[self.path], **headers)
+                else:
+                    self.answer(404)
 
         do_HEAD = do_GET
+
+        def do_DELETE(self):
+            with guard:
+                if "If-Match" in self.headers and self.headers["If-Match"] != etags.get(self.path):
+                    self.answer(412)
+                else:
+                    files.pop(self.path, None)
+                    etags.pop(self.path, None)
+                    self.answer(204)
 
         def do_MKCOL(self):
             self.answer(405)
@@ -187,6 +256,83 @@ def dav_core(root, origin, *, direct_bundle=False):
     })
     webdav.apply()
     return CoreStore(domains=[relay, webdav, ProvidersModelsDomain(config)]), relay
+
+
+def test_confirmed_logout_after_an_unknown_check_posts_once_and_saves(tmp_path):
+    with station() as (origin, calls), dav_server() as (dav, _, dav_calls):
+        core, relay = dav_core(tmp_path, dav)
+        account = dict(account_id="fixture-account", account_type="newapi", label="Relay", origin=origin)
+        core.accept_relay_login(
+            **account, pending_account=True, username="fixture", access_token="fixture-old",
+            password="fixture-password", remember_password=True, user_id="7",
+        )
+        # Model a loaded account whose remembered password survived without a session.
+        document = json.loads(relay.storage_path.read_bytes())
+        document["accounts"][0].update(session={}, session_issued_at="", login_status="signed_out", login_observed_at="")
+        relay.storage_path.write_text(json.dumps(document), encoding="utf-8")
+        core, relay = dav_core(tmp_path, dav)
+        relay._session_recheck_seconds = lambda: 60
+
+        assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_out"
+        assert relay.snapshot()["accounts"][0]["login_observed_seconds_ago"] is None
+        assert calls == []
+        assert not any(method == "LOCK" for method, _, _ in dav_calls)
+
+        relay.set_login_status(account["account_id"], "signed_out")
+        for _ in range(2):
+            assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
+        core, relay = dav_core(tmp_path, dav)
+        assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"] == "fixture-live"
+        assert [call for call in calls if call[0] == "POST"] == [("POST", "/api/user/login")]
+        assert sum(method == "LOCK" for method, _, _ in dav_calls) == 2
+
+
+def test_automatic_password_login_publishes_signing_in_before_signed_in(tmp_path):
+    posting = threading.Event()
+    finish_post = threading.Event()
+
+    def hold_login():
+        posting.set()
+        finish_post.wait(timeout=5)
+
+    with station(first_login=hold_login) as (origin, calls):
+        core, _relay, account = saved_account(tmp_path, origin)
+        events = []
+        core.subscribe(events.append)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            restoring = executor.submit(core.restore_relay_session, **account, login_status="unknown")
+            assert posting.wait(timeout=5)
+            progress = [event for event in events if event.get("event") == "job"]
+            assert [(event["state"], event.get("result")) for event in progress] == [
+                ("running", None),
+            ]
+            finish_post.set()
+            assert restoring.result(timeout=5)["login_status"] == "signed_in"
+
+        progress = [event for event in events if event.get("event") == "job"]
+        assert [event["state"] for event in progress] == ["running", "done"]
+        assert progress[-1]["result"]["login_status"] == "signed_in"
+        assert calls.count(("POST", "/api/user/login")) == 1
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_station_rejection_proves_expiry_even_with_an_unobserved_signed_out_label(tmp_path, background):
+    with station() as (origin, calls):
+        _, relay, account = saved_account(tmp_path, origin)
+        document = json.loads(relay.storage_path.read_bytes())
+        document["accounts"][0].update(login_status="signed_out", login_observed_at="")
+        relay.storage_path.write_text(json.dumps(document), encoding="utf-8")
+        relay = RelayAccountsDomain(tmp_path)
+        core = CoreStore(domains=[relay])
+
+        if background:
+            core.relay_maintenance()._run_due(RELAY_LOGIN, [account["account_id"]])
+            assert relay.snapshot()["accounts"][0]["login_status"] == "signed_in"
+        assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"] == "fixture-live"
+        assert calls.count(("POST", "/api/user/login")) == 1
 
 
 @pytest.mark.parametrize("probe,refresh,has_refresh", [
@@ -303,7 +449,8 @@ def test_concurrent_recovery_posts_once_and_saves_while_an_edit_is_staged(tmp_pa
 
 
 @pytest.mark.parametrize("use_refresh", [False, True])
-def test_webdav_lease_blocks_a_second_core_until_it_can_reuse_the_session(tmp_path, use_refresh):
+@pytest.mark.parametrize("lock_status,conditional_writes", [(200, True), (405, True), (405, False)])
+def test_webdav_lease_blocks_a_second_core_until_it_can_reuse_the_session(tmp_path, use_refresh, lock_status, conditional_writes):
     posting = threading.Event()
     release = threading.Event()
 
@@ -315,7 +462,9 @@ def test_webdav_lease_blocks_a_second_core_until_it_can_reuse_the_session(tmp_pa
         "first_refresh": hold_login,
         "refresh": (200, {"success": True, "data": {"access_token": "fixture-live"}}),
     } if use_refresh else {"first_login": hold_login}
-    with station(**station_settings) as (origin, calls), dav_server() as (dav, files, dav_calls):
+    with station(**station_settings) as (origin, calls), dav_server(
+        lock_status=lock_status, conditional_writes=conditional_writes,
+    ) as (dav, files, dav_calls):
         first, first_relay = dav_core(tmp_path / "first", dav)
         second, second_relay = dav_core(tmp_path / "second", dav, direct_bundle=True)
         account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
@@ -335,11 +484,17 @@ def test_webdav_lease_blocks_a_second_core_until_it_can_reuse_the_session(tmp_pa
             finally:
                 release.set()
             assert recovering.result(timeout=5)["login_status"] == "signed_in"
-        assert any(method == "LOCK" and status == 423 for method, _, status in dav_calls)
+        if lock_status == 200:
+            assert any(method == "LOCK" and status == 423 for method, _, status in dav_calls)
+        elif conditional_writes:
+            assert any(method == "PUT" and status == 412 for method, _, status in dav_calls)
+        else:
+            assert any(method == "MOVE" and status == 409 for method, _, status in dav_calls)
         # The lease is gone, the old bundle is still on the server, and this
         # peer restarts. The shared attempt record still prevents a second POST.
         second, second_relay = dav_core(tmp_path / "second", dav, direct_bundle=True)
-        assert second.restore_relay_session(**account, login_status="unknown")["login_status"] == "expired"
+        after_restart = second.restore_relay_session(**account, login_status="unknown")["login_status"]
+        assert after_restart in {"expired", "signed_in"}
         first.run_automatic_webdav_sync()
         assert second.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
         endpoint = "/api/user/auth/refresh" if use_refresh else "/api/user/login"
@@ -347,20 +502,238 @@ def test_webdav_lease_blocks_a_second_core_until_it_can_reuse_the_session(tmp_pa
         for relay in (first_relay, second_relay):
             assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"] == "fixture-live"
         coordination = next(value for path, value in files.items() if "young-router-login-" in path)
-        assert set(json.loads(coordination)) == {"at", "state", "retry_at"}
+        coordination_record = json.loads(coordination)
+        if lock_status == 200:
+            assert set(coordination_record) == {"at", "state", "retry_at"}
+        else:
+            assert set(coordination_record) == {"owner", "expires_at", "at", "state", "retry_at"}
 
 
-def test_webdav_without_lock_does_not_fall_back_to_password_login(tmp_path):
-    with station() as (origin, calls), dav_server(lock_status=405) as (dav, _, _):
+@pytest.mark.parametrize("lock_status,phantom_lock", [(405, False), (200, True)])
+@pytest.mark.parametrize("cookie", ["session=fixture-old", "new_api_refresh=fixture-old"])
+def test_webdav_without_a_valid_lock_still_tries_saved_password_once(tmp_path, lock_status, phantom_lock, cookie):
+    with station() as (origin, calls), dav_server(lock_status=lock_status, phantom_lock=phantom_lock) as (dav, _, dav_calls):
+        core, relay = dav_core(tmp_path, dav)
+        account = dict(account_id="fixture-account", account_type="newapi", label="Relay", origin=origin)
+        core.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie=cookie,
+            password="fixture-password", remember_password=True,
+        )
+        assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
+        assert [call for call in calls if call == ("POST", "/api/user/login")] == [("POST", "/api/user/login")]
+        assert relay.snapshot()["accounts"][0]["login_status"] == "signed_in"
+        assert any(method == "PUT" and status == 201 and ".claim.json" in path for method, path, status in dav_calls)
+        assert not any(".probe-" in path for _, path, _ in dav_calls)
+
+
+def test_unverified_webdav_conditionals_and_moves_do_not_authorize_a_password_post(tmp_path):
+    with station() as (origin, calls), dav_server(
+        lock_status=405, conditional_writes=False, move_writes=False,
+    ) as (dav, _, dav_calls):
         core, relay = dav_core(tmp_path, dav)
         account = dict(account_id="fixture-account", account_type="newapi", label="Relay", origin=origin)
         core.accept_relay_login(
             **account, pending_account=True, username="fixture", cookie="session=fixture-old",
             password="fixture-password", remember_password=True,
         )
+
         assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "expired"
+        assert not any(method == "POST" and path == "/api/user/login" for method, path in calls)
         assert relay.snapshot()["accounts"][0]["login_failure"] == "sync_unavailable"
+        assert not any(method == "PUT" and path.endswith(".claim.json") for method, path, _ in dav_calls)
+
+
+@pytest.mark.parametrize("lock_status,bare_lock_token", [(405, False), (200, True)])
+def test_webdav_atomic_move_claim_restores_login_once(tmp_path, lock_status, bare_lock_token):
+    with station() as (origin, calls), dav_server(
+        lock_status=lock_status,
+        phantom_lock=lock_status == 200,
+        bare_lock_token=bare_lock_token,
+        conditional_writes=False,
+    ) as (dav, files, dav_calls):
+        core, relay = dav_core(tmp_path, dav)
+        account = dict(account_id="fixture-account", account_type="newapi", label="Relay", origin=origin)
+        core.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie="session=fixture-old",
+            password="fixture-password", remember_password=True,
+        )
+
+        assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
+        claim_path = next(path for path in files if path.endswith(".claim.json"))
+        claim = json.loads(files[claim_path])
+        assert claim["state"] == "pending"
+        assert claim["at"]
+        assert calls.count(("POST", "/api/user/login")) == 1
+        assert any(method == "MOVE" and status == 201 for method, _, status in dav_calls)
+        assert not any(".young-router-login-probe-" in path for path in files)
+        assert not any(".young-router-login-owner-" in path for path in files)
+
+
+def test_move_claim_keeps_the_attempt_marker_after_an_expired_lease(tmp_path):
+    with dav_server(lock_status=405, conditional_writes=False) as (dav, files, _):
+        settings = webdav_core.Settings(url=dav + "fixture.json?token=fixture")
+        client = webdav_core.WebDAVClient(settings)
+        first = client.acquire_login_lease("move-restart")
+        first.write_attempt("2026-01-01T00:00:00.000000Z", "pending")
+        first.release()
+
+        second = client.acquire_login_lease("move-restart")
+        try:
+            assert second.move_claim
+            assert second.read_attempt() == {
+                "at": "2026-01-01T00:00:00.000000Z", "state": "pending", "retry_at": 0,
+            }
+        finally:
+            second.release()
+
+
+@pytest.mark.parametrize("lock_status,accept_peer", [(405, True), (405, False), (200, True)])
+def test_readable_peer_session_needs_no_lock_and_is_saved_only_after_verification(tmp_path, lock_status, accept_peer):
+    with station(accept_new_token=accept_peer) as (origin, calls), dav_server(lock_status=lock_status) as (dav, _, dav_calls):
+        first, _ = dav_core(tmp_path / "first", dav)
+        second, relay = dav_core(tmp_path / "second", dav, direct_bundle=True)
+        account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
+        first.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie="session=fixture-old",
+            remember_password=False, user_id="7",
+        )
+        first.run_automatic_webdav_sync()
+        second.run_automatic_webdav_sync()
+        first.accept_relay_login(**account, username="fixture", access_token="fixture-live", user_id="7")
+        first.run_automatic_webdav_sync()
+
+        result = second.restore_relay_session(**account, login_status="unknown")
+
+        assert result["login_status"] == ("signed_in" if accept_peer else "expired")
+        row = json.loads(relay.storage_path.read_bytes())["accounts"][0]
+        assert row["session"]["access_token"] == ("fixture-live" if accept_peer else "")
+        assert row["session"]["cookie"] == ("" if accept_peer else "session=fixture-old")
+        assert not any(method == "LOCK" for method, _, _ in dav_calls)
         assert [call for call in calls if call[0] == "POST"] == []
+
+
+def test_recovery_rechecks_the_bundle_after_acquiring_the_lease(tmp_path):
+    first = None
+
+    def publish_before_lock():
+        first.run_automatic_webdav_sync()
+
+    with station() as (origin, calls), dav_server(before_lock=publish_before_lock) as (dav, _, _):
+        first, _ = dav_core(tmp_path / "first", dav)
+        second, relay = dav_core(tmp_path / "second", dav)
+        account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
+        first.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie="session=fixture-old",
+            password="fixture-password", remember_password=True, user_id="7",
+        )
+        first.run_automatic_webdav_sync()
+        second.run_automatic_webdav_sync()
+        first.accept_relay_login(**account, username="fixture", access_token="fixture-live", user_id="7")
+
+        assert second.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_in"
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"] == "fixture-live"
+        assert [call for call in calls if call[0] == "POST"] == []
+
+
+def test_lease_lost_after_a_rejected_refresh_cannot_authorize_password_login(tmp_path):
+    with station() as (origin, calls), dav_server(reject_claim=lambda: ("POST", "/api/user/auth/refresh") in calls) as (dav, _, _):
+        core, relay = dav_core(tmp_path, dav)
+        account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
+        core.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie="new_api_refresh=fixture-old",
+            password="fixture-password", remember_password=True, user_id="7",
+        )
+
+        assert core.restore_relay_session(**account, login_status="unknown")["login_status"] == "expired"
+        assert [call for call in calls if call[0] == "POST"] == [("POST", "/api/user/auth/refresh")]
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["cookie"] == "new_api_refresh=fixture-old"
+
+
+def test_accepted_but_unsaved_login_claim_never_authorizes_a_station_post(tmp_path):
+    with station() as (origin, calls), dav_server(claim_write_pending=True) as (dav, _, dav_calls):
+        core, relay = dav_core(tmp_path, dav)
+        account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
+        core.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie="new_api_refresh=fixture-old",
+            password="fixture-password", remember_password=True, user_id="7",
+        )
+
+        core.relay_maintenance()._run_due(RELAY_LOGIN, [account["account_id"]])
+
+        assert [(method, status) for method, _, status in dav_calls if method in {"LOCK", "PUT", "UNLOCK"}] == [
+            ("LOCK", 200), ("LOCK", 423), ("PUT", 202), ("UNLOCK", 204),
+        ]
+        assert [call for call in calls if call[0] == "POST"] == []
+        assert relay.snapshot()["accounts"][0]["login_failure"] == "sync_unavailable"
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["cookie"] == "new_api_refresh=fixture-old"
+        task = next(row for row in core.log_view("scheduled-tasks")["log"]["records"] if row["id"] == RELAY_LOGIN)
+        assert task["history"][0]["issues"][0]["message"] == "WebDAV did not finish saving the login record"
+
+
+def test_waiting_core_checks_for_the_session_without_an_open_pane(tmp_path, monkeypatch):
+    monkeypatch.setattr(relay_maintenance, "SHARED_LOGIN_RECHECK_SECONDS", 0.02)
+    with station() as (origin, calls), dav_server() as (dav, _, _):
+        first, _ = dav_core(tmp_path / "first", dav)
+        second, relay = dav_core(tmp_path / "second", dav)
+        account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
+        first.accept_relay_login(
+            **account, pending_account=True, username="fixture", cookie="session=fixture-old",
+            password="fixture-password", remember_password=True, user_id="7",
+        )
+        first.run_automatic_webdav_sync()
+        second.run_automatic_webdav_sync()
+        first.restore_relay_session(**account, login_status="unknown")
+        assert second.restore_relay_session(**account, login_status="unknown")["login_status"] == "expired"
+        assert relay.snapshot()["accounts"][0]["login_failure"] == "sync_waiting"
+
+        maintenance = second.relay_maintenance()
+        maintenance.start()
+        try:
+            first.run_automatic_webdav_sync()
+            deadline = time.monotonic() + 5
+            def signed_in():
+                accounts = second.snapshot()["domains"]["relay_accounts"]["accounts"]
+                return bool(accounts) and accounts[0]["login_status"] == "signed_in"
+
+            while not signed_in() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert signed_in()
+        finally:
+            maintenance.stop()
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"] == "fixture-live"
+        assert [call for call in calls if call[0] == "POST"] == [("POST", "/api/user/login")]
+
+
+def test_background_recovers_from_webdav_read_failure_without_treating_absence_as_logout(tmp_path):
+    readable = False
+    with station() as (origin, calls), dav_server(bundle_readable=lambda: readable) as (dav, _, dav_calls):
+        first, relay = dav_core(tmp_path / "first", dav)
+        account = dict(account_id="shared-account", account_type="newapi", label="Relay", origin=origin)
+        first.accept_relay_login(
+            **account, pending_account=True, username="fixture", access_token="fixture-old",
+            password="fixture-password", remember_password=True,
+        )
+        document = json.loads(relay.storage_path.read_bytes())
+        document["accounts"][0].update(session={}, session_issued_at="", login_status="signed_out", login_observed_at="")
+        relay.storage_path.write_text(json.dumps(document), encoding="utf-8")
+        first, relay = dav_core(tmp_path / "first", dav)
+        assert first.restore_relay_session(**account, login_status="unknown")["login_status"] == "signed_out"
+        assert relay.snapshot()["accounts"][0]["login_failure"] == "sync_unavailable"
+
+        readable = True
+        accounts = first._relay_maintenance_accounts()[RELAY_LOGIN]
+        assert accounts == [account["account_id"]]
+        first.relay_maintenance()._run_due(RELAY_LOGIN, accounts)
+        assert relay.snapshot()["accounts"][0]["login_observed_seconds_ago"] is None
+
+        second, _ = dav_core(tmp_path / "second", dav)
+        second.accept_relay_login(**account, pending_account=True, username="fixture", access_token="fixture-live")
+        second.run_automatic_webdav_sync()
+        first.relay_maintenance()._run_due(RELAY_LOGIN, accounts)
+        assert relay.snapshot()["accounts"][0]["login_status"] == "signed_in"
+        assert json.loads(relay.storage_path.read_bytes())["accounts"][0]["session"]["access_token"] == "fixture-live"
+        assert not any(method == "LOCK" for method, _, _ in dav_calls)
+        assert not any(method == "POST" for method, _ in calls)
 
 
 @pytest.mark.parametrize("with_webdav", [False, True])

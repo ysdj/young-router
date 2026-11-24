@@ -807,15 +807,8 @@ class HookStreamingFailoverTests(HookTestCase):
             output,
         )
 
-    async def test_two_item_cap_cuts_inside_five_minutes_park_the_route(self) -> None:
-        """A route that runs out of items twice in five minutes is out.
-
-        Measured 2026-11-20: tken cut long thinking turns at 100 and 98
-        generated items while the same model finished on flux/youyangai without
-        stating ``max_messages`` at all.  That is the route's own budget, so it
-        is charged like any other transient failure -- two inside five minutes
-        -- not the one strike a cut answer earns.
-        """
+    async def test_repeated_item_cap_continuations_do_not_park_the_route(self) -> None:
+        """An unfinished step cannot cool the only route out of its next sample."""
 
         hooks, _proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()
@@ -846,16 +839,16 @@ class HookStreamingFailoverTests(HookTestCase):
 
         await run("cap-one")
         state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
-        self.assertEqual(1, state.get("failures"))
         self.assertFalse(state.get("cooldown_until"))
+        self.assertFalse(state.get("item_cap_strikes"))
 
         await run("cap-two")
-        state = hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"]
-        self.assertEqual(2, state["failures"])
-        self.assertGreater(state["cooldown_until"], time.time())
+        state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
+        self.assertFalse(state.get("cooldown_until"))
+        self.assertFalse(state.get("item_cap_strikes"))
 
-    async def test_an_item_cap_hop_charges_the_route_once(self) -> None:
-        """The hop is the turn staying alive; the route still pays for the cap."""
+    async def test_an_item_cap_after_delivered_reasoning_closes_with_continuation(self) -> None:
+        """Delivered reasoning is not replayed when its route hits the item cap."""
 
         hooks, proxy_server = load_hook_module()
         routing = importlib.import_module("young_router.proxy.routing")
@@ -866,20 +859,9 @@ class HookStreamingFailoverTests(HookTestCase):
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
 
-        def answered():
-            async def stream():
-                yield {"type": "response.created", "response": {"id": "resp-ok"}}
-                yield {"type": "response.output_text.delta", "delta": "the answer"}
-                yield {
-                    "type": "response.completed",
-                    "response": {"id": "resp-ok", "status": "completed", "output": []},
-                }
-
-            return stream()
-
         class FakeRouter:
             async def aresponses(self, **payload):
-                return answered()
+                raise AssertionError("delivered reasoning must not be replayed")
 
         proxy_server.llm_router = FakeRouter()
         request_data = {
@@ -899,26 +881,24 @@ class HookStreamingFailoverTests(HookTestCase):
             chunk
             async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
-                response=self._capped_turn("Sending now")(),
+                response=self._capped_turn()(),
                 request_data=request_data,
             )
         ]
 
-        self.assertIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        self.assertNotIn("the answer", [chunk.get("delta") for chunk in chunks])
+        self.assertTrue(any(
+            item.get("phase") == "commentary"
+            and "Continue the original request" in item["content"][0]["text"]
+            for item in chunks[-1]["response"]["output"]
+        ))
         state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
-        self.assertEqual(1, state.get("failures"))
         self.assertFalse(state.get("cooldown_until"))
+        self.assertFalse(state.get("item_cap_strikes"))
 
-    async def test_a_success_between_two_caps_does_not_erase_the_first(self) -> None:
-        """The tally has to survive the capped attempt's own "success".
-
-        The capped attempt's body closes normally once the hop starts, and the
-        success callback clears the cooldown entry 0.4 s later (live 2026-11-20
-        12:02:53, ``deployment_cooldown_cleared failures=1``).  If the strike
-        record lived in that entry, two caps in five minutes could never add up
-        -- and the gateway runs five workers, so a per-process tally sees a
-        fifth of them.
-        """
+    async def test_a_completed_item_cap_does_not_charge_a_route_strike(self) -> None:
+        """A safe continuation is a completed step, not a route failure."""
 
         hooks, _proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()
@@ -946,22 +926,17 @@ class HookStreamingFailoverTests(HookTestCase):
                 request_data=request_data,
             ):
                 pass
-            # The capped attempt's body closes normally; that is the callback
-            # that used to wipe the count.
             hooks._record_deployment_success_for_cooldown(request_data)
 
-        await run("cap-first")
+        for index in range(6):
+            await run(f"cap-{index}")
+
         state = hooks._DEPLOYMENT_COOLDOWNS.get("id:capping-route") or {}
-        self.assertEqual(1, state.get("failures"))
-        self.assertEqual(1, len(state.get("item_cap_strikes") or []))
+        self.assertFalse(state.get("cooldown_until"))
+        self.assertFalse(state.get("item_cap_strikes"))
 
-        await run("cap-second")
-        state = hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"]
-        self.assertEqual(2, state["failures"])
-        self.assertGreater(state["cooldown_until"], time.time())
-
-    async def test_an_item_cap_from_ten_minutes_ago_does_not_count(self) -> None:
-        """The rule is a rate: a cap an hour old says nothing about this minute."""
+    async def test_a_completed_item_cap_does_not_create_a_cooldown_strike(self) -> None:
+        """A prior transient failure does not turn safe continuation into failure."""
 
         hooks, _proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()
@@ -995,8 +970,8 @@ class HookStreamingFailoverTests(HookTestCase):
             pass
 
         state = hooks._DEPLOYMENT_COOLDOWNS["id:capping-route"]
-        self.assertEqual(1, state["failures"])
         self.assertFalse(state.get("cooldown_until"))
+        self.assertFalse(state.get("item_cap_strikes"))
 
     def test_route_recovery_rejects_reasoning_only_completed_response(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -6108,10 +6083,17 @@ class ReplayLadderTests(HookTestCase):
         self.assertIsNone(hooks._session_replay_shortening(request))
 
     def test_a_cap_before_anything_was_delivered_still_marks_the_thread(self) -> None:
-        """A refusal that arrives before the response starts is about the replay."""
+        """A bare refusal marks a heavy replay that can actually be shortened."""
 
         hooks, _ = load_hook_module()
         request = self._request("thread-cap-before-output")
+        request["input"] = [
+            *[
+                {"type": "reasoning", "id": f"rs-{index}", "summary": []}
+                for index in range(150)
+            ],
+            {"type": "message", "role": "user", "content": "Continue."},
+        ]
         exception = hooks._responses_incomplete_stream_exception(
             "terminal response event before response.completed",
             buffer=[
@@ -6134,6 +6116,30 @@ class ReplayLadderTests(HookTestCase):
             hooks._REPLAY_TOO_LARGE_SHORTENING_LADDER[0],
             hooks._session_replay_shortening(request),
         )
+
+    def test_a_bare_cap_on_a_short_replay_does_not_add_a_shortening_mark(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._request("thread-short-cap-before-output")
+        request["input"] = [
+            {"type": "message", "role": "user", "content": "Continue."}
+        ]
+        terminal = {
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_messages"},
+                "output": [],
+            },
+        }
+
+        exception = hooks._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[terminal],
+            request_data=request,
+        )
+
+        self.assertTrue(hooks._is_upstream_input_item_limit_error(exception))
+        self.assertIsNone(hooks._session_replay_shortening(request))
 
     def test_a_mark_written_before_the_cap_was_told_apart_is_not_evidence(self) -> None:
         """Old entries meant "some item cap", so they cannot keep shortening."""

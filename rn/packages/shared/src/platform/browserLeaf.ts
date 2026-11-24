@@ -1209,6 +1209,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       options.presentChild?.("file-editor");
     },
     prepareFileEditor: () => undefined,
+    prepareDirectApiWindows: () => undefined,
     pendingFileEditorTarget: () => pendingFileEditorTarget,
     showReadOnlyText: async (title, text, closeLabel) => {
       // The native hosts open their own code-viewer window. A page draws the

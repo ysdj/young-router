@@ -4439,7 +4439,48 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("clearTitle=", self.ui)
         self.assertNotIn("onClear=", self.ui)
 
-    def test_client_api_switch_opens_the_shared_direct_connection_form(self) -> None:
+    def test_a_child_close_request_does_not_close_the_settings_shell(self) -> None:
+        """Every React root hears the native close request, but only the
+        settings window it names may answer it; a child's own close is the
+        child root's job."""
+
+        self.assertIn(
+            "const closeAction = `request-close-${windowRoute}`;",
+            self.ui,
+        )
+        self.assertIn(
+            "if (nativeAction?.id !== closeAction || closing.current) return;",
+            self.ui,
+        )
+        self.assertIn(
+            "if (nativeAction?.id !== `request-close-${route}` && nativeAction?.id !== `request-close-${canonicalWindowRoute(route)}`) return;",
+            self.ui,
+        )
+
+    def test_the_direct_api_form_is_warmed_and_refreshes_when_presented(self) -> None:
+        """Opening a small form must not boot its root on the click.
+
+        macOS builds both API forms hidden while the settings shell mounts, and
+        a presented warm window tells its root to re-read the live connection
+        instead of showing the values captured at startup.
+        """
+
+        self.assertIn("native.prepareDirectApiWindows?.();", self.ui)
+        self.assertIn('nativeAction={nativeAction}', self.ui)
+        self.assertIn("const presented = nativeAction?.id === `present-${client}-api-settings` ? nativeAction.sequence : 0;", self.ui)
+        self.assertIn("}, [client, ipc, translate, presented]);", self.ui)
+        self.assertIn("func prepareDirectApiWindows()", self.macos_leaf)
+        self.assertIn(r'emitAction("present-\(windowRoute)")', self.macos_leaf)
+        self.assertIn("function directApiConnectionFingerprint", self.ui)
+        self.assertIn(
+            "directApiConnectionFingerprint(loadedConnection.current) === directApiConnectionFingerprint(next)",
+            self.ui,
+        )
+        self.assertIn("if (loadedConnection.current", self.ui)
+        self.assertIn("prepareDirectApiWindows", self.platform_entry)
+        self.assertIn("prepareDirectApiWindows", self.macos_leaf)
+
+    def test_client_api_switch_is_two_way_and_the_form_edits_the_off_position(self) -> None:
         for marker in (
             'client === "codex" ? "codex-api-settings" : "claude-api-settings"',
             'client={directApiClient}',
@@ -4447,6 +4488,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={translate("settings.directApiEdit")}',
             'placeholder={optional} plainText disabled={saving}',
             'domain: client, type: "use_direct_api"',
+            # The switch is two-way: on installs this app's full identity, and
+            # off restores the remembered direct route (when there is one)
+            # before opening this dialog for editing.
+            'onLeaveLocalApi={() => saveLocalApi(onLeaveLocalApi)}',
+            'onLeaveLocalApi={() => saveLocalApi(leaveClaudeLocalApi)}',
+            'const answer = await onLeaveLocalApi();',
+            'else openDirectApi();',
+            'onLeaveLocalApi={() => dispatch("leave_local_api", {}, "codex")}',
+            'onClaudeLeaveLocalApi={(app) => dispatch("leave_local_api", { client: app }, "claude")}',
+            'apiActive={yrapiActive}',
+            'const claudeYrapiActive = claudeApps.every(({ state }) => booleanValue(state.uses_yrapi_api));',
+            'apiActive={claudeYrapiActive}',
+            # The form edits the off position, so its catalog URL is an
+            # ordinary editable field in both modes.
+            '{client === "codex" ? input(translate("settings.directApiCatalog"), catalog, setCatalog) : null}',
             # A child panel draws no pane header, so the form's own body states
             # the inset that holds its first row off the title bar.
             'style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_CONTENT}',
@@ -4481,6 +4537,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assertNotIn('"status.cancel"', self.zh + self.en)
         self.assertNotIn('translate("status.cancel")', self.ui + self.relay + (ROOT / "rn/packages/shared/src/ui/RelayGroupSheet.tsx").read_text(encoding="utf-8"))
+        self.assertNotIn("catalog_url_editable", self.ui)
+        self.assertNotIn("activate:", self.ui)
+        self.assertNotIn("The switch reflects the file until the child saves a replacement.", self.ui)
         self.assertIn('translate("settings.keepEditing")', self.ui)
         self.assertNotIn("function savedRouteMenuGroups(", self.ui)
         self.assertNotIn('dispatch("use_saved_model"', self.ui)
@@ -4562,11 +4621,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "SETTINGS_FIELD_VALUE_SLOT",
             "SETTINGS_FIELD_HELP_SLOT",
             "SETTINGS_FIELD_SWITCH_SLOT",
-            'codexModelCatalogEnabled={codexModelCatalogEnabled}',
-            'booleanValue(codexModelCatalogState(snapshot).enabled)',
-            'const CODEX_MODEL_CATALOG_FILE_ID = "codex_model_catalog";',
             "const openClientFile = (file: ClientFile): void => {",
-            "if (file.id === CODEX_MODEL_CATALOG_FILE_ID) { generatedFileOpen(file, codexModelCatalogEnabled); return; }",
             # Claude Code keeps its picker in its own settings document, so
             # that file is generated too and needs the same warning first.
             'const CLAUDE_CODE_SETTINGS_FILE_ID = "claude.settings";',
@@ -4586,14 +4641,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "SETTINGS_FIELD_HELP_SLOT",
             # One on/off setting is a switch, never a checkbox.
             "<NativeToggle",
-            "value={localApiActive}",
+            "value={apiActive}",
             'const label = translate("settings.useLocalApi");',
             'title={translate("settings.directApiEdit")}',
             "disabled={busy || clientActionBusy}",
             "onValueChange={toggleLocalApi}",
-            'localApiActive={codexUsesLocalApi}',
+            'apiActive={yrapiActive}',
             'onUseLocalApi={() => dispatch("use_local_api", {}, "codex")}',
             'const codexUsesLocalApi = booleanValue(codexState.uses_local_api);',
+            'const codexUsesYrapiApi = booleanValue(codexState.uses_yrapi_api);',
             'onClaudeUseLocalApi={(app) => dispatch("use_local_api", { client: app }, "claude")}',
         ):
             self.assertIn(marker, self.ui if marker not in pane else pane)
@@ -5623,7 +5679,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{ client: "claude", titleKey: "clients.claude"',
             'hintKey: "clients.claudeFilesHint"',
             "const claudeApps:",
-            "const claudeLocalApiActive = claudeApps.every(",
+            "const claudeYrapiActive = claudeApps.every(",
             'for (const { app } of claudeApps) if (await onClaudeUseLocalApi(app) === false) return false;',
             'onUseLocalApi={useClaudeApiAndOfferPlugin}',
             # Every Claude app's files under those controls.
@@ -8048,7 +8104,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "void beginAddLogin();",
             "const loginAccount = async (account: AddedRelayAccount): Promise<boolean> => {",
             "native.relayLogin({",
-            "const restoreSavedSession = async (account: RelayAccount): Promise<void> => {",
+            "const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {",
             "native.restoreRelaySession({",
         ):
             self.assertIn(marker, relay)
@@ -8073,7 +8129,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await commit("credential_cleanup_confirm", { id: account.id, kind: "credentials" });', removal)
         # The mount effect quietly checks Core and then reads resources. Its
         # dependency is an observation, not each newly delivered array.
-        self.assertIn("if (!fresh) await restoreSavedSession(account);", relay)
+        self.assertIn('const signedIn = fresh ? account.loginStatus === "signed_in" : await restoreSavedSession(account);', relay)
         self.assertIn("await refreshAccountResources(account, { silent: true });", relay)
         self.assertNotIn("}, [busy, sessionRecheckSeconds, stationAccounts]);", relay)
         self.assertIn("sessionRecheckSeconds?: number;", relay)
@@ -8096,8 +8152,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # signed out and is never disabled; 刷新资源 and 分组管理 are the controls
         # that act on a session, so they appear only once the row reads 已登录.
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
+        self.assertIn('const [loading, setLoading] = useState<Record<string, AccountLoading>>(() => Object.fromEntries(', relay)
+        self.assertIn('if (checkedAccounts.current.get(account.id) === undefined && !loginObservationIsFresh(account)) return "checking_login";', relay)
         self.assertIn('if (account.loginStatus === "signed_in") return "signed_in";', relay)
+        self.assertIn('const RELAY_AUTO_LOGIN_JOB_PREFIX = "relay-auto-login:";', relay)
+        self.assertIn('event.result?.login_status === "signed_in"', relay)
+        self.assertIn('if (automaticLoginStatus[account.id] === "signing_in") return "signing_in";', relay)
         self.assertIn('if (loading[account.id]?.checking) return "checking_login";', relay)
+        self.assertIn('ipc={ipc}', self.ui)
         self.assertIn('return "signed_out";', relay)
         # 未登录 is a conclusion, not a placeholder: the mount check is a station
         # round trip whose network timeout is long enough that a row painted
@@ -8109,7 +8171,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # must be able to interrupt the check rather than sit it out.
         self.assertIn('updateLoading(account.id, "checking", true);', relay)
         self.assertIn('updateLoading(account.id, "checking", false);', relay)
-        probe_lanes = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<void> => {", 1)[1].split("const loginAccount", 1)[0]
+        probe_lanes = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {", 1)[1].split("const loginAccount", 1)[0]
         self.assertNotIn('"session"', probe_lanes)
         self.assertNotIn('updateLoading(account.id, "resources"', probe_lanes)
         self.assertIn('type AccountLoading = { session: boolean; checking: boolean; resources: boolean };', relay)

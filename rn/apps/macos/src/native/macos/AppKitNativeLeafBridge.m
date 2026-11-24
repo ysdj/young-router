@@ -46,6 +46,7 @@ RCT_EXTERN_METHOD(openExternalURL:(NSString *)url)
 RCT_EXTERN_METHOD(revealFile:(NSString *)path)
 RCT_EXTERN_METHOD(openFileEditor:(NSString *)payload)
 RCT_EXTERN_METHOD(prepareFileEditor)
+RCT_EXTERN_METHOD(prepareDirectApiWindows)
 RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(pendingFileEditorTarget)
 RCT_EXTERN_METHOD(quit)
 @end

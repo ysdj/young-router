@@ -1,4 +1,13 @@
-"""Client API endpoints and ownership records for generated model lists."""
+"""Client API endpoints, remembered direct connections, and generated lists.
+
+The state file is this app's own private bookkeeping (mode 0600, never part of
+a Core snapshot and never synced): the generated model list a client owns, and
+the direct connection a client left when it moved onto this app's proxy.  The
+remembered connection holds the client's own API key because leaving the proxy
+has to put that client back on the very endpoint and credential it used before;
+the key is read only through Core's secret capability, exactly like the copy the
+client document already holds.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +23,8 @@ from ._shared import DomainError, local_proxy_endpoint
 
 CLIENT_ROUTE_STATE_FILE_NAME = "client-routes.json"
 CLIENT_ROUTE_CLIENTS = ("claudeCode", "claudeDesktop")
+DIRECT_CONNECTION_CLIENTS = ("codex", "claudeCode", "claudeDesktop")
+DIRECT_CONNECTION_KEY = "direct_connection"
 
 
 def direct_api_url(value: object, *, optional: bool = False) -> str:
@@ -63,17 +74,112 @@ def _read_state(runtime_root: object) -> dict[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _write_state(runtime_root: object, state: Mapping[str, Any]) -> None:
+def _write_state(runtime_root: object, state: Mapping[str, Any], *, strict: bool = False) -> None:
     path = _state_path(runtime_root)
     if path is None:
+        if strict:
+            raise DomainError("The direct API connection could not be saved")
         return
     from ..persistence import atomic_write_json
 
     try:
         atomic_write_json(path, dict(state))
     except Exception:
-        # A model list already saved to the client remains usable.
-        pass
+        # A model list already saved to the client remains usable.  A direct
+        # connection is the off position of a switch and the only copy of the
+        # credential it will write, so its caller is told instead of leaving a
+        # switch that cannot return.
+        if strict:
+            raise DomainError("The direct API connection could not be saved") from None
+
+
+def _direct_text(value: object, *, limit: int = 4096) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > limit or "\x00" in text or "\n" in text or "\r" in text:
+        return ""
+    return text
+
+
+def normalise_direct_connection(value: object) -> dict[str, Any] | None:
+    """Read one remembered direct connection, rejecting junk.
+
+    The endpoint is the identity of the connection, so a record without a valid
+    one is nothing this app can restore -- except for the built-in OpenAI
+    provider and a client on its own official endpoint, where "no address" is
+    the connection.  The key is kept verbatim (single line only) because it is
+    the credential the client's document held; every other field is a short
+    plain-text identifier.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    provider = _direct_text(value.get("provider"))
+    try:
+        base_url = direct_api_url(
+            value.get("base_url"), optional=provider in {"openai", "official"}
+        )
+    except DomainError:
+        return None
+    result: dict[str, Any] = {"base_url": base_url}
+    if provider:
+        result["provider"] = provider
+    for field in (
+        "model",
+        "model_catalog_url",
+        "auth_mode",
+        "env_key",
+        "env_model",
+        "web_search",
+    ):
+        text = _direct_text(value.get(field))
+        if text:
+            result[field] = text
+    key = value.get("api_key")
+    if (
+        isinstance(key, str)
+        and key
+        and len(key) <= 16384
+        and "\x00" not in key
+        and "\n" not in key
+        and "\r" not in key
+    ):
+        result["api_key"] = key
+    if isinstance(value.get("supports_standalone_web_search"), bool):
+        result["supports_standalone_web_search"] = value["supports_standalone_web_search"]
+    return result
+
+
+def read_direct_connection(runtime_root: object, client: str) -> dict[str, Any] | None:
+    """The direct connection this app last saw one client on, if any."""
+
+    if client not in DIRECT_CONNECTION_CLIENTS:
+        return None
+    entry = _read_state(runtime_root).get(client)
+    if not isinstance(entry, Mapping):
+        return None
+    return normalise_direct_connection(entry.get(DIRECT_CONNECTION_KEY))
+
+
+def store_direct_connection(runtime_root: object, client: str, connection: object | None) -> None:
+    """Remember (or clear) the connection a client leaves for this app's proxy."""
+
+    if client not in DIRECT_CONNECTION_CLIENTS:
+        return
+    state = _read_state(runtime_root)
+    entry = state.get(client)
+    remembered = dict(entry) if isinstance(entry, Mapping) else {}
+    resolved = normalise_direct_connection(connection)
+    if resolved is None:
+        remembered.pop(DIRECT_CONNECTION_KEY, None)
+    else:
+        remembered[DIRECT_CONNECTION_KEY] = resolved
+    if remembered:
+        state[client] = remembered
+    else:
+        state.pop(client, None)
+    _write_state(runtime_root, state, strict=True)
 
 
 def read_generated_models(runtime_root: object, client: str) -> list[str]:
@@ -205,11 +311,16 @@ __all__ = [
     "CLAUDE_DESKTOP_REFUSED_TOKENS",
     "CLIENT_ROUTE_CLIENTS",
     "CLIENT_ROUTE_STATE_FILE_NAME",
+    "DIRECT_CONNECTION_CLIENTS",
+    "DIRECT_CONNECTION_KEY",
     "anthropic_base_url",
     "direct_api_url",
     "endpoint",
     "names_a_claude_model",
+    "normalise_direct_connection",
     "public_direct_api_url",
+    "read_direct_connection",
     "read_generated_models",
+    "store_direct_connection",
     "store_generated_models",
 ]

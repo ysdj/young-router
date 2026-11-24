@@ -37,7 +37,12 @@ from typing import Any, Iterable
 #: to answer with an admin console.
 ENDPOINT_ENV = "YOUNG_ROUTER_CORE_IPC_ENDPOINT"
 #: The prefixes this app owns on the published port.
-FORWARDED_PREFIXES = ("/ui", "/ipc")
+#:
+#: ``/codex/models`` is the catalog a client fetches itself when its provider
+#: row names this app's address.  It is one exact path -- OpenAI's own Codex
+#: backend answers ``/backend-api/codex/models`` -- and not the whole ``/codex``
+#: namespace, so a future LiteLLM route there is not swallowed.
+FORWARDED_PREFIXES = ("/ui", "/ipc", "/codex/models")
 #: The `Host` the browser actually used, forwarded for Core's own decision.
 #:
 #: Core sees a loopback `Host` on every forwarded request (the line above), so
@@ -186,6 +191,22 @@ async def _no_page(scope_path: str, send: Any) -> None:
 
     if scope_path == "/ipc" or scope_path.startswith("/ipc/"):
         payload = b'{"ok": false, "error": {"code": "core_unavailable", "message": "The local Core is not answering"}}'
+        await send({
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"application/json; charset=utf-8"),
+                (b"cache-control", b"no-store"),
+                (b"content-length", str(len(payload)).encode("latin-1")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": payload})
+        return
+    if scope_path.rstrip("/") == "/codex/models":
+        # A client asks this with its own credential and reads only the body.
+        # Answering the page's plain text here would read as a malformed
+        # catalog, which drops that client's whole model list.
+        payload = b'{"error":{"code":"catalog_unavailable","message":"The local Core is not answering"}}'
         await send({
             "type": "http.response.start",
             "status": 503,

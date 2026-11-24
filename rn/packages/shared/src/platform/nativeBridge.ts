@@ -183,6 +183,7 @@ export interface NativeLeafBridge {
   revealFile?(path: string): void;
   openFileEditor?(target: string): void;
   prepareFileEditor?(): void;
+  prepareDirectApiWindows?(): void;
   pendingFileEditorTarget?(): string;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
@@ -284,6 +285,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     revealFile: bridge.revealFile ? (path) => bridge.revealFile!(path) : undefined,
     openFileEditor: bridge.openFileEditor ? (target) => bridge.openFileEditor!(target) : undefined,
     prepareFileEditor: bridge.prepareFileEditor ? () => bridge.prepareFileEditor!() : undefined,
+    prepareDirectApiWindows: bridge.prepareDirectApiWindows ? () => bridge.prepareDirectApiWindows!() : undefined,
     pendingFileEditorTarget: bridge.pendingFileEditorTarget ? () => bridge.pendingFileEditorTarget!() : undefined,
     setLocalization: (strings) => bridge.setLocalization(strings),
     setShortcuts: (shortcuts) => bridge.setShortcuts(shortcuts),

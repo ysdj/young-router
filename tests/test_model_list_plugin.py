@@ -137,3 +137,41 @@ def test_direct_api_commits_the_client_then_syncs(tmp_path, monkeypatch, host):
         sync.assert_called_once_with(host)
     assert key not in path.read_text()
     assert not core.trusted_secret_read_descriptor(host, "direct_api_key", token)["present"]
+
+
+def test_saving_the_yrapi_triplet_from_the_form_is_the_on_direction(tmp_path, monkeypatch):
+    """The form and the switch are one state: its full triplet adopts the proxy."""
+
+    monkeypatch.setenv("LITELLM_PORT", "4000")
+    home = tmp_path / "codex"
+    home.mkdir()
+    runtime = tmp_path / "config.yaml"
+    runtime.write_text('model_list: []\ngeneral_settings: {master_key: fixture-router-key}\n')
+    path = home / "config.toml"
+    path.write_text(
+        'model_provider = "custom"\n'
+        "\n"
+        '[model_providers.custom]\n'
+        'base_url = "http://127.0.0.1:4000/v1"\n'
+        'requires_openai_auth = true\n'
+    )
+    (home / "auth.json").write_text('{"OPENAI_API_KEY": "fixture-router-key"}\n')
+    adapter = CodexSettingsDomain(runtime, codex_home=home)
+    core = CoreStore(domains=[adapter])
+    key = "fixture-router-key"
+    token = "direct-api-form-token"
+    core.stage_secret("codex", "direct_api_key", token, key, revision=core.snapshot()["revision"])
+    payload = {
+        "base_url": "http://127.0.0.1:4000/v1",
+        "model": "example-model",
+        "model_catalog_url": "",
+        "key_token": token,
+    }
+    with mock.patch.object(model_list_plugin, "sync_if_enabled", return_value={}) as sync:
+        core.dispatch({"domain": "codex", "type": "use_direct_api", "payload": payload})
+        sync.assert_called_once_with("codex")
+    assert adapter.snapshot()["uses_yrapi_api"]
+    document = tomllib.loads(path.read_text())
+    assert document["model_provider"] == "custom"
+    assert "young-router-direct" not in document["model_providers"]
+    assert document["model_providers"]["custom"]["base_url"] == "http://127.0.0.1:4000/v1"

@@ -905,6 +905,10 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         leaf.prepareFileEditor()
     }
 
+    @objc func prepareDirectApiWindows() {
+        leaf.prepareDirectApiWindows()
+    }
+
     @objc func pendingFileEditorTarget() -> String {
         leaf.pendingFileEditorTarget()
     }

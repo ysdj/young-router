@@ -127,6 +127,7 @@ type NativeModule = {
   revealFile?: (path: string) => void;
   openFileEditor?: (target: string) => void;
   prepareFileEditor?: () => void;
+  prepareDirectApiWindows?: () => void;
   pendingFileEditorTarget?: () => string;
   quit?: () => void;
   setShortcuts?: (shortcuts: Record<string, string>) => void;
@@ -244,6 +245,7 @@ const nativeBridge: NativeLeafBridge = {
   revealFile: (path) => call("revealFile", path),
   openFileEditor: (target) => call("openFileEditor", target),
   prepareFileEditor: () => call("prepareFileEditor"),
+  prepareDirectApiWindows: () => call("prepareDirectApiWindows"),
   pendingFileEditorTarget: () => (typeof leaf.pendingFileEditorTarget === "function" ? leaf.pendingFileEditorTarget() : ""),
   setLocalization: (strings) => {
     nativeStrings = strings;

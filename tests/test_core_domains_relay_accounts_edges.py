@@ -23,6 +23,14 @@ class EmptySub2APIClient:
         raise AssertionError(f"unexpected relay path: {path}")
 
 
+class ValidSessionClient:
+    def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+        del origin, headers
+        if path == "/api/user/self":
+            return {"success": True, "data": {"id": 7, "username": "person"}}
+        raise AssertionError(f"unexpected relay path: {path}")
+
+
 class _StoredCatalogClient:
     def __init__(self) -> None:
         self.model_reads: list[str] = []
@@ -78,7 +86,7 @@ class RelayAccountEdgeTests(unittest.TestCase):
 
     def test_restoring_without_a_password_keeps_a_session_only_login(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            domain = RelayAccountsDomain(directory)
+            domain = RelayAccountsDomain(directory, http_client=ValidSessionClient())
             account = domain.dispatch(
                 "account.add",
                 {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},

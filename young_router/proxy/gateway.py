@@ -14,6 +14,7 @@ from litellm.proxy.proxy_server import app as app  # noqa: F401  (uvicorn target
 
 from . import claude_desktop_listing as _claude_desktop_listing
 from . import image_context_endpoint as _image_context_endpoint
+from . import local_listing_key as _local_listing_key
 from . import reasoning_capability as _reasoning_capability
 from . import route_miss as _route_miss
 from . import web_forward as _web_forward
@@ -31,6 +32,9 @@ _route_miss.register(app)
 # address serves the app and the router.  Registered after everything else so
 # it is the outermost middleware and sees `/ui` before LiteLLM's own mount.
 _web_forward.register(app)
+# A person on this machine may read a model listing without a key; nothing else
+# becomes keyless, and a published proxy keeps its 401 for remote callers.
+_local_listing_key.register(app)
 # Claude Desktop's own discovery reads the alias view this app publishes; the
 # marker lives on the app so the listing builder can tell that request from
 # every other client's /v1/models read.

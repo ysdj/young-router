@@ -38,7 +38,9 @@ from ._shared_api import (
     anthropic_base_url,
     desktop_accepts_model_name,
     public_direct_api_url,
+    read_direct_connection,
     read_generated_models,
+    store_direct_connection,
     store_generated_models,
 )
 
@@ -1303,6 +1305,7 @@ class ClaudeSettingsDomain:
         # than per snapshot: it reads the runtime settings and the large
         # runtime configuration while snapshots are polled with a window open.
         self._local_api_base_url: str | None = None
+        self._local_api_key = ""
         self.refresh_local_api_endpoint()
         # Production uses both official sources.  Tests and callers that pass
         # an explicit Claude Code path stay isolated unless they also provide
@@ -2225,11 +2228,12 @@ class ClaudeSettingsDomain:
         """Resolve this app's proxy endpoint for the "use this API" action."""
 
         try:
-            self._local_api_base_url = _shared_api.endpoint(
+            self._local_api_base_url, self._local_api_key = _shared_api.endpoint(
                 self.runtime_config_path
-            )[0]
+            )
         except Exception:
             self._local_api_base_url = None
+            self._local_api_key = ""
 
     def _code_env(self) -> dict[str, Any]:
         return _mapping(self._draft.get("env", {}), "env")
@@ -2238,6 +2242,31 @@ class ClaudeSettingsDomain:
         """True when Claude Code's own ``env`` already names this proxy."""
 
         return self._code_uses_local_api(self._draft)
+
+    def _code_api_key(self, document: Mapping[str, Any] | None = None) -> str:
+        env = _mapping((document if document is not None else self._draft).get("env", {}), "env")
+        value = env.get("ANTHROPIC_AUTH_TOKEN")
+        if not isinstance(value, str) or not value:
+            value = env.get("ANTHROPIC_API_KEY")
+        return value.strip() if isinstance(value, str) else ""
+
+    def code_uses_yrapi_api(self) -> bool:
+        """True when Claude Code carries this app's whole API, key included."""
+
+        return (
+            self.code_uses_local_api()
+            and bool(self._local_api_key)
+            and self._code_api_key() == self._local_api_key
+        )
+
+    def desktop_uses_yrapi_api(self) -> bool:
+        if self._desktop is None or not self.desktop_uses_local_api() or not self._local_api_key:
+            return False
+        try:
+            key = self._desktop.secret_value("desktop_gateway_api_key")
+        except ClaudeDesktopConfigError:
+            return False
+        return key.strip() == self._local_api_key
 
     def _names_local_api(self, configured: object) -> bool:
         """Whether a client names the endpoint this domain already resolved.
@@ -2261,6 +2290,193 @@ class ClaudeSettingsDomain:
         base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, Mapping) else None
         return self._names_local_api(base_url)
 
+    def _remember_direct_connection(self, client: str) -> None:
+        """Remember the connection one Claude app leaves for this app's proxy.
+
+        Claude Code keeps it in ``env`` and Claude Desktop in its third-party
+        profile; adopting the proxy overwrites both the address and the key.
+        The off position of the pane's switch returns to this record.
+        """
+
+        if client == "claudeDesktop":
+            if self._desktop is None or self.desktop_uses_yrapi_api():
+                return
+            draft = self._desktop.draft_state()
+            draft = draft.get("config") if isinstance(draft, Mapping) else None
+            draft = draft if isinstance(draft, Mapping) else {}
+            provider = str(draft.get("inferenceProvider") or "").strip()
+            gateway_url = str(draft.get("inferenceGatewayBaseUrl") or "").strip()
+            if not gateway_url:
+                store_direct_connection(
+                    self.app_state_root,
+                    "claudeDesktop",
+                    {"provider": "official", "base_url": "", "auth_mode": "bearer"},
+                )
+                return
+            key = ""
+            try:
+                key = self._desktop.secret_value("desktop_gateway_api_key")
+            except ClaudeDesktopConfigError:
+                key = ""
+            store_direct_connection(
+                self.app_state_root,
+                "claudeDesktop",
+                {
+                    "provider": provider or "gateway",
+                    "base_url": gateway_url,
+                    "auth_mode": str(draft.get("inferenceGatewayAuthScheme") or "bearer"),
+                    "api_key": key,
+                },
+            )
+            return
+        if self.code_uses_yrapi_api():
+            return
+        env = self._code_env()
+        raw_url = env.get("ANTHROPIC_BASE_URL")
+        url = raw_url.strip() if isinstance(raw_url, str) else ""
+        bearer = str(env.get("ANTHROPIC_AUTH_TOKEN") or "")
+        api_key = str(env.get("ANTHROPIC_API_KEY") or "")
+        auth_mode = "x-api-key" if api_key and not bearer else "bearer"
+        key = api_key if auth_mode == "x-api-key" else bearer
+        connection: dict[str, Any] = {
+            "provider": "gateway" if url else "official",
+            "base_url": anthropic_base_url(url) if url else "",
+            "model": str(self._draft.get("model") or ""),
+            "auth_mode": auth_mode,
+        }
+        env_model = env.get("ANTHROPIC_MODEL")
+        if isinstance(env_model, str) and env_model.strip():
+            connection["env_model"] = env_model.strip()
+        if key:
+            connection["api_key"] = key
+        store_direct_connection(self.app_state_root, "claudeCode", connection)
+
+    def _form_direct_connection(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """The form's connection in the shape the state file remembers."""
+
+        connection: dict[str, Any] = {
+            "provider": "gateway",
+            "base_url": anthropic_base_url(str(data.get("base_url") or "")),
+            "model": str(data.get("model") or "").strip(),
+            "auth_mode": str(data.get("auth_mode") or "bearer"),
+        }
+        key = data.get("api_key")
+        if isinstance(key, str) and key.strip() and not data.get("clear_key"):
+            connection["api_key"] = key.strip()
+        return connection
+
+    def _apply_direct_connection(self, data: Mapping[str, Any]) -> None:
+        """Point both Claude apps at one direct connection and keep its key."""
+
+        from ..model_list_plugin import target_initialized
+
+        connection = self._form_direct_connection(data)
+        base_url = str(connection.get("base_url") or "")
+        key = str(connection.get("api_key") or "")
+        auth = str(connection.get("auth_mode") or "bearer")
+        model = str(connection.get("model") or "")
+        current = self._code_env()
+        old_url = current.get("ANTHROPIC_BASE_URL")
+        if (not key and not data.get("clear_key") and not self.code_uses_yrapi_api()
+                and isinstance(old_url, str) and anthropic_base_url(old_url) == base_url):
+            key = current.get("ANTHROPIC_API_KEY" if auth == "x-api-key" else "ANTHROPIC_AUTH_TOKEN") or ""
+            connection["api_key"] = key
+        store_direct_connection(self.app_state_root, "claudeCode", connection)
+        store_direct_connection(self.app_state_root, "claudeDesktop", connection)
+        candidate = copy.deepcopy(self._draft)
+        env = _mapping(candidate.get("env", {}), "env")
+        auth_key = "ANTHROPIC_API_KEY" if auth == "x-api-key" else "ANTHROPIC_AUTH_TOKEN"
+        env["ANTHROPIC_BASE_URL"] = base_url
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env.pop("ANTHROPIC_MODEL", None)
+        if key:
+            env[auth_key] = key
+        if model:
+            candidate["model"] = model
+        else:
+            candidate.pop("model", None)
+        candidate["env"] = env
+        if read_generated_models(self.app_state_root, "claudeCode") and not target_initialized("claude"):
+            candidate.pop("modelPicker", None)
+        errors = validate_settings(candidate)
+        if errors:
+            raise ClaudeSettingsError(errors[0])
+        if self._desktop is not None:
+            self._desktop.patch({
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": base_url,
+                "inferenceGatewayAuthScheme": auth,
+                "inferenceModels": [],
+            })
+            self._desktop.stage_secret("desktop_gateway_api_key", key)
+        self._draft = candidate
+        self._revision += 1
+
+    def _leave_local_api(self, data: Mapping[str, Any]) -> None:
+        """Stage the off position for one Claude app."""
+
+        client = _claude_client(data)
+        if client == "claudeDesktop":
+            if self._desktop is None:
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            remembered = read_direct_connection(self.app_state_root, "claudeDesktop")
+            if remembered is None:
+                return
+            try:
+                if str(remembered.get("provider") or "gateway") == "official" or not remembered.get("base_url"):
+                    self._desktop.patch({
+                        "inferenceProvider": None,
+                        "inferenceGatewayBaseUrl": None,
+                        "inferenceGatewayAuthScheme": None,
+                    })
+                    self._desktop.stage_secret("desktop_gateway_api_key", "")
+                else:
+                    self._desktop.patch({
+                        "inferenceProvider": str(remembered.get("provider") or "gateway"),
+                        "inferenceGatewayBaseUrl": str(remembered.get("base_url") or ""),
+                        "inferenceGatewayAuthScheme": str(remembered.get("auth_mode") or "bearer"),
+                    })
+                    key = remembered.get("api_key")
+                    self._desktop.stage_secret(
+                        "desktop_gateway_api_key", key.strip() if isinstance(key, str) else ""
+                    )
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return
+        remembered = read_direct_connection(self.app_state_root, "claudeCode")
+        if remembered is None:
+            return
+        candidate = copy.deepcopy(self._draft)
+        env = _mapping(candidate.get("env", {}), "env")
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env.pop("ANTHROPIC_MODEL", None)
+        base_url = str(remembered.get("base_url") or "")
+        provider = str(remembered.get("provider") or "gateway")
+        if base_url and provider != "official":
+            env["ANTHROPIC_BASE_URL"] = anthropic_base_url(base_url)
+        key = remembered.get("api_key")
+        key = key.strip() if isinstance(key, str) else ""
+        if key:
+            env["ANTHROPIC_API_KEY" if remembered.get("auth_mode") == "x-api-key" else "ANTHROPIC_AUTH_TOKEN"] = key
+        env_model = str(remembered.get("env_model") or "")
+        if env_model:
+            env["ANTHROPIC_MODEL"] = env_model
+        model = str(remembered.get("model") or "")
+        if model:
+            candidate["model"] = model
+        else:
+            candidate.pop("model", None)
+        candidate["env"] = env
+        errors = validate_settings(candidate)
+        if errors:
+            raise ClaudeSettingsError(errors[0])
+        self._draft = candidate
+        self._revision += 1
+
     def _adopt_local_api(self, data: Mapping[str, Any]) -> None:
         """Point one Claude client at this app's own proxy and adopt its key.
 
@@ -2269,16 +2485,20 @@ class ClaudeSettingsDomain:
         carries no ``/v1``: each appends ``/v1/messages`` itself.  One staging
         path for both entries that name this endpoint -- the pane's switch and
         the Edit API form saved on the proxy's own address -- so the route, the
-        key and the picker this app generates stay one decision.
+        key and the picker this app generates stay one decision.  The connection
+        being replaced is remembered first, because the switch's off position
+        has to return to it.
         """
 
         client = _claude_client(data)
+        self._remember_direct_connection(client)
         base_url, key = _shared_api.endpoint(self.runtime_config_path)
         # The endpoint just adopted *is* this app's proxy, whatever this
         # domain resolved at construction: a checkout with no installed
         # config resolved nothing, and both `uses_local_api` answers would
         # then contradict the document that was just written.
         self._local_api_base_url = base_url
+        self._local_api_key = key
         base_url = anthropic_base_url(base_url)
         if client == "claudeDesktop":
             if self._desktop is None:
@@ -2612,20 +2832,36 @@ class ClaudeSettingsDomain:
             self._desktop.reset_draft()
             return
 
-    def snapshot(self) -> dict[str, Any]:
-        settings = self._safe_projection(self._draft)
-        uses_local_api = self.code_uses_local_api()
-        env = self._code_env()
-        # The Edit API form edits one connection and shows whichever one Claude
-        # Code runs.  With this app's API switched on that turns out to be the
-        # proxy itself; answering an empty object instead left every field
-        # blank beside a switch that said the client was connected.
-        direct_api = {
+    def _direct_api_settings(
+        self, settings: Mapping[str, Any], env: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The Code connection the client is on, as the Edit API form prefills it.
+
+        The off toggle applies the remembered direct gateway before it opens the
+        form, so that path shows the route the switch returns to; opening the
+        form while the switch is on shows this app's live pair, and an unchanged
+        save keeps the switch on.  The address and key are both part of the
+        switch's identity, so the prefill follows the exact connection, not
+        merely an address that happens to be local.
+        """
+
+        return {
             "base_url": settings["gateway_url"],
             "model": settings.get("model"),
             "key_configured": settings["token_configured"],
             "auth_mode": "x-api-key" if not env.get("ANTHROPIC_AUTH_TOKEN") and env.get("ANTHROPIC_API_KEY") else "bearer",
         }
+
+    def snapshot(self) -> dict[str, Any]:
+        settings = self._safe_projection(self._draft)
+        uses_local_api = self.code_uses_local_api()
+        env = self._code_env()
+        # The Edit API form edits the off position of the pane's switch.  While
+        # this app's API is on, the client's env names the proxy, and offering
+        # that back would turn a save of the form into a look-alike gateway.
+        # The connection the client left is remembered under the app's state
+        # root; without one the form is empty rather than a copy of the proxy.
+        direct_api = self._direct_api_settings(settings, env)
         return {
             "domain": self.name,
             "revision": self._revision,
@@ -2636,6 +2872,7 @@ class ClaudeSettingsDomain:
             "clients": {
                 "claudeCode": {
                     "uses_local_api": uses_local_api,
+                    "uses_yrapi_api": self.code_uses_yrapi_api(),
                     "model_list_enabled": self.code_model_list_enabled(),
                     "nonstream_fallback_enabled": self.code_nonstream_fallback_enabled(),
                     "auto_mode_enabled": self.code_auto_mode_enabled(),
@@ -2643,6 +2880,7 @@ class ClaudeSettingsDomain:
                 },
                 "claudeDesktop": {
                     "uses_local_api": self.desktop_uses_local_api(),
+                    "uses_yrapi_api": self.desktop_uses_yrapi_api(),
                     "model_list_enabled": self.desktop_model_list_enabled(),
                 },
             },
@@ -2710,54 +2948,23 @@ class ClaudeSettingsDomain:
             self._revision += 1
             return self.snapshot()
         if name == "use_direct_api":
-            from ..model_list_plugin import target_initialized
-
-            base_url = anthropic_base_url(data["base_url"])
-            if self._names_local_api(base_url):
-                # The form edits one connection, and saving this app's own
-                # proxy back is that connection: the local route owns its
-                # endpoint, its master key and the picker this app generates.
-                # Writing the same endpoint as a hand-managed gateway would
-                # drop the picker while the pane's switch still read "on".
+            base_url = anthropic_base_url(str(data.get("base_url") or ""))
+            key = data.get("api_key")
+            key = key.strip() if isinstance(key, str) else ""
+            if self._names_local_api(base_url) and bool(self._local_api_key) and key == self._local_api_key:
+                # The form is the off editor, but saving this app's full
+                # endpoint-and-key pair is how its other direction is reached:
+                # the local route owns the picker and the gateway profile as one
+                # connection instead of a look-alike hand-managed gateway.
                 self._adopt_local_api(data)
                 return self.snapshot()
-            key, model, auth = data["api_key"], data["model"], data["auth_mode"]
-            candidate = copy.deepcopy(self._draft)
-            env = _mapping(candidate.get("env", {}), "env")
-            auth_key = "ANTHROPIC_API_KEY" if auth == "x-api-key" else "ANTHROPIC_AUTH_TOKEN"
-            old_url = env.get("ANTHROPIC_BASE_URL")
-            if (not key and not data.get("clear_key") and not self.code_uses_local_api()
-                    and isinstance(old_url, str) and anthropic_base_url(old_url) == base_url):
-                key = env.get(auth_key) or ""
-            env["ANTHROPIC_BASE_URL"] = base_url
-            env.pop("ANTHROPIC_API_KEY", None)
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-            env.pop("ANTHROPIC_MODEL", None)
-            if key:
-                env[auth_key] = key
-            if model:
-                candidate["model"] = model
-            else:
-                candidate.pop("model", None)
-            candidate["env"] = env
-            if read_generated_models(self.app_state_root, "claudeCode") and not target_initialized("claude"):
-                candidate.pop("modelPicker", None)
-            errors = validate_settings(candidate)
-            if errors:
-                raise ClaudeSettingsError(errors[0])
-            if self._desktop is not None:
-                self._desktop.patch({
-                    "inferenceProvider": "gateway",
-                    "inferenceGatewayBaseUrl": base_url,
-                    "inferenceGatewayAuthScheme": auth,
-                    "inferenceModels": [],
-                })
-                self._desktop.stage_secret("desktop_gateway_api_key", key)
-            self._draft = candidate
-            self._revision += 1
+            self._apply_direct_connection(data)
             return self.snapshot()
         if name in {"use_local_api", "uselocalapi"}:
             self._adopt_local_api(data)
+            return self.snapshot()
+        if name in {"leave_local_api", "leavelocalapi"}:
+            self._leave_local_api(data)
             return self.snapshot()
         if name in {"desktop_models_patch", "desktopmodelspatch"}:
             # The Desktop list as an explicit value rather than a switch.  Older
@@ -2915,19 +3122,10 @@ class ClaudeSettingsDomain:
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
         if field == "direct_api_key" and target:
-            # The form is available in both modes. In local mode show the
-            # router key that would be written when the user switches away;
-            # otherwise read the active direct client credential.
-            if self.code_uses_local_api():
-                try:
-                    return _shared_api.endpoint(self.runtime_config_path)[1]
-                except Exception:
-                    return ""
-            if self._desktop is not None and not self.desktop_uses_local_api():
-                try:
-                    return self._desktop.secret_value("desktop_gateway_api_key")
-                except ClaudeDesktopConfigError:
-                    pass
+            # The form edits the Code connection the client is on.  After the
+            # off action has applied the remembered gateway, that gateway's key
+            # is what the field reads; while yrapi is on, it reads the token the
+            # client actually sends.
             return self.trusted_secret_value("deployment_token")
         if target is not None:
             raise ClaudeSettingsError("The requested secret field is unavailable")

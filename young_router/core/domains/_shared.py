@@ -245,3 +245,32 @@ def local_proxy_endpoint(
             "the client was not switched to it."
         )
     return f"http://127.0.0.1:{port}/v1", key
+
+
+def local_catalog_url(config_path: Path | None = None) -> str:
+    """The catalog address this app serves, or ``""``.
+
+    Codex fetches a provider's ``model_catalog_url`` itself, with that
+    provider's credentials, so the address names the port the proxy is bound to
+    -- the same one ``local_proxy_endpoint`` reports, because a stepped start
+    moves it and a client written from the preference waits out a turn on a
+    closed address.  The path is Core's own, forwarded through that port exactly
+    as ``/ui`` is; it is not under ``/v1``, which belongs to LiteLLM.
+    """
+
+    from .. import codex_config
+    from ..model_catalog import SERVED_CATALOG_ROUTE
+
+    try:
+        port = codex_config.local_port(config_path)
+    except Exception:
+        return ""
+    # ``local_port`` answers with the text a client document would carry, which
+    # is the form both the recorded port file and ``LITELLM_PORT`` hold.
+    try:
+        number = int(port)
+    except (TypeError, ValueError):
+        return ""
+    if not 1 <= number <= 65535:
+        return ""
+    return f"http://127.0.0.1:{number}{SERVED_CATALOG_ROUTE}"
