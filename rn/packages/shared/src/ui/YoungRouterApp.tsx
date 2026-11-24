@@ -2719,10 +2719,18 @@ function useWebMediaQuery(query: string): boolean {
  * middle table was folded to two truncated columns and the inspector's fields
  * clipped — the width at which side-by-side stops being a layout and becomes a
  * crop.  The pane then draws one column: the lists, and a row's inspector in
- * their place.
+ * their place (or, for 供应商, underneath the lists).
+ *
+ * A short, wide viewport is the exception.  A landscape phone has the width
+ * for three columns but not the height for a list band plus an inspector, so
+ * it keeps the side-by-side layout the width already pays for — the one-column
+ * shape is for a page with a tall, narrow reading column, not for every page
+ * under 1024 pt.
  */
 function useCompactProvidersPane(): boolean {
-  return useWebMediaQuery("(max-width: 1024px)");
+  const narrow = useWebMediaQuery("(max-width: 1024px)");
+  const shortAndWide = useWebMediaQuery("(min-width: 880px) and (max-height: 560px)");
+  return narrow && !shortAndWide;
 }
 
 /**
@@ -3171,15 +3179,17 @@ function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: 
 }
 
 /**
- * The bar a one-column pane's detail wears instead of the column it was opened
- * from — the way back to the list, and the name of the row it belongs to.
+ * The bar a one-column drill-down's detail wears instead of the column it was
+ * opened from — the way back to the list, and the name of the row it belongs
+ * to.
  *
- * A native window shows the list and the inspector side by side, so leaving a
- * row is pressing another one.  A phone has no second column to put beside the
- * list: the row opens the inspector in the list's place, and without this bar
- * the address bar's Back would be the only way out of it.  It carries the
- * row's own name too, because the inspector's header starts below it and the
- * pane would otherwise read as a page the user never asked for.
+ * 供应商 draws its inspector under the list instead (see
+ * `providerLeftColumnCompact`), so a tap never leaves the list.  路由's table
+ * and its inspector both need the full height, so there the row opens the
+ * inspector in the list's place; without this bar the address bar's Back would
+ * be the only way out of it.  It carries the row's own name too, because the
+ * inspector's header starts below it and the pane would otherwise read as a
+ * page the user never asked for.
  */
 function CompactDetailBar({ title, onBack, translate }: { title: string; onBack: () => void; translate: Translate }): React.JSX.Element {
   const backLabel = translate("common.back");
@@ -7532,10 +7542,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // the picker follows the row the user is looking at (see
   // `preferredFetchKeyID`).
   const selectedModelKeyID = model ? (modelProviderKeyState(model, provider ?? {})?.id ?? "") : "";
-  // A phone has one column.  The lists fill it, and a row opens its inspector
-  // in their place; `compactDetail` is that one bit of navigation.  No
-  // selection defaults into it: a provider is selected as soon as one exists,
-  // and opening straight on the editor would hide the models the pane is for.
+  // A phone has one column.  In 供应商 the lists keep their place at the top
+  // and the selected row's inspector is drawn underneath them, so a tap
+  // changes what is below the list instead of replacing the list with a page
+  // the user then has to leave.  The list band is deliberately shorter than
+  // the pane: the inspector below it has to be visible for the tap to read as
+  // "details below" rather than "details somewhere off screen".  路由 keeps
+  // the drill-down (`compactDetail`): its table and a route's inspector both
+  // want the full height, and the row is the only way back.
   // This pane keeps its own, wider breakpoint (see `useCompactProvidersPane`).
   const compactWeb = useCompactProvidersPane();
   const [compactDetail, setCompactDetail] = useState(false);
@@ -8565,7 +8579,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const inspectorHasContent = viewMode === "routes"
     ? Boolean(activePublicGroup || activeRoute)
     : Boolean(provider || model);
-  const showProviderInspector = inspectorHasContent && (!compactWeb || compactDetail);
+  // In 供应商 the inspector is part of the same column as the lists, so it is
+  // shown for the selection the lists already carry (a provider is selected as
+  // soon as one exists).  路由 still opens its inspector from a row.
+  const compactProviderInline = compactWeb && viewMode === "providers";
+  const showProviderInspector = inspectorHasContent && (!compactWeb || compactProviderInline || compactDetail);
   // The title the one-column detail bar carries: the row this pane was opened
   // from, named the way the list it came from names it.
   const compactDetailTitle = viewMode === "routes"
@@ -8574,8 +8592,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // A row that was deleted while its detail was open, or a window widened past
   // the breakpoint, leaves the pane on the list instead of on an empty frame.
   useEffect(() => {
-    if (!compactWeb) setCompactDetail(false);
-  }, [compactWeb]);
+    if (!compactWeb || compactProviderInline) setCompactDetail(false);
+  }, [compactWeb, compactProviderInline]);
   useEffect(() => {
     if (compactDetail && !inspectorHasContent) setCompactDetail(false);
   }, [compactDetail, inspectorHasContent]);
@@ -8588,15 +8606,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setSelectedProvider(key);
     setSelectedModel(undefined);
     setProviderSourceModel(undefined);
-    if (compactWeb) setCompactDetail(true);
-  }, [clearPendingSelection, compactWeb]);
+    // 供应商 draws the inspector under the lists, so selecting a row changes
+    // the column below it.  路由 is still a drill-down.
+    if (compactWeb && viewMode === "routes") setCompactDetail(true);
+  }, [clearPendingSelection, compactWeb, viewMode]);
   const selectModelRow = (key: string): void => {
     const modelId = key ? modelIDFromRowKey(key) : undefined;
     if (key && (modelId === undefined || !modelKeys.includes(modelId))) return;
     clearPendingSelection();
     setSelectedModel(modelId);
     setProviderSourceModel(undefined);
-    if (compactWeb && key) setCompactDetail(true);
   };
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
@@ -8719,7 +8738,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     <Text style={styles.providerEmptyHint}>{translate("providers.unavailableHint")}</Text>
   </View>;
   return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={[styles.providersLayout, compactWeb && styles.providersLayoutCompact]}>
-    {compactWeb && compactDetail ? null : <View style={styles.providerLeftColumn}>
+    {compactWeb && compactDetail && viewMode === "routes" ? null : <View style={[styles.providerLeftColumn, compactProviderInline && showProviderInspector && styles.providerLeftColumnCompact]}>
       <View style={styles.providerToolbar}>
         <WindowTabs values={[{ id: "providers", title: translate("providers.providers") }, { id: "routes", title: translate("providers.routes") }]} selected={viewMode} onSelect={(value) => chooseViewMode(value as "providers" | "routes")} />
         {/* The wizard is an action, not a third tab: keep it right-aligned so
@@ -8760,7 +8779,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <TablePane style={[styles.providerListPane, compactWeb && styles.providerListPaneCompact]} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteProvider} /> : null}</>}>
             <ProviderListTable providers={providers} bindingIssues={bindingIssues} translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />
           </TablePane>
-          <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
+          <View style={[styles.providerMiddlePane, compactWeb && styles.providerMiddlePaneCompact]} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={selectModelRow} style={styles.modelTable} /></View>
               {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) chooseFetchKey(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
@@ -8769,7 +8788,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </View>
       </View>}
     </View>}
-    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} onRename={renamePublicModel} /> : activeRoute ? (providerSourceModel === editorIdentifier(activeRoute.model) ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
+    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb && !compactProviderInline ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} onRename={renamePublicModel} /> : activeRoute ? (providerSourceModel === editorIdentifier(activeRoute.model) ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
                   const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), destinationId, activeRoute.key)} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { clearPendingSelection(); setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationId) => moveModel(providerId, editorIdentifier(model), destinationId)} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
@@ -18091,14 +18110,25 @@ const styles = StyleSheet.create({
   compactRailChipSelected: { backgroundColor: systemColors.selectedContent, borderColor: systemColors.selectedContent },
   compactRailChipText: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   compactRailChipTextSelected: { color: systemColors.selectedControlText, fontWeight: "600" },
-  // The providers pane on one column: the lists share the height until a row
-  // is opened, then the inspector takes all of it.  A 120 pt provider column
-  // beside a model table beside a 320 pt inspector is three columns in a 360
-  // pt page, which is why every field in it read as clipped text.
+  // The providers pane on one column.  供应商 keeps the lists above the
+  // inspector and gives them a band of the pane rather than all of it: the
+  // provider band is a fixed short list, the model band takes the rest of the
+  // 42%, and the inspector below owns the remaining 58%.  The band is clamped
+  // so a tall page does not hand the lists the room the inspector needs, and a
+  // short phone still leaves the model table enough height to scroll instead
+  // of collapsing it to its title.  A 120 pt provider column beside a model
+  // table beside a 320 pt inspector is three columns in a 360 pt page, which
+  // is why every field in it read as clipped text.
   providersLayoutCompact: { flexDirection: "column", gap: 8 },
-  providerModelColumnsCompact: { flexDirection: "column", gap: 8 },
-  providerListPaneCompact: { width: "100%", minWidth: 0, maxWidth: "100%", height: 148, flexBasis: "auto", flexGrow: 0, flexShrink: 0 },
-  providerInspectorCompact: { width: "100%", minWidth: 0, maxWidth: "100%", flexGrow: 1, flexShrink: 1 },
+  providerLeftColumnCompact: { flexGrow: 0, flexShrink: 1, flexBasis: "42%", minHeight: 300, maxHeight: 340 },
+  providerModelColumnsCompact: { flexDirection: "column", gap: 8, flex: 1, minHeight: 0 },
+  providerListPaneCompact: { width: "100%", minWidth: 0, maxWidth: "100%", height: 120, flexBasis: "auto", flexGrow: 0, flexShrink: 0 },
+  // The model table keeps its own scroller inside the band.  Its 120 pt floor
+  // is what makes short phones leave a readable model list instead of folding
+  // the table to its column header; the band's own 300 pt floor above is what
+  // keeps that list from spilling over the inspector underneath it.
+  providerMiddlePaneCompact: { minHeight: 120 },
+  providerInspectorCompact: { width: "100%", minWidth: 0, maxWidth: "100%", flexGrow: 1, flexBasis: 0, flexShrink: 1 },
   compactDetailBar: { minHeight: 34, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
   compactDetailBack: { flexDirection: "row", alignItems: "center", gap: 2, paddingVertical: 6, paddingRight: 8 },
   compactDetailBackText: { color: systemColors.link, fontSize: UI_FONT_SIZE },

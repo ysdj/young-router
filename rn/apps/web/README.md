@@ -89,11 +89,15 @@ serving it over a link nobody sized for it.
   page answers it: below 760 pt the sidebar becomes a strip of route tabs, and
   the second-level rails of 运行时, 外部 and 备份与同步 become horizontal strips of
   chips above the detail they select. Below 1024 pt the providers pane draws one
-  column — the provider list and the model table — and a pressed row's
-  inspector replaces them, with a back bar returning to the list; three columns
-  need about 900 pt before the middle table folds to truncated cells. Both
-  breakpoints live in `useWebMediaQuery` in the shared UI (`useCompactWebShell`
-  and `useCompactProvidersPane`), so a wide page and both native hosts keep the
+  column: 供应商 keeps its provider and model lists in a shorter band at the top
+  and draws the selected row's inspector underneath them, so a tap changes what
+  is below the list and never replaces the list with a page; 路由 keeps a
+  drill-down, where a pressed row's inspector replaces the table and a back bar
+  returns to it. Three columns need about 900 pt before the middle table folds
+  to truncated cells; a short, wide page (a landscape phone) keeps them instead
+  of squeezing a list band and an inspector into the height. These breakpoints
+  live in `useWebMediaQuery` in the shared UI (`useCompactWebShell` and
+  `useCompactProvidersPane`), so a wide page and both native hosts keep the
   layout they had.
 - **A child surface is a layer, not a window.** `NativeWindow.open` presents
   the provider wizard, the raw editor and 分组管理 as a modal layer pinned to

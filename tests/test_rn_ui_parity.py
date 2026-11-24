@@ -2299,7 +2299,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('modelListPane: { flex: 1, minWidth: 0 }')
         self.assert_ui_has('providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={[styles.providersLayout, compactWeb && styles.providersLayoutCompact]}>')
-        self.assert_ui_has('{compactWeb && compactDetail ? null : <View style={styles.providerLeftColumn}>')
+        self.assert_ui_has('{compactWeb && compactDetail && viewMode === "routes" ? null : <View style={[styles.providerLeftColumn, compactProviderInline && showProviderInspector && styles.providerLeftColumnCompact]}>')
         self.assert_ui_has('<TablePane wide style={styles.routeTablePane}')
         self.assert_ui_has('<View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>')
         self.assertEqual(1, self.ui.count('<View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>'))
@@ -9651,30 +9651,43 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('return useWebMediaQuery("(max-width: 760px)");')
         # The providers pane needs more room than the shell: three columns want
         # about 900 pt, and below this the middle table folded to two truncated
-        # columns while the inspector kept 320 of the pane's width.
+        # columns while the inspector kept 320 of the pane's width.  A short,
+        # wide viewport is the exception: landscape has the width for the three
+        # columns and lacks the height for a list band plus an inspector.
         self.assert_ui_has("function useCompactProvidersPane(): boolean {")
-        self.assert_ui_has('return useWebMediaQuery("(max-width: 1024px)");')
+        self.assert_ui_has('const narrow = useWebMediaQuery("(max-width: 1024px)");')
+        self.assert_ui_has('const shortAndWide = useWebMediaQuery("(min-width: 880px) and (max-height: 560px)");')
+        self.assert_ui_has("return narrow && !shortAndWide;")
         self.assert_ui_has("const compactWeb = useCompactProvidersPane();")
         self.assert_ui_has("const [compactDetail, setCompactDetail] = useState(false);")
         self.assert_ui_has('const inspectorHasContent = viewMode === "routes"')
-        self.assert_ui_has('const showProviderInspector = inspectorHasContent && (!compactWeb || compactDetail);')
-        # A row opens its inspector in the list's place, so the pane needs the
-        # bar that takes a phone back to the list: there is no second column
-        # left to press.
+        self.assert_ui_has('const compactProviderInline = compactWeb && viewMode === "providers";')
+        self.assert_ui_has('const showProviderInspector = inspectorHasContent && (!compactWeb || compactProviderInline || compactDetail);')
+        # 供应商 keeps the lists above the inspector instead of replacing them:
+        # a selected row changes the column below, and the list band is capped
+        # so the inspector below it stays in sight.
+        self.assert_ui_has('providerLeftColumnCompact: { flexGrow: 0, flexShrink: 1, flexBasis: "42%", minHeight: 300, maxHeight: 340 }')
+        self.assert_ui_has('providerMiddlePaneCompact: { minHeight: 120 }')
+        # A row opens its inspector in the list's place only in the routes tab,
+        # so 路由 keeps the bar that takes a phone back to the table.
         self.assert_ui_has("function CompactDetailBar({ title, onBack, translate }: { title: string; onBack: () => void; translate: Translate }): React.JSX.Element {")
         self.assert_ui_has('const backLabel = translate("common.back");')
         self.assert_ui_has('compactDetailBar: { minHeight: 34, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }')
-        # The lists are one column, the provider list a fixed band above the
-        # models, and the inspector takes the whole width when opened.  The
-        # band states `flexBasis: "auto"`: a plain `height` beside the pane's
-        # `flex: 1` keeps the shorthand's basis, and the band collapsed to
-        # zero -- the two list titles drew over each other.
+        # The lists are one column: the provider list a short fixed band above
+        # the models, the model band taking the rest of the capped list area,
+        # and the inspector sharing the pane with them.  The band states
+        # `flexBasis: "auto"`: a plain `height` beside the pane's `flex: 1`
+        # keeps the shorthand's basis, and the band collapsed to zero -- the
+        # two list titles drew over each other.
         self.assert_ui_has('providersLayoutCompact: { flexDirection: "column", gap: 8 }')
-        self.assert_ui_has('providerModelColumnsCompact: { flexDirection: "column", gap: 8 }')
-        self.assert_ui_has('providerListPaneCompact: { width: "100%", minWidth: 0, maxWidth: "100%", height: 148, flexBasis: "auto", flexGrow: 0, flexShrink: 0 }')
-        self.assert_ui_has('providerInspectorCompact: { width: "100%", minWidth: 0, maxWidth: "100%"')
+        self.assert_ui_has('providerModelColumnsCompact: { flexDirection: "column", gap: 8, flex: 1, minHeight: 0 }')
+        self.assert_ui_has('providerListPaneCompact: { width: "100%", minWidth: 0, maxWidth: "100%", height: 120, flexBasis: "auto", flexGrow: 0, flexShrink: 0 }')
+        self.assert_ui_has('providerInspectorCompact: { width: "100%", minWidth: 0, maxWidth: "100%", flexGrow: 1, flexBasis: 0, flexShrink: 1 }')
         # The routes tab keeps the same drill-down: a row opens its inspector.
-        self.assert_ui_has("if (compactWeb) setCompactDetail(true);")
+        self.assert_ui_has('onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }}')
+        self.assert_ui_has('if (compactWeb && viewMode === "routes") setCompactDetail(true);')
+        # 供应商's row click must not set the drill-down flag.
+        self.assertNotIn('if (compactWeb && key) setCompactDetail(true);\n  };', self.ui)
         # A rail (runtime settings, external clients, backup & sync) becomes a
         # strip of chips above the detail it selects instead of a 200 pt column
         # beside it -- the column left the detail about 160 pt on a phone.
