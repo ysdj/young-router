@@ -9691,7 +9691,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A rail (runtime settings, external clients, backup & sync) becomes a
         # strip of chips above the detail it selects instead of a 200 pt column
         # beside it -- the column left the detail about 160 pt on a phone.
-        self.assert_ui_has("  if (compact) {\n    return <ScrollView horizontal showsHorizontalScrollIndicator={false}")
+        #
+        # The strip is its own component because a mouse-only strip was the one
+        # list on the page with no arrow/Home/End movement: it now shares
+        # `useListKeyboard`, so it keeps the chip rhythm and gains the keyboard
+        # contract every other list already had.
+        self.assert_ui_has("  if (compact) {\n    return <CompactSettingsRail rows={rows} selectedKey={selectedKey} onSelectionChange={onSelectionChange} />;")
+        self.assert_ui_has('const keyboard = useListKeyboard(selectedKey, () => rows.map((row) => row.key), onSelectionChange, () => {}, "horizontal");')
+        self.assert_ui_has('<ScrollView horizontal showsHorizontalScrollIndicator={false}')
+        self.assert_ui_has('onPress={(event) => keyboard.selectFromClick(row.key, event)}')
         self.assert_ui_has('accessibilityRole="tab"')
         self.assert_ui_has('compactRailBody: { flexDirection: "column", gap: 0 }')
         self.assert_ui_has('compactRailChip: { minHeight: 28, maxWidth: 200, paddingHorizontal: 10, justifyContent: "center", borderRadius: 14')

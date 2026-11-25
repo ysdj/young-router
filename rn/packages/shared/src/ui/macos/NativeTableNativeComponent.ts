@@ -10,7 +10,7 @@ import type {
   WithDefault,
 } from "react-native/Libraries/Types/CodegenTypes";
 
-type SelectionChangeEvent = Readonly<{ key: string; index: Int32 }>;
+type SelectedKeysChangeEvent = Readonly<{ keys: string[]; key: string; index: Int32 }>;
 type RowDoublePressEvent = Readonly<{ key: string; index: Int32 }>;
 
 export interface NativeTableProps extends ViewProps {
@@ -19,6 +19,7 @@ export interface NativeTableProps extends ViewProps {
   rowKeys: ReadonlyArray<string>;
   cells: ReadonlyArray<string>;
   selectedKey: string;
+  selectedKeys?: ReadonlyArray<string>;
   alternatingRows?: WithDefault<boolean, false>;
   compact?: WithDefault<boolean, false>;
   followBottom?: WithDefault<boolean, false>;
@@ -50,7 +51,7 @@ export interface NativeTableProps extends ViewProps {
   alertRowKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;
   selectableSpanningRowKeys?: ReadonlyArray<string>;
-  onSelectionChange?: DirectEventHandler<SelectionChangeEvent>;
+  onSelectedKeysChange?: DirectEventHandler<SelectedKeysChangeEvent>;
   onRowDoublePress?: DirectEventHandler<RowDoublePressEvent>;
 }
 

@@ -979,18 +979,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "- (void)tableViewSelectionDidChange:", 1
         )[1].split("- (void)handleRowClick:", 1)[0]
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        # A click below the rows or on a group header names no row, and AppKit
-        # answers it by dropping the native selection.  This table draws the
-        # selection React holds, so reporting the cleared state left the list
-        # with nothing highlighted and the pane beside it with nothing to edit.
-        self.assertIn("const NSInteger kept = SegmentIndex(viewProps.rowKeys, viewProps.selectedKey);", mac_table)
-        self.assertIn("if (kept >= 0 && ![self isDisabledRow:kept] && ![self isSelectableSpanningRow:kept]) {", mac_table)
-        self.assertIn("[_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:kept] byExtendingSelection:NO];", mac_table)
+        # A click outside the rows names no selection action. The controlled
+        # multi-selection remains the native table's source of truth.
+        self.assertIn("if (selectedRows.count == 0 && clickedRow < 0)", mac_table)
+        self.assertIn("[self synchronizeSelectionFromProps];", mac_table)
         self.assertNotIn('OnSelectionChange event{"", -1}', mac_table)
         # Windows is a React table; a row press always reaches the shared view,
         # and a press that hits no row reaches nothing at all.
-        self.assertIn('const select = React.useCallback((row: TableProps["rows"][number], index: number): void => {', adapter)
-        self.assertIn("onSelectionChange?.(row.key, index);", adapter)
+        self.assertIn('const select = React.useCallback((row: TableProps["rows"][number], index: number, modifiers: ListSelectionModifiers): void => {', adapter)
+        self.assertIn('rowChoices.current.onSelectionAction({ type: "press", key: row.key, ...modifiers });', adapter)
 
 
     def test_native_tables_emit_one_selection_event_for_each_row_click(self) -> None:
@@ -1001,10 +998,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("![self isSelectableSpanningRow:row]", mac_table)
         self.assertNotIn("([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])", mac_table)
-        self.assertIn("onSelectionChange(event);", mac_table)
+        self.assertIn("[self emitSelectionChangeForActiveRow:row];", mac_table)
         # The React table has one row press path. A double press is a second
         # report, not a second click handler.
-        self.assertIn("onPress={() => onSelect(row, index)}", adapter)
+        self.assertIn("onPress={(event) => onSelect(row, index, listSelectionModifiers(event as unknown as ListSelectionKeyboardEvent))}", adapter)
         self.assertIn("onRowDoublePress?.(row.key, index)", adapter)
         self.assertIn("lastPress.current?.key === row.key", adapter)
 
@@ -1016,13 +1013,29 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "- (void)handleRowClick:", 1
         )[1].split("- (void)handleDoubleClick:", 1)[0]
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        self.assertIn("_tableView.selectedRow == row &&", mac_table)
-        self.assertIn("row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)", mac_table)
-        self.assertIn("onSelectionChange(event);", mac_table)
+        self.assertIn("[_tableView.selectedRowIndexes containsIndex:static_cast<NSUInteger>(row)]", mac_table)
+        self.assertIn("[self emitSelectionChangeForActiveRow:row];", mac_table)
         # The React table does not gate its press on the controlled selection.
-        self.assertIn("const select = React.useCallback((row: TableProps[\"rows\"][number], index: number): void => {", adapter)
-        self.assertIn("onSelectionChange?.(row.key, index);", adapter)
+        self.assertIn("const select = React.useCallback((row: TableProps[\"rows\"][number], index: number, modifiers: ListSelectionModifiers): void => {", adapter)
+        self.assertIn('rowChoices.current.onSelectionAction({ type: "press", key: row.key, ...modifiers });', adapter)
         self.assertNotIn("if (row.key === selectedKey) return;", adapter)
+
+    def test_appkit_table_uses_the_shared_multi_selection_contract(self) -> None:
+        spec = (SHARED / "ui/nativeSpecs/NativeTable.spec.ts").read_text(encoding="utf-8")
+        wrapper = (SHARED / "ui/AppKitControls.tsx").read_text(encoding="utf-8")
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        table = controls.split("@implementation LiteLLMAppKitTableComponentView", 1)[1].split(
+            "Class<RCTComponentViewProtocol> LiteLLMAppKitTableCls", 1
+        )[0]
+        self.assertIn("selectedKeys?: ReadonlyArray<string>;", spec)
+        self.assertIn("onSelectedKeysChange?: DirectEventHandler<SelectedKeysChangeEvent>;", spec)
+        self.assertIn("selectedKeys={selectedKeys}", wrapper)
+        self.assertIn("onSelectedKeysChange={onSelectedKeysChange}", wrapper)
+        self.assertIn("_tableView.allowsMultipleSelection = YES;", table)
+        self.assertIn("(flags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0", controls)
+        self.assertIn("event.keyCode == 115 || event.keyCode == 119", controls)
+        self.assertIn("onSelectedKeysChange(multiEvent);", table)
+        self.assertNotIn("onSelectionChange(singleEvent);", table)
 
 
     def test_native_pickers_do_not_emit_change_for_controlled_props(self) -> None:
@@ -3354,7 +3367,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_scrollView.acceptsVerticalScroll = needsVerticalScroller;", controls)
         self.assertIn("_tableView.acceptsVerticalScroll = needsVerticalScroller;", controls)
         self.assertIn("headerFrame.size.height = newViewProps.compact ? 24 : 28;", controls)
-        self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller)", controls)
+        self.assertIn("if (selectionChanged && selectedIndex >= 0 && _scrollView.hasVerticalScroller)", controls)
         self.assertIn("_tableView.action = @selector(handleRowClick:);", controls)
         self.assertIn("- (void)handleRowClick", controls)
         table_start = controls.index("@implementation LiteLLMAppKitTableComponentView")
@@ -3821,9 +3834,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
     def test_native_boolean_controls_skip_unrelated_prop_rewrites(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        self.assertIn("const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;", mac)
-        self.assertIn("if (selectionChanged || _tableView.selectedRow != selectedIndex)", mac)
-        self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller) {", mac)
+        # The active-row reveal only runs for a selection change, and only when
+        # that row is out of sight: an unrelated prop rewrite must not scroll the
+        # table.  `synchronizeSelectionFromProps` is what keeps the native index
+        # set in step with the controlled selection, and it writes only when the
+        # set actually differs.
+        self.assertIn("const bool selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey ||", mac)
+        self.assertIn("} else if (![_tableView.selectedRowIndexes isEqualToIndexSet:indexes]) {", mac)
+        self.assertIn("if (selectionChanged && selectedIndex >= 0 && _scrollView.hasVerticalScroller) {", mac)
         self.assertIn("if (!NSIsEmptyRect(visibleRect) && !NSContainsRect(visibleRect, selectedRect)) {", mac)
         self.assertIn("BOOL TableIsFollowingBottom(NSScrollView *scrollView, NSTableView *tableView)", mac)
         self.assertIn("const BOOL initialDataLoad = !_hasLoadedData;", mac)

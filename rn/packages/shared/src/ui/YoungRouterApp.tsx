@@ -10,6 +10,7 @@ import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeE
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { orderedModelGroupIDs } from "./modelGroupOrder";
 import { useRowSelection } from "./rowSelection";
+import { LIST_SELECTION_KEYS, listSelectionActionForKey, listSelectionEqual, listSelectionModifiers, normalizeListSelection, reduceListSelection, type ListSelectionKeyboardEvent } from "./listSelection";
 import { displayUpstreamModel, groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";
 import { apiKeyDisplayName, providerKeyChoiceLabel, relaySourceName } from "./providerKeyLabels";
 import { AccountsTable } from "./AccountsTable";
@@ -3095,23 +3096,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange, details, style, co
   // its own selection capsule and row rhythm, which is what tells the rows
   // apart; the rail's single right divider is its only rule.
   if (compact) {
-    return <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.compactRailScroll} contentContainerStyle={styles.compactRailStrip}>
-      {rows.map((row) => {
-        const selected = row.key === selectedKey;
-        const label = row.cells[0] ?? row.key;
-        return <Pressable
-          key={row.key}
-          onPress={() => onSelectionChange(row.key)}
-          accessibilityRole="tab"
-          accessibilityLabel={label}
-          accessibilityState={{ selected }}
-          aria-selected={selected}
-          style={[styles.compactRailChip, selected && styles.compactRailChipSelected]}
-        >
-          <Text numberOfLines={1} style={[styles.compactRailChipText, selected && styles.compactRailChipTextSelected]}>{label}</Text>
-        </Pressable>;
-      })}
-    </ScrollView>;
+    return <CompactSettingsRail rows={rows} selectedKey={selectedKey} onSelectionChange={onSelectionChange} />;
   }
   return <View style={[styles.settingsRail, isWindowsShell && styles.settingsRailWindows, style]}>
     <NativeTable
@@ -3129,6 +3114,34 @@ function SettingsRail({ rows, selectedKey, onSelectionChange, details, style, co
       style={styles.settingsRailList}
     />
     <View style={styles.settingsRailDivider} />
+  </View>;
+}
+
+function CompactSettingsRail({ rows, selectedKey, onSelectionChange }: {
+  rows: { key: string; cells: string[] }[];
+  selectedKey: string;
+  onSelectionChange: (key: string) => void;
+}): React.JSX.Element {
+  const keyboard = useListKeyboard(selectedKey, () => rows.map((row) => row.key), onSelectionChange, () => {}, "horizontal");
+  return <View ref={keyboard.ref} style={styles.compactRailKeyboardSurface} collapsable={false} {...keyboard.keyboardProps}>
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.compactRailScroll} contentContainerStyle={styles.compactRailStrip}>
+      {rows.map((row) => {
+        const selected = keyboard.selectedKeys.includes(row.key);
+        const label = row.cells[0] ?? row.key;
+        return <Pressable
+          key={row.key}
+          onPress={(event) => keyboard.selectFromClick(row.key, event)}
+          onFocus={() => keyboard.select(row.key)}
+          accessibilityRole="tab"
+          accessibilityLabel={label}
+          accessibilityState={{ selected }}
+          aria-selected={selected}
+          style={[styles.compactRailChip, selected && styles.compactRailChipSelected]}
+        >
+          <Text numberOfLines={1} style={[styles.compactRailChipText, selected && styles.compactRailChipTextSelected]}>{label}</Text>
+        </Pressable>;
+      })}
+    </ScrollView>
   </View>;
 }
 
@@ -7400,8 +7413,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       : stringValue(entry.endpoint, stringValue(entry.api_base));
   }, [providerBaseUrlDrafts]);
   // A custom provider whose base URL already targets a relay station is
-  // rebound to that station automatically (`station.example.test` and
-  // `www.station.example.test` stay distinct sites).  Core treats a rebind that leaves
+  // rebound to that station automatically. Core treats a rebind that leaves
   // the visible name and URL untouched as cosmetic, so the draft stays clean
   // and closing the window never asks to discard a change that altered
   // nothing visible.
@@ -12700,6 +12712,26 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   </View>;
 }
 
+function DataManagementSectionList({ available, selected, disabled, translate, onSelectionChange }: {
+  available: readonly ConfigDomain[];
+  selected: readonly ConfigDomain[];
+  disabled: boolean;
+  translate: Translate;
+  onSelectionChange: (keys: ConfigDomain[]) => void;
+}): React.JSX.Element {
+  const sections = useMemo(() => DATA_PACKAGE_SECTIONS.filter(({ domain }) => available.includes(domain)), [available]);
+  const keys = useMemo(() => sections.map(({ domain }) => domain), [sections]);
+  const keyboard = useListKeyboard(selected[0], () => keys, () => {}, () => {}, "vertical", (nextKeys) => {
+    onSelectionChange(nextKeys.filter((key): key is ConfigDomain => keys.includes(key as ConfigDomain)) as ConfigDomain[]);
+  }, selected);
+  const toggle = (domain: ConfigDomain): void => {
+    keyboard.apply({ type: "press", key: domain, ctrlKey: true });
+  };
+  return <View ref={keyboard.ref} style={styles.dataManagementSectionList} collapsable={false} {...(disabled ? {} : keyboard.keyboardProps)}>
+    {sections.map(({ domain, labelKey }) => <NativeCheckbox key={domain} label={translate(labelKey)} value={selected.includes(domain)} disabled={disabled} onValueChange={() => toggle(domain)} style={styles.dataManagementSectionItem} />)}
+  </View>;
+}
+
 function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, translate, onFlushPendingFields, onTabSwitchError, onOpenWebDavSettings, onInspectImport, onImport, onConfirmImportReplace, onExport }: {
   snapshot?: CoreSnapshot;
   /** The active tab is the route surface's, because it decides whose result the
@@ -12764,15 +12796,19 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, t
   const toggleSection = (setter: React.Dispatch<React.SetStateAction<ConfigDomain[]>>, domain: ConfigDomain, enabled: boolean): void => setter((current) => enabled
     ? DATA_PACKAGE_DOMAINS.filter((item) => item === domain || current.includes(item))
     : current.filter((item) => item !== domain));
-  const sectionList = (available: readonly ConfigDomain[], selected: readonly ConfigDomain[], disabled: boolean, onToggle: (domain: ConfigDomain, enabled: boolean) => void): React.JSX.Element => {
-    const sections = DATA_PACKAGE_SECTIONS.filter(({ domain }) => available.includes(domain));
-    // Choosing among many saved sections is a multi-select, so these stay
-    // checkboxes: a switch is for one on/off setting, not for a checkbox list.
-    // One section is one checkbox row, and the checkbox carries its own label:
-    // a short list of names stays one tight column instead of stretching a
-    // label to the far edge of the pane, where the eye has to travel for it.
-    return <View style={styles.dataManagementSectionList}>{sections.map(({ domain, labelKey }) => <NativeCheckbox key={domain} label={translate(labelKey)} value={selected.includes(domain)} disabled={disabled} onValueChange={(enabled) => onToggle(domain, enabled)} style={styles.dataManagementSectionItem} />)}</View>;
-  };
+  const sectionList = (available: readonly ConfigDomain[], selected: readonly ConfigDomain[], disabled: boolean, onToggle: (domain: ConfigDomain, enabled: boolean) => void): React.JSX.Element => <DataManagementSectionList
+    available={available}
+    selected={selected}
+    disabled={disabled}
+    translate={translate}
+    onSelectionChange={(keys) => {
+      const selectedSet = new Set(keys);
+      for (const domain of available) {
+        const enabled = selectedSet.has(domain);
+        if (enabled !== selected.includes(domain)) onToggle(domain, enabled);
+      }
+    }}
+  />;
   // The list's own line: what is chosen now, and the tool that chooses it all.
   const sectionListHeader = (summary: string, tools?: React.ReactNode): React.JSX.Element => <View style={styles.dataManagementSelectionBar}><Text numberOfLines={1} style={styles.dataManagementSelectionCount}>{summary}</Text><View style={styles.dataManagementToolbarButtons}>{tools}</View></View>;
   const chooseImportFile = async (): Promise<void> => {
@@ -15448,33 +15484,58 @@ function routeTraceAttemptIcon(state: RouteTraceAttempt["state"]): string {
   return "•";
 }
 
-type LogListKey = {
-  key?: string;
-  altKey?: boolean;
-  ctrlKey?: boolean;
-  metaKey?: boolean;
-  shiftKey?: boolean;
-};
-type LogListKeyboardEvent = LogListKey & { nativeEvent?: LogListKey; preventDefault: () => void };
+type LogListKeyboardEvent = ListSelectionKeyboardEvent;
 
-const LOG_LIST_KEYS = ["ArrowUp", "ArrowDown", "Home", "End"] as const;
 const LOG_LIST_NATIVE_KEYS = Platform.OS === "windows"
-  ? LOG_LIST_KEYS.map((code) => ({ code, handledEventPhase: 3 }))
-  : LOG_LIST_KEYS.map((key) => ({ key }));
+  ? LIST_SELECTION_KEYS.map((key) => ({ code: key === "a" || key === "A" ? "KeyA" : key, handledEventPhase: 3 }))
+  : LIST_SELECTION_KEYS.map((key) => ({ key }));
 const logListViewCommands = codegenNativeCommands<{ focus: (view: HostInstance) => void }>({ supportedCommands: ["focus"] });
 
 // Keep focus on the list surface so a virtualized row can leave the rendered
 // window (or a new run can arrive) without dropping keyboard navigation.
-function useLogListKeyboard(selectedKey: string | undefined, getKeys: () => string[], onSelect: (key: string) => void, reveal: (index: number) => void) {
+function useListKeyboard(selectedKey: string | undefined, getKeys: () => string[], onSelect: (key: string) => void, reveal: (index: number) => void, axis: "vertical" | "horizontal" = "vertical", onSelectionKeysChange?: (keys: readonly string[], activeKey?: string) => void, controlledSelectedKeys?: readonly string[]) {
   const ref = useRef<View>(null);
-  const cursor = useRef(selectedKey);
-  useEffect(() => { cursor.current = selectedKey; }, [selectedKey]);
-  const select = (key: string): void => {
-    cursor.current = key;
-    onSelect(key);
+  const keysRef = useRef<string[]>(getKeys());
+  keysRef.current = getKeys();
+  const [selection, setSelection] = useState(() => normalizeListSelection(keysRef.current, { selectedKeys: controlledSelectedKeys ?? (selectedKey ? [selectedKey] : []), activeKey: selectedKey, anchorKey: selectedKey }));
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  useEffect(() => {
+    if (controlledSelectedKeys !== undefined) {
+      const next = normalizeListSelection(keysRef.current, { ...selectionRef.current, selectedKeys: controlledSelectedKeys, activeKey: selectedKey, anchorKey: selectionRef.current.anchorKey });
+      if (!listSelectionEqual(next, selectionRef.current)) {
+        selectionRef.current = next;
+        setSelection(next);
+      }
+      return;
+    }
+    if (!selectedKey) {
+      if (selectionRef.current.selectedKeys.length === 0) return;
+      const next = reduceListSelection(keysRef.current, selectionRef.current, { type: "clear" });
+      selectionRef.current = next;
+      setSelection(next);
+      return;
+    }
+    if (selectionRef.current.activeKey === selectedKey) return;
+    const next = reduceListSelection(keysRef.current, selectionRef.current, { type: "press", key: selectedKey });
+    selectionRef.current = next;
+    setSelection(next);
+  }, [controlledSelectedKeys, selectedKey]);
+  const apply = (action: Parameters<typeof reduceListSelection>[2]): void => {
+    const next = reduceListSelection(keysRef.current, selectionRef.current, action);
+    if (listSelectionEqual(next, selectionRef.current)) return;
+    selectionRef.current = next;
+    setSelection(next);
+    if (next.activeKey) onSelect(next.activeKey);
+    onSelectionKeysChange?.(next.selectedKeys, next.activeKey);
   };
-  const selectFromClick = (key: string): void => {
-    select(key);
+  const select = (key: string): void => {
+    apply({ type: "press", key });
+  };
+  const selectFromClick = (key: string, event?: unknown): void => {
+    const source = event as LogListKeyboardEvent | undefined;
+    const modifiers = source ? listSelectionModifiers(source) : {};
+    apply({ type: "press", key, ctrlKey: modifiers.ctrlKey, metaKey: modifiers.metaKey, shiftKey: modifiers.shiftKey });
     const view = ref.current;
     if (!view) return;
     // HostInstance.focus() is gated by React Native's imperative-focus flag;
@@ -15484,22 +15545,27 @@ function useLogListKeyboard(selectedKey: string | undefined, getKeys: () => stri
     else logListViewCommands.focus(view);
   };
   const onKeyDown = (event: LogListKeyboardEvent): void => {
-    const { key, altKey, ctrlKey, metaKey, shiftKey } = event.nativeEvent ?? event;
-    if (altKey || ctrlKey || metaKey || shiftKey || !LOG_LIST_KEYS.some((name) => name === key)) return;
-    const keys = getKeys();
+    const keys = keysRef.current;
     if (!keys.length) return;
     event.preventDefault();
-    const current = keys.indexOf(cursor.current ?? "");
-    const next = key === "Home" ? 0 : key === "End" ? keys.length - 1 : current < 0 ? 0
-      : Math.max(0, Math.min(keys.length - 1, current + (key === "ArrowDown" ? 1 : -1)));
-    if (next === current) return;
-    select(keys[next]);
-    reveal(next);
+    const action = listSelectionActionForKey(event, axis);
+    if (action === undefined) return;
+    if (action.type === "all") {
+      apply(action);
+      return;
+    }
+    const current = selectionRef.current.activeKey;
+    const nextSelection = reduceListSelection(keys, selectionRef.current, action);
+    const next = nextSelection.activeKey;
+    const nextIndex = next === undefined ? -1 : keys.indexOf(next);
+    if (next === undefined || next === current || nextIndex < 0) return;
+    apply(action);
+    reveal(nextIndex);
   };
   const keyboardProps = Platform.OS === "web"
     ? { onKeyDown, tabIndex: 0 as const }
     : { onKeyDown, focusable: true, keyDownEvents: LOG_LIST_NATIVE_KEYS, enableFocusRing: Platform.OS === "macos" ? false : undefined };
-  return { ref, keyboardProps, select, selectFromClick };
+  return { ref, keyboardProps, select, selectFromClick, apply, selectedKeys: selection.selectedKeys, activeKey: selection.activeKey };
 }
 
 function useLogListScroll() {
@@ -15530,7 +15596,7 @@ function LogSidebar<Item>({ data, keyExtractor, describe, selectedKey, onSelect,
   const [appActive, setAppActive] = useState(() => AppState.currentState === "active");
   const listRef = useRef<FlatList<Item>>(null);
   const scroll = useLogListScroll();
-  const keyboard = useLogListKeyboard(selectedKey, () => data.map(keyExtractor), onSelect, (index) => {
+  const keyboard = useListKeyboard(selectedKey, () => data.map(keyExtractor), onSelect, (index) => {
     scroll.reveal(index * rowHeight, rowHeight, (offset) => listRef.current?.scrollToOffset({ offset, animated: false }));
   });
   useEffect(() => {
@@ -15559,7 +15625,7 @@ function LogSidebar<Item>({ data, keyExtractor, describe, selectedKey, onSelect,
       showsVerticalScrollIndicator
       renderItem={({ item }) => {
         const key = keyExtractor(item);
-        const isSelected = key === selectedKey;
+        const isSelected = keyboard.selectedKeys.includes(key);
         const selectedTextStyle = isSelected && appActive ? styles.logSidebarSelectedText : null;
         const { title, meta, detail, status, statusStyle } = describe(item);
         return <Pressable
@@ -15569,7 +15635,7 @@ function LogSidebar<Item>({ data, keyExtractor, describe, selectedKey, onSelect,
             !isSelected && pressed && styles.logSidebarRowPressed,
             isSelected && (appActive ? styles.logSidebarRowSelected : styles.logSidebarRowSelectedInactive),
           ]}
-          onPress={() => keyboard.selectFromClick(key)}
+          onPress={(event) => keyboard.selectFromClick(key, event)}
           onFocus={() => keyboard.select(key)}
           accessibilityRole="button"
           accessibilityLabel={[title, meta, detail, status].filter(Boolean).join(" · ")}
@@ -15808,7 +15874,7 @@ function ScheduledTaskHistory({ task, native, translate }: { task: ScheduledTask
       return { run, key: `${identity}/${occurrence}` };
     });
   }, [history]);
-  const keyboard = useLogListKeyboard(selectedKey, () => runEntries.map((entry) => entry.key), setSelectedKey, (index) => {
+  const keyboard = useListKeyboard(selectedKey, () => runEntries.map((entry) => entry.key), setSelectedKey, (index) => {
     lastPress.current = undefined;
     const row = rowLayouts.current.get(runEntries[index].key);
     if (row) scroll.reveal(row.y, row.height, (y) => scrollRef.current?.scrollTo({ y, animated: false }));
@@ -15828,8 +15894,8 @@ function ScheduledTaskHistory({ task, native, translate }: { task: ScheduledTask
       html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
     });
   };
-  const pressRun = (run: ScheduledTaskRecord["history"][number], key: string): void => {
-    keyboard.selectFromClick(key);
+  const pressRun = (run: ScheduledTaskRecord["history"][number], key: string, event?: unknown): void => {
+    keyboard.selectFromClick(key, event);
     const now = Date.now();
     if (lastPress.current?.key === key && now - lastPress.current.at < 360) {
       lastPress.current = undefined;
@@ -15853,7 +15919,7 @@ function ScheduledTaskHistory({ task, native, translate }: { task: ScheduledTask
             const count = run[key];
             return count === undefined ? [] : [translate(`tasks.total.${key}`, { count })];
           });
-          const isSelected = key === selectedKey;
+          const isSelected = keyboard.selectedKeys.includes(key);
           const selectedTextStyle = isSelected ? styles.logSidebarSelectedText : null;
           return <View
             key={key}
@@ -15871,7 +15937,7 @@ function ScheduledTaskHistory({ task, native, translate }: { task: ScheduledTask
               }
             }}
             onStartShouldSetResponder={() => true}
-            onResponderRelease={() => pressRun(run, key)}
+            onResponderRelease={(event) => pressRun(run, key, event)}
             style={[styles.scheduledTaskRun, isSelected && styles.logSidebarRowSelected]}
           >
             <Text role="cell" style={[styles.scheduledTaskValue, styles.scheduledTaskTimeColumn, selectedTextStyle]}>{shortLogTimestamp(run.started_at)}</Text>
@@ -18104,6 +18170,7 @@ const styles = StyleSheet.create({
   // left it — a wrapping strip would change the detail's height as categories
   // are added, and move the row under the thumb to another line.
   compactRailBody: { flexDirection: "column", gap: 0 },
+  compactRailKeyboardSurface: { minWidth: 0, flexShrink: 0 },
   compactRailScroll: { flexGrow: 0, flexShrink: 0, maxWidth: "100%" },
   compactRailStrip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 6 },
   compactRailChip: { minHeight: 28, maxWidth: 200, paddingHorizontal: 10, justifyContent: "center", borderRadius: 14, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.control },

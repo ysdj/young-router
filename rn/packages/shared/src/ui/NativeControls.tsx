@@ -34,6 +34,7 @@ import {
 import WinUISecureTextInput from "./windows/NativeSecureTextInputNativeComponent";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import { getBrowserSecretReader, getBrowserSecretStager } from "../platform/browserSecrets";
+import { LIST_SELECTION_KEYS, listSelectionActionForKey, listSelectionEqual, listSelectionModifiers, normalizeListSelection, reduceListSelection, type ListSelectionAction, type ListSelectionKeyboardEvent, type ListSelectionModifiers, type ListSelectionState } from "./listSelection";
 
 type ButtonProps = {
   title: string;
@@ -374,6 +375,8 @@ type TableProps = {
   columns: TableColumn[];
   rows: TableRow[];
   selectedKey?: string;
+  /** Every selected row; `selectedKey` remains the active row for the inspector. */
+  selectedKeys?: readonly string[];
   striped?: boolean;
   /**
    * Compact density: 22 pt rows for a plain table, and 26 pt rows for a source
@@ -431,6 +434,7 @@ type TableProps = {
    */
   selectableSpanningRowKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
+  onSelectedKeysChange?: (keys: string[], key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
   /**
    * The list was scrolled to its end (oldest row).  A log tab that holds one
@@ -1268,8 +1272,8 @@ type WindowsTableRowProps = {
   selectableSpanning: boolean;
   cellPadding: number;
   firstColumnPadding: number;
-  onSelect: (row: TableRow, index: number) => void;
-  onNavigate?: (event: React.KeyboardEvent<HTMLElement>, index: number) => void;
+  onSelect: (row: TableRow, index: number, modifiers: ListSelectionModifiers) => void;
+  onNavigate?: (event: ListKeyboardEvent, index: number) => void;
   onRowFocus?: (node: HTMLElement) => void;
   onRowNode?: (key: string, node: HTMLElement | null) => void;
 };
@@ -1354,6 +1358,12 @@ function windowsRowHeight(compact: boolean): number {
   return compact ? 30 : WINDOWS_CONTROL.sourceRowHeight;
 }
 
+type ListKeyboardEvent = ListSelectionKeyboardEvent;
+
+const TABLE_NATIVE_KEYS = Platform.OS === "windows"
+  ? [...LIST_SELECTION_KEYS.map((key) => ({ code: key === "a" || key === "A" ? "KeyA" : key, handledEventPhase: 3 }))]
+  : LIST_SELECTION_KEYS.map((key) => ({ key }));
+
 const WindowsTableRow = React.memo(function WindowsTableRow({
   row,
   index,
@@ -1413,13 +1423,14 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   return <Pressable
     ref={onRowNode ? setRowNode as never : undefined}
     disabled={disabled || (spanning && !selectableSpanning)}
-    onPress={() => onSelect(row, index)}
+    onPress={(event) => onSelect(row, index, listSelectionModifiers(event as unknown as ListSelectionKeyboardEvent))}
     onHoverIn={sourceList ? () => setHovered(true) : undefined}
     onHoverOut={sourceList ? () => setHovered(false) : undefined}
     {...(onNavigate && {
       tabIndex: -1,
+      ...(Platform.OS === "windows" && { focusable: true, keyDownEvents: TABLE_NATIVE_KEYS }),
       onFocus: (event: React.FocusEvent<HTMLElement>) => onRowFocus?.(event.currentTarget),
-      onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => onNavigate(event, index),
+      onKeyDown: (event: ListKeyboardEvent) => onNavigate(event, index),
     } as object)}
     accessibilityRole={spanning && !(onNavigate && selectableSpanning) ? "header" : "button"}
     accessibilityLabel={rowLabel}
@@ -1489,10 +1500,11 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   </Pressable>;
 }, sameTableRow);
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, cellHorizontalPadding, firstColumnHorizontalPadding, onSelectionChange, onRowDoublePress, onEndReached, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, selectedKeys, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, cellHorizontalPadding, firstColumnHorizontalPadding, onSelect, onSelectionAction, onRowDoublePress, onEndReached, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
+  selectedKeys: string[];
   stripedRows: boolean;
   compact: boolean;
   followBottom: boolean;
@@ -1509,7 +1521,8 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   selectableSpanningKeys: Set<string>;
   cellHorizontalPadding: number;
   firstColumnHorizontalPadding: number;
-  onSelectionChange?: (key: string, index: number) => void;
+  onSelect: (row: TableProps["rows"][number], index: number, modifiers: ListSelectionModifiers) => void;
+  onSelectionAction: (action: ListSelectionAction) => ListSelectionState;
   onRowDoublePress?: (key: string, index: number) => void;
   onEndReached?: () => void;
   style?: StyleProp<ViewStyle>;
@@ -1535,6 +1548,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // log that appends 20 entries a second otherwise rebuilt the same lookups
   // for every visible row on every frame.
   const disabledKeys = React.useMemo(() => new Set(disabledRowKeys), [disabledRowKeys]);
+  const selectedKeysSet = React.useMemo(() => new Set(selectedKeys), [selectedKeys]);
   const secondaryRowKeysSet = React.useMemo(() => new Set(secondaryRowKeys), [secondaryRowKeys]);
   const alertKeys = React.useMemo(() => new Set(alertRowKeys), [alertRowKeys]);
   const secondaryKeys = React.useMemo(() => new Set(secondaryCellKeys), [secondaryCellKeys]);
@@ -1565,38 +1579,36 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     }
   }, [setFocusedRow]);
   // Log refreshes replace the rows without changing their keyboard handlers.
-  const rowChoices = React.useRef({ rows, disabledKeys, selectableSpanningKeys, onSelectionChange });
-  rowChoices.current = { rows, disabledKeys, selectableSpanningKeys, onSelectionChange };
-  const navigateRow = React.useCallback((event: React.KeyboardEvent<HTMLElement>, index: number): void => {
-    const { rows, disabledKeys, selectableSpanningKeys, onSelectionChange } = rowChoices.current;
-    const home = event.key === "Home";
-    const end = event.key === "End";
-    if (!home && !end && event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
-    event.preventDefault();
-    const direction = home || event.key === "ArrowDown" ? 1 : -1;
-    const start = home || end || index < 0 ? (direction === 1 ? 0 : rows.length - 1) : index + direction;
-    for (let next = start; next >= 0 && next < rows.length; next += direction) {
-      const row = rows[next];
-      if (disabledKeys.has(row.key) || (row.spanning && !selectableSpanningKeys.has(row.key))) continue;
-      if (next === index) return;
-      // Group headers with a click action stay reachable for Enter. Only
-      // regular rows change the selection as you navigate, as in AppKit.
-      if (!row.spanning) onSelectionChange?.(row.key, next);
-      const node = rowNodes.current.get(row.key);
-      if (node) {
-        pendingRowFocus.current = null;
-        node.focus();
-      } else {
-        // Home and End can jump beyond the rendered window. Move focus when
-        // the newly visible target mounts, unless the reader left the table.
-        pendingRowFocus.current = { key: row.key, from: event.currentTarget };
-        verticalList.current?.scrollToIndex({
-          index: next,
-          animated: false,
-          viewPosition: home ? 0 : end ? 1 : direction === 1 ? 1 : 0,
-        });
-      }
+  const rowChoices = React.useRef({ rows, disabledKeys, selectableSpanningKeys, onSelectionAction });
+  rowChoices.current = { rows, disabledKeys, selectableSpanningKeys, onSelectionAction };
+  const navigateRow = React.useCallback((event: ListKeyboardEvent, index: number): void => {
+    const { rows, onSelectionAction } = rowChoices.current;
+    const action = listSelectionActionForKey(event);
+    if (action?.type === "all") {
+      event.preventDefault();
+      event.stopPropagation?.();
+      onSelectionAction(action);
       return;
+    }
+    if (action?.type !== "move") return;
+    event.preventDefault();
+    event.stopPropagation?.();
+    const state = onSelectionAction(action);
+    const nextKey = state.activeKey;
+    const next = nextKey === undefined ? -1 : rows.findIndex((row) => row.key === nextKey);
+    if (next < 0 || next === index) return;
+    const node = Platform.OS === "web" ? rowNodes.current.get(nextKey!) : undefined;
+    if (node) {
+      pendingRowFocus.current = null;
+      node.focus();
+    } else {
+      const currentTarget = Platform.OS === "web" ? event.currentTarget as HTMLElement | undefined : undefined;
+      pendingRowFocus.current = currentTarget ? { key: nextKey!, from: currentTarget } : null;
+      verticalList.current?.scrollToIndex({
+        index: next,
+        animated: false,
+        viewPosition: action.direction === "first" ? 0 : action.direction === "last" ? 1 : action.direction === "down" ? 1 : 0,
+      });
     }
   }, []);
   React.useEffect(() => {
@@ -1619,13 +1631,13 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // invalidate every mounted row.
   const selectableSpanningRef = React.useRef(selectableSpanningKeys);
   selectableSpanningRef.current = selectableSpanningKeys;
-  const select = React.useCallback((row: TableProps["rows"][number], index: number): void => {
+  const select = React.useCallback((row: TableProps["rows"][number], index: number, modifiers: ListSelectionModifiers): void => {
     if (row.spanning && !selectableSpanningRef.current.has(row.key)) return;
     const now = Date.now();
     if (lastPress.current?.key === row.key && now - lastPress.current.at < 360) onRowDoublePress?.(row.key, index);
     lastPress.current = { key: row.key, at: now };
-    onSelectionChange?.(row.key, index);
-  }, [onRowDoublePress, onSelectionChange]);
+    rowChoices.current.onSelectionAction({ type: "press", key: row.key, ...modifiers });
+  }, [onRowDoublePress]);
   // The vertical thumb, the same 4 pt capsule `PersistentScrollView` draws:
   // the FlatList's overflow is the browser's own `overflow: auto`, and macOS
   // Chrome paints that as an overlay bar that only appears mid-scroll — a list
@@ -1685,7 +1697,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     columns={laidOutColumns}
     sourceList={sourceList}
     stripedRows={stripedRows}
-    selected={item.key === selectedKey}
+    selected={selectedKeysSet.has(item.key)}
     disabled={disabledKeys.has(item.key)}
     secondaryRow={secondaryRowKeysSet.has(item.key)}
     alert={alertKeys.has(item.key)}
@@ -1698,10 +1710,10 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     cellPadding={cellHorizontalPadding}
     firstColumnPadding={firstColumnHorizontalPadding}
     onSelect={select}
-    onNavigate={Platform.OS === "web" ? navigateRow : undefined}
+    onNavigate={Platform.OS === "web" || Platform.OS === "windows" ? navigateRow : undefined}
     onRowFocus={Platform.OS === "web" ? setFocusedRow : undefined}
     onRowNode={Platform.OS === "web" ? onRowNode : undefined}
-  />, [alertKeys, cellHorizontalPadding, laidOutColumns, disabledKeys, firstColumnHorizontalPadding, navigateRow, onRowNode, rowDetails, rowHeight, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKey, setFocusedRow, sourceList, stripedRows]);
+  />, [alertKeys, cellHorizontalPadding, laidOutColumns, disabledKeys, firstColumnHorizontalPadding, navigateRow, onRowNode, rowDetails, rowHeight, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKeysSet, setFocusedRow, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   const body = <View style={[windowsTableStyles.horizontalBody, !sourceList && { minWidth: totalWidth }]}>
     {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
@@ -1770,7 +1782,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   const scrollThumb = scrollMetrics.overflow && scrollMetrics.height > 0
     ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { top: scrollMetrics.top + 2, height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} />
     : null;
-  const frameFocus = Platform.OS === "web" ? {
+  const frameFocus = Platform.OS === "web" || Platform.OS === "windows" ? {
     tabIndex: rows.length > 0 ? 0 : -1,
     onFocus: (event: React.FocusEvent<HTMLElement>) => {
       if (event.target !== event.currentTarget) return;
@@ -1786,8 +1798,9 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
         setFocusedRow(null);
       }
     },
-    onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
-      if (event.target === event.currentTarget) navigateRow(event, -1);
+    ...(Platform.OS === "windows" && { focusable: true, keyDownEvents: TABLE_NATIVE_KEYS }),
+    onKeyDown: (event: ListKeyboardEvent & { target?: unknown }) => {
+      if (Platform.OS !== "web" || event.target === event.currentTarget) navigateRow(event, -1);
     },
   } as object : undefined;
   return <View ref={setFrameRef} {...frameFocus} style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
@@ -1940,7 +1953,7 @@ const windowsTableStyles = StyleSheet.create({
 // with them every mounted row) even when no prop changed.
 const EMPTY_STRINGS: string[] = [];
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, scrollRequest, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, onEndReached, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", selectedKeys, striped = true, compact = true, followBottom = false, scrollToRow = -1, scrollRequest, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onSelectedKeysChange, onRowDoublePress, onEndReached, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
@@ -1955,6 +1968,75 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     const spanning = new Set(spanningRowKeys);
     return new Set(selectableSpanningRowKeys.filter((key) => spanning.has(key)));
   }, [spanningRowKeys, selectableSpanningRowKeys]);
+  const rowKeys = React.useMemo(() => rows.map((row) => row.key), [rows]);
+  const disabledKeys = React.useMemo(() => new Set(disabledRowKeys), [disabledRowKeys]);
+  const selectableKeys = React.useMemo(() => new Set(rows
+    .filter((row) => !disabledKeys.has(row.key) && (!row.spanning || selectableSpanningKeys.has(row.key)))
+    .map((row) => row.key)), [disabledKeys, rows, selectableSpanningKeys]);
+  const selectionOptions = React.useMemo(() => ({ isSelectable: (key: string) => selectableKeys.has(key) }), [selectableKeys]);
+  const selectedKeysControlled = selectedKeys !== undefined;
+  const [internalSelection, setInternalSelection] = React.useState<ListSelectionState>(() => ({
+    selectedKeys: selectedKeys ?? (selectedKey ? [selectedKey] : []),
+    activeKey: selectedKey || selectedKeys?.[0],
+    anchorKey: selectedKey || selectedKeys?.[0],
+  }));
+  const sourceSelection: ListSelectionState = selectedKeysControlled
+    ? { ...internalSelection, selectedKeys: selectedKeys! }
+    : internalSelection;
+  const selection = normalizeListSelection(rowKeys, sourceSelection, selectionOptions);
+  const selectionRef = React.useRef(selection);
+  selectionRef.current = selection;
+  React.useEffect(() => {
+    if (!listSelectionEqual(internalSelection, selection)) setInternalSelection(selection);
+  }, [internalSelection, selection]);
+  const previousSelectedKey = React.useRef(selectedKey);
+  const lastReportedSelection = React.useRef<{ from: string; key: string } | undefined>(undefined);
+  React.useEffect(() => {
+    if (previousSelectedKey.current === selectedKey) return;
+    const previous = previousSelectedKey.current;
+    previousSelectedKey.current = selectedKey;
+    const reported = lastReportedSelection.current;
+    lastReportedSelection.current = undefined;
+    if (reported?.from === previous && reported.key === selectedKey) return;
+    if (selectedKeysControlled) {
+      selectionRef.current = { ...selectionRef.current, activeKey: selectedKey || undefined, anchorKey: selectedKey || undefined };
+      setInternalSelection(selectionRef.current);
+    } else {
+      const next = selectedKey && rowKeys.includes(selectedKey)
+        ? reduceListSelection(rowKeys, selectionRef.current, { type: "press", key: selectedKey }, selectionOptions)
+        : reduceListSelection(rowKeys, selectionRef.current, { type: "clear" }, selectionOptions);
+      selectionRef.current = next;
+      setInternalSelection(next);
+    }
+  }, [rowKeys, selectedKey, selectedKeysControlled, selectionOptions]);
+  const reportSelection = React.useCallback((next: ListSelectionState): void => {
+    const key = next.activeKey ?? "";
+    const index = key ? rowKeys.indexOf(key) : -1;
+    if (key) lastReportedSelection.current = { from: selectedKey, key };
+    onSelectionChange?.(key, index);
+    onSelectedKeysChange?.([...next.selectedKeys], key, index);
+  }, [onSelectedKeysChange, onSelectionChange, rowKeys, selectedKey]);
+  const applySelectionAction = React.useCallback((action: ListSelectionAction): ListSelectionState => {
+    const next = reduceListSelection(rowKeys, selectionRef.current, action, selectionOptions);
+    if (listSelectionEqual(next, selectionRef.current)) return next;
+    selectionRef.current = next;
+    if (!selectedKeysControlled) setInternalSelection(next);
+    reportSelection(next);
+    return next;
+  }, [reportSelection, rowKeys, selectedKeysControlled, selectionOptions]);
+  const receiveNativeSelection = React.useCallback((keys: readonly string[], key: string, index: number): void => {
+    const next = normalizeListSelection(rowKeys, {
+      ...selectionRef.current,
+      selectedKeys: keys,
+      activeKey: key || undefined,
+      anchorKey: key || selectionRef.current.anchorKey,
+    }, selectionOptions);
+    selectionRef.current = next;
+    if (!selectedKeysControlled) setInternalSelection(next);
+    if (key) lastReportedSelection.current = { from: selectedKey, key };
+    onSelectionChange?.(key, index);
+    onSelectedKeysChange?.([...next.selectedKeys], key, index);
+  }, [onSelectedKeysChange, onSelectionChange, rowKeys, selectedKey, selectedKeysControlled, selectionOptions]);
   // A scroll *request* is an event, not a state.  `scrollToRow` states where the
   // table should be, and both hosts honour that on every update — which is
   // right for a table rebuilt under the reader, and wrong for a request: the
@@ -1981,19 +2063,21 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     return () => clearTimeout(timer);
   }, [scrollDelivery]);
   const effectiveScrollToRow = scrollDelivery !== null ? scrollDelivery.row : scrollRequest !== undefined ? -1 : scrollToRow;
+  const activeSelectionKey = selection.activeKey ?? selectedKey;
+  const visibleSelectedKeys = [...selection.selectedKeys];
   if (Platform.OS === "windows" || Platform.OS === "web") {
     // This React table is the only Windows table path, and the browser's too:
     // a browser has no AppKit table to delegate to, and the fallback below is a
     // one-line-per-row list that drops every column this app reads.  The
     // Windows leaf is already a virtualized React table, so the browser host
     // gets the same rows, columns, stripes and selection instead of a stub.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={effectiveScrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys}
+    return <WindowsTable columns={columns} rows={rows} selectedKey={activeSelectionKey} selectedKeys={visibleSelectedKeys} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={effectiveScrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys}
       // A caller that names its own inset expects it on the web too: these two
       // reached only the macOS table, so a list that asked for 6 or 0 was drawn
       // at this table's fixed 8 and its header 16 — the pane's own alignment
       // was a value the browser silently ignored.
       cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding}
-      onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} onEndReached={onEndReached} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+      onSelect={(row, index, modifiers) => applySelectionAction({ type: "press", key: row.key, ...modifiers })} onSelectionAction={applySelectionAction} onRowDoublePress={onRowDoublePress} onEndReached={onEndReached} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   // The macOS bridge props are built per render, and the list above them can be
   // thousands of rows: building them before the platform branch made a Windows
@@ -2024,7 +2108,8 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
           return [...tooltips, ...Array(Math.max(0, columns.length - tooltips.length)).fill("")];
         })
         : EMPTY_STRINGS,
-      selectedKey,
+      selectedKey: activeSelectionKey,
+      selectedKeys: visibleSelectedKeys,
       alternatingRows: stripedRows,
       compact,
       followBottom,
@@ -2049,18 +2134,18 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
       spanningRowKeys,
       selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
     };
-    return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectedKeysChange={(event) => receiveNativeSelection(event.nativeEvent.keys, event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   return <View style={[styles.tableFallback, !framed && styles.tableFallbackUnframed, style]}>{rows.map((row, index) => {
-    const selected = row.key === selectedKey;
+    const selected = visibleSelectedKeys.includes(row.key);
     const stripe = stripedRows && !selected && index % 2 === 1 ? styles.tableFallbackStripe : undefined;
     if (row.spanning) {
       if (!selectableSpanningKeys.has(row.key)) {
         return <View key={row.key} style={[styles.tableFallbackGroupRow, stripe]}><Text numberOfLines={1} style={[styles.selectableTitle, styles.tableFallbackGroupText]}>{row.cells[0] ?? ""}</Text></View>;
       }
-      return <Pressable key={row.key} onPress={() => onSelectionChange?.(row.key, index)} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} selected={selected} style={[styles.tableFallbackGroupRow, stripe]} /></Pressable>;
+      return <Pressable key={row.key} onPress={(event) => applySelectionAction({ type: "press", key: row.key, ...listSelectionModifiers(event as unknown as ListSelectionKeyboardEvent) })} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} selected={selected} style={[styles.tableFallbackGroupRow, stripe]} /></Pressable>;
     }
-    return <Pressable key={row.key} onPress={() => onSelectionChange?.(row.key, index)} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} detail={row.cells.slice(1).join(" | ")} selected={selected} style={stripe} /></Pressable>;
+    return <Pressable key={row.key} onPress={(event) => applySelectionAction({ type: "press", key: row.key, ...listSelectionModifiers(event as unknown as ListSelectionKeyboardEvent) })} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} detail={row.cells.slice(1).join(" | ")} selected={selected} style={stripe} /></Pressable>;
   })}</View>;
 }
 

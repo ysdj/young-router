@@ -1042,9 +1042,88 @@ void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
 @interface LiteLLMTableView : NSTableView
 @property(nonatomic) BOOL acceptsVerticalScroll;
 @property(nonatomic) BOOL acceptsHorizontalScroll;
+@property(nonatomic) BOOL applyingKeyboardSelection;
+@property(nonatomic, copy) void (^keyboardSelectionDidChange)(NSInteger row);
 @end
 
 @implementation LiteLLMTableView
+
+- (void)keyDown:(NSEvent *)event
+{
+  const NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+  NSString *characters = event.charactersIgnoringModifiers.lowercaseString;
+  const BOOL selectAll = [characters isEqualToString:@"a"] &&
+      (flags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0 &&
+      (flags & (NSEventModifierFlagOption | NSEventModifierFlagShift)) == 0;
+  if (selectAll) {
+    [self selectAll:nil];
+    return;
+  }
+  if (event.keyCode == 115 || event.keyCode == 119) { // Home / End
+    const NSInteger direction = event.keyCode == 115 ? 1 : -1;
+    const NSInteger start = event.keyCode == 115 ? 0 : self.numberOfRows - 1;
+    const BOOL extending = (flags & NSEventModifierFlagShift) != 0;
+    NSInteger target = start;
+    while (target >= 0 && target < self.numberOfRows &&
+           ![self.delegate tableView:self shouldSelectRow:target]) {
+      target += direction;
+    }
+    if (target >= 0 && target < self.numberOfRows) {
+      NSMutableIndexSet *selection = [NSMutableIndexSet indexSet];
+      if (extending && self.selectedRowIndexes.count > 0) {
+        const NSInteger anchor = event.keyCode == 115
+            ? static_cast<NSInteger>(self.selectedRowIndexes.lastIndex)
+            : static_cast<NSInteger>(self.selectedRowIndexes.firstIndex);
+        const NSInteger lower = MIN(anchor, target);
+        const NSInteger upper = MAX(anchor, target);
+        for (NSInteger row = lower; row <= upper; row += 1) {
+          if ([self.delegate tableView:self shouldSelectRow:row]) {
+            [selection addIndex:static_cast<NSUInteger>(row)];
+          }
+        }
+      } else {
+        [selection addIndex:static_cast<NSUInteger>(target)];
+      }
+      self.applyingKeyboardSelection = YES;
+      [self selectRowIndexes:selection byExtendingSelection:NO];
+      self.applyingKeyboardSelection = NO;
+      [self scrollRowToVisible:target];
+      if (self.keyboardSelectionDidChange != nil) self.keyboardSelectionDidChange(target);
+    }
+    return;
+  }
+  NSIndexSet *previous = [self.selectedRowIndexes copy];
+  self.applyingKeyboardSelection = YES;
+  [super keyDown:event];
+  self.applyingKeyboardSelection = NO;
+  if (![previous isEqualToIndexSet:self.selectedRowIndexes] && self.keyboardSelectionDidChange != nil) {
+    NSInteger active = self.selectedRow;
+    if ((flags & NSEventModifierFlagShift) != 0 && self.selectedRowIndexes.count > 0) {
+      if (event.keyCode == 126) active = static_cast<NSInteger>(self.selectedRowIndexes.firstIndex);
+      else if (event.keyCode == 125) active = static_cast<NSInteger>(self.selectedRowIndexes.lastIndex);
+    }
+    self.keyboardSelectionDidChange(active);
+  }
+}
+
+- (void)selectAll:(__unused id)sender
+{
+  NSIndexSet *previous = [self.selectedRowIndexes copy];
+  const NSInteger previousActive = self.selectedRow;
+  const BOOL wasApplyingKeyboardSelection = self.applyingKeyboardSelection;
+  self.applyingKeyboardSelection = YES;
+  NSMutableIndexSet *selectableRows = [NSMutableIndexSet indexSet];
+  for (NSInteger row = 0; row < self.numberOfRows; row += 1) {
+    if ([self.delegate tableView:self shouldSelectRow:row]) {
+      [selectableRows addIndex:static_cast<NSUInteger>(row)];
+    }
+  }
+  [self selectRowIndexes:selectableRows byExtendingSelection:NO];
+  self.applyingKeyboardSelection = wasApplyingKeyboardSelection;
+  if (!wasApplyingKeyboardSelection && ![previous isEqualToIndexSet:self.selectedRowIndexes] && self.keyboardSelectionDidChange != nil) {
+    self.keyboardSelectionDidChange(previousActive >= 0 ? previousActive : self.selectedRow);
+  }
+}
 
 // AppKit resizes a table's document view behind the component's back.
 //
@@ -3093,6 +3172,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 - (void)tableColumnDidResize:(NSNotification *)notification;
 - (BOOL)isSpanningRow:(NSInteger)row;
 - (BOOL)isSelectableSpanningRow:(NSInteger)row;
+- (void)synchronizeSelectionFromProps;
+- (void)emitSelectionChangeForActiveRow:(NSInteger)row;
 - (void)refreshSelectableSpanningSelection;
 @end
 
@@ -3130,7 +3211,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _tableView.target = self;
     _tableView.action = @selector(handleRowClick:);
     _tableView.doubleAction = @selector(handleDoubleClick:);
-    _tableView.allowsMultipleSelection = NO;
+    _tableView.allowsMultipleSelection = YES;
     _tableView.allowsEmptySelection = YES;
     _tableView.allowsColumnReordering = NO;
     _tableView.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
@@ -3139,6 +3220,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _tableView.intercellSpacing = NSZeroSize;
     _tableView.rowHeight = 28;
     _tableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleRegular;
+    __weak LiteLLMAppKitTableComponentView *weakSelf = self;
+    _tableView.keyboardSelectionDidChange = ^(NSInteger row) {
+      [weakSelf emitSelectionChangeForActiveRow:row];
+    };
     _tableView.usesAlternatingRowBackgroundColors = NO;
     _tableView.floatsGroupRows = NO;
     // Keep the body as an AppKit list, rather than a boxed spreadsheet.  The
@@ -3210,6 +3295,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       oldViewProps.selectableSpanningRowKeys != newViewProps.selectableSpanningRowKeys ||
       oldViewProps.rowDetails != newViewProps.rowDetails ||
       oldViewProps.cellTooltips != newViewProps.cellTooltips;
+  const bool selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey ||
+      oldViewProps.selectedKeys != newViewProps.selectedKeys;
   const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
       overflowBehaviorChanged || sourceListChanged || rowsChanged;
   const BOOL initialDataLoad = !_hasLoadedData;
@@ -3329,53 +3416,65 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     });
   }
 
+  [self synchronizeSelectionFromProps];
   const NSInteger selectedIndex = SegmentIndex(newViewProps.rowKeys, newViewProps.selectedKey);
-  const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;
-  // A disabled row is not selectable from the React side either.  AppKit does
-  // not consult shouldSelectRow: for a programmatic selection, so selectedKey
-  // could still land the highlight on a row the pane then acts from -- the
-  // provider list falls back to its first provider, and a config whose first
-  // provider is off opens with it selected.
-  if (selectedIndex >= 0 && [self isDisabledRow:selectedIndex]) {
-    if (_tableView.selectedRow >= 0) {
-      [_tableView deselectAll:nil];
+  if (selectionChanged && selectedIndex >= 0 && _scrollView.hasVerticalScroller) {
+    // Only reveal the active row when it is out of sight. Scrolling a row
+    // already visible parks it under the floating header and hides rows above.
+    const NSRect visibleRect = _scrollView.documentVisibleRect;
+    const NSRect selectedRect = [_tableView rectOfRow:selectedIndex];
+    if (!NSIsEmptyRect(visibleRect) && !NSContainsRect(visibleRect, selectedRect)) {
+      [_tableView scrollRowToVisible:selectedIndex];
     }
-  } else if (selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]) {
-    // A public-model row is a clickable section header, not a selectable row:
-    // the selected route must not keep its highlight while the pane shows the
-    // public model, so the table clears the row selection instead and paints
-    // the section header itself (refreshSelectableSpanningSelection).
-    if (_tableView.selectedRow >= 0) {
-      [_tableView deselectAll:nil];
-    }
-    if (selectionChanged && _scrollView.hasVerticalScroller) {
-      const NSRect visibleRect = _scrollView.documentVisibleRect;
-      const NSRect selectedRect = [_tableView rectOfRow:selectedIndex];
-      if (!NSIsEmptyRect(visibleRect) && !NSContainsRect(visibleRect, selectedRect)) {
-        [_tableView scrollRowToVisible:selectedIndex];
-      }
-    }
-  } else if (selectedIndex >= 0) {
-    if (selectionChanged || _tableView.selectedRow != selectedIndex) {
-      [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selectedIndex] byExtendingSelection:NO];
-    }
-    if (selectionChanged && _scrollView.hasVerticalScroller) {
-      // Only reveal a selected row that is actually out of sight.  Scrolling
-      // a row that is already visible parks it under the floating header and
-      // hides every row above it, so the list no longer reads from the top.
-      const NSRect visibleRect = _scrollView.documentVisibleRect;
-      const NSRect selectedRect = [_tableView rectOfRow:selectedIndex];
-      if (!NSIsEmptyRect(visibleRect) && !NSContainsRect(visibleRect, selectedRect)) {
-        [_tableView scrollRowToVisible:selectedIndex];
-      }
-    }
-  } else if (_tableView.selectedRow >= 0) {
-    [_tableView deselectAll:nil];
   }
   if (selectionChanged || dataChanged) {
     [self refreshSelectableSpanningSelection];
   }
   _synchronizingSelection = NO;
+}
+
+- (void)synchronizeSelectionFromProps
+{
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  NSMutableIndexSet *indexes = [NSMutableIndexSet indexSet];
+  for (const std::string &key : viewProps.selectedKeys) {
+    const NSInteger row = SegmentIndex(viewProps.rowKeys, key);
+    if (row >= 0 && ![self isDisabledRow:row] && ![self isSpanningRow:row]) {
+      [indexes addIndex:static_cast<NSUInteger>(row)];
+    }
+  }
+  if (indexes.count == 0) {
+    if (_tableView.selectedRowIndexes.count > 0) [_tableView deselectAll:nil];
+  } else if (![_tableView.selectedRowIndexes isEqualToIndexSet:indexes]) {
+    [_tableView selectRowIndexes:indexes byExtendingSelection:NO];
+  }
+}
+
+- (void)emitSelectionChangeForActiveRow:(NSInteger)row
+{
+  if (!_eventEmitter) return;
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  std::vector<std::string> keys;
+  const NSIndexSet *selectedRows = _tableView.selectedRowIndexes;
+  for (NSUInteger index = selectedRows.firstIndex; index != NSNotFound; index = [selectedRows indexGreaterThanIndex:index]) {
+    if (index >= viewProps.rowKeys.size()) continue;
+    const NSInteger selected = static_cast<NSInteger>(index);
+    if (![self isDisabledRow:selected] && ![self isSpanningRow:selected]) {
+      keys.push_back(viewProps.rowKeys[index]);
+    }
+  }
+  if ((row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() ||
+       ![selectedRows containsIndex:static_cast<NSUInteger>(row)] ||
+       [self isDisabledRow:row] || [self isSpanningRow:row]) && selectedRows.count > 0) {
+    row = static_cast<NSInteger>(selectedRows.lastIndex);
+  }
+  const bool hasActiveRow = row >= 0 && static_cast<size_t>(row) < viewProps.rowKeys.size() &&
+      [selectedRows containsIndex:static_cast<NSUInteger>(row)] &&
+      ![self isDisabledRow:row] && ![self isSpanningRow:row];
+  const std::string activeKey = hasActiveRow ? viewProps.rowKeys[static_cast<size_t>(row)] : std::string{};
+  const int activeIndex = hasActiveRow ? static_cast<int>(row) : -1;
+  LiteLLMAppKitTableEventEmitter::OnSelectedKeysChange multiEvent{keys, activeKey, activeIndex};
+  std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectedKeysChange(multiEvent);
 }
 
 - (void)refreshSelectableSpanningSelection
@@ -4116,13 +4215,23 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
 - (void)tableViewSelectionDidChange:(NSNotification *)notification
 {
-  if (_synchronizingSelection || notification.object != _tableView || !_eventEmitter) {
+  if (_synchronizingSelection || _tableView.applyingKeyboardSelection || notification.object != _tableView || !_eventEmitter) {
     return;
   }
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
-  const NSInteger selectedRow = _tableView.selectedRow;
-  if (selectedRow < 0 || static_cast<size_t>(selectedRow) >= viewProps.rowKeys.size() ||
-      ([self isSpanningRow:selectedRow] && ![self isSelectableSpanningRow:selectedRow])) {
+  const NSIndexSet *selectedRows = _tableView.selectedRowIndexes;
+  NSEvent *event = NSApp.currentEvent;
+  const BOOL mouseClick = event.type == NSEventTypeLeftMouseDown || event.type == NSEventTypeLeftMouseUp ||
+      event.type == NSEventTypeRightMouseDown || event.type == NSEventTypeRightMouseUp;
+  const NSInteger clickedRow = mouseClick ? _tableView.clickedRow : -1;
+  if (clickedRow >= 0 && static_cast<size_t>(clickedRow) < viewProps.rowKeys.size() &&
+      ([self isDisabledRow:clickedRow] || [self isSpanningRow:clickedRow])) {
+    _synchronizingSelection = YES;
+    [self synchronizeSelectionFromProps];
+    _synchronizingSelection = NO;
+    return;
+  }
+  if (selectedRows.count == 0 && clickedRow < 0) {
     // A click below the rows — or on a group header — names no row, and AppKit
     // answers it by dropping the native selection.  That is not a state these
     // lists can be in: the highlighted row is the only thing that says what the
@@ -4131,19 +4240,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     // Put the highlight back on the row ``selectedKey`` names and report
     // nothing: a click on a row is a selection, a click on the space around the
     // rows is not.
-    const NSInteger kept = SegmentIndex(viewProps.rowKeys, viewProps.selectedKey);
     _synchronizingSelection = YES;
-    if (kept >= 0 && ![self isDisabledRow:kept] && ![self isSelectableSpanningRow:kept]) {
-      [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:kept] byExtendingSelection:NO];
-    } else if (_tableView.selectedRow >= 0) {
-      [_tableView deselectAll:nil];
-    }
+    [self synchronizeSelectionFromProps];
     _synchronizingSelection = NO;
     return;
   }
-  LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
-      viewProps.rowKeys[static_cast<size_t>(selectedRow)], static_cast<int>(selectedRow)};
-  std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+  NSInteger activeRow = clickedRow >= 0 && [selectedRows containsIndex:static_cast<NSUInteger>(clickedRow)]
+      ? clickedRow : _tableView.selectedRow;
+  if (activeRow < 0 || ![selectedRows containsIndex:static_cast<NSUInteger>(activeRow)]) {
+    activeRow = selectedRows.firstIndex == NSNotFound ? -1 : static_cast<NSInteger>(selectedRows.firstIndex);
+  }
+  [self emitSelectionChangeForActiveRow:activeRow];
 }
 
 - (void)handleRowClick:(__unused id)sender
@@ -4173,18 +4280,19 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   if ([self isDisabledRow:row]) {
     return;
   }
-  if (_tableView.selectedRow == row && row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)) {
-    LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
-        viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};
-    std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+  if ([_tableView.selectedRowIndexes containsIndex:static_cast<NSUInteger>(row)]) {
+    [self emitSelectionChangeForActiveRow:row];
     return;
   }
   if (![self isSelectableSpanningRow:row]) {
     return;
   }
-  LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
-      viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};
-  std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+  // AppKit does not select group rows, but selectable spanning entries remain
+  // the row that drives their inspector. Include that active key in the same
+  // shared selection event while the ordinary selection stays empty.
+  LiteLLMAppKitTableEventEmitter::OnSelectedKeysChange multiEvent{
+      {viewProps.rowKeys[static_cast<size_t>(row)]}, viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};
+  std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectedKeysChange(multiEvent);
 }
 
 - (void)handleDoubleClick:(__unused id)sender
