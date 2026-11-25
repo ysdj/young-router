@@ -1427,6 +1427,42 @@ _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS = (
     "invalid_api_key",
     "invalid api key",
 )
+# An upstream can refuse with a status that reads like a credential answer
+# while its own body says the *model* is queued.  Qoder's CN gateway answers
+# ``http 403`` with ``{"code":"10605","message":"{\"isqueued\":true,
+# \"modelkey\":\"hmodel\",\"queuecount\":9031,\"retryafterseconds\":30,
+# \"serviceavailable\":true}"}``: the account is fine, the model is behind a
+# 9000-deep queue, and the upstream itself states when to come back.  Read by
+# the 403 marker *below* this was a rejected session -- the route was parked as
+# a logged-out account and every row of the turn said 上游会话被拒绝 while the
+# client was only waiting (live 2026-11-25, Codex thread 01a211fa).
+#
+# The body arrives re-escaped inside LiteLLM's own exception sentence, so a
+# marker spelled with quotes would never match; the key names survive.  The flag
+# plus one field that only this envelope carries is a queue answer, never a
+# credential refusal.
+_UPSTREAM_QUEUE_WAIT_FLAG_MARKERS = ("isqueued",)
+_UPSTREAM_QUEUE_WAIT_DETAIL_MARKERS = (
+    "retryafterseconds",
+    "queuecount",
+    "queuetype",
+)
+# Spellings that state the queue on their own: the plugin's business-code line
+# (``上游业务错误 code=10605``) and this proxy's own worker sentence, which is
+# what a retried envelope looks like once it has no body left.
+_UPSTREAM_QUEUE_WAIT_EXPLICIT_MARKERS = (
+    "code=10605",
+    "code 10605",
+    "upstream queued",
+)
+# The wait the same envelope states, in the spellings the upstream and the local
+# adapters write it: ``retryAfterSeconds`` / ``retry_after_seconds`` in the body,
+# ``retry-after: 30`` on a header, or the ``retry after 30 seconds`` sentence a
+# relay writes in prose.
+_UPSTREAM_QUEUE_WAIT_SECONDS_PATTERN = re.compile(
+    r"retry[_\-\s]?after(?:[_\-\s]?seconds)?\\*\"?\s*[:=]?\s*\\*\"?(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 # The station's own envelope answers for the *channel* behind the route, not
 # for this route's key: New API / sub2api spell it as
 # ``{"type":"upstream_error","message":"Upstream access forbidden, please

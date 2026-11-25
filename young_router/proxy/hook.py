@@ -304,6 +304,8 @@ class YoungRouterHook(CustomLogger):
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="failure")
         if _routing_module._should_suppress_recent_failure_log(kwargs, response_obj):
             return
+        if _routing_module._hold_queued_request_row(kwargs, response_obj):
+            return
         _state_module._append_recent_request(
             _routing_module._request_log_record("failure", kwargs, response_obj, start_time, end_time)
         )

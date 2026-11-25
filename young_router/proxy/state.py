@@ -443,6 +443,122 @@ async def _settle_recent_request_after(
     _settle_recent_request(request_id, "no_terminal_callback", attempt=attempt)
 
 
+async def _settle_recent_request_after_queue_wait(
+    request_id: str,
+    wait_seconds: float,
+    attempt: Optional[int] = None,
+) -> None:
+    """Close a queued attempt as its own refusal once the stated wait is over.
+
+    The upstream said "queued, come back in N seconds" and the router obeys it,
+    so until that moment the attempt is not over: the turn is still in flight and
+    the row says so.  If no further attempt reports within the wait, the attempt
+    did end -- with that queue answer -- and the row must say it instead of
+    waiting out the fifteen-minute stale window as an unclear interruption.
+    """
+
+    await asyncio.sleep(max(0.0, wait_seconds))
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id)
+        failure = dict(entry.get("failure") or {}) if isinstance(entry, Mapping) else {}
+    if not failure:
+        return
+    _settle_failed_request(
+        request_id,
+        failure.get("error") or {},
+        deployment_id=failure.get("deployment_id"),
+        attempt=attempt,
+    )
+
+
+def _hold_recent_request_for_queue_wait(
+    request_id: Any,
+    error: Mapping[str, Any],
+    *,
+    wait_seconds: float,
+) -> Optional[str]:
+    """Keep a queued attempt's row in flight for the wait the upstream stated.
+
+    A queued upstream is not a refused route: the answer itself asks for a later
+    attempt and names the delay, and the client waits through it inside the same
+    turn.  Writing the attempt's terminal row here is what made 请求 read 失败
+    for minutes while the client showed 正在思考 (live 2026-11-25, Codex thread
+    01a211fa: every row of the turn said 上游会话被拒绝).
+
+    The row keeps the in-flight status, states the queue and its wait, and the
+    refusal is kept on the entry so the watch closes it as that failure once the
+    stated wait passes with no further attempt.  A later attempt under the same
+    request id replaces the row as usual, which is what keeps a retrying turn
+    reading 发送中.
+
+    ``"written"`` and ``"already"`` are both answers this router holds the row
+    for, and the two writers of the same attempt (LiteLLM's failure callback and
+    the dispatch patch) reach this for one failure -- the second must not add a
+    twin row.  ``None`` means there was no in-flight row to join.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return None
+    request_id = request_id.strip()
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id)
+        if entry is None:
+            return None
+        record = dict(entry["record"])
+        if record.get("queue_wait") and entry.get("failure"):
+            # This attempt's row is already held for the same wait.
+            return "already"
+        attempt = entry.get("attempt")
+    _append_recent_request(
+        {
+            **record,
+            "status": "pending",
+            "ts": _utc_now_iso(),
+            "heartbeat": True,
+            "queue_wait": {
+                "reason": error.get("reason") or "upstream-queued",
+                **({"retry_after_seconds": error["retry_after_seconds"]} if "retry_after_seconds" in error else {}),
+            },
+        },
+        attempt=attempt if isinstance(attempt, int) else None,
+    )
+    now = time.monotonic()
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id)
+        if entry is None:
+            return None
+        # Written after the row above: publishing a row replaces the registry
+        # entry, so a stash kept before it would be gone when the watch wakes.
+        entry["failure"] = {
+            "error": dict(error),
+            "deployment_id": error.get("failed_deployment_id"),
+        }
+        # The wait the upstream stated restarts this row's clock: it is progress
+        # the upstream itself reported, not silence.
+        entry["touched_at"] = now
+        entry["reported_at"] = now
+        attempt = entry.get("attempt")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return "written"
+    # The stated wait plus one report interval: an attempt that follows reports
+    # inside it, and one that never comes is closed as this refusal instead of
+    # as an interruption.  The empty context is deliberate, as in
+    # ``_schedule_recent_request_settlement``.
+    task = loop.create_task(
+        _settle_recent_request_after_queue_wait(
+            request_id,
+            wait_seconds + max(_MIN_REQUEST_HEARTBEAT_SECONDS, min(30.0, wait_seconds / 2)),
+            attempt if isinstance(attempt, int) else None,
+        ),
+        context=contextvars.Context(),
+    )
+    _PENDING_SETTLEMENT_TASKS.add(task)
+    task.add_done_callback(_PENDING_SETTLEMENT_TASKS.discard)
+    return "written"
+
+
 def _schedule_recent_request_settlement(record: Mapping[str, Any]) -> None:
     """Close an in-flight row the runtime can prove will not report again."""
 

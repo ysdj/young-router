@@ -2670,8 +2670,9 @@ class HookPatchTests(HookTestCase):
                     )
 
             def refuses(items) -> bool:
-                # The wire's own rule, measured: an empty ``reasoning_text`` is
-                # refused exactly like a missing one, and one character answers.
+                # The current endpoint treats empty or whitespace-only
+                # ``reasoning_text`` as absent; a visible non-blank marker is
+                # required.
                 for item in items:
                     if not isinstance(item, dict) or item.get("type") != "reasoning":
                         continue
@@ -2679,7 +2680,7 @@ class HookPatchTests(HookTestCase):
                     if not any(
                         isinstance(part, dict)
                         and isinstance(part.get("text"), str)
-                        and part["text"]
+                        and part["text"].strip()
                         for part in parts
                     ):
                         return True
@@ -2745,7 +2746,7 @@ class HookPatchTests(HookTestCase):
             repaired_input = calls[1]["input"]
             self.assertEqual("opaque-blob", repaired_input[1]["encrypted_content"])
             self.assertEqual(
-                [{"type": "reasoning_text", "text": " "}],
+                [{"type": "reasoning_text", "text": replay_module.REASONING_TEXT_PLACEHOLDER}],
                 repaired_input[1]["content"],
             )
             self.assertIs(readable, repaired_input[2])
@@ -2790,7 +2791,7 @@ class HookPatchTests(HookTestCase):
             self.assertIsNotNone(pre_call)
             assert pre_call is not None
             self.assertEqual(
-                [{"type": "reasoning_text", "text": " "}],
+                [{"type": "reasoning_text", "text": replay_module.REASONING_TEXT_PLACEHOLDER}],
                 pre_call["input"][0]["content"],
             )
             # ... and only for that route.
@@ -2932,7 +2933,10 @@ class HookPatchTests(HookTestCase):
             # ``function_call`` (measured on the real route).
             inserted = calls[1]["input"][1]
             self.assertEqual("reasoning", inserted["type"])
-            self.assertEqual(" ", inserted["content"][0]["text"])
+            self.assertEqual(
+                replay_module.REASONING_TEXT_PLACEHOLDER,
+                inserted["content"][0]["text"],
+            )
             self.assertIn("call_9", inserted["id"])
             self.assertEqual("message", calls[1]["input"][2]["type"])
             self.assertEqual("function_call", calls[1]["input"][3]["type"])

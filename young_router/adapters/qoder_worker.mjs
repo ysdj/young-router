@@ -233,6 +233,17 @@ function readBody(req) {
 }
 
 /**
+ * The one spelling this worker answers when the upstream *queued* the model.
+ *
+ * ``young_router.proxy.routing`` reads this phrase (``upstream queued``) before
+ * any status-worded classifier, because LiteLLM's exception carries no
+ * structured field for the queue and the envelope's own HTTP status is a 403
+ * that would otherwise read as a refused credential.  The proxy's marker list
+ * and this string are the same fact; change both together.
+ */
+const UPSTREAM_QUEUED_PREFIX = 'qoder upstream queued:'
+
+/**
  * One upstream failure, in the vocabulary LiteLLM and its clients classify by.
  *
  * A pre-first-byte failure is a non-200 JSON answer: LiteLLM reads
@@ -243,6 +254,29 @@ function readBody(req) {
  */
 function errorStatus(error) {
   const kind = typeof error?.kind === 'string' ? error.kind : ''
+  const queue = error?.queue
+  // The upstream put this model in its own queue and the service itself is up
+  // (``isQueued: true`` and not ``serviceAvailable: false``).  The account, the
+  // credential and this worker are all fine; what the answer asks for is a
+  // later attempt, and it states how much later.  Only the message is rewritten:
+  // the envelope's own status is an HTTP 403, and the transport mapping for a
+  // transient upstream failure (502) stays as it is.  A 429 would be the more
+  // literal "come back later", but the managed router retries a rate-limit
+  // failure eight times (``RateLimitErrorRetries``) before it answers, so one
+  // queued turn would spend eight upstream calls inside the same request and
+  // hold the client for the whole backoff.  The queue facts therefore ride in
+  // the message (with ``Retry-After`` from ``retryAfterMs``), where the proxy's
+  // classifier reads them without inviting a retry storm.
+  let message = String(error?.message ?? error ?? 'upstream error')
+  if (queue && typeof queue === 'object' && queue.isQueued === true && queue.serviceAvailable !== false) {
+    const seconds = typeof queue.retryAfterSeconds === 'number' && Number.isFinite(queue.retryAfterSeconds)
+      ? Math.max(1, Math.ceil(queue.retryAfterSeconds))
+      : undefined
+    const depth = typeof queue.queueCount === 'number' && Number.isFinite(queue.queueCount)
+      ? ` (queuecount ${queue.queueCount})`
+      : ''
+    message = `${UPSTREAM_QUEUED_PREFIX}${depth}${seconds === undefined ? '' : `; retry after ${seconds}s`}`
+  }
   const mapping = {
     network: [502, 'connection_error'],
     auth: [401, 'invalid_api_key'],
@@ -254,7 +288,7 @@ function errorStatus(error) {
     unknown: [500, 'upstream_error'],
   }
   const [status, code] = mapping[kind] ?? [500, 'upstream_error']
-  return { status, code, kind: kind || 'unknown', message: String(error?.message ?? error ?? 'upstream error') }
+  return { status, code, kind: kind || 'unknown', message }
 }
 
 /** The upstream total, read the way the plugin's own credits view reads it. */
@@ -329,6 +363,82 @@ function thinkingEffortsOf(model) {
     ...(names.length > 0 ? { thinkingEfforts: names } : {}),
     ...(typeof declaredDefault === 'string' && declaredDefault !== '' ? { defaultThinkingEffort: declaredDefault } : {}),
   }
+}
+
+/**
+ * The upstream's model list is one array per client surface it calls a scene.
+ *
+ * The chat call goes out as ``cosy-scene: assistant`` (the package's own
+ * ``DEFAULT_HEADERS``), and that is the scene Qoder's own model menu lists
+ * (its order is Auto, Fast, HungerG, … — measured from the CN desktop app on
+ * 2026-11-25).  The package's ``fetchModels`` reads only ``chat``, so a row
+ * the assistant scene adds is missing from this account's list even though
+ * the same gateway accepts a chat to it.  HungerG (``hmodel``) is exactly
+ * that row: it is only in ``assistant``, and a chat to it answers with the
+ * upstream's own queue envelope (code 10605) rather than "model not found".
+ *
+ * ``chat`` is kept as the second scene so a row that only that surface lists
+ * is still callable here; assistant order wins because that is the order
+ * Qoder's own menu shows.
+ */
+const CATALOG_SCENES = Object.freeze(['assistant', 'chat'])
+/**
+ * ``auto`` is the upstream's router row, not a model id this worker can serve.
+ * The package's ``fetchModels`` drops it (its private ``ROUTER_MODEL_IDS``), so
+ * a direct scene read must not resurrect it.
+ */
+const CATALOG_ROUTER_KEYS = Object.freeze(new Set(['auto']))
+
+/**
+ * The rows one ``model/list`` document offers this worker's chat surface.
+ *
+ * ``undefined`` means the document states no scene this adapter knows: the
+ * caller then asks the package's own ``fetchModels`` instead of answering an
+ * empty catalog.  A row without a key or a display name is not a model; a
+ * duplicate key is answered once, by the earlier scene.
+ */
+function catalogRowsOf(document) {
+  const rows = []
+  const seen = new Set()
+  for (const scene of CATALOG_SCENES) {
+    const listed = document?.[scene]
+    if (!Array.isArray(listed)) continue
+    for (const row of listed) {
+      if (!row || typeof row !== 'object') continue
+      const key = typeof row.key === 'string' ? row.key.trim().toLowerCase() : ''
+      const name = typeof row.display_name === 'string' ? row.display_name.trim() : ''
+      if (key === '' || name === '' || CATALOG_ROUTER_KEYS.has(key) || seen.has(key)) continue
+      seen.add(key)
+      rows.push(row)
+    }
+  }
+  return rows.length > 0 ? rows : undefined
+}
+
+/**
+ * This region's catalog, preferring the scene its chat requests are sent as.
+ *
+ * ``bearerGet`` is the package's signed read, so no protocol is reimplemented
+ * here: only which array of the answered document is the catalog.  A package
+ * release that renames the seam, or a document without the scenes, falls back
+ * to ``fetchModels`` — the catalog this worker had before the direct read.
+ */
+async function readCatalog(client, pat) {
+  try {
+    const region = client?.region ?? {}
+    const gateway = typeof region.gateway === 'string' ? region.gateway : ''
+    const path = typeof region.modelsPath === 'string' ? region.modelsPath : ''
+    if (typeof client?.bearerGet === 'function' && gateway !== '' && path !== '') {
+      const holder = await client.ensureSession(pat)
+      const rows = catalogRowsOf(await client.bearerGet(holder, `${gateway}${path}`))
+      if (rows !== undefined) return rows
+    }
+  } catch {
+    // The package's own read below names the failure if it is real (an auth
+    // error stays an auth error); a scene this adapter cannot find is not a
+    // reason to answer no catalog at all.
+  }
+  return client.fetchModels(pat)
 }
 
 /** One upstream catalog row, in the shape the Core's catalog reader consumes. */
@@ -659,7 +769,7 @@ class RegionRuntime {
     const token = credential.pat
     let models
     try {
-      models = await this._call(credential, () => this.client.fetchModels(token))
+      models = await this._call(credential, () => readCatalog(this.client, token))
     } catch (error) {
       this.catalogError = String(error?.message ?? error)
       if (errorStatus(error).kind === 'auth' && credential.source === 'app') {
@@ -668,7 +778,7 @@ class RegionRuntime {
         this._desktopSessionCache = undefined
         const retried = await this.credential()
         if (retried?.source === 'app') {
-          models = await this._call(retried, () => this.client.fetchModels(retried.pat))
+          models = await this._call(retried, () => readCatalog(this.client, retried.pat))
         } else {
           throw error
         }
@@ -1153,7 +1263,7 @@ async function main() {
 
 // Importable for the tests below without starting a listener: the entry point
 // runs only when this file is the process's main module.
-export { loadUpstream, normalizeModel, creditsOf, errorStatus }
+export { loadUpstream, catalogRowsOf, readCatalog, normalizeModel, creditsOf, errorStatus }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   main().catch(error => {

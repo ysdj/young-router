@@ -182,6 +182,10 @@ from .base import (
     _UPSTREAM_CLIENT_VERSION_REJECTION_MARKERS,
     _UPSTREAM_CLIENT_VERSION_REJECTION_PATTERN,
     _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS,
+    _UPSTREAM_QUEUE_WAIT_FLAG_MARKERS,
+    _UPSTREAM_QUEUE_WAIT_DETAIL_MARKERS,
+    _UPSTREAM_QUEUE_WAIT_EXPLICIT_MARKERS,
+    _UPSTREAM_QUEUE_WAIT_SECONDS_PATTERN,
     _UPSTREAM_CHANNEL_REFUSED_ERROR_MARKERS,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
@@ -438,6 +442,8 @@ def _settle_failed_attempt(
         # the row still has to say the turn ended in an error rather than in an
         # interruption.
         error = {"reason": "stream_error"}
+    if _hold_queued_recent_request_row(request_data, request_id, error, exception):
+        return True
     if not _state_module._settle_failed_request(
         request_id,
         error,
@@ -477,6 +483,82 @@ def _remember_failed_hop(
         request_id,
         error,
         deployment_id=_deployment_id_from_request(request_kwargs),
+    )
+
+
+def _hold_queued_recent_request_row(
+    request_data: Optional[dict],
+    request_id: str,
+    error: Mapping[str, Any],
+    exception: BaseException,
+) -> bool:
+    """Keep the row of an attempt the upstream queued in flight.
+
+    Two endings write this attempt's terminal row -- ``_settle_failed_attempt``
+    and LiteLLM's own failure callback -- and both must leave a queued answer
+    alone: the turn is still alive through the wait the upstream stated, so a
+    失败 row written now reports a turn that ended where it is only waiting
+    (live 2026-11-25: Codex showed 正在思考 while every row of the turn said
+    失败).  The row keeps its in-flight status, names the queue and its wait, and
+    the watch the hold installs closes it as this refusal when the wait passes
+    with no further attempt.
+    """
+
+    if not isinstance(exception, Exception) or not isinstance(request_id, str):
+        return False
+    if not request_id.strip() or not _is_upstream_queue_wait_error(exception):
+        return False
+    queue_wait = _upstream_queue_wait_seconds(exception)
+    if queue_wait is None:
+        # The answer named the queue but no delay: nothing states how long the
+        # turn is meant to stay open, so the row keeps the ordinary terminal
+        # path (which still reports the queue as its reason).
+        return False
+    held = _state_module._hold_recent_request_for_queue_wait(
+        request_id.strip(),
+        error,
+        wait_seconds=min(queue_wait, _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS),
+    )
+    if held is None:
+        return False
+    if held == "written":
+        _trace_module._request_route_trace(
+            "request_log_held_for_upstream_queue",
+            request_data or {},
+            retry_after_seconds=queue_wait,
+            exception=_trace_exception(exception),
+        )
+    return True
+
+
+def _hold_queued_request_row(
+    request_kwargs: Optional[dict],
+    response_obj: Any = None,
+) -> bool:
+    """The logging-callback entry point for the same hold.
+
+    LiteLLM's failure callback writes a row of its own for an attempt that
+    failed before any stream existed, and that is the path a pre-dispatch queue
+    answer takes.  Routing it through the same hold keeps the two writers from
+    disagreeing about whether a queued attempt is over.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    exception = _request_log_exception(request_kwargs, response_obj)
+    if not isinstance(exception, Exception):
+        return False
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return False
+    error = _request_log_error_summary({"exception": exception}, None)
+    if not error:
+        error = {"reason": "stream_error"}
+    return _hold_queued_recent_request_row(
+        request_kwargs,
+        request_id,
+        error,
+        exception,
     )
 
 
@@ -1366,6 +1448,14 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     # so a station that refuses every channel cannot hold the client for the
     # whole recovery window.
     if _is_upstream_channel_refused_error(exception):
+        return _RECOVERY_POLICY_RECOVERY
+
+    # The upstream said the model is queued and when to come back.  Its own
+    # status for that is a 403, which the raw-status branch below parks as a
+    # policy refusal: that cooldown removed a healthy route from every later
+    # attempt for a wait the upstream had already bounded.  Nothing was refused
+    # and nothing else about the route changed, so this is recovery.
+    if _is_upstream_queue_wait_error(exception):
         return _RECOVERY_POLICY_RECOVERY
 
     if _is_no_deployments_available_error(exception):
@@ -4572,6 +4662,10 @@ def _request_log_error_summary(
             error["failed_route_key"] = traced.get("failed_deployment_route_key")
         if traced.get("failed_deployment_order") is not None:
             error["failed_deployment_order"] = traced.get("failed_deployment_order")
+        if traced.get("retry_after_seconds") is not None:
+            # A queued upstream stated how long the wait is; the 请求 row says
+            # it instead of leaving the reader to guess from the timestamps.
+            error["retry_after_seconds"] = traced.get("retry_after_seconds")
 
     for source_key, target_key in (
         ("error_type", "type"),
@@ -6985,6 +7079,13 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         # which side of the relay the refusal belonged to, and the credential
         # label sent the reader to refresh an account that was never refused.
         reason = "upstream-channel-refused"
+    elif _is_upstream_queue_wait_error(exception):
+        # The upstream queued this model behind its own wait.  Read by the 403
+        # marker below it became a rejected session, which sent the reader to
+        # refresh an account that was never refused (live 2026-11-25: Codex
+        # thread 01a211fa showed 正在思考 while every row of its turn said
+        # 上游会话被拒绝).
+        reason = "upstream-queued"
     elif _is_upstream_session_rejected_error(exception):
         reason = "upstream-session-rejected"
     elif _is_upstream_account_restricted_error(exception):
@@ -7087,6 +7188,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
             exception
         ),
         "recovery_policy": _recovery_policy_for_exception(exception),
+        # The wait the upstream itself stated, when it stated one.  The row and
+        # the recovery pane read the same field, so no consumer re-parses the
+        # envelope to say how long the queue asked for.
+        **({"retry_after_seconds": wait} if (wait := _upstream_queue_wait_seconds(exception)) is not None else {}),
     }
 
 
@@ -7172,6 +7277,24 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
                 "error: the channel it selected refused the turn. The route's "
                 "key was accepted, and the next attempt may reach another "
                 "channel, so this route is not parked."
+            ),
+        }
+    elif _is_upstream_queue_wait_error(exception):
+        queue_wait = _upstream_queue_wait_seconds(exception)
+        result = {
+            "kind": "upstream_queued",
+            "title": "The upstream queued this model",
+            "detail": (
+                "The upstream accepted the route's credential and put this "
+                "model in its own queue"
+                + (
+                    f"; it stated a {queue_wait:g} s wait before the next "
+                    "attempt"
+                    if queue_wait is not None
+                    else "; it stated no wait for the next attempt"
+                )
+                + ". Nothing is broken at this route and no account needs "
+                "signed in again."
             ),
         }
     elif _is_upstream_account_restricted_error(exception):
@@ -7623,6 +7746,19 @@ def _route_exhaustion_retry_delay_for_exception(
 ) -> float:
     if configured_delay_seconds <= 0:
         return 0.0
+    queue_wait = (
+        _upstream_queue_wait_seconds(exception)
+        if _is_upstream_queue_wait_error(exception)
+        else None
+    )
+    if queue_wait is not None:
+        # The queued upstream stated its own wait.  Retrying before it drains
+        # pays the same envelope again, and the same-route round exists to wait
+        # this out rather than to poll a backlog.
+        return max(
+            configured_delay_seconds,
+            min(queue_wait, _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS),
+        )
     if _exception_status_code(exception) != 429:
         return configured_delay_seconds
     retry_after = _exception_retry_after_seconds(exception)
@@ -9153,6 +9289,12 @@ def _is_repeatable_transient_route_failure(exception: Exception) -> bool:
 
     if _is_no_deployments_available_error(exception):
         return False
+    if _is_upstream_queue_wait_error(exception):
+        # The upstream put this model in its own queue: the route's credential
+        # and its channel are fine, and the wait it stated is what the next
+        # attempt obeys.  Counting it would park a healthy route after the
+        # configured threshold and hide the queue behind a cooldown.
+        return False
     if _is_local_shutdown_exception(exception):
         return False
     if _is_local_stream_timeout_error(exception):
@@ -9986,7 +10128,52 @@ def _is_upstream_session_rejected_error(exception: Exception) -> bool:
     """
 
     text = _exception_text(exception).lower()
+    if _is_upstream_queue_wait_error(exception):
+        return False
     return any(marker in text for marker in _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS)
+
+
+def _is_upstream_queue_wait_error(exception: Exception) -> bool:
+    """Whether the upstream queued this model instead of refusing the account.
+
+    ``http 403`` is the status Qoder's CN gateway answers with while the model
+    sits in its own queue (business code 10605, ``isQueued: true``,
+    ``queueCount``, ``retryAfterSeconds``).  The envelope names the queue and the
+    wait, so the account is not the problem: the route's credential is intact and
+    the upstream is asking for a later attempt.  Read by the 403 marker it became
+    a rejected session, which parked a healthy route and wrote 上游会话被拒绝 into
+    every row of a turn that was only waiting (live 2026-11-25).
+    """
+
+    text = _exception_text(exception).lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _UPSTREAM_QUEUE_WAIT_EXPLICIT_MARKERS):
+        return True
+    return any(
+        marker in text for marker in _UPSTREAM_QUEUE_WAIT_FLAG_MARKERS
+    ) and any(marker in text for marker in _UPSTREAM_QUEUE_WAIT_DETAIL_MARKERS)
+
+
+def _upstream_queue_wait_seconds(exception: Exception) -> Optional[float]:
+    """The wait the upstream's queue envelope itself stated, in seconds.
+
+    ``None`` means the answer named the queue but no delay: the reader then
+    knows the model is queued and that the upstream did not say for how long,
+    which is a different fact from "wait zero seconds".
+    """
+
+    text = _exception_text(exception)
+    if not text:
+        return None
+    match = _UPSTREAM_QUEUE_WAIT_SECONDS_PATTERN.search(text)
+    if match is None:
+        return None
+    try:
+        seconds = float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return seconds if 0 < seconds < float("inf") else None
 
 
 def _is_upstream_channel_refused_error(exception: Exception) -> bool:
@@ -10376,6 +10563,31 @@ def _sanitized_upstream_route_failure_message(
             "selects its upstream channel per attempt, so another attempt can "
             "be served by a different one; send the message again. This "
             "attempt's stream ended without a terminal response event."
+        )
+    if _is_upstream_queue_wait_error(exception):
+        # The upstream queued the model and stated when to come back; nothing
+        # was refused and no account needs signing in again.  The sentence
+        # carries the wait so the reader (and the client's retry classifier)
+        # knows a later attempt is the right move.
+        queue_wait = _upstream_queue_wait_seconds(exception)
+        wait_sentence = (
+            f" It reported a {queue_wait:g} s wait before the next attempt can"
+            " be served."
+            if queue_wait is not None
+            else " It reported no wait for the next attempt."
+        )
+        route_scope = (
+            " This group configures no other route, so the next attempt reaches "
+            "the same queue."
+            if _request_group_deployment_count(request_kwargs) == 1
+            else " No other candidate route answered it either."
+        )
+        return (
+            f"The upstream queued this model behind its own backlog for "
+            f"{model_group}.{wait_sentence} The route's credential was "
+            f"accepted.{route_scope} This attempt's stream ended without a "
+            "terminal response event; send the message again once the queue "
+            "has drained."
         )
     if _is_upstream_session_rejected_error(exception):
         # The route's own credential is what the upstream refused, even though

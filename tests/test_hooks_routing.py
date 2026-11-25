@@ -5269,6 +5269,80 @@ class HookRoutingTests(HookTestCase):
             hooks._recovery_policy_for_exception(credential),
         )
 
+    def test_an_upstream_queue_is_not_a_rejected_session(self) -> None:
+        """A queued model is a wait, not a refused credential.
+
+        Qoder's CN gateway answers ``HTTP 403`` with its own queue envelope
+        (``code 10605``, ``isQueued: true``, ``queueCount``,
+        ``retryAfterSeconds``) while the account and the key are fine.  Read by
+        the 403 marker this became ``upstream-session-rejected``: a healthy
+        route was cooled down for the whole of its backlog, and every row of
+        the turn said 上游会话被拒绝 while Codex showed 正在思考 and retried every
+        30 s (live 2026-11-25, thread 01a211fa).
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        envelope = (
+            "litellm.BadGatewayError: OpenAIException - 上游信封错误: http 403 "
+            '{"code":"403","message":"{\\"code\\":\\"10605\\",'
+            '\\"message\\":\\"{\\\\"isqueued\\\\":true,'
+            '\\\\"modelkey\\\\":\\\\"hmodel\\\\",'
+            '\\\\"queuecount\\\\":9031,\\\\"queuetype\\\\":\\\\"p3\\\\",'
+            '\\\\"retryafterseconds\\\\":30,'
+            '\\\\"serviceavailable\\\\":true}\\"}"}'
+        )
+        exception = RuntimeError(envelope)
+        exception.status_code = 502
+
+        self.assertTrue(hooks._is_upstream_queue_wait_error(exception))
+        self.assertFalse(hooks._is_upstream_session_rejected_error(exception))
+        self.assertEqual(30.0, hooks._upstream_queue_wait_seconds(exception))
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_RECOVERY,
+            hooks._recovery_policy_for_exception(exception),
+        )
+        # The route is waiting on its own queue, not broken: parking it would
+        # hide the queue behind a cooldown on every later attempt.
+        self.assertFalse(
+            hooks._should_count_deployment_failure_for_cooldown(exception)
+        )
+        traced = hooks._trace_exception(exception)
+        self.assertEqual("upstream-queued", traced["reason"])
+        self.assertEqual(30.0, traced["retry_after_seconds"])
+        self.assertEqual(
+            "upstream_queued", hooks._recovery_diagnostic(exception)["kind"]
+        )
+
+        message = hooks._sanitized_upstream_route_failure_message(
+            "hungerg",
+            exception,
+            {"model": "hungerg"},
+        )
+        # The stop names the queue and its wait, and it never sends the reader
+        # to refresh an account that was not refused.
+        self.assertIn("queued", message)
+        self.assertIn("30 s", message)
+        self.assertIn("credential was accepted", message)
+        self.assertNotIn("refused the credential", message)
+        self.assertNotIn("refresh that route's account", message)
+
+        # A credential refusal keeps its own branch and its own policy.
+        credential = RuntimeError(
+            "litellm.BadGatewayError: OpenAIException - upstream refused "
+            "(http 403): forbidden"
+        )
+        self.assertFalse(hooks._is_upstream_queue_wait_error(credential))
+        self.assertTrue(hooks._is_upstream_session_rejected_error(credential))
+
+        # The bundled adapter states the same fact in words once the body is
+        # gone; the queue reading may not depend on the escaped JSON spelling.
+        worker_sentence = RuntimeError(
+            "qoder upstream queued: (queuecount 9031); retry after 30s"
+        )
+        self.assertTrue(hooks._is_upstream_queue_wait_error(worker_sentence))
+        self.assertEqual(30.0, hooks._upstream_queue_wait_seconds(worker_sentence))
+
     def test_an_empty_pool_is_not_charged_to_the_only_route(self) -> None:
         """The pool answer for *this request* is not a failure of a route.
 

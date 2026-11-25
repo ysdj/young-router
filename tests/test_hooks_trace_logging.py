@@ -634,6 +634,114 @@ class HookTraceLoggingTests(HookTestCase):
                     "the settlement watch inherited the request body",
                 )
 
+    async def test_the_failure_callback_also_leaves_a_queued_attempt_open(self) -> None:
+        """The other writer of the same row agrees about the queue.
+
+        A failure that happens before any stream exists is reported by LiteLLM's
+        own logging callback, not by ``_settle_failed_attempt``.  That is the
+        path a queued pre-dispatch answer takes (measured on the live host
+        2026-11-25), so the callback has to keep the row in flight too -- a
+        terminal row from either writer would contradict the other.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "hungerg",
+                "stream": True,
+                "litellm_call_id": "queued-callback-call",
+            }
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+            exception = RuntimeError(
+                "qoder upstream queued: (queuecount 9031); retry after 30s"
+            )
+            exception.status_code = 502
+            await hook.async_log_failure_event(
+                kwargs,
+                exception,
+                start,
+                start + timedelta(milliseconds=400),
+            )
+
+            records = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=10_000)
+                if line.strip()
+            ]
+            self.assertEqual("pending", records[-1]["status"])
+            self.assertEqual(
+                {"reason": "upstream-queued", "retry_after_seconds": 30.0},
+                records[-1]["queue_wait"],
+            )
+
+    async def test_a_queued_upstream_keeps_its_row_in_flight(self) -> None:
+        """The upstream's queue is a wait, not the end of the attempt.
+
+        Qoder's CN gateway answers ``http 403`` with ``isQueued: true`` and
+        ``retryAfterSeconds: 30`` while its model sits in its own queue.  The
+        turn is still in flight: the client waits through the stated delay
+        inside the same request.  Writing the attempt's terminal row there made
+        请求 read 失败 for minutes while Codex showed 正在思考 (live 2026-11-25,
+        thread 01a211fa).  The row therefore keeps its in-flight status and
+        names the queue, and only a wait that ends with no further attempt turns
+        it into the refusal the upstream gave.
+        """
+
+        hooks, _ = load_hook_module()
+        state = sys.modules["young_router.proxy.state"]
+        hook = hooks.YoungRouterHook()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            request_data = {
+                "call_type": "aresponses",
+                "model": "hungerg",
+                "input": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "litellm_call_id": "queued-call",
+            }
+            await hook.async_pre_call_deployment_hook(
+                request_data, call_type="aresponses"
+            )
+            exception = RuntimeError(
+                "qoder upstream queued: (queuecount 9031); retry after 30s"
+            )
+            exception.status_code = 502
+
+            self.assertTrue(hooks._settle_failed_attempt(request_data, exception))
+            rows = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=10_000)
+                if line.strip()
+            ]
+            self.assertEqual("pending", rows[-1]["status"])
+            self.assertEqual(
+                {"reason": "upstream-queued", "retry_after_seconds": 30.0},
+                rows[-1]["queue_wait"],
+            )
+            self.assertNotIn("error", rows[-1])
+
+            # The watch the hold installed closes the row as the queue refusal
+            # once the stated wait passes with no attempt under the same id.
+            await state._settle_recent_request_after_queue_wait(
+                request_data["litellm_call_id"], 0
+            )
+            rows = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=10_000)
+                if line.strip()
+            ]
+            self.assertEqual("failure", rows[-1]["status"])
+            self.assertEqual("upstream-queued", rows[-1]["error"]["reason"])
+            self.assertEqual(30.0, rows[-1]["error"]["retry_after_seconds"])
+
     async def test_a_client_that_stops_reading_closes_its_row_at_once(self) -> None:
         """Pressing stop is an ending no callback reports.
 
