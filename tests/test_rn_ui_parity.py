@@ -1038,7 +1038,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             '"providers.probe": "探测"',
             '"providers.deepTest": "探测"',
-            '"providers.deepTestHint": "先验可用性，再用 modelprint 指纹表核对这一路到底服务哪个模型"',
+            '"providers.deepTestHint": "先验可用性，再核对指纹"',
             '"providers.degradationUnavailable": "核验不可用"',
             '"providers.degradationError": "核验失败"',
         ):
@@ -2001,7 +2001,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         the row could not do, and 获取模型 could only fail.  Neither sentence is
         drawn now.  The table's own headers and the ＋ stay, and the fetch row
         appears once a configured or relay key, or a signed-in login account,
-        exists.
+        exists.  The free lane is the one keyless kind that still offers the
+        row: its adapter, not a user credential, owns the roster it reads.
         """
 
         self.assertIn("const providerHasModelCredential = useMemo(() => {", self.ui)
@@ -2009,6 +2010,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>", self.ui)
         self.assertNotIn("providers.modelsEmpty", self.ui)
         self.assertNotIn("providers.modelsEmptyHint", self.ui)
+        self.assertNotIn('if (providerKindSelected === "ourFreeModel") return false;', self.ui)
+
+    def test_the_free_lane_offers_its_own_fetch_without_a_key_picker(self) -> None:
+        """获取模型 on the free lane reads the adapter's roster, not a user key.
+
+        The lane mints its own slot and publishes its roster through
+        ``our_free_model_models``; the credential gate excluded `ourFreeModel`
+        outright, so the one provider whose roster this app can always read had
+        no way to read it again after the create.  The lane's own availability
+        gates the row now, and no picker is drawn because the lane names no
+        credential of the user's.
+        """
+
+        workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split("function TablePane(", 1)[0]
+        self.assertIn('if (providerKindSelected === "ourFreeModel") return providerAuthStatus(provider) === "signed_in";', workspace)
+        # The picker stays absent for a keyless kind...
+        self.assertIn("if (providerHoldsNoKey) return [];", workspace)
+        # ...and the press addresses the lane's own catalog through the adapter.
+        self.assertIn("const ownerService = providerHoldsNoKey", workspace)
+        self.assertIn("? managedServiceForSlot(true, providerAuthKind(provider))", workspace)
+        self.assertIn("handleFetchedServiceModels(summary, laneService);", workspace)
 
     def test_the_fetch_press_sends_only_the_listing(self) -> None:
         """获取模型 asks for one roster; the station refresh it ran first is gone.
@@ -5558,6 +5580,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'if (language === "yaml") return "ace/mode/yaml";',
             "function configureEditor(command: ReplaceDocumentCommand): void",
             "aceEditor.session.setUseWorker(false);",
+            # A whole document handed over by the host is not a user edit.
+            # Ace's `Editor#setValue` keeps the session history, so the first
+            # ⌘Z after opening a file used to restore the empty document.
+            "function applyHostDocument(editor: AceEditor, text: string, cursorAtEnd: boolean): void {",
+            "editor.session.setValue(text);",
+            "applyHostDocument(aceEditor, normalizedText(command.value), false);",
+            "if (replaceText) applyHostDocument(aceEditor, nextText, !documentChanged);",
             "function createEditor(command: ReplaceDocumentCommand): void",
             "aceEditor = aceApi.edit(",
             'aceEditor.session.on("change", reportChange);',
@@ -5579,6 +5608,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "diffSummaryElement",
         ):
             self.assertNotIn(marker, self.code_editor_web)
+        # Undo steps belong to edits made in the editor; a host replacement
+        # must never enter that history as one full-document delta.
+        self.assertNotIn("aceEditor.setValue(", self.code_editor_web)
         self.assertNotIn('fontSize: "13px"', self.code_editor_web)
         self.assertIn('return platform === "windows" ? "16px/1.45" : "12px/1.55";', self.code_editor_page)
         self.assertIn("font: ${aceEditorFont(platform)} ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;", self.code_editor_page)
@@ -6935,6 +6967,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('field="provider_auth_token"', editor)
         self.assertNotIn("将打开 Claude 官方网页完成登录", self.zh)
         self.assertNotIn("official Claude sign-in page opens in your browser", self.en)
+
+    def test_an_account_that_could_not_be_renewed_offers_its_own_re_login(self) -> None:
+        """The expired row is the only state with no other way back.
+
+        Beside an account, − signs out (deletes the credential) and + starts a
+        *second* account.  So a session Core could not renew had no recovery in
+        the pane at all, even though Core can renew that same reference when the
+        sign-in names it.  The re-login therefore names the row's own account and
+        is drawn only for that state, and it is the person's answer to a grant
+        the issuer refused — so it must not sit behind the refresh backoff.
+        """
+
+        editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
+        for marker in (
+            'dispatchWithOutcome("service_provider.auth_start", { provider_id: id, account_ref: accountRef }, "providers_models")',
+            'providerAuthStatus(selectedAuthAccount) === "expired"',
+            'translate("relay.officialProviderRelogin")',
+        ):
+            self.assertIn(marker, editor)
+        self.assertIn('"relay.officialProviderRelogin": "重新登录"', self.zh)
+        self.assertIn('"relay.officialProviderRelogin": "Sign in again"', self.en)
+        # The action is a sign-in, so it presents the challenge the wizard and
+        # the workspace already present rather than a second window of its own.
+        relogin = editor.split("const reloginAccount = async", 1)[1].split("const logoutAccount", 1)[0]
+        self.assertIn("presentProviderAuthChallenge(", relogin)
+        # Core keeps the same account: the reference is passed through, so the
+        # renewed credential lands on the row that could not be refreshed.
+        self.assertNotIn('{ provider_id: id }, "providers_models")', relogin)
 
     def test_unified_workspace_stages_relay_and_provider_drafts_together(self) -> None:
         for marker in (
@@ -10168,11 +10228,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "void field.commit().catch(() => undefined);",
             "hasPendingFieldEdits())",
             "registry?.setDirty(fieldId.current, true);",
-            "const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 500;",
-            "const TEXT_INPUT_COMMIT_DEBOUNCE_MS = 500;",
-            "const secretDebounceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);",
-            "if (autoCommit) {",
-            "}, SECRET_INPUT_COMMIT_DEBOUNCE_MS);",
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
             "refreshAfter = true",
             "if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) {",
@@ -10198,9 +10253,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (!dirtyRef.current) {\n      committedRef.current = value;", pending_hook)
         self.assertIn("onDraftChangeRef.current?.(next);", pending_hook)
         self.assertIn("if (dirtyRef.current) void commit().catch(() => undefined);", pending_hook)
-        self.assertIn("if (commitTimer.current !== undefined) clearTimeout(commitTimer.current);", pending_hook)
-        self.assertIn("}, TEXT_INPUT_COMMIT_DEBOUNCE_MS);", pending_hook)
-        self.assertIn("if (dirtyRef.current) void commit().catch(() => undefined);", pending_hook)
+        # Typing only marks the draft dirty.  A quiet-period timer staged every
+        # half-typed value (a number still being typed, a name still being
+        # spelled) and applied it, so the field now writes at commit points
+        # only: Enter, blur, the pane's flush, or the window close.
+        self.assertNotIn("setTimeout", pending_hook)
+        self.assertNotIn("COMMIT_DEBOUNCE", pending_hook)
+        self.assertIn("onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }}", self.ui)
+        self.assertIn("onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }}", self.ui)
+        # The browser secret leaf has no timer either: its own commit points are
+        # the field's blur and Enter, the same two the native hosts answer.
+        web_secret_leaf = (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8").split("function WebSecureTextInput(", 1)[1].split("/** One stable DOM id", 1)[0]
+        self.assertIn("const commitFromField = (): void => {", web_secret_leaf)
+        self.assertIn("onBlur={commitFromField}", web_secret_leaf)
+        self.assertIn("onSubmitEditing={multiline ? undefined : commitFromField}", web_secret_leaf)
+        self.assertNotIn("setTimeout", web_secret_leaf)
+        self.assertNotIn("secretDebounceTimer", self.ui)
+        self.assertNotIn("SECRET_INPUT_COMMIT_DEBOUNCE_MS", self.ui)
+        self.assertNotIn("TEXT_INPUT_COMMIT_DEBOUNCE_MS", self.ui)
+        # The browser host is the one surface with no close handshake: it warns
+        # while a draft is dirty instead of letting the tab take the text away.
+        self.assertIn('if (Platform.OS !== "web" || typeof window === "undefined") return;', self.ui)
+        self.assertIn('window.addEventListener("beforeunload", guard);', self.ui)
+        self.assertIn("event.preventDefault();\n      event.returnValue = \"\";", self.ui)
         self.assertIn("onDraftChange={onNameDraftChange}", self.ui)
         self.assertIn("drafts?.providerDisplayName(provider)", self.ui)
         self.assertIn("setProviderNameDraft", self.ui)

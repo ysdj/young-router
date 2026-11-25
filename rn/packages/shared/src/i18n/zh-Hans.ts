@@ -189,6 +189,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.routeTrace.retry": "第 {value} 次重试",
   "logs.routeTrace.maxRetries": "最多重试 {value} 次",
   "logs.routeTrace.retryDelay": "{value} 秒后重试",
+  "logs.requestRetryAfter": "{value} 秒后重试",
   "logs.routeTrace.protocolResponses": "Responses",
   "logs.routeTrace.protocolChat": "Chat",
   "logs.routeTrace.protocolMessages": "Messages",
@@ -244,6 +245,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.routeTrace.reasonGateway": "上游网关请求错误",
   "logs.routeTrace.reasonResponses": "上游不支持 Responses 请求格式",
   "logs.routeTrace.reasonNetwork": "上游网络连接失败",
+  "logs.routeTrace.reasonQueued": "上游排队中",
   "logs.routeTrace.reasonTemporary": "上游临时不可用",
   "logs.routeTrace.reasonTerminal": "请求因提示词或策略终止",
   "logs.routeTrace.reasonStreamStartTimeout": "上游首包超时",
@@ -689,7 +691,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.preciseDetail": "量化核验: {detail}",
   "providers.probe": "探测",
   "providers.deepTest": "探测",
-  "providers.deepTestHint": "先验可用性，再用 modelprint 指纹表核对这一路到底服务哪个模型",
+  "providers.deepTestHint": "先验可用性，再核对指纹",
   // The Images wire has no dry run: the only honest availability test is one
   // picture.  Said before the press, because the user pays for it.
   "providers.probeImagesHint": "发一次生图请求验可用性（会计费）",
@@ -1044,6 +1046,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.officialProviderSignOutAllTitle": "退出全部账号的登录？",
   "relay.officialProviderSignOutAllBody": "{name} 下的账号将全部退出，在你重新登录之前，它的线路不会再作答。",
   "relay.officialProviderCancel": "停止登录",
+  "relay.officialProviderRelogin": "重新登录",
+  "relay.officialProviderReloginHint": "这次登录无法自动续期，请重新登录该账号。",
   "relay.officialProviderMultiAccountHint": "可同时启用多个账号，请求自动分流。",
   "relay.officialProviderApiKeyHint": "只有 API 密钥时，用「自定义」添加一条 https://api.openai.com/v1 线路。",
   "relay.officialProviderWebViewHint": "将打开原生登录窗口。凭据只留在服务商页面，漾路由只接收登录状态。",

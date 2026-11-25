@@ -23,6 +23,14 @@ _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _LEGACY_OPENAI_SESSION_REF = "chatgpt-account"
 _SAFE_STATUS = {"signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"}
 _MAX_ERROR_BYTES = 160
+#: How long one failed refresh keeps the next attempt from being made.
+#:
+#: Every snapshot projection reads each account's status, so an account whose
+#: refresh token the issuer refuses would otherwise send a token refresh on
+#: every render of the provider pane, the log view, and the scheduled check.
+#: The wait is the pane's own backoff, not a verdict about the sign-in: the
+#: person's next explicit re-login (`start`) clears it.
+_REFRESH_BACKOFF_SECONDS = 60
 
 
 def _chatgpt_account_identity(auth: Mapping[str, Any]) -> str:
@@ -100,6 +108,16 @@ class ProviderAuthManager:
         # poll times out, and a flag could not tell that worker apart from the
         # attempt that replaced it.
         self._attempts: dict[str, int] = {}
+        # One refresh at a time per account, and when each last failed.  A
+        # refresh rotates the refresh token, so two concurrent attempts with
+        # the same old token would race and one of them would be refused for
+        # good; the failed-at stamp is the backoff above.
+        self._refreshing: dict[str, threading.Lock] = {}
+        self._refresh_failed_at: dict[str, float] = {}
+        # The result of the last successful renew: Core is built once per service
+        # and several of its readers project the same credential, so the answer
+        # is stated here instead of being re-verified by every projection.
+        self._refresh_settled: dict[str, dict[str, Any]] = {}
         self._active_openai_file = self.root / "active-openai.json"
 
     def _canonical_ref(self, kind: str, ref: str) -> str:
@@ -254,6 +272,163 @@ class ProviderAuthManager:
         self._write_active_openai_ref(ref)
         return {"status": "signed_in", "configured": True, "active": True, "credential_ref": ref}
 
+    def _refresh_lock(self, ref: str) -> threading.Lock:
+        with self._lock:
+            lock = self._refreshing.get(ref)
+            if lock is None:
+                lock = threading.Lock()
+                self._refreshing[ref] = lock
+            return lock
+
+    def _refresh_chatgpt_tokens(self, ref: str, *, wait: bool = True) -> dict[str, Any] | None:
+        """Redeem this account's refresh token, and return its new record.
+
+        The access token a ChatGPT sign-in minted lasts hours, the refresh
+        token lasts weeks: a fleet that only ever read ``expires_at`` therefore
+        reported every account as expired as soon as the first token aged out,
+        even though the grant behind it was still good.  The exchange is
+        LiteLLM's own (it is the same call the proxy adapter makes when a
+        request finds the token stale), and the record it writes is the shape
+        the adapter reads back.
+
+        ``wait`` is the caller's patience, not a preference.  A projection that
+        answers a snapshot (``status``) passes ``False``: it starts the renewal
+        and returns at once, because a snapshot is read while a person waits
+        for a window, and an unreachable issuer would otherwise hold that
+        window for the exchange's whole timeout.  A request that is *about* the
+        credential (a model listing, a probe) passes ``True`` and gets the new
+        token, since it could not ask the upstream without one.
+
+        Returns the refreshed record, or ``None`` when this account cannot be
+        refreshed right now (no refresh token, an exchange the issuer refused,
+        a refresh that just failed and is still backing off, or one still in
+        flight for a caller that does not wait).  Nothing here ever raises: a
+        status projection must still answer when the network does not.
+        """
+
+        with self._lock:
+            failed_at = self._refresh_failed_at.get(ref)
+        if failed_at is not None and time.time() - failed_at < _REFRESH_BACKOFF_SECONDS:
+            return None
+        # Plain lookups only while the caller's own lock is not held: the record
+        # below is read under this manager's lock, and nesting the two orders
+        # would be a deadlock waiting for a second thread.
+        with self._lock:
+            settled = self._refresh_settled.get(ref)
+        if isinstance(settled, dict):
+            settled_expiry = settled.get("expires_at")
+            if isinstance(settled_expiry, (int, float)) and time.time() < float(settled_expiry) - 60:
+                # This exact credential was just renewed; asking the issuer again
+                # would rotate the token once more for no reason.
+                return dict(settled)
+        # The account's own directory is audited before the exchange, exactly as
+        # every other read of it is: a symlinked account directory is refused
+        # rather than written through.
+        try:
+            auth_file = self._secure_chatgpt_auth_file(ref)
+            stored = read_json(auth_file)
+        except Exception:
+            return None
+        if not isinstance(stored, dict):
+            return None
+        refresh_token = stored.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return None
+        lock = self._refresh_lock(ref)
+        if not wait:
+            # One renewal per account is in flight at most, and the caller is
+            # told nothing yet: the row keeps reading 登录已过期 for the second or
+            # two the exchange takes, and the next snapshot states the answer.
+            if lock.locked():
+                return None
+            threading.Thread(
+                target=self._refresh_chatgpt_tokens,
+                args=(ref,),
+                daemon=True,
+                name=f"litellm-refresh-{ref}",
+            ).start()
+            return None
+        if not lock.acquire(blocking=False):
+            # Another caller is already redeeming this grant; its answer is the
+            # one to read, so wait for that lock rather than start a second
+            # exchange with the same old token.
+            lock.acquire()
+            lock.release()
+            with self._lock:
+                record = self._refresh_settled.get(ref)
+            return dict(record) if isinstance(record, dict) else None
+        try:
+            # Re-read under the lock: the token may have rotated while this
+            # caller waited for its own lock to be free.
+            stored = read_json(auth_file)
+            refresh_token = stored.get("refresh_token") if isinstance(stored, dict) else None
+            if not isinstance(refresh_token, str) or not refresh_token:
+                return None
+            expires_at = stored.get("expires_at")
+            if isinstance(expires_at, (int, float)) and time.time() < float(expires_at) - 60:
+                # Another caller refreshed it between the two reads.
+                return dict(stored)
+            # LiteLLM's adapter cannot refresh from inside a running event loop
+            # worker; this is an ordinary Core thread, which can.  The exchange
+            # is called directly rather than through ``get_access_token``:
+            # that method falls back to a *device-code login*, which waits for a
+            # person and would hold this thread for the poll's whole lifetime
+            # from inside what is supposed to be a status read.
+            from litellm.llms.chatgpt.authenticator import Authenticator
+
+            auth = Authenticator.__new__(Authenticator)
+            auth.token_dir = str(auth_file.parent)
+            auth.auth_file = str(auth_file)
+            auth._refresh_tokens(refresh_token)
+            record = read_json(auth_file)
+            if not isinstance(record, dict) or not record.get("access_token"):
+                return None
+            with self._lock:
+                self._refresh_failed_at.pop(ref, None)
+                self._refresh_settled[ref] = dict(record)
+            return dict(record)
+        except Exception:
+            with self._lock:
+                self._refresh_failed_at[ref] = time.time()
+            return None
+        finally:
+            lock.release()
+
+    def _status_from_auth(self, ref: str, auth: Mapping[str, Any]) -> dict[str, Any]:
+        """The projection of one readable credential, refreshed if it aged out.
+
+        A credential whose access token has expired is renewed once before it
+        is called expired: the token is short-lived by design and the grant
+        behind it usually is not, so "expired" is the answer only after the
+        redemption the adapter itself would have made has been tried and
+        refused.  A refresh that fails is why the person sees 登录已过期 and the
+        pane's re-login action.
+        """
+
+        # Which account this credential belongs to.  A pane that offers "sign
+        # out" over a row that only says "OpenAI" is asking the person to end a
+        # session they cannot name, and with several accounts on one provider it
+        # cannot be inferred from the row.  The id token already states it;
+        # nothing else is read from it.
+        account = _chatgpt_account_identity(auth)
+        identity = {"account": account} if account else {}
+        active = self.active_openai_ref(ref, auth) == ref
+        # Backoff is asked of the refresh itself; reading it here as well made
+        # the expired branch skip the very call that would have cleared it.
+        expires_at = auth.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
+            # The renewal starts here and reports on a later read: this method
+            # answers a snapshot, and a snapshot may not wait on the network.
+            refreshed = self._refresh_chatgpt_tokens(ref, wait=False)
+            if refreshed is not None:
+                auth = refreshed
+                account = _chatgpt_account_identity(auth)
+                identity = {"account": account} if account else {}
+                expires_at = auth.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
+            return {"status": "expired", "configured": True, "active": active, "expires_at": expires_at, **identity}
+        return {"status": "signed_in", "configured": True, "active": active, "expires_at": expires_at, **identity}
+
     def chatgpt_request_credential(self, credential_ref: str) -> dict[str, str]:
         """The bearer and account id a signed-in ChatGPT account asks with.
 
@@ -266,6 +441,17 @@ class ProviderAuthManager:
         auth = read_json(self._secure_chatgpt_auth_file(ref))
         if not isinstance(auth, dict):
             return {}
+        expires_at = auth.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
+            # The caller is about to ask the upstream as this account.  An
+            # access token the issuer already aged out answers 401 there, which
+            # the pane can only read as "the login is gone"; the refresh the
+            # adapter would make on that same request is made here first, so a
+            # listing or a probe is not refused over a token that was still
+            # renewable.
+            refreshed = self._refresh_chatgpt_tokens(ref)
+            if isinstance(refreshed, dict):
+                auth = refreshed
         token = auth.get("access_token")
         if not isinstance(token, str) or not token:
             return {}
@@ -275,24 +461,63 @@ class ProviderAuthManager:
             credential["account_id"] = account_id
         return credential
 
+    def _pending_authorization(self, ref: str) -> dict[str, Any] | None:
+        """The challenge of a sign-in this account is waiting on, or nothing.
+
+        Only a worker that is still alive counts.  A record left in
+        ``authorizing`` by a process that has since restarted, or by an attempt
+        whose poll timed out, describes no live challenge: reporting it would
+        print a device code nobody is waiting for and hide the credential's real
+        state behind it.
+        """
+
+        with self._lock:
+            thread = self._threads.get(ref)
+            state = dict(self._states.get(ref, {}))
+        if thread is None or not thread.is_alive() or state.get("status") != "authorizing":
+            return None
+        result: dict[str, Any] = {"status": "authorizing", "configured": False, "active": False}
+        for key in ("user_code", "verification_uri"):
+            value = state.get(key)
+            if isinstance(value, str) and value:
+                result[key] = value
+        # Keep saying who is signing in.  The challenge replaces the credential's
+        # own state, and leaving the account id out made the row that a person
+        # was re-authorizing render with no address at all -- the list said
+        # 正在等待登录 beside an empty name, which reads as a different, nameless
+        # account.  The identity is not part of the challenge and does not
+        # depend on the sign-in finishing; it comes from the credential still on
+        # disk, which is the account this attempt belongs to.
+        identity = self._pending_account_identity(ref)
+        if identity:
+            result["account"] = identity
+        return result
+
+    def _pending_account_identity(self, ref: str) -> str:
+        """The account a sign-in belongs to, read without touching the network."""
+
+        try:
+            auth = read_json(self._secure_chatgpt_auth_file(ref))
+        except Exception:
+            return ""
+        return _chatgpt_account_identity(auth) if isinstance(auth, dict) else ""
+
     def status(self, kind: str, credential_ref: str) -> dict[str, Any]:
         ref = self._canonical_ref(kind, credential_ref)
         if kind == "openai_login":
             auth_file = self._secure_chatgpt_auth_file(ref)
             auth = read_json(auth_file)
             if isinstance(auth, dict) and isinstance(auth.get("access_token"), str) and auth.get("access_token"):
-                expires_at = auth.get("expires_at")
-                # Which account this credential belongs to.  A pane that offers
-                # "sign out" over a row that only says "OpenAI" is asking the
-                # person to end a session they cannot name, and with several
-                # accounts on one provider it cannot be inferred from the row.
-                # The id token already states it; nothing else is read from it.
-                account = _chatgpt_account_identity(auth)
-                identity = {"account": account} if account else {}
-                active = self.active_openai_ref(ref, auth) == ref
-                if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
-                    return {"status": "expired", "configured": True, "active": active, "expires_at": expires_at, **identity}
-                return {"status": "signed_in", "configured": True, "active": active, "expires_at": expires_at, **identity}
+                # A sign-in in progress outranks the credential it is replacing.
+                # 重新登录 on an expired account starts a device code while the old
+                # (unusable) credential is still on disk; reading the file first
+                # kept reporting that grant as expired, so the pane never saw
+                # 正在等待登录, never showed the code, and the sign-in it had just
+                # started could not be finished.
+                pending = self._pending_authorization(ref)
+                if pending is not None:
+                    return pending
+                return self._status_from_auth(ref, auth)
             with self._lock:
                 state = dict(self._states.get(ref, {}))
             result: dict[str, Any] = {
@@ -329,6 +554,12 @@ class ProviderAuthManager:
             # superseded worker now goes stale instead of blocking the new one.
             generation = self._attempts.get(ref, 0) + 1
             self._attempts[ref] = generation
+            # A press of 登录 is the person's own answer to a session this
+            # account could not renew: the backoff that kept silent refreshes
+            # from repeating belongs to the attempt that failed, not to this
+            # one.
+            self._refresh_failed_at.pop(ref, None)
+            self._refresh_settled.pop(ref, None)
             self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
             thread = threading.Thread(
                 target=self._run_chatgpt,
@@ -377,6 +608,10 @@ class ProviderAuthManager:
             raise ValueError("Provider credentials could not be removed") from None
         with self._lock:
             self._states.pop(ref, None)
+            # A credential that no longer exists has neither a settled renew nor
+            # a backoff: a later sign-in to the same reference starts clean.
+            self._refresh_settled.pop(ref, None)
+            self._refresh_failed_at.pop(ref, None)
         return {"status": "signed_out", "configured": False}
 
     def environment(self) -> dict[str, str]:

@@ -547,6 +547,54 @@ def _station_display_name(origin: str) -> str:
     return origin
 
 
+def _label_is_station_origin(label: object, origin: object) -> bool:
+    """Whether an account label is only another spelling of its station URL.
+
+    Account labels are user-facing metadata, not a second URL store.  Older
+    records used the URL as the label, so a station rename left a stale
+    ``https://www.example`` string behind even after the station origin was
+    canonicalized.  Only labels that parse to the same station identity are
+    eligible for repair; ordinary names remain user-owned.
+    """
+
+    if not isinstance(label, str) or not label.strip() or not isinstance(origin, str) or not origin.strip():
+        return False
+    raw = label.strip()
+    # A bare host is still an URL-shaped label, while a normal name such as
+    # "Relay" is not treated as one unless it resolves to the station itself.
+    candidate = raw if "://" in raw else f"https://{raw.lstrip('/')}"
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.strip("/")
+    ):
+        return False
+    try:
+        return _station_origin_key(candidate) == _station_origin_key(str(origin))
+    except RelayAccountsError:
+        return False
+
+
+def _account_label_for_station(label: object, station: Mapping[str, str]) -> str:
+    """Repair only a URL-shaped account label while retaining normal names."""
+
+    value = label.strip() if isinstance(label, str) else ""
+    if not _label_is_station_origin(value, station.get("origin", "")):
+        return value
+    station_name = str(station.get("name", "")).strip()
+    if station_name and not _label_is_station_origin(station_name, station.get("origin", "")):
+        return station_name
+    return _station_display_name(str(station.get("origin", "")))
+
+
 def _private_station(
     raw: Mapping[str, Any],
     *,
@@ -2425,6 +2473,10 @@ class RelayAccountsDomain:
                 relinked_accounts = True
             account["station_id"] = station["id"]
             account["origin"] = station["origin"]
+            repaired_label = _account_label_for_station(account.get("label"), station)
+            if account.get("label") != repaired_label:
+                relinked_accounts = True
+                account["label"] = repaired_label
 
         raw_cleanups = loaded.get("pending_credential_cleanups", [])
         if not isinstance(raw_cleanups, list) or len(raw_cleanups) > MAX_PENDING_CLEANUPS:
@@ -2685,6 +2737,7 @@ class RelayAccountsDomain:
                     moved["origin"] = target["origin"]
                 moved["type"] = new_type
                 moved["station_id"] = target_id
+                moved["label"] = _account_label_for_station(moved.get("label"), target)
                 self._accounts[account_index] = _private_account(moved)
             self._stations.pop(index)
             self._remember_removal(station_ids=(source_id,))
@@ -2710,6 +2763,7 @@ class RelayAccountsDomain:
                 self._session_secrets.pop(str(account["id"]), None)
                 updated = self._invalidate_account_session(account, new_origin)
             updated["type"] = new_type
+            updated["label"] = _account_label_for_station(updated.get("label"), self._stations[index])
             self._accounts[account_index] = _private_account(updated)
 
     def _move_account_to_station(self, index: int, station: Mapping[str, str]) -> None:
@@ -2725,6 +2779,7 @@ class RelayAccountsDomain:
             updated = copy.deepcopy(account)
             updated["origin"] = new_origin
         updated["station_id"] = station["id"]
+        updated["label"] = _account_label_for_station(updated.get("label"), station)
         self._accounts[index] = _private_account(updated)
         if old_station_id and old_station_id != station["id"] and self._station_account_count(old_station_id) == 0:
             self._stations = [item for item in self._stations if item["id"] != old_station_id]
@@ -3124,7 +3179,9 @@ class RelayAccountsDomain:
                 raise RelayAccountsError("Relay account type is invalid")
             station_ids_before = {station["id"] for station in self._stations}
             station, account_origin = self._account_station(data, account_type)
-            label = data.get("label", data.get("username", station["name"]))
+            label = _account_label_for_station(
+                data.get("label", data.get("username", station["name"])), station
+            )
             try:
                 account = _private_account(
                     {
@@ -4255,6 +4312,7 @@ class RelayAccountsDomain:
             data["station_origin"] = station_origin
         station_ids_before = {station["id"] for station in self._stations}
         station, account_origin = self._account_station(data, account_type)
+        data["label"] = _account_label_for_station(data["label"], station)
         try:
             account = _private_account(
                 {

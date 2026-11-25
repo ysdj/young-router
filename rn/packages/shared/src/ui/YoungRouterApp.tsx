@@ -930,13 +930,10 @@ const compactStyles = StyleSheet.create({
 const SETTINGS_DISK_POLL_MS = 5_000;
 // Immediate settings commit: a staged control change applies shortly after the
 // last edit so the runtime picks it up without an explicit Apply button. The
-// short debounce coalesces rapid toggles into one Core apply; it sits *after*
-// the text/secret field's own quiet period, so a typed value lands in about
-// 700 ms rather than a full second.
+// short debounce coalesces rapid toggles into one Core apply; a text field
+// stages nothing before the user states the value (Enter or blur), so its
+// apply starts right after that one commit.
 const IMMEDIATE_APPLY_DEBOUNCE_MS = 200;
-// Text fields use the same quiet-period behavior as VS Code's autosave: the
-// field stays responsive locally, then one settled value is staged and applied.
-const TEXT_INPUT_COMMIT_DEBOUNCE_MS = 500;
 const LOG_VIEW_POLL_MS = 5_000;
 const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
@@ -1049,13 +1046,6 @@ const DSH_VISION_ROUTER_QUICK_DEFAULTS: Record<string, string> = {
   YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED: "off",
   YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED: "off",
 };
-// Ordinary configuration text stays local until blur, submit, or the shell's
-// automatic save. Core
-// publishes a full settings snapshot for every staged change, so committing
-// active typing would make every settings surface pay for unrelated edits.
-// Native secret inputs keep a short quiet-period commit because their values
-// intentionally never enter React state.
-const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 500;
 const RAW_EDITOR_SYNC_INTERVAL_MS = 120;
 
 function sameDiskState(left: DiskState | undefined, right: DiskState | undefined): boolean {
@@ -4195,6 +4185,21 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     onRegisterFlush(() => flushAndApply.current());
     return () => onRegisterFlush(undefined);
   }, [onRegisterFlush, shell]);
+  // The browser host has no window-close handshake: the native hosts ask React
+  // to flush and close only after the answer, while a document can be torn down
+  // the moment the tab or the address bar takes it away, and a commit's fetch
+  // dies with the page.  A dirty draft therefore asks the browser's own leave
+  // confirmation, the one place a page can still speak before it goes.
+  useEffect(() => {
+    if (Platform.OS !== "web" || typeof window === "undefined") return;
+    if (!hasPendingFieldEdits()) return;
+    const guard = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", guard);
+    return () => window.removeEventListener("beforeunload", guard);
+  }, [hasPendingFieldEdits, pendingFieldRevision]);
   const inspectImportDataManagement = async (): Promise<IpcResults["import_preview"] | undefined> => {
     let inspected: IpcResults["import_preview"] | undefined;
     await runDataManagement("import", async () => {
@@ -7606,8 +7611,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const shownChallenge = useRef<Record<string, string>>({});
   // A provider that holds no key of its own has nothing for 获取模型 to pick:
   // WorkBuddy's sign-in belongs to the desktop app, and the free lane imports
-  // its roster on create.  Listing a synthesized "key" for them only put a
-  // picker with one meaningless name beside 获取模型.
+  // its roster on create and reads it through its own adapter afterwards.
+  // Listing a synthesized "key" for them only put a picker with one meaningless
+  // name beside 获取模型; the fetch row itself stays (see
+  // `providerHasModelCredential`).
   const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyGlobal"
     || providerKindSelected === "ourFreeModel";
   const relayAccountPrefixByID = useMemo(() => relayAccountPrefixes(snapshot), [snapshot]);
@@ -7655,9 +7662,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // sentence at all; keep the table's own headers and the ＋ that adds a key or
   // model, and show the fetch action only once a key (or a signed-in login
   // account) exists.
+  // The free lane holds no user key and its Core-owned slot is not a picker
+  // choice, but the lane's adapter publishes the roster 获取模型 reads; its own
+  // availability, not a credential, is what the fetch row needs.  Hiding the
+  // row here left that roster with no way to ask again.
   const providerHasModelCredential = useMemo(() => {
     if (!provider) return false;
-    if (providerKindSelected === "ourFreeModel") return false;
+    if (providerKindSelected === "ourFreeModel") return providerAuthStatus(provider) === "signed_in";
     if (fetchKeyChoices.some((choice) =>
       choice.kind === "account" || choice.kind === "relay" || choice.state?.configured === true
     )) return true;
@@ -7822,7 +7833,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // Poll official-account authorizations so a login that starts here (or in
   // the wizard window) still completes its device-code challenge.
   useEffect(() => {
-    const authorizing = providers.filter((entry) => providerAuthStatus(entry) === "authorizing");
+    // One entry per provider that has *any* sign-in waiting, which is not the
+    // same as a row whose own state says so: a re-login on an expired account
+    // starts a device code while a sibling account is still signed in, and the
+    // row then reports 已登录.  Reading only the row state left that challenge
+    // with nothing to poll for, so the window that shows its code never opened.
+    const authorizing = providers.filter((entry) => providerAuthStatus(entry) === "authorizing"
+      || asRecords(entry.accounts).some((account) => providerAuthStatus(account) === "authorizing"));
     if (authorizing.length === 0) return;
     const timer = setInterval(() => {
       for (const entry of authorizing) {
@@ -7830,8 +7847,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         if (kind !== "openai_login") continue;
         const providerID = editorIdentifier(entry);
         const label = stringValue(entry.display_name, stringValue(entry.name, serviceProviderKindLabel(kind, translate)));
-        void dispatchWithOutcome("service_provider.auth_status", { provider_id: providerID }, "providers_models", true)
-          .then((next) => presentProviderAuthChallenge(native, translate, next, kind, label, providerID, shownChallenge.current))
+        // The account whose challenge is waiting, so the code is attributed to
+        // the account that is signing in rather than to the row.  The
+        // projection that names it is the same one the status read answers
+        // with, so the poll's own request is aimed at that account.
+        const pendingAccount = asRecords(entry.accounts).find((account) => providerAuthStatus(account) === "authorizing");
+        const accountRef = stringValue(pendingAccount?.ref);
+        void dispatchWithOutcome(
+          "service_provider.auth_status",
+          accountRef ? { provider_id: providerID, account_ref: accountRef } : { provider_id: providerID },
+          "providers_models",
+          true,
+        )
+          .then((next) => presentProviderAuthChallenge(native, translate, next, kind, label, accountRef || providerID, shownChallenge.current))
           .catch(() => undefined);
       }
     }, 1_000);
@@ -10893,6 +10921,24 @@ function ProviderEditor({ provider, relayStations, ipc, native, busy, translate,
       setAuthPending(undefined);
     }
   };
+  const reloginAccount = async (accountRef: string): Promise<void> => {
+    if (!accountRef || authPending !== undefined) return;
+    // 重新登录 is the expired row's own recovery, and it names that row's
+    // account: Core renews this account's record in place instead of appending
+    // a new one.  Without it the only controls beside an expired account were
+    // − (sign out, which deletes the credential) and + (a *new* account), so a
+    // session the account could not renew had no way back except by hand.
+    setAuthPending(`relogin:${accountRef}`);
+    try {
+      const kindLogin: ServiceProviderKind = "openai_login";
+      const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: id, account_ref: accountRef }, "providers_models");
+      presentProviderAuthChallenge(native, translate, next, kindLogin, providerKindLabel(kind, translate), accountRef, shownChallenge.current);
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+    } finally {
+      setAuthPending(undefined);
+    }
+  };
   const logoutAccount = async (accountRef: string): Promise<void> => {
     if (!accountRef || authPending !== undefined) return;
     // Signing out ends this row's session and takes the account off the list;
@@ -11097,6 +11143,16 @@ function ProviderEditor({ provider, relayStations, ipc, native, busy, translate,
               readable, so it wraps instead of ellipsizing. */}
           <TooltipText tooltip={providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")} accessibilityLabel={providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")} selectable style={styles.providerAuthStatusValue}>{providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")}</TooltipText>
         </View>
+        {/* A session Core could not renew is the one state the account row has
+            no other action for: − ends the account and + starts a *second* one,
+            so without this button the way back was deleting the account and
+            signing in again.  It is drawn only for that state, and it names the
+            account it renews. */}
+        {providerAuthStatus(selectedAuthAccount) === "expired" ? <View style={styles.fieldRow}>
+          <Text style={styles.fieldLabel} />
+          <NativeButton title={translate("relay.officialProviderRelogin")} compact busy={authPending === `relogin:${stringValue(selectedAuthAccount.ref)}`} disabled={(busy || loginBusy) && authPending !== `relogin:${stringValue(selectedAuthAccount.ref)}`} onPress={() => { void reloginAccount(stringValue(selectedAuthAccount.ref)); }} />
+          <Text numberOfLines={2} style={styles.keysHint}>{translate("relay.officialProviderReloginHint")}</Text>
+        </View> : null}
       </View> : null}
     </View> : null}
     {!isLogin && station ? <StationAccountsPanel
@@ -13173,9 +13229,11 @@ type PendingTextFieldState = {
   hasError: () => boolean;
 };
 
-// Ordinary text keeps its draft local for the short autosave quiet period,
-// then commits without requiring a blur or an explicit Apply. Blur, submit and
-// the shell's close/navigation flush remain immediate fallback commit points.
+// Ordinary text keeps its draft local while it is being typed and reaches Core
+// only at a commit point: Enter, blur, the pane being left, or the window
+// closing. There is deliberately no quiet-period autosave: half-typed text is
+// not a value the user stated, and every commit stages a settings document and
+// applies it.
 function usePendingTextField(value: string, onCommit: (next: string) => void | Promise<unknown>, label: string, onDraftChange?: (next: string) => void, validate?: (next: string) => string | undefined): PendingTextFieldState {
   const [draft, setDraft] = useState(value);
   const [error, setError] = useState<string>();
@@ -13187,7 +13245,6 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   const dirtyRef = useRef(false);
   const errorRef = useRef<string | undefined>(undefined);
   const commitInFlight = useRef<Promise<void> | undefined>(undefined);
-  const commitTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const onCommitRef = useRef(onCommit);
   const onDraftChangeRef = useRef(onDraftChange);
   const validateRef = useRef(validate);
@@ -13216,10 +13273,6 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   }, [registry]);
 
   const commit = useCallback(async (): Promise<void> => {
-    if (commitTimer.current !== undefined) {
-      clearTimeout(commitTimer.current);
-      commitTimer.current = undefined;
-    }
     while (dirtyRef.current) {
       const existing = commitInFlight.current;
       if (existing) {
@@ -13256,23 +13309,13 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
     // re-validates before anything reaches Core.
     if (errorRef.current !== undefined) setFieldError(undefined);
     // If an earlier staged value is still in flight, returning to the last
-    // known draft still needs one more stage after that write finishes.
+    // known draft still needs one more stage after that write finishes. The
+    // draft itself stays here: only a commit point writes it.
     const dirty = next !== committedRef.current || commitInFlight.current !== undefined;
     setDirty(dirty);
-    if (commitTimer.current !== undefined) clearTimeout(commitTimer.current);
-    if (dirty) {
-      commitTimer.current = setTimeout(() => {
-        commitTimer.current = undefined;
-        void commit().catch(() => undefined);
-      }, TEXT_INPUT_COMMIT_DEBOUNCE_MS);
-    }
-  }, [commit, setDirty, setFieldError]);
+  }, [setDirty, setFieldError]);
 
   const reset = useCallback((): void => {
-    if (commitTimer.current !== undefined) {
-      clearTimeout(commitTimer.current);
-      commitTimer.current = undefined;
-    }
     const next = valueRef.current;
     committedRef.current = next;
     draftRef.current = next;
@@ -13285,10 +13328,6 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   // Reset-to-default must clear an uncommitted local draft too, otherwise the
   // field keeps showing the old value after the Core value returns to default.
   const resetTo = useCallback((next: string): void => {
-    if (commitTimer.current !== undefined) {
-      clearTimeout(commitTimer.current);
-      commitTimer.current = undefined;
-    }
     committedRef.current = next;
     draftRef.current = next;
     setDraft(next);
@@ -13296,12 +13335,6 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
     setFieldError(undefined);
     setDirty(false);
   }, [setDirty, setFieldError]);
-
-  useEffect(() => {
-    return () => {
-      if (commitTimer.current !== undefined) clearTimeout(commitTimer.current);
-    };
-  }, []);
 
   useEffect(() => {
     registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current, hasError: () => errorRef.current !== undefined, flushBeforeAssistantEditor: true });
@@ -13628,11 +13661,12 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
     fittedHeight.current = wanted;
     onSetContentSize(600, wanted);
   };
-  // The native secure field stages the password through Core as it is typed;
-  // its value never enters this process. It is still part of this one draft,
+  // The native secure field stages the password through Core at its own
+  // commit points (end editing, Enter, or this form's flush); its value never
+  // enters this process. It is still part of this one draft,
   // so a save that changed nothing else must apply it (and 关闭 drops it).
   //
-  // The ref is what the write itself reads: the field's own debounce can land
+  // The ref is what the write itself reads: the field's own commit can land
   // while that call awaits its flush. The state is the footer's copy of the
   // same fact, because a disabled-looking button is a render and a ref moving
   // does not render one.
@@ -13650,8 +13684,8 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
     setTesting(true);
     setActionError(undefined);
     try {
-      // A password typed a moment ago may still be inside the field's own
-      // debounce; flushing it lets the probe test it too, and 关闭 still drops
+      // A password typed a moment ago is still only a draft in the field;
+      // flushing it lets the probe test it too, and 关闭 still drops
       // what Core staged for this form.
       await onFlushPendingFields();
       await onProbe(webDavDetailProbe(values));
@@ -13688,8 +13722,8 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
     let written = false;
     let nothingToWrite = false;
     try {
-      // A password typed a moment ago may still be inside the field's own
-      // debounce: flush it (the secret field registers an awaitable commit)
+      // A password typed a moment ago is still only a draft in the field:
+      // flush it (the secret field registers an awaitable commit)
       // before the one apply this button sends.
       await onFlushPendingFields();
       const patch = webDavDetailPatch(values, saved);
@@ -14256,6 +14290,10 @@ const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
   "responses-schema-unsupported": "logs.routeTrace.reasonResponses",
   "image-parameter-or-capability-bad-request": "logs.routeTrace.reasonResponses",
   "upstream-network-connectivity": "logs.routeTrace.reasonNetwork",
+  // The upstream put this model in its own queue and stated when to come back.
+  // Without this branch the reason fell to ``other`` and the cell said only
+  // 失败, which read as a broken route while the client was still retrying.
+  "upstream-queued": "logs.routeTrace.reasonQueued",
   "upstream-temporary-class": "logs.routeTrace.reasonTemporary",
   "upstream-temporary-text": "logs.routeTrace.reasonTemporary",
   "terminal-prompt-or-policy": "logs.routeTrace.reasonTerminal",
@@ -14317,6 +14355,16 @@ function requestStatusLabel(value: string, translate: Translate, record?: Record
   const status = translate(key);
   if (!record) return status;
   const details = [status];
+  // A row still in flight can be waiting out a queue the upstream itself
+  // stated.  Without this the cell said only 发送中 beside a turn whose request
+  // log had been naming 上游会话被拒绝; the queue and its wait are the fact the
+  // reader needs to tell "waiting for an answer" from "stuck".
+  const queueWait = asRecord(record.queue_wait);
+  if (Object.keys(queueWait).length > 0 && !record.error) {
+    details.push(translate("logs.routeTrace.reasonQueued"));
+    const queueSeconds = compactLogValue(queueWait.retry_after_seconds);
+    if (queueSeconds) details.push(translate("logs.requestRetryAfter", { value: queueSeconds }));
+  }
   if (key === "logs.aborted") {
     details.push(requestAbortedDetail(record.aborted, translate, ""));
   } else if (key === "logs.failed" || key === "logs.stuck") {
@@ -14324,6 +14372,11 @@ function requestStatusLabel(value: string, translate: Translate, record?: Record
     const reasonCode = compactLogValue(error.reason);
     const httpStatus = compactLogValue(error.status_code);
     details.push(requestErrorReasonLabel(reasonCode === "other" ? "" : reasonCode, translate, httpStatus ? `HTTP ${httpStatus}` : ""));
+    // A queued upstream states its own wait.  The cell carries the delay the
+    // way the route trace does, so the reader sees the same number the router
+    // will obey instead of guessing from two rows thirty seconds apart.
+    const retryAfter = compactLogValue(error.retry_after_seconds);
+    if (retryAfter) details.push(translate("logs.requestRetryAfter", { value: retryAfter }));
   }
   if (record.internal_attempt === "head_hedge") {
     details.push(translate("logs.siblingDispatch"));
@@ -14496,6 +14549,9 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
     timeout: "logs.recoveryReason.timeout",
     upstream_channel_refused: "logs.recoveryReason.stationChannelRefused",
     upstream_model_unavailable: "logs.routeTrace.reasonModelUnavailable",
+    // The route is healthy and the upstream put its model in a queue: the
+    // recovery pane says which wait this is instead of "正在重试".
+    upstream_queued: "logs.routeTrace.reasonQueued",
     unknown: "logs.recoveryReason.unknown",
   };
   return value.split(" · ").map((part) => {
@@ -16935,10 +16991,12 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, mu
   const fieldId = useRef(Symbol(`${domain}:${field}:${target ?? ""}`));
   const statusRef = useRef(status);
   const dirtyRef = useRef(false);
-  const secretDebounceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const commitSequence = useRef(0);
   const pendingCommit = useRef<{ promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } | undefined>(undefined);
   const requestSecretCommit = useCallback((): Promise<void> => {
+    // An auto-commit secret stages at its own host field's commit points (Enter
+    // and end editing), so typing leaves it dirty here and nothing is written
+    // until one of those points, this flush, or the window close asks for it.
     const currentStatus = statusRef.current;
     if (currentStatus !== "dirty" && currentStatus !== "saving") return Promise.resolve();
     if (pendingCommit.current) return pendingCommit.current.promise;
@@ -16965,10 +17023,6 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, mu
   }, [autoCommit, requestSecretCommit]);
   const commit = useCallback((): Promise<void> => requestSecretCommit(), [requestSecretCommit]);
   const reset = useCallback((): void => {
-    if (secretDebounceTimer.current !== undefined) {
-      clearTimeout(secretDebounceTimer.current);
-      secretDebounceTimer.current = undefined;
-    }
     pendingCommit.current?.resolve();
     pendingCommit.current = undefined;
     dirtyRef.current = false;
@@ -16976,10 +17030,6 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, mu
     if (!autoCommit) setResetRequest((current) => current + 1);
   }, [autoCommit, registry]);
   useEffect(() => {
-    if (secretDebounceTimer.current !== undefined) {
-      clearTimeout(secretDebounceTimer.current);
-      secretDebounceTimer.current = undefined;
-    }
     pendingCommit.current?.resolve();
     pendingCommit.current = undefined;
     statusRef.current = "ready";
@@ -16989,7 +17039,6 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, mu
   useEffect(() => {
     registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current });
     return () => {
-      if (secretDebounceTimer.current !== undefined) clearTimeout(secretDebounceTimer.current);
       pendingCommit.current?.resolve();
       pendingCommit.current = undefined;
       registry?.register(fieldId.current);
@@ -17002,18 +17051,7 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, mu
     if (state.status === "dirty") {
       dirtyRef.current = true;
       registry?.setDirty(fieldId.current, true);
-      if (autoCommit) {
-        if (secretDebounceTimer.current !== undefined) clearTimeout(secretDebounceTimer.current);
-        secretDebounceTimer.current = setTimeout(() => {
-          secretDebounceTimer.current = undefined;
-          void requestSecretCommit().catch(() => undefined);
-        }, SECRET_INPUT_COMMIT_DEBOUNCE_MS);
-      }
     } else if (state.status === "saved" || state.status === "ready" || state.status === "error") {
-      if (secretDebounceTimer.current !== undefined) {
-        clearTimeout(secretDebounceTimer.current);
-        secretDebounceTimer.current = undefined;
-      }
       dirtyRef.current = false;
       registry?.setDirty(fieldId.current, false);
       const pending = pendingCommit.current;

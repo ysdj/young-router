@@ -1044,6 +1044,32 @@ class CodexSettingsDomain:
         self._catalog_url_checked_at = 0.0
         return True
 
+    def _keep_served_catalog_current(self) -> None:
+        """Rebuild the served catalog while no local client is switched on.
+
+        ``_catalog_response`` answers whoever fetches the address, and that
+        client need not be on this machine: a remote Codex presents this
+        proxy's key and reads the same body.  Without this pass the view was
+        only refreshed when a local client named the catalog, so a host that
+        serves other machines answered nothing until an unrelated reload.
+
+        The source probe has already run; a failed one is not an observed empty
+        list, so the last good body is kept.  Nothing is written to a client.
+        """
+
+        if not self._catalog_source_is_available(self._raw):
+            return
+        names = self._catalog_model_names(self._raw)
+        if not names:
+            return
+        native_models = self._catalog_native_models()
+        if native_models is None:
+            return
+        base_slug = self._catalog_base_profile(native_models)
+        # ``_catalog_payload_for`` is keyed on the inputs, so a pass that finds
+        # nothing new pays a comparison rather than a rebuild.
+        self._catalog_payload_for(names, native_models, base_slug)
+
     def _catalog_payload_for(
         self,
         names: Sequence[str],
@@ -1339,15 +1365,20 @@ class CodexSettingsDomain:
         require_stable_repair: bool = False,
     ) -> bool:
         delivery = self._catalog_delivery(self._raw)
-        if delivery == "off":
-            # Nothing is switched on: an untouched client keeps its own list.
-            self._reset_catalog_repair_observation()
-            return False
         pointer = self._catalog_pointer(self._raw)
         owned_pointer = pointer is not None and pointer in self._managed_catalog_paths()
         plugin_pointer = pointer is not None and pointer.name == PLUGIN_CATALOG_FILE_NAME
         dangling = owned_pointer and not pointer.exists()
         source_refreshed = self._refresh_live_catalog_source(force=force_source_refresh)
+        if delivery == "off":
+            # No client on this machine reads the catalog, but the address this
+            # app serves does not belong to one client: another machine points
+            # its own Codex at it, with no local app in the loop at all.  So the
+            # served body stays current even here -- only the client-side writes
+            # below are off, and an untouched client keeps its own list.
+            self._keep_served_catalog_current()
+            self._reset_catalog_repair_observation()
+            return False
         if not self._catalog_source_is_available(self._raw):
             self._reset_catalog_repair_observation()
             if dangling and source_refreshed:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import threading
 import tomllib
 import unittest
@@ -813,6 +814,70 @@ class ServedRouteTests(unittest.TestCase):
             status, body = call("sk-synthetic-master")
             self.assertEqual(200, status)
             self.assertEqual(["public-a"], [model["slug"] for model in json.loads(body)["models"]])
+
+    def test_a_client_that_names_no_catalog_still_gets_the_served_one(self) -> None:
+        """The address belongs to whoever fetches it, not to this machine's client.
+
+        A remote Codex presents this proxy's key and reads ``/codex/models``
+        while no local client has the catalog switched on.  The pass that keeps
+        the body warm therefore cannot be gated on this machine's delivery.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, domain = self._core(root)
+            self.assertEqual("off", domain.snapshot()["model_catalog"]["delivery"])
+            with mock.patch(
+                "young_router.core.codex_config.local_exposed_models",
+                return_value=(["public-a", "public-b"], True),
+            ):
+                domain._catalog_source_checked_at = 0.0
+                domain.refresh_model_catalog()
+            # The warm body is the pass's own work: a request must not have to
+            # be the thing that builds it.
+            self.assertIsNotNone(domain._served_payload)
+            status, body = core.codex_catalog_response()
+            self.assertEqual(200, status)
+            self.assertEqual(
+                ["public-a", "public-b"],
+                [model["slug"] for model in json.loads(body)["models"]],
+            )
+
+    def test_a_gateway_route_accepts_the_key_the_proxy_was_handed(self) -> None:
+        """The document's key is another machine's on a host that states its own."""
+
+        from young_router.core import host_profile
+        from young_router.core.ipc import CoreIPCServer
+        import http.client
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, domain = self._core(root)
+            self._expose(domain, ["public-a"])
+            key_file = root / "gateway-master-key"
+            key_file.write_text("sk-host-key\n", encoding="utf-8")
+            env = {
+                host_profile.PROFILE_ENV: host_profile.GATEWAY,
+                host_profile.PROXY_KEY_ENV: str(key_file),
+            }
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual("sk-host-key", core.local_master_key())
+                server = CoreIPCServer(core)
+                server.start()
+                self.addCleanup(server.stop)
+
+                def call(key: str) -> int:
+                    connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+                    connection.request(
+                        "GET", SERVED_CATALOG_ROUTE, headers={"Authorization": f"Bearer {key}"}
+                    )
+                    answer = connection.getresponse()
+                    answer.read()
+                    connection.close()
+                    return answer.status
+
+                self.assertEqual(200, call("sk-host-key"))
+                self.assertEqual(401, call("sk-synthetic-master"))
 
 
 class ServedCatalogBodyTests(unittest.TestCase):

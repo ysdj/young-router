@@ -473,6 +473,12 @@ def local_api_key(config: dict[str, Any]) -> str:
         variable = value.removeprefix("os.environ/").strip()
         value = os.environ.get(variable) if variable else None
     value = str(value or os.environ.get("LITELLM_MASTER_KEY") or "").strip()
+    # On a host that states its own key, the document's copy is another
+    # machine's value: the staged document the proxy loads carries the host's.
+    # See ``host_profile.effective_master_key``.
+    from .host_profile import effective_master_key
+
+    value = effective_master_key(value)
     if not value or "\n" in value or "\r" in value:
         raise EditorError(
             "LiteLLM master key is unavailable or malformed: the proxy would "

@@ -443,3 +443,40 @@ class ClaudeDesktopListingPatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishedWindowTests(unittest.TestCase):
+    """The Anthropic shape states the same window the canonical listing does."""
+
+    def setUp(self) -> None:
+        self.windows = {"glm-5.4": 1_000_000, "grok-4.7": 500_000, "gpt-image-2.6-flare": 0}
+        patcher = mock.patch.object(
+            claude_desktop_listing,
+            "_public_context_window",
+            side_effect=lambda name: self.windows.get(name),
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_a_missing_window_is_filled_from_the_router(self) -> None:
+        rows = claude_desktop_listing.with_published_windows(
+            _response("glm-5.4", "grok-4.7")
+        )["data"]
+        self.assertEqual([1_000_000, 500_000], [row["max_input_tokens"] for row in rows])
+
+    def test_a_stated_window_is_left_alone(self) -> None:
+        response = _response("glm-5.4")
+        response["data"][0]["max_input_tokens"] = 200_000
+        rows = claude_desktop_listing.with_published_windows(response)["data"]
+        self.assertEqual(200_000, rows[0]["max_input_tokens"])
+
+    def test_a_ceiling_is_stated_as_the_one_million_spelling(self) -> None:
+        self.windows["gemini-4-neon"] = 1_048_576
+        rows = claude_desktop_listing.with_published_windows(_response("gemini-4-neon"))["data"]
+        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+
+    def test_a_generator_and_an_unknown_route_stay_empty(self) -> None:
+        rows = claude_desktop_listing.with_published_windows(
+            _response("gpt-image-2.6-flare", "nobody-knows")
+        )["data"]
+        self.assertEqual([None, None], [row["max_input_tokens"] for row in rows])

@@ -203,6 +203,71 @@ class RelayStationDomainTests(unittest.TestCase):
             self.assertEqual("signed_in", reloaded_account["login_status"])
             self.assertTrue(reloaded_account["password_saved"])
 
+    def test_migration_repairs_only_url_labels_after_station_canonicalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / ".litellm-runtime" / "relay-accounts.json"
+            storage.parent.mkdir(parents=True)
+            storage.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "stations": [
+                            {"id": "station-tken", "name": "tken", "origin": "https://tken.fun", "type": "newapi"},
+                        ],
+                        "accounts": [
+                            {
+                                "id": "url-label",
+                                "station_id": "station-tken",
+                                "type": "newapi",
+                                "label": "https://www.tken.fun",
+                                "username": "person@example.test",
+                            },
+                            {
+                                "id": "named-label",
+                                "station_id": "station-tken",
+                                "type": "newapi",
+                                "label": "Work account",
+                                "username": "other@example.test",
+                            },
+                        ],
+                    }
+                )
+            )
+
+            domain = RelayAccountsDomain(directory)
+
+            self.assertEqual(
+                {"url-label": "tken", "named-label": "Work account"},
+                {item["id"]: item["label"] for item in domain.snapshot()["accounts"]},
+            )
+            stored = json.loads(storage.read_text())
+            self.assertEqual(
+                {"url-label": "tken", "named-label": "Work account"},
+                {item["id"]: item["label"] for item in stored["accounts"]},
+            )
+            self.assertNotIn("origin", stored["accounts"][0])
+
+    def test_restore_uses_station_identity_when_account_label_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "tken", "origin": "https://tken.fun", "station_name": "tken"},
+            )["accounts"][0]
+            core = CoreStore(domains=[domain])
+
+            restored = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="newapi",
+                label="https://www.tken.fun",
+                origin="https://www.tken.fun",
+                login_status="signed_in",
+                username="person@example.test",
+                cookie="session=fixture",
+            )
+
+            self.assertEqual("signed_in", restored["login_status"])
+
     def test_deleting_last_account_removes_empty_station(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RelayAccountsDomain(directory)

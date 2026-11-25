@@ -276,5 +276,190 @@ class ProviderAuthManagerTests(unittest.TestCase):
             atomic_write_json(auth_file, {"access_token": "token", "expires_at": 4102444800})
             self.assertNotIn("account", manager.status("openai_login", ref))
 
+    def test_an_aged_out_access_token_is_renewed_before_it_is_called_expired(self) -> None:
+        """The refresh token outlives the access token, so expiry is a question.
+
+        A ChatGPT sign-in mints an access token that lasts hours and a refresh
+        token that lasts weeks.  Status used to compare ``expires_at`` and stop
+        there, so every account read as 登录已过期 as soon as its first token
+        aged out — while the grant behind it was still redeemable, and while
+        the proxy adapter would have renewed it on the next request.  The
+        projection now redeems the grant itself, and the pane only offers a
+        re-login once the issuer actually refuses it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ProviderAuthManager(Path(directory))
+            ref = "openai-profile-renew"
+            auth_file = manager._secure_chatgpt_auth_file(ref, create=True)
+            atomic_write_json(
+                auth_file,
+                {
+                    "access_token": "stale-access-token",
+                    "refresh_token": "synthetic-refresh-token",
+                    "expires_at": int(time.time()) - 60,
+                },
+            )
+            exchanges: list[str] = []
+
+            def redeem(self, refresh_token: str) -> dict[str, str]:
+                exchanges.append(refresh_token)
+                tokens = {
+                    "access_token": "renewed-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "id_token": "",
+                }
+                self._write_auth_file({**tokens, "expires_at": int(time.time()) + 3_600})
+                return tokens
+
+            import litellm.llms.chatgpt.authenticator as chatgpt_authenticator
+
+            def settled(predicate, timeout: float = 3.0) -> dict[str, object]:
+                deadline = time.monotonic() + timeout
+                state: dict[str, object] = {}
+                while time.monotonic() < deadline:
+                    state = manager.status("openai_login", ref)
+                    if predicate(state):
+                        return state
+                    time.sleep(0.01)
+                return state
+
+            with patch.object(chatgpt_authenticator.Authenticator, "_refresh_tokens", redeem):
+                # A snapshot read must not wait on the issuer: it starts the
+                # renewal and answers with what is on disk right now.
+                first = manager.status("openai_login", ref)
+                self.assertIn(first["status"], {"signed_in", "expired"})
+                # The renewal lands in the background, and the next read states
+                # it without spending a second exchange.
+                renewed = settled(lambda state: state.get("status") == "signed_in")
+                self.assertEqual("signed_in", renewed["status"])
+                self.assertEqual(["synthetic-refresh-token"], exchanges)
+                # A caller that needs the token gets it, and does not rotate the
+                # grant again: the answer is already in hand.
+                self.assertEqual("renewed-access-token", manager.chatgpt_request_credential(ref)["access_token"])
+                self.assertEqual(1, len(exchanges))
+
+    def test_a_refused_renewal_reports_expired_and_backs_off(self) -> None:
+        """A grant the issuer refuses is the one case that asks for a re-login.
+
+        That refusal must also stop the projection from re-asking the issuer on
+        every render: status is read by the provider pane, the logs view and the
+        scheduled check, and each read would otherwise spend a token exchange
+        on an answer that is not going to change.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ProviderAuthManager(Path(directory))
+            ref = "openai-profile-refused"
+            auth_file = manager._secure_chatgpt_auth_file(ref, create=True)
+            atomic_write_json(
+                auth_file,
+                {
+                    "access_token": "stale-access-token",
+                    "refresh_token": "refused-refresh-token",
+                    "expires_at": int(time.time()) - 60,
+                },
+            )
+            attempts: list[str] = []
+            refused = True
+
+            import litellm.llms.chatgpt.authenticator as chatgpt_authenticator
+
+            def redeem(self, refresh_token: str) -> dict[str, str]:
+                attempts.append(refresh_token)
+                if refused:
+                    raise chatgpt_authenticator.RefreshAccessTokenError(
+                        message="synthetic refusal", status_code=400
+                    )
+                tokens = {
+                    "access_token": "renewed-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "id_token": "",
+                }
+                self._write_auth_file({**tokens, "expires_at": int(time.time()) + 3_600})
+                return tokens
+
+            with patch.object(chatgpt_authenticator.Authenticator, "_refresh_tokens", redeem):
+                status = manager.status("openai_login", ref)
+                self.assertIn(status["status"], {"signed_in", "expired"})
+                # A signed-out projection is not what an expired grant is: the
+                # credential is still there, it just cannot authenticate.
+                self.assertTrue(status["configured"])
+                # The refusal is remembered: the pane, the log view and the
+                # scheduled check all project this row, and each read would
+                # otherwise spend a token exchange on the same answer.
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and not attempts:
+                    time.sleep(0.01)
+                self.assertEqual("expired", manager.status("openai_login", ref)["status"])
+                self.assertEqual(1, len(attempts))
+                # The person's own 登录 is not held behind that wait: it clears
+                # the backoff, and the token request that follows redeems the
+                # grant because the person asked for it.
+                refused = False
+                with patch.object(manager, "_run_chatgpt"):
+                    manager.start("openai_login", ref)
+                credential = manager.chatgpt_request_credential(ref)
+                self.assertEqual("renewed-access-token", credential["access_token"])
+                self.assertEqual(2, len(attempts))
+                self.assertEqual("signed_in", manager.status("openai_login", ref)["status"])
+            self.assertNotIn(ref, manager._refresh_failed_at)
+
+    def test_a_sign_in_in_progress_outranks_the_credential_it_replaces(self) -> None:
+        """A re-login over an expired account must show its code, not the corpse.
+
+        重新登录 starts a device code while the old, unusable credential is still
+        on disk.  Reading the file first therefore kept answering 登录已过期, so
+        the pane never entered 正在等待登录, never opened the sign-in window, and
+        the code the issuer had already issued could not be entered.  Only a
+        worker that is still alive counts: a record left behind by a restart
+        describes no challenge.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ProviderAuthManager(Path(directory))
+            ref = "openai-profile-relogin"
+            auth_file = manager._secure_chatgpt_auth_file(ref, create=True)
+            atomic_write_json(
+                auth_file,
+                {
+                    "access_token": "stale-access-token",
+                    "refresh_token": "refused-refresh-token",
+                    "expires_at": int(time.time()) - 60,
+                },
+            )
+            release = threading.Event()
+            started = threading.Event()
+
+            def pending_worker(worker_ref: str, generation: int) -> None:
+                started.set()
+                release.wait(5)
+
+            try:
+                with patch.object(manager, "_run_chatgpt", side_effect=pending_worker), patch.object(
+                    manager, "_refresh_chatgpt_tokens", return_value=None
+                ):
+                    manager.start("openai_login", ref)
+                    self.assertTrue(started.wait(2))
+                    manager._set_state(
+                        ref,
+                        kind="openai_login",
+                        status="authorizing",
+                        configured=False,
+                        verification_uri="https://auth.example.test/codex/device",
+                        user_code="RELG-CODE",
+                    )
+                    state = manager.status("openai_login", ref)
+                    self.assertEqual("authorizing", state["status"])
+                    self.assertEqual("RELG-CODE", state["user_code"])
+            finally:
+                release.set()
+            # Once no worker owns the flow, the credential's own state is what
+            # the row reads again.  The worker that was patched out never
+            # registered its thread, so there is nothing to wait for: the test
+            # only asserts the projection no longer claims the challenge.
+            state = manager.status("openai_login", ref)
+            self.assertNotEqual("authorizing", state["status"])
+
 if __name__ == "__main__":
     unittest.main()

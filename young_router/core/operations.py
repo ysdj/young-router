@@ -1046,23 +1046,20 @@ class CoreServiceController:
         from . import host_profile
         from .domains.runtime import master_key_from_document
 
-        if host_profile.active():
-            # A host that states its own key hands *that* to the child, because
-            # it is also the key the staged document now carries.  Reading the
-            # editor document here would state a key the proxy does not accept
-            # in the instant before it loads the staged one.
-            stated = host_profile.stated_key()
-            if stated:
-                return stated
         source = _provider_config_source(self.paths)
         try:
             text = source.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
-            return ""
+            # A host that states its own key hands *that* to the child even when
+            # the editor document cannot be read: it is the key the staged
+            # document carries, and reading the editor document here would state
+            # a key the proxy does not accept.
+            return host_profile.effective_master_key("")
         try:
-            return master_key_from_document(text)
+            document_key = master_key_from_document(text)
         except Exception:
-            return ""
+            document_key = ""
+        return host_profile.effective_master_key(document_key)
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
         if env is None:

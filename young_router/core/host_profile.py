@@ -79,6 +79,29 @@ def stated_key() -> str:
     return stripped.splitlines()[0].strip() if stripped else ""
 
 
+def effective_master_key(document_key: str) -> str:
+    """The key this host's own proxy actually accepts.
+
+    ``document()`` replaces the shared document's key with the one this host
+    states, so on a gateway the value written in that document is one machine's
+    setting, not this proxy's credential.  Every reader that means "the key a
+    client of *this* proxy presents" -- the catalog probe, the catalog route's
+    own credential check, the "use this API" action -- answers through here.
+    Without it the copy from the shared document was compared against a proxy
+    that had been handed the mounted key, and a client presenting the working
+    key was refused by the one endpoint that read the document instead.
+
+    A host that states no key keeps the document's answer, which is also what
+    a desktop (where :func:`active` is false) serves.
+    """
+
+    if active():
+        stated = stated_key()
+        if stated:
+            return stated
+    return document_key
+
+
 def stated_port() -> int | None:
     """The port this host publishes, or ``None`` when it states none.
 
@@ -202,6 +225,7 @@ __all__ = [
     "PROXY_KEY_ENV",
     "active",
     "document",
+    "effective_master_key",
     "reachable",
     "stated_key",
 ]

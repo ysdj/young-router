@@ -189,6 +189,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.routeTrace.retry": "Retry {value}",
   "logs.routeTrace.maxRetries": "Maximum retries {value}",
   "logs.routeTrace.retryDelay": "Retry in {value}s",
+  "logs.requestRetryAfter": "Retry in {value}s",
   "logs.routeTrace.protocolResponses": "Responses",
   "logs.routeTrace.protocolChat": "Chat",
   "logs.routeTrace.protocolMessages": "Messages",
@@ -244,6 +245,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.routeTrace.reasonGateway": "Upstream gateway request error",
   "logs.routeTrace.reasonResponses": "Upstream does not support the Responses request format",
   "logs.routeTrace.reasonNetwork": "Upstream network connection failed",
+  "logs.routeTrace.reasonQueued": "Queued at the upstream",
   "logs.routeTrace.reasonTemporary": "Upstream is temporarily unavailable",
   "logs.routeTrace.reasonTerminal": "Request stopped by prompt or policy",
   "logs.routeTrace.reasonStreamStartTimeout": "Upstream first chunk timed out",
@@ -682,7 +684,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.preciseDetail": "Precision check: {detail}",
   "providers.probe": "Probe",
   "providers.deepTest": "Probe",
-  "providers.deepTestHint": "Availability, then the modelprint table to check which model this route really serves",
+  "providers.deepTestHint": "Availability first, then the fingerprint check",
   // The Images wire has no dry run: the only honest availability test is one
   // picture.  Said before the press, because the user pays for it.
   "providers.probeImagesHint": "Sends one image request to test availability (billed)",
@@ -1031,6 +1033,8 @@ export const en: Record<TranslationKey, string> = {
   "relay.officialProviderSignOutAllTitle": "Sign out of every account?",
   "relay.officialProviderSignOutAllBody": "Every account of {name} is signed out, and its routes stop answering until you sign one in again.",
   "relay.officialProviderCancel": "Stop signing in",
+  "relay.officialProviderRelogin": "Sign in again",
+  "relay.officialProviderReloginHint": "This sign-in could not be renewed automatically. Sign in to this account again.",
   "relay.officialProviderMultiAccountHint": "Enable several accounts to spread requests.",
   "relay.officialProviderApiKeyHint": "With only an API key, add a Custom route for https://api.openai.com/v1.",
   "relay.officialProviderWebViewHint": "A native sign-in window opens. Credentials stay inside the provider page; Young Router only receives the login status.",

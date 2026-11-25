@@ -616,6 +616,20 @@ class ProvidersModelsDomain:
         # The surface each row answers on, per lane, as the upstream routed it.
         self._lane_wires_by_id: dict[str, dict[str, str]] = {}
         self.revision = 0
+        # What the last credential read observed, per provider: the account
+        # rows a projection draws.  A login observation changes no settings
+        # draft -- nothing is staged, nothing is dirty -- so the projection
+        # that carries it is only ever rebuilt when *someone* moves the shared
+        # revision.  ``CoreStore`` did not, so a memoized projection kept
+        # answering the state from before the sign-in: the pane polled a row
+        # that stayed 登录已过期 while Core's own live answer was authorizing,
+        # and the device code it had just issued could never be shown.
+        self._auth_observation: dict[str, Any] = {}
+        #: What the last login action observed, beside the projection's own
+        #: baseline.  ``None`` means nothing has been read yet, so the first
+        #: read establishes the baseline instead of claiming a change.
+        self._auth_last_observed: dict[str, Any] | None = None
+        self._auth_observation_changed = False
         self.reload()
 
     def _auth_manager(self):
@@ -1306,6 +1320,24 @@ class ProvidersModelsDomain:
     def snapshot(self) -> dict[str, Any]:
         providers = self._draft.get("providers", [])
         safe = [self._safe_provider(provider, index) for index, provider in enumerate(providers) if isinstance(provider, Mapping)]
+        # What this projection just drew, for the login rows.  A login read
+        # stages nothing, so the only thing that can make the memoized
+        # projection stale is the credential moving underneath it.  Recording
+        # the drawn state here is what gives ``auth_observation()`` a baseline
+        # to compare against, and it costs nothing: the rows above were already
+        # read to draw them.
+        drawn: dict[str, Any] = {}
+        for row in safe:
+            if row.get("auth_kind") != "openai_login":
+                continue
+            drawn[str(row.get("editor_id", ""))] = {
+                "status": row.get("auth_status"),
+                "accounts": [
+                    {"ref": account.get("ref"), "status": account.get("status")}
+                    for account in (row.get("accounts") or [])
+                ],
+            }
+        self._auth_observation = drawn
         return {
             "domain": self.name,
             "revision": self.revision,
@@ -5812,19 +5844,28 @@ class ProvidersModelsDomain:
             # service serves, and an account still authorizing means the
             # pane has a sign-in to follow even when another account is the
             # first one listed.
+            #
+            # An account waiting on a device code outranks a sibling whose old
+            # credential merely aged out: 重新登录 on that sibling is the action
+            # that produced the wait, and reporting the row as expired hid it,
+            # so the pane never followed the sign-in it had just started.
             states: list[str] = []
+            authorizing = False
             for entry in self._provider_accounts(provider):
                 try:
-                    states.append(
-                        str(
-                            self._auth_manager()
-                            .status(kind, entry["ref"])
-                            .get("status", "signed_out")
-                        )
+                    state = str(
+                        self._auth_manager()
+                        .status(kind, entry["ref"])
+                        .get("status", "signed_out")
                     )
                 except Exception:
-                    states.append("error")
-            for candidate in ("signed_in", "authorizing", "expired", "error"):
+                    state = "error"
+                if state == "authorizing":
+                    authorizing = True
+                states.append(state)
+            if authorizing:
+                return "authorizing"
+            for candidate in ("signed_in", "expired", "error"):
                 if candidate in states:
                     return candidate
             return "signed_out"
@@ -10411,6 +10452,11 @@ class ProvidersModelsDomain:
             if name in {"provider_auth_status", "service_provider_auth_status"}
             else None
         )
+        # What a window is shown right now, captured before the action runs.
+        # A login action records the state it leaves behind, and comparing that
+        # against a baseline the action had itself refreshed made a poll that
+        # changed nothing look like news and a fresh sign-in look like nothing.
+        auth_drawn_before = copy.deepcopy(self._auth_observation)
         if name in {"set_raw", "setraw"}:
             self._set_raw(data)
         elif name in {"providers_import_selected", "provider_import_selected", "import_selected"}:
@@ -10491,10 +10537,109 @@ class ProvidersModelsDomain:
             raise DomainError("The requested provider/model action is unavailable")
         if auth_status_draft_before is None or self._draft != auth_status_draft_before:
             self.revision += 1
+        if name in {
+            "provider_auth_status",
+            "service_provider_auth_status",
+            "provider_auth_start",
+            "service_provider_auth_start",
+            "provider_auth_cancel",
+            "provider_auth_logout",
+            "service_provider_auth_cancel",
+            "service_provider_auth_logout",
+        }:
+            # Every login action can move an account row, not only the status
+            # poll: 重新登录 itself is what turns 登录已过期 into 正在等待登录.  The
+            # marker starts from this action's own answer, so a mark left by an
+            # earlier one can never make an unchanged read look like news.
+            self._auth_observation_changed = False
+            self._record_auth_observation(data, drawn=auth_drawn_before)
         result = self.snapshot()
         if hasattr(self, "_last_operation"):
             result["operation_summary"] = copy.deepcopy(self._last_operation)
         return result
+
+    def auth_observation(self) -> dict[str, Any]:
+        """What the last credential read observed, as one comparable value.
+
+        A login observation stages nothing: the account a person signs into,
+        the state it reports, and the device code it is waiting on all live
+        outside the settings draft.  The memoized projection that carries them
+        is a function of the shared revision, so Core asks this instead to
+        learn whether a read *moved something a window draws* — and advances
+        the revision only when it did.  Without it the projection froze at
+        whatever an earlier read had observed: 重新登录 issued a device code,
+        Core's own status answered ``authorizing``, and the pane kept reading
+        the aged-out row, so it never followed the sign-in it had started.
+
+        The value is secret-free by construction: it holds the account rows a
+        snapshot already publishes.
+        """
+
+        return copy.deepcopy(self._current_auth_observation())
+
+    def _current_auth_observation(self) -> dict[str, Any]:
+        """The login rows as a window draws them, keyed by provider.
+
+        Only the two facts a snapshot uses to draw an account row -- the row's
+        state and each account's state -- because that is what this value is
+        compared against.  Reading the whole account record here made every
+        read look like a change: the baseline recorded by ``snapshot`` keeps
+        just these two, and comparing a narrow record to a wide one marked
+        every poll as news.
+        """
+
+        observed: dict[str, Any] = {}
+        providers = self._draft.get("providers")
+        if not isinstance(providers, list):
+            return observed
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                continue
+            auth = self._provider_auth_state(provider)
+            if auth.get("kind") != "openai_login":
+                continue
+            observed[self._editor_id(provider)] = {
+                "status": self._provider_auth_status(provider, auth),
+                "accounts": [
+                    {"ref": account["ref"], "status": account["status"]}
+                    for account in self._provider_account_states(provider, auth)
+                ],
+            }
+        return observed
+
+    def _record_auth_observation(
+        self, data: Mapping[str, Any], *, drawn: Mapping[str, Any] | None = None
+    ) -> None:
+        """Remember the login rows a status read just answered for.
+
+        A read that observes the same rows Core already published is not a
+        change: the pane's own poll runs once a second, and advancing the
+        shared revision for every tick would re-announce the whole projection
+        to every window and make the pane's debounced Apply see edits it never
+        made.
+        """
+
+        # Compared against what the projection last drew, which is the only
+        # thing a window is shown.  A read that agrees with it has nothing to
+        # publish -- the pane asks once a second, and a poll that keeps
+        # answering the same 登录已过期 is not news -- while a read that disagrees
+        # with it does, even the first time it runs: 重新登录 is exactly that
+        # case, and skipping it left the window showing a device-code wait the
+        # pane could never see.
+        current = self._current_auth_observation()
+        self._auth_last_observed = current
+        baseline = self._auth_observation if drawn is None else drawn
+        if current == baseline:
+            return
+        self._auth_observation = current
+        self._auth_observation_changed = True
+
+    def take_auth_observation_change(self) -> bool:
+        """Consume whether the last read changed a row a window draws."""
+
+        changed = getattr(self, "_auth_observation_changed", False)
+        self._auth_observation_changed = False
+        return bool(changed)
 
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field == "import_link" and target is None:

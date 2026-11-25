@@ -26,6 +26,11 @@ const LOGIN_FAILURE_MESSAGES = {
   unavailable: "relay.autoSignInUnavailable",
 } as const;
 const RELAY_AUTO_LOGIN_JOB_PREFIX = "relay-auto-login:";
+const RETRYABLE_AUTOMATIC_LOGIN_FAILURES = new Set<keyof typeof LOGIN_FAILURE_MESSAGES>([
+  "sync_waiting",
+  "sync_unavailable",
+  "unavailable",
+]);
 
 function isLoginFailure(value: unknown): value is keyof typeof LOGIN_FAILURE_MESSAGES {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(LOGIN_FAILURE_MESSAGES, value);
@@ -322,6 +327,19 @@ export function stationDisplayName(station: RelayStation, translate: Translate):
   const name = station.name.trim();
   if (name && !/^https?:\/\//iu.test(name)) return name;
   return originHostLabel(station.origin) || name;
+}
+
+/**
+ * Labels are account metadata, while the station owns the URL.  Older rows
+ * used the URL as the label; once the station was canonicalized that stale
+ * spelling was still sent to Core and shown by the login surface.  Keep real
+ * user labels, but replace only a label that resolves to this station with the
+ * station's own display name.
+ */
+function relayAccountLoginLabel(account: Pick<RelayAccount, "label">, station: RelayStation, translate: Translate): string {
+  const label = account.label.trim();
+  if (label && stationOriginKey(label) !== stationOriginKey(station.origin)) return label;
+  return stationDisplayName(station, translate);
 }
 
 function usernameShortName(account: RelayAccount): string {
@@ -891,7 +909,7 @@ export function StationAccountsPanel({
       const result = await native.restoreRelaySession({
         accountId: account.id,
         type: account.type,
-        label: account.label,
+        label: relayAccountLoginLabel(account, station, translate),
         origin: account.origin,
         username: account.username || undefined,
       });
@@ -917,7 +935,7 @@ export function StationAccountsPanel({
       const result = await native.relayLogin({
         accountId: account.id,
         type: account.type,
-        label: account.label,
+        label: relayAccountLoginLabel(account, station, translate),
         origin: account.origin,
         ...(signInPath ? { signInPath } : {}),
         language,
@@ -958,16 +976,29 @@ export function StationAccountsPanel({
   // Check on entry, and again if the observed state becomes recoverable while
   // the panel is open. Resource snapshots and the clock do not start new work.
   const checkedAccounts = useRef(new Map<string, boolean>());
+  const automaticLoginRetryTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const [automaticLoginRetryTick, setAutomaticLoginRetryTick] = useState(0);
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
+  useEffect(() => () => {
+    for (const timer of automaticLoginRetryTimers.current.values()) clearTimeout(timer);
+    automaticLoginRetryTimers.current.clear();
+  }, []);
   const mountProbeKey = stationAccounts
-    .map((account) => `${account.id}:${account.loginStatus}:${account.loginObservedSecondsAgo !== null}:${account.passwordSaved}`)
+    .map((account) => `${account.id}:${account.loginStatus}:${account.loginObservedSecondsAgo !== null}:${account.passwordSaved}:${account.loginFailure ?? ""}:${account.loginFailureAt ?? ""}`)
     .join("\u001f");
   useEffect(() => {
     if (busy) return;
+    const present = new Set(accountsRef.current.map((account) => account.id));
+    for (const [accountID, timer] of automaticLoginRetryTimers.current) {
+      if (!present.has(accountID)) {
+        clearTimeout(timer);
+        automaticLoginRetryTimers.current.delete(accountID);
+      }
+    }
     for (const account of accountsRef.current) {
       const observed = account.loginObservedSecondsAgo;
       const recoveryNeeded = account.passwordSaved && observed !== null
@@ -977,15 +1008,42 @@ export function StationAccountsPanel({
         if (!recoveryNeeded) {
           // A check on entry or a later sign-in doesn't spend the next logout's check.
           checkedAccounts.current.set(account.id, false);
+          const timer = automaticLoginRetryTimers.current.get(account.id);
+          if (timer) clearTimeout(timer);
+          automaticLoginRetryTimers.current.delete(account.id);
           continue;
         }
-        if (checked) continue;
+        if (checked) {
+          const retryable = account.loginFailure
+            && RETRYABLE_AUTOMATIC_LOGIN_FAILURES.has(account.loginFailure);
+          if (!retryable) {
+            const timer = automaticLoginRetryTimers.current.get(account.id);
+            if (timer) clearTimeout(timer);
+            automaticLoginRetryTimers.current.delete(account.id);
+            continue;
+          }
+          // Temporary coordination/network failures get another Core check,
+          // but snapshots and loading-state renders must not create a tight
+          // retry loop. Core still owns the login lease and refusal backoff.
+          if (!automaticLoginRetryTimers.current.has(account.id)) {
+            const timer = setTimeout(() => {
+              automaticLoginRetryTimers.current.delete(account.id);
+              checkedAccounts.current.set(account.id, false);
+              setAutomaticLoginRetryTick((current) => current + 1);
+            }, 10_000);
+            automaticLoginRetryTimers.current.set(account.id, timer);
+          }
+          continue;
+        }
       }
       const accountLoading = loadingRef.current[account.id];
       if (accountLoading?.session || accountLoading?.resources || (accountLoading?.checking && checked !== undefined)) continue;
       checkedAccounts.current.set(account.id, recoveryNeeded);
       // A failure from Core already answers this recovery. Its own retry rules apply.
-      if (checked !== undefined && account.loginFailure) continue;
+      // Sync/network coordination failures are temporary answers.  Let Core's
+      // own backoff and lease rules decide when to retry; treating them like a
+      // permanent rejection left a saved password stranded after one outage.
+      if (checked !== undefined && account.loginFailure && !RETRYABLE_AUTOMATIC_LOGIN_FAILURES.has(account.loginFailure)) continue;
       // A recent 未登录 with a password still has work for Core to do. Core
       // probes any saved session and decides whether another POST is needed.
       const fresh = loginObservationIsFresh(account);
@@ -994,7 +1052,7 @@ export function StationAccountsPanel({
         if (signedIn && mounted.current) await refreshAccountResources(account, { silent: true });
       })();
     }
-  }, [busy, loading, sessionRecheckSeconds, mountProbeKey]);
+  }, [automaticLoginRetryTick, busy, loading, sessionRecheckSeconds, mountProbeKey]);
   // The add flow never reserves an account slot. The webview login runs
   // first (its own modal window over the workspace); Core creates the account
   // shell only when sign-in actually succeeds (pending_account), so a
@@ -1072,7 +1130,7 @@ export function StationAccountsPanel({
     await runPendingAction("retry", async () => {
       setFormBusy(true);
       try {
-        await commit("session.retry", { id: account.id, type: account.type, label: account.label, origin: account.origin, refused_at: account.loginFailureAt });
+        await commit("session.retry", { id: account.id, type: account.type, label: relayAccountLoginLabel(account, station, translate), origin: account.origin, refused_at: account.loginFailureAt });
         await refreshAccounts();
       } catch {
         publish(translate("relay.autoSignInUnavailable"));
@@ -1105,7 +1163,7 @@ export function StationAccountsPanel({
         void native.openRelayDashboard({
           accountId: account.id,
           type: account.type,
-          label: account.label,
+          label: relayAccountLoginLabel(account, station, translate),
           origin: account.origin,
           ...(dashboardPath ? { dashboardPath } : {}),
           language,

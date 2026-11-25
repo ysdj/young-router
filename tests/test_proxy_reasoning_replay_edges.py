@@ -11,6 +11,32 @@ from hook_test_utils import *
 from young_router import runtime_store
 
 
+class ReasoningReplayRepairTests(HookTestCase):
+    def test_whitespace_only_reasoning_text_is_repaired_and_then_idempotent(self) -> None:
+        hooks, _ = load_hook_module()
+        replay = hooks._reasoning_replay_module
+        item = {
+            "type": "reasoning",
+            "id": "rs_whitespace",
+            "summary": [{"type": "summary_text", "text": " \t"}],
+            "content": [{"type": "reasoning_text", "text": " \t"}],
+            "encrypted_content": "opaque",
+        }
+
+        repaired = replay.with_reasoning_text_replay({"input": [item]})
+
+        self.assertIsNotNone(repaired)
+        assert repaired is not None
+        self.assertEqual(
+            [{"type": "reasoning_text", "text": replay.REASONING_TEXT_PLACEHOLDER}],
+            repaired["input"][0]["content"],
+        )
+        self.assertEqual("opaque", repaired["input"][0]["encrypted_content"])
+        self.assertIsNone(
+            replay.with_reasoning_text_replay({"input": repaired["input"]})
+        )
+
+
 class ReasoningReplayStoreFailureTests(HookTestCase):
     def setUp(self) -> None:
         super().setUp()

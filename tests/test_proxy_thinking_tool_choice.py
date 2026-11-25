@@ -260,6 +260,59 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
         request["extra_body"]["thinking"] = {"type": "disabled"}
         self.assertFalse(contract._deepseek_thinking_rejects_forced_choice(request))
 
+    async def test_replay_repair_keeps_official_tool_choice_relaxed(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        replay = hooks._reasoning_replay_module
+        request = {
+            "api_base": "https://api.deepseek.com/v1",
+            "model": "deepseek-v4.1-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "check"},
+                {
+                    "type": "reasoning",
+                    "id": "rs-replay",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-probe",
+                    "name": "probe",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-probe",
+                    "output": "ok",
+                },
+            ],
+            "tools": [{"type": "function", "name": "probe"}],
+            "tool_choice": "required",
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+        calls = []
+
+        async def upstream(**kwargs):
+            calls.append(kwargs.copy())
+            if len(calls) == 1:
+                raise _BadRequest(
+                    "the `reasoning_text` in the thinking mode must be passed back"
+                )
+            return "ok"
+
+        result = await replay.call_with_replay_repair(
+            lambda: contract._call_with_deepseek_tool_choice(upstream, request),
+            request,
+        )
+
+        self.assertEqual("ok", result)
+        self.assertEqual(["auto", "auto"], [call["tool_choice"] for call in calls])
+        self.assertEqual(
+            replay.REASONING_TEXT_PLACEHOLDER,
+            calls[1]["input"][1]["content"][0]["text"],
+        )
+
     def test_refusals_do_not_park_the_route(self) -> None:
         hooks, _ = load_hook_module()
         routing = hooks._routing_module

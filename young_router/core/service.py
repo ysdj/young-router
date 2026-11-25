@@ -4310,11 +4310,14 @@ class CoreStore:
                     )
                     if not isinstance(matching, Mapping):
                         raise CoreError("relay_login_failed", "Relay account is unavailable")
-                if (
-                    matching.get("type") != account_type
-                    or matching.get("label") != label
-                    or matching.get("origin") != origin
-                ):
+                from .domains.relay_accounts import RelayAccountsError, normalize_relay_origin
+
+                try:
+                    requested_origin = normalize_relay_origin(origin)
+                    saved_origin = normalize_relay_origin(matching.get("origin", ""))
+                except RelayAccountsError:
+                    raise CoreError("relay_login_failed", "Relay account does not match the saved site") from None
+                if matching.get("type") != account_type or saved_origin != requested_origin:
                     raise CoreError("relay_login_failed", "Relay account does not match the saved site")
                 host_session = cookie if isinstance(cookie, str) else ""
                 host_token = access_token if isinstance(access_token, str) else ""
@@ -5175,10 +5178,16 @@ class CoreStore:
             )
             if not isinstance(matching, Mapping):
                 raise CoreError("relay_restore_failed", "Relay account is unavailable")
+            from .domains.relay_accounts import RelayAccountsError, normalize_relay_origin
+
+            try:
+                requested_origin = normalize_relay_origin(origin)
+                saved_origin = normalize_relay_origin(matching.get("origin", ""))
+            except RelayAccountsError:
+                raise CoreError("relay_restore_failed", "Relay account does not match the saved site") from None
             if (
                 matching.get("type") != account_type
-                or matching.get("label") != label
-                or matching.get("origin") != origin
+                or saved_origin != requested_origin
             ):
                 raise CoreError("relay_restore_failed", "Relay account does not match the saved site")
             try:
@@ -6922,6 +6931,7 @@ class CoreStore:
                     self._relay_reachable_stations(adapter, released_relay) if released_relay is not None else []
                 )
                 released_station_ids: list[str] = []
+                auth_observation_changed = False
                 try:
                     if name == "providers_models" and normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS:
                         resource_data = _as_mapping(payload)
@@ -6950,6 +6960,10 @@ class CoreStore:
                             "api_key_name": resolved.get("api_key_name"),
                         }
                     result = adapter.dispatch(action_type, payload)
+                    auth_observation_changed = bool(
+                        getattr(adapter, "take_auth_observation_change", None)
+                        and adapter.take_auth_observation_change()
+                    )
                     if relay_station_update and providers is not None:
                         from .domains.relay_accounts import normalize_relay_origin
 
@@ -7210,6 +7224,19 @@ class CoreStore:
                                 else self._revision
                             ),
                         )
+                    self._persist_metadata()
+                elif auth_observation_changed:
+                    # A login read staged nothing but learned something a window
+                    # draws: the account went 已过期 -> 正在等待登录, or the sign-in
+                    # finished.  The projection that carries those rows is
+                    # memoized on the shared revision, so without this it kept
+                    # answering the state from before the read -- Core's own
+                    # action reply said ``authorizing`` while every snapshot in
+                    # the app still said 登录已过期, and the pane therefore never
+                    # opened the window holding the device code it had just been
+                    # granted.  This advances only the projection revision: no
+                    # draft moved, so no window sees an edit it never made.
+                    self._advance_projection_revision()
                     self._persist_metadata()
             if self._revision != previous_revision:
                 should_emit = True

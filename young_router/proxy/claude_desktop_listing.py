@@ -282,6 +282,44 @@ def _kept_row(
     return kept
 
 
+def with_published_windows(response: Mapping[str, object]) -> dict[str, object]:
+    """State this app's published window on every Anthropic listing row.
+
+    LiteLLM's Anthropic shape carries ``max_input_tokens`` only when the
+    deployment states one.  A public window this app resolves from its own
+    registry -- the number the canonical ``/v1/models`` already answers --
+    otherwise arrives as null, and every reader of this shape then guesses: the
+    model-list-plugin, for one, fills a null from public catalogs and writes a
+    picker whose auto-compact window is the guessed number.
+
+    A row that already states a window keeps it: that is LiteLLM's reading of
+    the route, and this function only fills what would otherwise be no
+    observation at all.  A generator's zero and an unresolvable route stay
+    absent, exactly as in ``_published_context``.
+    """
+
+    rows = response.get("data")
+    if not isinstance(rows, list):
+        return dict(response)
+    filled: list[object] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            filled.append(row)
+            continue
+        current = row.get("max_input_tokens")
+        if isinstance(current, int) and not isinstance(current, bool) and current > 0:
+            filled.append(dict(row))
+            continue
+        model_id = row.get("id")
+        published = (
+            _published_context(model_id, _public_context_window)
+            if isinstance(model_id, str) and model_id.strip()
+            else None
+        )
+        filled.append({**dict(row), "max_input_tokens": published} if published is not None else dict(row))
+    return {**dict(response), "data": filled}
+
+
 def desktop_model_rows(
     response: Mapping[str, object],
     display_names: Mapping[str, str] | None = None,
@@ -390,7 +428,10 @@ def install_patch() -> None:
                 if not _listing_row_serves_generation(row)
             ]
         response = original(models, display_names or {}, listed_ids or {})
-        if not _VIEW_ACTIVE.get() or not isinstance(response, Mapping):
+        if not isinstance(response, Mapping):
+            return response
+        response = with_published_windows(response)
+        if not _VIEW_ACTIVE.get():
             return response
         return desktop_model_rows(response, display_names)
 
@@ -450,4 +491,5 @@ __all__ = [
     "is_claude_desktop_client",
     "is_claude_listing_client",
     "register",
+    "with_published_windows",
 ]

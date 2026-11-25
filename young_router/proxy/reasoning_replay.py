@@ -12,12 +12,13 @@ identical bodies:
 reasoning item carrying only ``encrypted_content``   400
 reasoning item carrying only ``summary``             400
 ``reasoning_text`` present but ``""``                400
-``reasoning_text`` present as one space              200
+``reasoning_text`` present as non-blank marker       200
 two items, only one of them repaired                 200
 ===============================================  ======
 
-So the requirement is per *item*, and presence is not the question -- an empty
-part answers exactly as little as a missing one, while one character answers.
+So the requirement is per *item*, and blank text is not enough -- the current
+endpoint treats whitespace-only content as absent, while a visible marker
+answers the field requirement.
 A client replays what its own transcript kept: Pi keeps the encrypted blob
 beside the summary, Codex keeps the opaque id, and neither is readable text.
 Every replayed turn with a tool call in it was therefore refused on the fastest
@@ -25,10 +26,11 @@ route of the group, before its answer could start, and the turn advanced to
 whatever sibling answered the same history (measured: a 3 s relay taking the
 place of a 160 ms route).
 
-The repair writes a placeholder, never thinking.  The text this wire asks for
-is the text it produced, which the client deliberately did not keep, and an
-opaque blob states exactly as much as one space does -- the same reading the
-chat bridge already applies when it echoes ``reasoning_content: ""``
+The repair writes a marker, never thinking.  The text this wire asks for is the
+text it produced, which the client deliberately did not keep.  The marker is
+explicitly non-blank because the current endpoint treats whitespace-only text
+as absent; it carries no claim about what the hidden reasoning said.  The chat
+bridge has a separate empty-string contract for ``reasoning_content``
 (``patches._install_responses_chat_bridge_reasoning_replay_patch``).
 
 The Chat wire of the same route has the same refusal under its own spelling
@@ -54,11 +56,11 @@ from typing import Any, Dict, List, Optional
 from . import request_context as _request_context_module
 from . import trace as _trace_module
 
-#: What a repaired item carries instead of the thinking it lost.  One space, not
-#: ``""``: an empty part is refused exactly like a missing one (measured above),
-#: so the placeholder has to be readable to satisfy the validator while saying
-#: nothing a model could mistake for its own reasoning.
-REASONING_TEXT_PLACEHOLDER = " "
+#: What a repaired item carries instead of the thinking it lost.  It must be a
+#: visible non-blank marker: the official endpoint currently treats a
+#: whitespace-only value as absent.  The marker is intentionally not phrased as
+#: model reasoning, so it cannot be mistaken for text the model actually wrote.
+REASONING_TEXT_PLACEHOLDER = "[reasoning text unavailable]"
 
 #: What the same contract costs on the Chat wire, measured the same way: an
 #: assistant message that carries tool calls and no ``reasoning_content`` at all
@@ -78,10 +80,9 @@ _READABLE_TEXT_FIELDS = ("reasoning_text", "text")
 def _readable_reasoning_text(item: Dict[str, Any]) -> Optional[str]:
     """The text this item already passes back, if it passes any back.
 
-    ``non-empty``, not ``non-blank``: the wire's own rule is that an empty
-    string states nothing while any character answers, and this has to read the
-    same rule -- read stricter and a repaired replay looks unrepaired to the
-    next pass, which then writes a second placeholder into it.
+    Whitespace-only text does not satisfy the upstream field requirement, so
+    the check follows the wire's non-blank rule.  The returned text itself is
+    left untouched; only blank content is treated as absent.
     """
 
     content = item.get("content")
@@ -92,7 +93,7 @@ def _readable_reasoning_text(item: Dict[str, Any]) -> Optional[str]:
             continue
         for field in _READABLE_TEXT_FIELDS:
             text = part.get(field)
-            if isinstance(text, str) and text:
+            if isinstance(text, str) and text.strip():
                 return text
     return None
 
@@ -103,7 +104,10 @@ def _is_blank_reasoning_text_part(part: Any) -> bool:
     return (
         isinstance(part, dict)
         and part.get("type") == "reasoning_text"
-        and not (isinstance(part.get("text"), str) and part["text"])
+        and not (
+            isinstance(part.get("text"), str)
+            and part["text"].strip()
+        )
     )
 
 
@@ -127,7 +131,7 @@ def _summary_text(item: Dict[str, Any]) -> Optional[str]:
             continue
         for field in ("text", "summary_text"):
             text = part.get(field)
-            if isinstance(text, str) and text:
+            if isinstance(text, str) and text.strip():
                 return text
     return None
 

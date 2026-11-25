@@ -175,6 +175,22 @@ class HostProfileProjectionTests(unittest.TestCase):
             ):
                 self.assertEqual("", host_profile.stated_key())
 
+    def test_the_effective_key_is_the_one_this_host_states(self) -> None:
+        """A gateway's catalog route and its proxy answer the same credential."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            key_file = Path(directory) / "gateway-master-key"
+            key_file.write_text("sk-lv-stated\n", encoding="utf-8")
+            with mock.patch.dict(
+                "os.environ",
+                {host_profile.PROFILE_ENV: "gateway", host_profile.PROXY_KEY_ENV: str(key_file)},
+                clear=True,
+            ):
+                self.assertEqual("sk-lv-stated", host_profile.effective_master_key("sk-published"))
+            # A desktop keeps the document's key: nothing overrides it there.
+            with mock.patch.dict("os.environ", {host_profile.PROXY_KEY_ENV: str(key_file)}, clear=True):
+                self.assertEqual("sk-published", host_profile.effective_master_key("sk-published"))
+
 
 class HostProfileStagingTests(unittest.TestCase):
     """The seam that matters: the document the proxy is handed."""
