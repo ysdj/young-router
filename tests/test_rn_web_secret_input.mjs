@@ -1,7 +1,7 @@
 // Exercise the browser secret leaf through a real React Native for Web mount.
-// Source assertions cannot catch the two timing contracts here: blur has to
-// leave the shared auto-commit timer alive, and a completed stage has to report
-// `saved` so the WebDAV child enables its password-only save.
+// Source assertions cannot catch these timing contracts: typing must stage
+// nothing, and a blur or Enter must stage exactly once while a completed stage
+// reports `saved` so the WebDAV child enables its password-only save.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -66,21 +66,11 @@ setBrowserSecretStager(async ({ value }) => {
 });
 
 function App() {
-  const [commitRequest, setCommitRequest] = React.useState(0);
   const [status, setStatus] = React.useState("ready");
   const [saved, setSaved] = React.useState(false);
-  const timer = React.useRef();
   const onSecretState = React.useCallback((state) => {
     setStatus(state.status);
-    if (state.status === "dirty") {
-      if (timer.current !== undefined) clearTimeout(timer.current);
-      timer.current = setTimeout(() => setCommitRequest((current) => current + 1), 500);
-    } else if (state.status === "saved") {
-      setSaved(true);
-    } else if (state.status === "ready" || state.status === "error") {
-      if (timer.current !== undefined) clearTimeout(timer.current);
-      timer.current = undefined;
-    }
+    if (state.status === "saved") setSaved(true);
   }, []);
   return <>
     <NativeSecureTextInput
@@ -89,7 +79,6 @@ function App() {
       label="Password"
       plainText
       autoCommit
-      commitRequest={commitRequest}
       onSecretState={onSecretState}
     />
     <NativeButton title="Outside" accessibilityLabel="outside" onPress={() => undefined} />
@@ -181,12 +170,17 @@ async function main() {
     };
     await click(input.result.value);
     await cdp.send("Input.insertText", { text: "blur-safe-secret" });
-    // This is the race that used to lose the edit: blur before the 500 ms
-    // quiet period. The timer must still stage exactly once.
-    await click(outside.result.value);
+    // Typing is draft-only now: no quiet-period timer may write the field while
+    // it still has focus.
     await sleep(750);
+    const typed = await readState();
+    if (typed.writes !== 0) throw new Error(`typing staged the secret (writes=${typed.writes})`);
+    if (typed.status !== "dirty") throw new Error(`typing did not stay dirty (${JSON.stringify(typed)})`);
+    // Blur is the commit point and must stage exactly once.
+    await click(outside.result.value);
+    await sleep(50);
     const state = await readState();
-    if (state.writes !== 1) throw new Error(`blur cancelled the auto-commit (writes=${state.writes})`);
+    if (state.writes !== 1) throw new Error(`blur did not stage once (writes=${state.writes})`);
     if (state.status !== "saved" || state.saved !== true) throw new Error(`stage completion was not reported as saved (${JSON.stringify(state)})`);
     console.log(JSON.stringify({ ok: true, state }));
   } finally {

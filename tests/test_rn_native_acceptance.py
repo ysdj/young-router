@@ -3876,6 +3876,38 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_table = native_controls.split("function WindowsTable(", 1)[1].split("const windowsTableStyles", 1)[0]
         self.assertNotIn("rows.map(", windows_table)
 
+    def test_macos_text_fields_end_editing_on_a_click_outside(self) -> None:
+        """A press on the pane's own surface is a blur, the way every field reads it.
+
+        AppKit keeps the field editor in charge of a text field's text until the
+        responder changes, and a click on a plain `NSView` -- a pane's
+        background, a heading, a card -- changes nothing.  The field kept the
+        caret and React never heard a blur, so the typed value stayed local until
+        Enter, another control, or the window close; the reported symptom was a
+        number sitting in the field while the pane said nothing had changed.
+        The text and secure leaves therefore install one click monitor for the
+        length of their editing session and end it on a click outside.
+        """
+
+        mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        self.assertIn("static id LiteLLMInstallOutsideClickMonitor(NSView *owner)", mac)
+        self.assertIn("NSEventMaskLeftMouseDown", mac)
+        self.assertIn("[hit isDescendantOf:strongOwner]", mac)
+        # Only the field that actually holds the editing session may end it: a
+        # recycled view's monitor cannot take the responder from another field.
+        self.assertIn("NSResponder *responder = window.firstResponder;", mac)
+        self.assertIn("NSView *host = [editor isFieldEditor] ? (NSView *)editor.delegate : editor;", mac)
+        # The event is only ever returned: ending the session is all this does,
+        # so the press still reaches the control it was aimed at.
+        self.assertIn("[window makeFirstResponder:nil];\n    return event;", mac)
+        for implementation in ("LiteLLMAppKitTextFieldComponentView", "LiteLLMAppKitSecureTextInputComponentView"):
+            view = mac.split(f"@implementation {implementation}", 1)[1].split("Class<RCTComponentViewProtocol>", 1)[0]
+            self.assertIn("id _outsideClickMonitor;", view)
+            self.assertIn("_outsideClickMonitor = LiteLLMInstallOutsideClickMonitor(self);", view)
+            self.assertIn("[NSEvent removeMonitor:_outsideClickMonitor];", view)
+            self.assertIn("- (void)controlTextDidBeginEditing:(__unused NSNotification *)notification", view)
+            self.assertIn("- (void)invalidate\n{\n  [self endOutsideClickMonitor];", view)
+
     def test_native_text_inputs_do_not_rewrite_active_text_for_unrelated_prop_updates(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")

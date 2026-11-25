@@ -69,6 +69,8 @@ type AceEditor = {
   execCommand: (command: string, args?: unknown) => void;
   focus: () => void;
   resize: (force?: boolean) => void;
+  navigateFileStart: () => void;
+  navigateFileEnd: () => void;
   on: (event: string, listener: () => void) => void;
 };
 type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) => AceEditor };
@@ -706,6 +708,25 @@ function applyEditorScale(scale?: number): void {
   aceEditor.setFontSize(baseFontSize * effectiveScale);
   document.documentElement.style.setProperty("--editor-scale", String(effectiveScale));
 }
+/**
+ * Apply a whole document the host hands us, never as an undoable user edit.
+ *
+ * Ace has two setters that look interchangeable and are not:
+ * `Editor#setValue` writes through the document but leaves the session's undo
+ * manager recording, so the bootstrap and every later host replacement became
+ * one giant undo step.  The first ⌘Z after opening a file therefore restored
+ * the empty document the session started with — the whole file disappeared —
+ * and an undo after a retarget could pull the previous document's text into
+ * the new one.  `EditSession#setValue` is the same replacement with the
+ * history reset, which is the ownership this page wants: only edits made in
+ * the editor are steps a person can undo.  The session setter always moves to
+ * the start, so the caller's caret position is restored afterwards.
+ */
+function applyHostDocument(editor: AceEditor, text: string, cursorAtEnd: boolean): void {
+  editor.session.setValue(text);
+  if (cursorAtEnd) editor.navigateFileEnd();
+  else editor.navigateFileStart();
+}
 function createEditor(command: ReplaceDocumentCommand): void {
   const aceApi = window.ace;
   if (!aceApi) throw new Error("Ace failed to load.");
@@ -713,7 +734,7 @@ function createEditor(command: ReplaceDocumentCommand): void {
   // `ace.edit` reads text from the element, not an options.value property.
   // Set the initial document before subscribing to changes so bootstrap does
   // not echo the host's replace command back as a user edit.
-  aceEditor.setValue(normalizedText(command.value), -1);
+  applyHostDocument(aceEditor, normalizedText(command.value), false);
   aceEditor.setTheme("ace/theme/textmate");
   configureEditor(command);
   aceEditor.session.on("change", reportChange);
@@ -745,7 +766,7 @@ function replaceDocument(command: ReplaceDocumentCommand): void {
     applyingHostUpdate = replaceText;
     try {
       configureEditor(command);
-      if (replaceText) aceEditor.setValue(nextText, documentChanged ? -1 : 1);
+      if (replaceText) applyHostDocument(aceEditor, nextText, !documentChanged);
       if (documentChanged) {
         aceEditor.renderer.scrollToY(0);
         aceEditor.selection?.clearSelection?.();

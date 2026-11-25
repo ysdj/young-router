@@ -2469,6 +2469,60 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
   return LiteLLMAppKitSegmentedControlComponentView.class;
 }
 
+/**
+ * Ends a field's editing session when the click that arrives next lands outside
+ * it.
+ *
+ * AppKit keeps the field editor in charge of a text field's text until the
+ * responder changes, and a press on the window's own surface changes nothing: a
+ * pane's background, a section heading or a card is an `NSView` that refuses
+ * first responder, so the click left the caret in the field and the pane never
+ * heard a blur.  A typed value therefore stayed local forever, and a closed
+ * window or a quit could take it away -- the reported symptom was a number
+ * sitting in the field while the pane said nothing had changed.
+ *
+ * The monitor is installed only while this view is being edited and removed the
+ * moment editing ends, so a click inside the field (placing the caret,
+ * selecting) is untouched: the hit view there is the field editor, a
+ * descendant of `owner`.  The event is always returned unchanged; ending the
+ * session is all this does.
+ */
+static id LiteLLMInstallOutsideClickMonitor(NSView *owner)
+{
+  __weak NSView *weakOwner = owner;
+  return [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown
+                                              handler:^NSEvent *(NSEvent *event) {
+    NSView *strongOwner = weakOwner;
+    NSWindow *window = strongOwner.window;
+    if (strongOwner == nil || window == nil || event.window != window) {
+      return event;
+    }
+    // Only while this view still hosts the editing session: a monitor left over
+    // from a recycled or already-ended field must not take the responder from
+    // whatever the person is actually using.
+    NSResponder *responder = window.firstResponder;
+    BOOL editingHere = responder == strongOwner;
+    if (!editingHere && [responder isKindOfClass:[NSTextView class]]) {
+      NSTextView *editor = (NSTextView *)responder;
+      NSView *host = [editor isFieldEditor] ? (NSView *)editor.delegate : editor;
+      editingHere = host != nil && (host == strongOwner || [host isDescendantOf:strongOwner]);
+    }
+    if (!editingHere) {
+      return event;
+    }
+    NSView *content = window.contentView;
+    if (content == nil) {
+      return event;
+    }
+    NSView *hit = [content hitTest:[content convertPoint:event.locationInWindow fromView:nil]];
+    if (hit != nil && (hit == strongOwner || [hit isDescendantOf:strongOwner])) {
+      return event;
+    }
+    [window makeFirstResponder:nil];
+    return event;
+  }];
+}
+
 @interface LiteLLMAppKitTextFieldHostView : NSView
 @property(nonatomic, strong, nullable) NSView *activeControl;
 @end
@@ -2701,6 +2755,9 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   NSScrollView *_scrollView;
   NSTextView *_multilineField;
   BOOL _synchronizing;
+  // The click that ends editing at a blank spot or a heading, held only while
+  // this view holds the field editor; see LiteLLMInstallOutsideClickMonitor.
+  id _outsideClickMonitor;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -2848,6 +2905,7 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 - (void)prepareForRecycle
 {
   [super prepareForRecycle];
+  [self endOutsideClickMonitor];
   static const auto defaultProps = std::make_shared<const LiteLLMAppKitTextFieldProps>();
   _props = defaultProps;
   _synchronizing = YES;
@@ -2895,6 +2953,7 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 
 - (void)invalidate
 {
+  [self endOutsideClickMonitor];
   _field.liteLLMShowsFocusBorder = NO;
   _secureField.liteLLMShowsFocusBorder = NO;
   _field.delegate = nil;
@@ -2912,8 +2971,36 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   [self emitTextChanged:((NSTextField *)notification.object).stringValue];
 }
 
+- (void)beginOutsideClickMonitor
+{
+  [self endOutsideClickMonitor];
+  _outsideClickMonitor = LiteLLMInstallOutsideClickMonitor(self);
+}
+
+- (void)endOutsideClickMonitor
+{
+  if (_outsideClickMonitor == nil) {
+    return;
+  }
+  [NSEvent removeMonitor:_outsideClickMonitor];
+  _outsideClickMonitor = nil;
+}
+
+- (void)controlTextDidBeginEditing:(__unused NSNotification *)notification
+{
+  [self beginOutsideClickMonitor];
+}
+
+- (void)textDidBeginEditing:(NSNotification *)notification
+{
+  if (notification.object == _multilineField) {
+    [self beginOutsideClickMonitor];
+  }
+}
+
 - (void)controlTextDidEndEditing:(NSNotification *)notification
 {
+  [self endOutsideClickMonitor];
   if (notification.object == _field) {
     _field.liteLLMShowsFocusBorder = NO;
     [self emitBlur];
@@ -2935,6 +3022,7 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 - (void)textDidEndEditing:(NSNotification *)notification
 {
   if (notification.object == _multilineField) {
+    [self endOutsideClickMonitor];
     [self emitBlur];
   }
 }
@@ -5158,6 +5246,9 @@ static BOOL IsDirectApiKey(NSString *domain, NSString *field, NSString *target)
   BOOL _secretDirty;
   BOOL _synchronizingField;
   NSString *_lastSyncedPlainText;
+  // The click that ends editing at a blank spot or a heading; see
+  // LiteLLMInstallOutsideClickMonitor.
+  id _outsideClickMonitor;
 }
 
 - (void)endActiveEditingOnLineField:(NSTextField *)field
@@ -5492,8 +5583,36 @@ static const NSTimeInterval kPlainTextSecretReadRetrySeconds = 0.5;
   [self emitRevision:_lastRevision present:_lastPresent status:@"dirty" error:@"" commitRequest:_lastCommitRequest];
 }
 
+- (void)controlTextDidBeginEditing:(__unused NSNotification *)notification
+{
+  [self beginOutsideClickMonitor];
+}
+
+- (void)textDidBeginEditing:(NSNotification *)notification
+{
+  if (notification.object == _multilineField) {
+    [self beginOutsideClickMonitor];
+  }
+}
+
+- (void)beginOutsideClickMonitor
+{
+  [self endOutsideClickMonitor];
+  _outsideClickMonitor = LiteLLMInstallOutsideClickMonitor(self);
+}
+
+- (void)endOutsideClickMonitor
+{
+  if (_outsideClickMonitor == nil) {
+    return;
+  }
+  [NSEvent removeMonitor:_outsideClickMonitor];
+  _outsideClickMonitor = nil;
+}
+
 - (void)controlTextDidEndEditing:(NSNotification *)notification
 {
+  [self endOutsideClickMonitor];
   if (notification.object == _field) {
     _field.liteLLMShowsFocusBorder = NO;
   } else if (notification.object == _plainField) {
@@ -5516,6 +5635,9 @@ static const NSTimeInterval kPlainTextSecretReadRetrySeconds = 0.5;
 
 - (void)textDidEndEditing:(NSNotification *)notification
 {
+  if (notification.object == _multilineField) {
+    [self endOutsideClickMonitor];
+  }
   if (_synchronizingField || notification.object != _multilineField || _host.control != _scrollView ||
       !_autoCommit || !_secretDirty) return;
   [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
@@ -5586,6 +5708,7 @@ doCommandBySelector:(SEL)commandSelector
 
 - (void)invalidate
 {
+  [self endOutsideClickMonitor];
   _generation += 1;
   _secretDirty = NO;
   _lastSyncedPlainText = @"";

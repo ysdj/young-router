@@ -2169,7 +2169,7 @@ export function NativeSecureTextInput({ domain, field, target = "", label, place
   if (Platform.OS === "macos") {
     return <AppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
   }
-  return <WebSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={style} />;
+  return <WebSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={style} />;
 }
 
 /**
@@ -2187,7 +2187,7 @@ export function NativeSecureTextInput({ domain, field, target = "", label, place
  * storage, or report it back through `onSecretState`.  A pane learns `dirty`,
  * `saving`, `saved`, `error`, exactly like the native leaves tell it.
  */
-function WebSecureTextInput({ domain, field, target, label, placeholder, multiline, plainText, disabled, commitRequest, resetRequest, onSecretState, style }: {
+function WebSecureTextInput({ domain, field, target, label, placeholder, multiline, plainText, autoCommit, disabled, commitRequest, resetRequest, onSecretState, style }: {
   domain: string;
   field: string;
   target: string;
@@ -2195,14 +2195,17 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
   placeholder?: string;
   multiline: boolean;
   plainText: boolean;
+  autoCommit: boolean;
   disabled?: boolean;
   commitRequest?: number;
   resetRequest?: number;
   onSecretState?: (state: SecureTextInputState) => void;
   style?: StyleProp<ViewStyle>;
 }): React.JSX.Element {
-  // The shared controller owns the auto-commit debounce; this leaf stages only
-  // when that commit arrives as `commitRequest`.
+  // This leaf stages at the same points the native hosts use: the caller's
+  // `commitRequest` (a flush, the close path, or the pane's own Set button),
+  // and its own end-editing/Enter for an auto-commit field.  Typing only marks
+  // it dirty; a quiet-period timer here wrote half-typed secrets.
   const inputRef = React.useRef<TextInput>(null);
   const edited = React.useRef(false);
   // Read and write the uncontrolled field within the host leaf.
@@ -2216,6 +2219,12 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     if (node) node.value = next;
   };
   const lastCommit = React.useRef(0);
+  // The leaf's own stages have their own request numbers: a caller's request is
+  // matched against `lastCommit`, so a sequence shared with it made a later
+  // caller request look like an already-handled one and the write was skipped.
+  const ownRequest = React.useRef(0);
+  // Whether the field holds text the caller has not staged yet.
+  const dirty = React.useRef(false);
   const lastReset = React.useRef(resetRequest ?? 0);
   const stateListener = React.useRef(onSecretState);
   stateListener.current = onSecretState;
@@ -2225,7 +2234,9 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
   const stage = React.useCallback((request: number): void => {
     const stager = getBrowserSecretStager();
     const value = fieldElement()?.value ?? "";
+    dirty.current = false;
     if (!stager) {
+      dirty.current = true;
       report("error", value.length > 0, "The secret field is unavailable", 0, request);
       return;
     }
@@ -2236,11 +2247,25 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
       // WebDAV child ignore a password-only stage, leaving Save disabled even
       // after Core accepted the value.
       report("saved", staged.present, "", staged.revision, request);
-    }).catch((error: unknown) => report("error", value.length > 0, error instanceof Error ? error.message : "The secret could not be saved", 0, request));
+      // Text typed while this stage was in flight is a newer draft that no
+      // stage has written: report it dirty again after `saved`, or the window
+      // close would read the old completion and skip it.
+      if ((fieldElement()?.value ?? "") !== value) {
+        dirty.current = true;
+        report("dirty", true);
+      }
+    }).catch((error: unknown) => {
+      // A refused stage leaves the text where it is so the next blur, Submit or
+      // close can try again.
+      dirty.current = true;
+      report("error", value.length > 0, error instanceof Error ? error.message : "The secret could not be saved", 0, request);
+    });
   }, [domain, field, target]);
   React.useEffect(() => {
     let current = true;
     edited.current = false;
+    dirty.current = false;
+    ownRequest.current = 0;
     setFieldValue("");
     inputRef.current?.clear();
     const reader = getBrowserSecretReader();
@@ -2257,21 +2282,27 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     if (lastReset.current === (resetRequest ?? 0)) return;
     lastReset.current = resetRequest ?? 0;
     edited.current = true;
+    dirty.current = false;
     setFieldValue("");
     inputRef.current?.clear();
     report("ready", false);
   }, [resetRequest]);
   React.useEffect(() => {
-    // This leaf is the one that asked, so its own timer's write must not be
+    // This leaf is the one that asked, so its own stage's write must not be
     // mistaken for a caller's request (`lastCommit` tracks the latter).
     const request = commitRequest ?? 0;
     if (request === 0 || request === lastCommit.current) return;
     lastCommit.current = request;
     stage(request);
   }, [commitRequest, stage]);
-  // There is deliberately no blur completion here.  The shared controller
-  // owns the quiet auto-commit timer, and a blur can happen before its 500 ms
-  // deadline; reporting ready there would clear dirty and cancel that write.
+  // An auto-commit secret stages when the field loses focus or Enter is
+  // pressed, exactly like AppKit's controlTextDidEndEditing and WinUI's
+  // StageOnBlur/StageOnSubmit.  Nothing is written while it still has focus.
+  const commitFromField = (): void => {
+    if (!autoCommit || !dirty.current) return;
+    ownRequest.current += 1;
+    stage(ownRequest.current);
+  };
   return <TextInput
     accessibilityLabel={label}
     placeholder={placeholder}
@@ -2285,12 +2316,14 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     autoCorrect={false}
     onChangeText={(next) => {
       edited.current = true;
-      // `dirty` is what makes the shared controller schedule its quiet-period
-      // commit (for an auto-commit field) or enable its own button.  The write
-      // itself is one call, from `commitRequest`: a second timer here would
-      // stage the same edit twice and the second answer is a revision conflict.
+      // The typed text is the field's own until a commit point writes it: the
+      // status the pane and the pending registry read is `dirty`, and only the
+      // blur/Enter/`commitRequest` paths call `stage`.
+      dirty.current = true;
       report("dirty", next.length > 0);
     }}
+    onBlur={commitFromField}
+    onSubmitEditing={multiline ? undefined : commitFromField}
     style={[styles.webSecretField, multiline && styles.webSecretFieldMultiline, style]}
   />;
 }
