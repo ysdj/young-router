@@ -1949,6 +1949,33 @@ def _synthesized_completed_response_event(
         completed_event["model"] = model
     return _json_stream_event(completed_event)
 
+
+def _codex_repeated_tool_loop_terminal(request_data: Optional[dict]) -> bool:
+    metadata = _request_context_module._request_metadata_dict(
+        request_data,
+        "litellm_metadata",
+    ) or {}
+    marker = metadata.get(
+        getattr(
+            _codex_contract_module,
+            "_REPEATED_TOOL_LOOP_METADATA_KEY",
+            "codex_repeated_tool_loop_barrier",
+        )
+    )
+    if isinstance(marker, dict) and marker.get("terminal_response") is True:
+        return True
+    # LiteLLM can rebuild the dispatch kwargs one more time after the adapter,
+    # dropping proxy metadata while preserving the replay itself. The repeated
+    # call/result tail is the durable evidence; use it as the same narrow
+    # fallback used by the request contract.
+    try:
+        return (
+            _responses_request_module._codex_replay_tool_loop_pairs(request_data)
+            >= 3
+        )
+    except Exception:
+        return False
+
 def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
@@ -7864,6 +7891,29 @@ async def _yield_guarded_original_stream(
                 )
                 for item in completed_output_items.values()
             )
+            if _codex_repeated_tool_loop_terminal(request_data):
+                # The request-side contract already proved that the tail is a
+                # no-progress loop. Do not hand a just-produced tool call back
+                # to Codex or append the generic "continue unfinished" text:
+                # either would recreate the same loop on the next request.
+                _trace_module._request_route_trace(
+                    "codex_repeated_tool_loop_terminal",
+                    request_data,
+                    reason=terminal_reason,
+                )
+                completed = _synthesized_completed_response_event(
+                    {},
+                    completion_state.created_response,
+                    completion_state.model,
+                    fallback_text=(
+                        synthesized_text().strip()
+                        or "Stopped the repeated tool loop after the same result made no progress."
+                    ),
+                    fallback_phase="commentary",
+                    end_turn=True,
+                    terminal=chunk,
+                )
+                return [completed] if completed is not None else None
             assistant_messages = [
                 item
                 for item in completed_output_items.values()

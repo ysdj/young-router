@@ -765,6 +765,413 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNone(contract.with_progress_message_contract(request))
 
+    def test_codex_repeated_tool_loop_forces_one_final_text_response(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        for index in range(3):
+            request["input"].append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"Finished check {index}; continuing.",
+                        }
+                    ],
+                }
+            )
+            call_id = f"call-exec-{index}"
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": "exec",
+                        "input": 'text(await tools.exec_command({"cmd":"git diff --check"}));',
+                        "status": "completed",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": "",
+                    },
+                ]
+            )
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as logs:
+            modified = contract.with_repeated_tool_loop_contract(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "none")
+        self.assertIn("codex_repeated_tool_loop_barrier", logs.output[0])
+        self.assertIn('"repeated_tool_pairs": 3', logs.output[0])
+
+    def test_codex_repeated_tool_loop_requires_the_same_result(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        for index in range(3):
+            call_id = f"call-exec-{index}"
+            request["input"].extend(
+                [
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": "exec",
+                        "arguments": '{"cmd":"git diff --check"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": f"result-{index}",
+                    },
+                ]
+            )
+
+        self.assertEqual(
+            hooks._responses_request_module._codex_replay_tool_loop_pairs(request),
+            1,
+        )
+        self.assertIsNone(contract.with_repeated_tool_loop_contract(request))
+
+    def test_codex_repeated_tool_loop_ignores_exec_wall_time_metadata(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        for index, elapsed in enumerate(("0.1s", "0.2s", "0.3s")):
+            call_id = f"call-exec-{index}"
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": "exec",
+                        "input": 'text(await tools.exec_command({"cmd":"git diff --check"}));',
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": f"\nWall time: {elapsed}\nProcess exited with code 0\nFinal output:\n",
+                    },
+                ]
+            )
+
+        self.assertEqual(
+            hooks._responses_request_module._codex_replay_tool_loop_pairs(request),
+            3,
+        )
+        modified = contract.with_repeated_tool_loop_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "none")
+
+    def test_codex_repeated_tool_loop_keeps_maximum_run_after_a_later_command(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        for index in range(3):
+            call_id = f"call-exec-{index}"
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": "exec",
+                        "input": "git diff --check",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": "same",
+                    },
+                ]
+            )
+        request["input"].extend(
+            [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-status",
+                    "name": "exec",
+                    "input": "git status --short",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-status",
+                    "output": " M file",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            hooks._responses_request_module._codex_replay_tool_loop_pairs(request),
+            3,
+        )
+        modified = contract.with_repeated_tool_loop_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "none")
+
+    def test_repeated_custom_tool_loop_is_evidence_after_metadata_is_removed(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = {
+            "call_type": "aresponses",
+            "input": [],
+            "tools": [
+                {"type": "function", "name": "exec"},
+            ],
+        }
+        for index in range(3):
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": f"call-{index}",
+                        "name": "exec",
+                        "input": "pwd",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-{index}",
+                        "output": "same",
+                    },
+                ]
+            )
+
+        self.assertTrue(contract._is_codex_responses_request(request))
+        modified = contract.with_repeated_tool_loop_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "none")
+
+    def test_codex_repeated_tool_loop_does_not_override_an_existing_choice(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["tool_choice"] = "required"
+        for index in range(3):
+            call_id = f"call-exec-{index}"
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": "exec",
+                        "input": "pwd",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": "same",
+                    },
+                ]
+            )
+
+        self.assertIsNone(contract.with_repeated_tool_loop_contract(request))
+
+    def test_codex_repeated_tool_loop_overrides_an_injected_cleanup_choice(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        for index in range(3):
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": f"call-exec-{index}",
+                        "name": "exec",
+                        "input": "pwd",
+                        "status": "completed",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-exec-{index}",
+                        "output": "same",
+                    },
+                ]
+            )
+
+        modified = request
+        for step in contract.CODEX_CONTRACT_REQUEST_STEPS:
+            updated = step(modified)
+            if updated is not None:
+                modified = updated
+
+        self.assertEqual(modified["tool_choice"], "none")
+        self.assertEqual(
+            modified["litellm_metadata"][contract._INJECTED_TOOL_CHOICE_KEY][
+                "original"
+            ],
+            "auto",
+        )
+
+    def test_codex_repeated_tool_loop_overrides_cleanup_choice_after_marker_loss(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        request["tool_choice"] = "required"
+        request["litellm_metadata"] = {
+            contract._responses_request_module._CODEX_DESCENDANT_CLEANUP_METADATA_KEY: {
+                "state": "active_descendants",
+                "tool_call_required": True,
+            }
+        }
+        for index in range(3):
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": f"call-exec-{index}",
+                        "name": "exec",
+                        "input": "pwd",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-exec-{index}",
+                        "output": "same",
+                    },
+                ]
+            )
+
+        modified = contract.with_repeated_tool_loop_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "none")
+
+    def test_codex_repeated_ordinary_tool_loop_breaks_stale_active_cleanup(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {"agent_name": "/root/audit", "agent_status": "running"},
+                    ]
+                }
+            ),
+        )
+        for index in range(3):
+            request["input"].extend(
+                [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": f"call-exec-{index}",
+                        "name": "exec",
+                        "input": "pwd",
+                        "status": "completed",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-exec-{index}",
+                        "output": "same",
+                    },
+                ]
+            )
+
+        modified = contract.with_repeated_tool_loop_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "none")
+
+    def test_codex_repeated_lifecycle_tool_loop_keeps_active_descendant_cleanup(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {"agent_name": "/root/audit", "agent_status": "running"},
+                    ]
+                }
+            ),
+        )
+        for index in range(3):
+            self._append_collaboration_call(
+                request,
+                call_id=f"call-list-{index}",
+                name="list_agents",
+                arguments='{"path_prefix":"/root"}',
+                output=json.dumps(
+                    {
+                        "agents": [
+                            {"agent_name": "/root", "agent_status": "running"},
+                            {"agent_name": "/root/audit", "agent_status": "running"},
+                        ]
+                    }
+                ),
+            )
+
+        self.assertIsNone(contract.with_repeated_tool_loop_contract(request))
+
+    def test_codex_evidence_survives_native_tool_passthrough(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["model_info"] = {}
+        request["api_base"] = "https://gateway.example/v1"
+
+        modified = hooks._responses_surfaces_module._with_responses_native_client_tool_passthrough(
+            request
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertNotIn("additional_tools", json.dumps(modified["input"]))
+        self.assertTrue(
+            hooks._responses_request_module._request_has_codex_client_evidence(
+                modified
+            )
+        )
+
     def test_codex_progress_contract_ignores_text_before_the_latest_user_message(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module

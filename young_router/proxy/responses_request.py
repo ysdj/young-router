@@ -1536,6 +1536,24 @@ def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
     if _request_has_codex_additional_tools_namespace(request_kwargs):
         return True
 
+    # The native client-tool passthrough promotes a leading ``additional_tools``
+    # item into the top-level ``tools`` array before the generic deployment
+    # helper runs.  At that point the original item is gone, but the Codex
+    # surface remains identifiable by its functions and collaboration
+    # namespaces.  Keep this narrow so an ordinary Responses request that only
+    # happens to declare a namespace is not treated as a Codex turn.
+    top_level_tools = request_kwargs.get("tools")
+    if isinstance(top_level_tools, list):
+        namespace_names = {
+            tool.get("name")
+            for tool in top_level_tools
+            if isinstance(tool, dict)
+            and tool.get("type") == "namespace"
+            and isinstance(tool.get("name"), str)
+        }
+        if {"functions", "collaboration"}.issubset(namespace_names):
+            return True
+
     for headers in _incoming_request_headers(request_kwargs):
         for header_name in (
             "X-Codex-Turn-Metadata",
@@ -2737,6 +2755,171 @@ _CODEX_REPLAY_CALL_ITEM_TYPES = frozenset(
         "tool_search_output",
     }
 )
+
+_CODEX_TOOL_LOOP_CALL_TYPES = frozenset({"function_call", "custom_tool_call"})
+_CODEX_TOOL_LOOP_OUTPUT_TYPES = frozenset(
+    {"function_call_output", "custom_tool_call_output"}
+)
+
+
+def _codex_replay_tool_loop_pairs(request_kwargs: dict) -> int:
+    """Count identical completed tool calls at the end of a Codex replay.
+
+    A normal continuation can repeat a command when its result changes, so the
+    call and its result are compared together.  Only a consecutive tail after
+    the latest user message counts; a new user turn or assistant text resets
+    the run.  The count is used by the request contract to stop a provider
+    from spinning on a command whose result never changes.
+    """
+
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return 0
+
+    def normalize_tool_output(value: Any) -> Any:
+        if isinstance(value, str):
+            normalized = re.sub(
+                r"(?im)^\s*Wall time:\s*[^\r\n]*$",
+                "",
+                value,
+            )
+            # Exec adapters add these lines around the command's actual text.
+            # When no text remains, all successful empty commands have the
+            # same result even if the wrapper's duration differs.
+            meaningful_lines = [
+                line.strip()
+                for line in normalized.splitlines()
+                if line.strip()
+                and line.strip() not in {"Script completed", "Output:", "Final output:"}
+                and not re.fullmatch(r"(?:Exit code|Process exited with code):\s*0", line.strip(), re.I)
+            ]
+            if not meaningful_lines:
+                return "<empty-tool-output>"
+            return normalized
+        if isinstance(value, list):
+            return [normalize_tool_output(item) for item in value]
+        if isinstance(value, dict):
+            return {key: normalize_tool_output(item) for key, item in value.items()}
+        return value
+
+    def canonical(value: Any, *, tool_output: bool = False) -> str:
+        if tool_output:
+            value = normalize_tool_output(value)
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return repr(value)
+
+    def item_identifier(item: dict) -> Optional[str]:
+        for key in ("call_id", "id"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    pending: dict[str, tuple[str, str]] = {}
+    repeated = 0
+    maximum_repeated = 0
+    previous_pair: Optional[tuple[str, str, str]] = None
+    tail_is_output = False
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        role = str(item.get("role") or "").lower()
+        if role == "user":
+            pending.clear()
+            repeated = 0
+            maximum_repeated = 0
+            previous_pair = None
+            tail_is_output = False
+            continue
+        if role == "assistant" and _codex_message_text(item).strip():
+            # Codex records a progress sentence between each automatic
+            # continuation.  Keep the pair history across that text: a model
+            # that says "done" and then runs the same command again is still
+            # repeating the same work.  The next user message resets the
+            # sequence above, while a different completed pair resets it at
+            # the comparison below.
+            pending.clear()
+            tail_is_output = False
+            continue
+        if item_type in _CODEX_TOOL_LOOP_CALL_TYPES:
+            identifier = item_identifier(item)
+            name = item.get("name")
+            if identifier is None or not isinstance(name, str) or not name:
+                continue
+            argument_key = "input" if item_type == "custom_tool_call" else "arguments"
+            pending[identifier] = (name, canonical(item.get(argument_key)))
+            tail_is_output = False
+            continue
+        if item_type not in _CODEX_TOOL_LOOP_OUTPUT_TYPES:
+            continue
+        identifier = item_identifier(item)
+        if identifier is None:
+            continue
+        call = pending.pop(identifier, None)
+        if call is None:
+            continue
+        pair = (*call, canonical(item.get("output"), tool_output=True))
+        if pair == previous_pair:
+            repeated += 1
+        else:
+            maximum_repeated = max(maximum_repeated, repeated)
+            repeated = 1
+            previous_pair = pair
+        tail_is_output = True
+
+    if tail_is_output:
+        maximum_repeated = max(maximum_repeated, repeated)
+    return maximum_repeated if tail_is_output else 0
+
+
+def _codex_replay_tool_loop_tail_name(request_kwargs: dict) -> Optional[str]:
+    """Return the name of the last completed replayed tool call.
+
+    The repeated-pair count deliberately stays a small integer API.  The
+    cleanup contract also needs to distinguish a stuck ordinary command from
+    a lifecycle call, though, because only the latter must retain the
+    descendant barrier.
+    """
+
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return None
+
+    pending: dict[str, str] = {}
+    latest_name: Optional[str] = None
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in _CODEX_TOOL_LOOP_CALL_TYPES:
+            identifier = item.get("call_id") or item.get("id")
+            name = item.get("name")
+            if (
+                isinstance(identifier, str)
+                and identifier
+                and isinstance(name, str)
+                and name
+            ):
+                pending[identifier] = name
+            continue
+        if item_type not in _CODEX_TOOL_LOOP_OUTPUT_TYPES:
+            continue
+        identifier = item.get("call_id") or item.get("id")
+        if not isinstance(identifier, str):
+            continue
+        name = pending.pop(identifier, None)
+        if name is not None:
+            latest_name = name
+    return latest_name
 
 
 def _codex_replay_trailing_progress_messages(request_kwargs: dict) -> int:

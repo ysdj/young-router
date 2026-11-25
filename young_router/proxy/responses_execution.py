@@ -1624,6 +1624,18 @@ def _wrap_generic_function_for_deployment_failover(
             )
         )
         if responses_tool_adapter_kwargs is not None:
+            # The adapter rebuilds the request after client tools have been
+            # promoted. Re-apply the no-progress contract to that exact body so
+            # the primary upstream call sees ``tool_choice: none`` instead of
+            # only the later hedge/fallback attempt seeing it.
+            repeated_loop_kwargs = (
+                _codex_contract_module.with_repeated_tool_loop_contract(
+                    responses_tool_adapter_kwargs,
+                    allow_existing_tool_choice=True,
+                )
+            )
+            if repeated_loop_kwargs is not None:
+                responses_tool_adapter_kwargs = repeated_loop_kwargs
             try:
                 return await _execute_responses_tool_adapter_call(
                     surface_adapted_original_function,
