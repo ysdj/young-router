@@ -1,0 +1,60 @@
+name: Upstream contracts
+
+# Why this workflow exists
+#
+# The desktop builds resolve each staged npm integration against its `latest`
+# dist-tag, so the package a release ships can change without a commit in this
+# repository.  `dsh-connect-workbuddy` 5.31.0 did exactly that: `fetchModels`
+# started answering `{ models, degraded }`, the worker still passed the answer
+# to a catalog that called `models.map`, and every build after the changepoint
+# shipped a fallback roster with no 倍率.  Unit tests could not see it because
+# they drive a hand-written stub, and the artifact builds ran only when someone
+# asked for one.
+#
+# This job resolves the latest releases on a schedule and drives the same
+# seams the workers use.  It is deliberately not a push/PR trigger and not the
+# desktop matrix: it spends no macOS/Windows runner time, and its only job is
+# to fail early when upstream moves under a staged adapter.
+on:
+  schedule:
+    # Once a day, before a maintainer is likely to start a release build.
+    - cron: "23 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  staged-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v5
+
+      # WorkBuddy: the desktop credential format, both catalogs, and the
+      # `fetchModels` return shape the worker stages.
+      - name: Stage the latest WorkBuddy package
+        run: >
+          uv run --no-project --python 3.12
+          scripts/update_connect_workbuddy.py
+          --output "$RUNNER_TEMP/connect-workbuddy"
+      - name: Verify the WorkBuddy contract
+        run: >
+          node scripts/verify_connect_workbuddy.mjs
+          "$RUNNER_TEMP/connect-workbuddy/lib/index.js"
+
+      # Qoder: the cosy client is found by shape, so a release that moves it
+      # must fail here rather than on the first request.
+      - name: Stage the latest Qoder package
+        run: >
+          uv run --no-project --python 3.12
+          scripts/update_connect_qoder.py
+          --output "$RUNNER_TEMP/connect-qoder"
+      - name: Verify the Qoder contract
+        run: >
+          node scripts/verify_connect_qoder.mjs
+          "$RUNNER_TEMP/connect-qoder/lib/index.js"

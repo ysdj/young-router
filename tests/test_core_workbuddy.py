@@ -1084,6 +1084,66 @@ class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
         self.assertEqual(controller._workbuddy_environment(autostart=True), {})
 
 
+class WorkBuddyBuildContractTests(unittest.TestCase):
+    """The artifact build must fail when the staged catalog seam moves.
+
+    The worker drives the third-party package's `fetchModels`, and 5.31.0
+    changed its answer from a roster to `{ models, degraded }`.  The build used
+    to check exported names only, so that release packaged cleanly while every
+    route lost the live roster and its 倍率.  These tests drive the verifier the
+    build now runs: a moved return shape is a build failure, and the package
+    the build stages still passes.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest("Node.js is not available on this machine")
+
+    def _verify(self, entry: Path):
+        import subprocess
+
+        return subprocess.run(
+            [self.node, str(ROOT / "scripts/verify_connect_workbuddy.mjs"), str(entry)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_a_moved_catalog_shape_fails_the_build(self) -> None:
+        """A return value the worker cannot stage is refused before packaging."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "index.js"
+            entry.write_text(
+                """\
+export class WorkBuddyCredentialStore {}
+export class WorkBuddyUpstreamClient { async fetchModels() { return { roster: [] } } }
+export class WorkBuddyCatalog {}
+export function createWorkBuddyShim() {}
+export const WORKBUDDY_REGIONS = ['cn', 'global']
+export const WORKBUDDY_PROVIDERS = { cn: 'workbuddy', global: 'workbuddy-global' }
+export const WORKBUDDY_PROVIDER_DISPLAY_NAMES = { cn: 'WorkBuddy', global: 'WorkBuddy Global' }
+export function workbuddyAppExecutableCandidates() { return [] }
+export function findWorkbuddyAppExecutable() { return undefined }
+""",
+                encoding="utf-8",
+            )
+            result = self._verify(entry)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no longer answers a roster", result.stderr)
+
+    def test_the_staged_package_passes_the_contract(self) -> None:
+        """The release this build stages still answers the worker's seam."""
+
+        entry = ROOT / "rn/.staging-cache/connect-workbuddy/lib/index.js"
+        if not entry.exists():
+            self.skipTest("staged library absent")
+        result = self._verify(entry)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class WorkBuddyDesktopCredentialTests(unittest.TestCase):
     """A sealed desktop credential must open for the product it belongs to.
 
@@ -1112,7 +1172,22 @@ class WorkBuddyDesktopCredentialTests(unittest.TestCase):
 export { WorkBuddyCredentialStore } from './chunk.js'
 export class WorkBuddyUpstreamClient {
   async refreshToken() { return { accessToken: 'a', refreshToken: 'r', expiresAtMs: Date.now() + 3600000 } }
-  async fetchModels() { return [] }
+  async fetchModels() {
+    // The shape the staged library publishes from 5.31.0 on (#288): a partial
+    // read must travel with its degradation, so the answer is an envelope and
+    // not the bare roster it used to be.
+    return {
+      models: [{
+        id: 'live-row',
+        name: 'Live row',
+        contextWindow: 1000000,
+        maxTokens: 64000,
+        supportsImages: true,
+        creditMultiplier: 0.42,
+      }],
+      degraded: { missing: 'cli', used: 'app', body: 'HTTP 429' },
+    }
+  }
   async fetchCredits() { return null }
 }
 export class WorkBuddyCatalog {
@@ -1148,7 +1223,9 @@ export class WorkBuddyCredentialStore {
   async status() {
     return { state: 'signed-in', region: this.region, ownPath: this.ownPath }
   }
-  async resolve() { throw new Error('the stub serves no credential') }
+  // A catalog read resolves the credential first; the value itself is opaque
+  // to the worker, which only forwards it to the library.
+  async resolve() { return { accessToken: 'a', refreshToken: 'r', expiresAtMs: Date.now() + 3600000, domain: 'www.codebuddy.cn', uid: '' } }
 }
 """
 
@@ -1246,6 +1323,29 @@ export class WorkBuddyCredentialStore {
             # The store keeps its own copy under a per-region name, so a
             # refresh for one gateway can never overwrite the other's.
             self.assertIn(f"/{provider_id}.auth.json", entry["ownPath"])
+
+    def test_a_catalog_read_keeps_the_live_roster_and_its_rates(self) -> None:
+        """5.31.0's `{ models, degraded }` answer is unwrapped, not handed to the catalog.
+
+        The library turned `fetchModels` from a bare roster into a catalog read
+        so a fallback could be reported (#288).  Passing that envelope straight
+        to `catalog.set` made its own `models.map` throw, so the worker reported
+        `models.map is not a function`, replaced the live roster with the
+        bundled fallback, and every 倍率 disappeared with it -- the pane then
+        had no rate to show and none to follow.  This pins the seam against the
+        shape the staged library actually publishes.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fake_apps(root)
+            document = self._get(self._start(root), "/control/models?provider=workbuddy")
+
+        self.assertIs(document.get("available"), True, document)
+        self.assertEqual([model["id"] for model in document["models"]], ["live-row"])
+        self.assertEqual(document["models"][0]["creditMultiplier"], 0.42)
+        self.assertNotIn("catalogError", document["status"])
+        self.assertNotIn("detail", document)
 
     def test_the_worker_iterates_the_librarys_regions(self) -> None:
         """The region list is the library's, not a pair written here."""

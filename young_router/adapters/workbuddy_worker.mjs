@@ -373,8 +373,19 @@ class RegionRuntime {
     const credential = await this.store.resolve()
     this.catalog.setRegionUsable(true)
     try {
-      const models = await this.client.fetchModels(credential)
-      this.catalog.set(models)
+      // The staged library answered the bare roster before 5.31.0 and
+      // `{ models, degraded }` from it on: a fallback read is a partial
+      // roster, so it has to reach the catalog with its flag.  Handing the
+      // whole answer to `catalog.set` made the catalog's own `models.map`
+      // throw (`models.map is not a function`), which reset the source to the
+      // bundled fallback -- so the live roster AND every 倍率 in it were
+      // replaced by 11 static rows with no rate to follow.
+      const read = await this.client.fetchModels(credential)
+      const models = Array.isArray(read) ? read : read?.models
+      if (!Array.isArray(models)) {
+        throw new Error('workbuddy model catalog read returned no roster')
+      }
+      this.catalog.set(models, 'upstream', Array.isArray(read) ? undefined : read.degraded)
       this.source = 'live'
       this.fetchedAtMs = Date.now()
       this.catalogError = ''

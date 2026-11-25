@@ -1118,47 +1118,13 @@ fi
 # WorkBuddy ships the desktop credential format and both model catalogs, so a
 # release that renames one of its published exports would break the provider at
 # request time rather than at build time. The bundle proves the staged package
-# still offers the surface the worker imports.
-#
-# The region names are checked beside those exports because they are what the
-# worker iterates: a release that renamed the list, or dropped one region from
-# it, would silently start serving one gateway and report success. The desktop
-# app probe is checked too, since a build whose probe disappeared could no
-# longer open the app that owns a signed-out account's sign-in.
-if ! "$CORE/runtime/bin/node" --input-type=module -e "
-const entry = process.argv[1]
-Promise.all([import(entry)]).then(async ([library]) => {
-  const required = [
-    'WorkBuddyCredentialStore',
-    'WorkBuddyUpstreamClient',
-    'WorkBuddyCatalog',
-    'createWorkBuddyShim',
-    'WORKBUDDY_REGIONS',
-    'WORKBUDDY_PROVIDERS',
-    'WORKBUDDY_PROVIDER_DISPLAY_NAMES',
-    'workbuddyAppExecutableCandidates',
-    'findWorkbuddyAppExecutable',
-  ]
-  const missing = required.filter((name) => library[name] === undefined)
-  if (missing.length > 0) { process.stderr.write('missing: ' + missing.join(', ') + '\n'); process.exit(1) }
-  const regions = library.WORKBUDDY_REGIONS
-  if (!Array.isArray(regions) || regions.length !== 2) {
-    process.stderr.write('WORKBUDDY_REGIONS is not the two regions: ' + JSON.stringify(regions) + '\n')
-    process.exit(1)
-  }
-  for (const region of regions) {
-    if (typeof library.WORKBUDDY_PROVIDERS[region] !== 'string') {
-      process.stderr.write('no provider id for region: ' + region + '\n')
-      process.exit(1)
-    }
-    if (typeof library.WORKBUDDY_PROVIDER_DISPLAY_NAMES[region] !== 'string') {
-      process.stderr.write('no display name for region: ' + region + '\n')
-      process.exit(1)
-    }
-  }
-}).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\n'); process.exit(1) })
-" "$CORE/young_router/adapters/connect-workbuddy/lib/index.js"; then
-  echo "The bundled dsh-connect-workbuddy package no longer exports the surface the worker uses." >&2
+# still offers the surface the worker imports -- and that the catalog read still
+# answers the roster shape the worker stages. 5.31.0 moved `fetchModels` to
+# `{ models, degraded }`; export-only checks passed while every route fell back
+# to the static roster and lost its 倍率, so the contract runs here now.
+if ! "$CORE/runtime/bin/node" "$PROJECT_ROOT/scripts/verify_connect_workbuddy.mjs" \
+  "$CORE/young_router/adapters/connect-workbuddy/lib/index.js"; then
+  echo "The bundled dsh-connect-workbuddy package no longer offers the surface the worker uses." >&2
   exit 5
 fi
 # Qoder ships the cosy protocol and the two gateways' clients inside one shared

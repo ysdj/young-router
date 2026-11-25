@@ -450,6 +450,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         automation = {
             "web-page.yml": {"push"},
             "docker.yml": {"release"},
+            # The staged npm integrations resolve their `latest` dist-tag, so
+            # the seam that hands a release to a worker can move with no commit
+            # here.  The scheduled job is the only place that sees it early.
+            "upstream-contracts.yml": {"schedule"},
         }
         for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
             with self.subTest(workflow=path.name):
@@ -1171,30 +1175,37 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # WorkBuddy ships the desktop credential format and both model
         # catalogs, so a release that renamed one of its published exports
         # would break the provider at request time instead of at build time.
-        # The smoke test names exactly what the worker imports.
+        #
+        # The exports are named by the verifier the build runs rather than
+        # inline in the build script: 5.31.0 moved `fetchModels` from a roster
+        # to `{ models, degraded }`, and an export-only list could not see it.
+        # `tests/test_upstream_contracts.py` holds the other half -- that this
+        # build (and Windows) actually runs this verifier.
         script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+        verifier = (ROOT / "scripts" / "verify_connect_workbuddy.mjs").read_text(encoding="utf-8")
         worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
             encoding="utf-8"
         )
+        self.assertIn("verify_connect_workbuddy.mjs", script)
         for name in (
             "WorkBuddyCredentialStore",
             "WorkBuddyUpstreamClient",
             "WorkBuddyCatalog",
             "createWorkBuddyShim",
         ):
-            self.assertIn(name, script)
+            self.assertIn(name, verifier)
             self.assertIn(name, worker)
         # The regions are what the worker iterates, so the build proves the
         # list still names two of them and that each has a provider id and a
         # display name: a release that dropped one would serve one gateway
         # while reporting success.
-        self.assertIn("WORKBUDDY_REGIONS", script)
-        self.assertIn("WORKBUDDY_PROVIDERS", script)
-        self.assertIn("WORKBUDDY_PROVIDER_DISPLAY_NAMES", script)
+        self.assertIn("WORKBUDDY_REGIONS", verifier)
+        self.assertIn("WORKBUDDY_PROVIDERS", verifier)
+        self.assertIn("WORKBUDDY_PROVIDER_DISPLAY_NAMES", verifier)
         self.assertIn("library.WORKBUDDY_REGIONS", worker)
         # The desktop app probe is how a signed-out card finds the app that
         # owns its sign-in; the worker must not carry those paths itself.
-        self.assertIn("workbuddyAppExecutableCandidates", script)
+        self.assertIn("workbuddyAppExecutableCandidates", verifier)
         self.assertIn("workbuddyAppExecutableCandidates", worker)
         self.assertNotIn("/Applications/WorkBuddy", worker)
 

@@ -346,6 +346,10 @@ print('young-router-modelprint-tables-ok')
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\connect-qoder\lib\index.js"))) {
     throw "The bundled dsh-connect-qoder package is missing."
   }
+  $WorkBuddySurface = & (Join-Path $RuntimeBin "node.exe") (Join-Path $ProjectRoot "scripts\verify_connect_workbuddy.mjs") (Join-Path $Core "young_router\adapters\connect-workbuddy\lib\index.js") 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "The bundled dsh-connect-workbuddy package no longer offers the surface the worker uses: $WorkBuddySurface"
+  }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\qoder_worker.mjs"))) {
     throw "The Windows build output does not contain young_router/adapters/qoder_worker.mjs."
   }
