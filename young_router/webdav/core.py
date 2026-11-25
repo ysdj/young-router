@@ -652,7 +652,7 @@ def _merge_relay_readings(
 ) -> dict[str, Any]:
     # A station edit changes the authority that issued a cookie, keys, or a
     # balance. The account's row and its enclosing station must both match.
-    identity_fields = ("station_id", "origin", "type", "username")
+    identity_fields = ("station_id", "type", "username")
     if any(local.get(field, "") != incoming.get(field, "") for field in identity_fields):
         return incoming
     if _relay_station_target(local, local_stations) != _relay_station_target(incoming, incoming_stations):
@@ -746,7 +746,12 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
             # to the station's new address or protocol on reload.
             discarded = LOCAL_READINGS.union(LOGIN_FIELDS, {"password"})
             account = {key: value for key, value in account.items() if key not in discarded}
-            account["origin"], account["type"] = new_target
+            # The station owns its URL, so the addition follows the address and
+            # protocol the peer moved it to. Leaving the account's own (now
+            # stale) ``origin`` beside the moved station is the drift the
+            # station-owns-the-URL rule exists to prevent: the pane would offer
+            # the old site with the new site's credentials removed.
+            account["origin"], account["type"] = new_target[0], new_target[1]
         merged_accounts.append(account)
 
     merged_account_station_ids = {

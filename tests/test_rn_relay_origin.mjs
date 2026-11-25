@@ -4,6 +4,7 @@ import { normalizeRelayOrigin, relayLoginLandedAccount, stationOriginKey, statio
 
 assert.equal(normalizeRelayOrigin("aaa.com/"), "https://aaa.com");
 assert.equal(normalizeRelayOrigin("https://x.bbb.com/login"), "https://x.bbb.com");
+assert.equal(normalizeRelayOrigin("https://www.tken.fun"), "https://tken.fun");
 
 assert.equal(suggestedRelayStationName("aaa.com"), "aaa");
 assert.equal(suggestedRelayStationName("x.bbb.com"), "bbb");
@@ -29,7 +30,7 @@ assert.equal(suggestedProviderName("http://127.0.0.1:4000"), "");
 // A station is one site whatever the spelling of its base URL: the host is
 // case-insensitive, a default port is not part of the identity, and the
 // dashboard/API leaf is trimmed.  A deployment base path stays.
-assert.equal(stationOriginKey("HTTPS://WWW.Example.test:443/v1/"), "https://www.example.test");
+assert.equal(stationOriginKey("HTTPS://WWW.Example.test:443/v1/"), "https://example.test");
 assert.equal(stationOriginKey("https://example.test:8443/relay/"), "https://example.test:8443/relay");
 
 // A sign-in asks with a pending id; the answer names the row the station

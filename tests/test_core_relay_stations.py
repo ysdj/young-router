@@ -144,6 +144,65 @@ class RelayStationDomainTests(unittest.TestCase):
             self.assertEqual("signed_out", merged["accounts"][0]["login_status"])
             self.assertFalse(domain.secret_present("session", first["id"]))
 
+    def test_www_alias_update_keeps_login_and_resources_on_one_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory)
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "newapi",
+                    "label": "account",
+                    "origin": "https://www.tken.fun",
+                    "station_name": "tken",
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                cookie="session=fixture",
+                password="saved-password",
+                remember_password=True,
+            )
+            domain._accounts[0]["resources"] = [
+                {
+                    "id": "key-1",
+                    "name": "group-a",
+                    "api_name": "group-a",
+                    "api_base": "https://www.tken.fun/v1",
+                    "key_hint": "sk-fixture",
+                    "enabled": True,
+                    "models": ["gpt-4o"],
+                    "group_id": "group-a",
+                    "group_name": "group-a",
+                }
+            ]
+            domain._accounts[0]["groups"] = [{"id": "group-a", "name": "group-a", "multiplier": 1.0}]
+
+            updated = domain.dispatch(
+                "station.update",
+                {"id": account["station_id"], "name": "tken", "origin": "https://tken.fun"},
+            )
+
+            self.assertEqual("https://tken.fun", updated["stations"][0]["origin"])
+            migrated = updated["accounts"][0]
+            self.assertEqual("https://tken.fun", migrated["origin"])
+            self.assertEqual("signed_in", migrated["login_status"])
+            self.assertTrue(migrated["password_saved"])
+            self.assertEqual(["key-1"], [item["id"] for item in migrated["resources"]])
+            self.assertEqual(["group-a"], [item["id"] for item in migrated["groups"]])
+            self.assertEqual("session=fixture", domain._accounts[0]["session"]["cookie"])
+            self.assertEqual("saved-password", domain._accounts[0]["password"])
+
+            domain.apply()
+            stored = json.loads((Path(directory) / ".litellm-runtime" / "relay-accounts.json").read_text())
+            self.assertEqual("https://tken.fun", stored["stations"][0]["origin"])
+            self.assertNotIn("origin", stored["accounts"][0])
+            reloaded = RelayAccountsDomain(directory)
+            reloaded_account = reloaded.snapshot()["accounts"][0]
+            self.assertEqual("https://tken.fun", reloaded_account["origin"])
+            self.assertEqual("signed_in", reloaded_account["login_status"])
+            self.assertTrue(reloaded_account["password_saved"])
+
     def test_deleting_last_account_removes_empty_station(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RelayAccountsDomain(directory)

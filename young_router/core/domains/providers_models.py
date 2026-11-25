@@ -200,10 +200,9 @@ def _relay_absent_source(value: object) -> tuple[str, str] | None:
 def _relay_site_key(value: object) -> tuple[str, str, int | None] | None:
     """Canonical relay site identity used to compare provider and station URLs.
 
-    The comparison is host-exact: ``station.example.test`` and ``www.station.example.test``
-    are different sites.  A trailing ``/v1`` API path does not change the
-    site, so a provider base URL that differs only in that suffix is treated
-    as the same site and keeps its existing spelling.
+    The www alias is part of the station's canonical identity. A trailing
+    ``/v1`` API path does not change the site, so a provider base URL that
+    differs only in that suffix is treated as the same site.
     """
 
     raw = str(value or "").strip()
@@ -219,7 +218,10 @@ def _relay_site_key(value: object) -> tuple[str, str, int | None] | None:
         port = parsed.port
         if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
             port = None
-        return (scheme, parsed.hostname.rstrip(".").lower(), port)
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname.startswith("www.") and len(hostname) > 4:
+            hostname = hostname[4:]
+        return (scheme, hostname, port)
     except ValueError:
         return None
 
@@ -6661,8 +6663,8 @@ class ProvidersModelsDomain:
         """Atomically bind a provider's URL and name to one relay station.
 
         A provider whose name and base URL already target the station is
-        rebound without touching either of them: its existing ``/v1``
-        spelling is kept, re-selecting the same station is a true no-op, and
+        rebound without changing its API surface: an existing ``/v1`` path is
+        kept while the host adopts the station's canonical spelling, and
         a binding that changes only the hidden source metadata is flagged as
         cosmetic so Core keeps the draft clean.  A window closing after such
         a binding must not ask the user to discard changes that never altered
@@ -6695,21 +6697,26 @@ class ProvidersModelsDomain:
         same_site = bool(
             current_site is not None and current_site == _relay_site_key(station_origin)
         )
+        current_path = urlsplit(
+            current_base if "://" in current_base else f"https://{current_base}"
+        ).path.rstrip("/").lower()
+        next_base = station_origin.rstrip("/")
+        if same_site and current_path.endswith("/v1"):
+            next_base = f"{next_base}/v1"
         if (
             current_source.get("kind") == "relay"
             and current_source.get("station_id") == station_id
             and same_site
             and current_name.casefold() == station_name.casefold()
+            and current_base == next_base
         ):
             # Already bound to this station with the same name and site:
             # nothing changes, so do not dirty the draft.
             return
         provider["name"] = station_name
-        # Keep the provider's existing API base when it already targets the
-        # same relay site.  Station origins omit a trailing /v1 API path;
-        # overwriting the provider URL with the bare origin would silently
-        # move every linked model off the /v1 endpoint.
-        provider["api_base"] = current_base if same_site else station_origin
+        # Station origins omit a trailing /v1 API path. Preserve that API
+        # surface while replacing an old www spelling with the station value.
+        provider["api_base"] = next_base
         self._cosmetic_binding = (
             str(provider["name"]) == current_name
             and str(provider["api_base"]) == current_base
@@ -6718,6 +6725,44 @@ class ProvidersModelsDomain:
         self._set_provider_source(provider, {"kind": "relay", "station_id": station_id})
         self._sync_provider_identity_to_models(provider)
         providers[provider_index] = provider
+
+    def sync_relay_station_origin(
+        self, station_id: object, station_origin: object, *, target_station_id: object | None = None,
+        station_name: object = "",
+    ) -> None:
+        """Project one station URL onto providers bound to that station.
+
+        The relay station owns the URL. A provider keeps an API-base projection
+        only because the LiteLLM config needs one, so a station edit must update
+        that projection in the same Core transaction and preserve its /v1
+        surface when it had one.
+        """
+
+        source_id = str(station_id or "").strip()
+        target_id = str(target_station_id or source_id).strip()
+        origin = str(station_origin or "").strip().rstrip("/")
+        if not source_id or not target_id or not origin:
+            raise DomainError("Relay station is unavailable")
+        target_name = str(station_name or "").strip()
+        providers = self._draft.get("providers")
+        if not isinstance(providers, list):
+            return
+        for index, raw_provider in enumerate(providers):
+            if not isinstance(raw_provider, Mapping):
+                continue
+            source = self._provider_source_state(raw_provider)
+            if source.get("kind") != "relay" or source.get("station_id") != source_id:
+                continue
+            provider = self._copy_provider_for_edit(raw_provider)
+            current_base = str(provider.get("api_base", "") or provider.get("endpoint", "")).strip()
+            parsed = urlsplit(current_base if "://" in current_base else f"https://{current_base}")
+            has_v1 = parsed.path.rstrip("/").lower().endswith("/v1")
+            provider["api_base"] = f"{origin}/v1" if has_v1 else origin
+            if target_name:
+                provider["name"] = target_name
+            self._set_provider_source(provider, {"kind": "relay", "station_id": target_id})
+            self._sync_provider_identity_to_models(provider)
+            providers[index] = provider
 
     # Login-backed providers are deliberately created and managed through the
     # Service Provider Management surface. The normal Providers & Models

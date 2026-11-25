@@ -301,6 +301,43 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
             self.assertEqual(core.revision, result["revision"])
 
+    def test_station_update_rewrites_bound_provider_base_from_station_source(self) -> None:
+        directory, providers, relay, core, station_id = self._relay_core()
+        with directory:
+            added = providers.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "atlas",
+                        "api_base": "https://atlas.example/v1",
+                        "models": [],
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station_id},
+                },
+                expected_revision=core.revision,
+            )
+            # Simulate a pre-migration provider projection that still carries
+            # the www alias while its station already owns the bare origin.
+            providers._draft["providers"][0]["api_base"] = "https://www.atlas.example/v1"
+            result = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "station.update",
+                    "payload": {"id": station_id, "origin": "https://atlas.example"},
+                },
+                expected_revision=core.revision,
+            )
+
+            self.assertEqual(core.revision, result["revision"])
+            self.assertEqual("https://atlas.example/v1", providers.draft_state()["providers"][0]["api_base"])
+
     def test_reselecting_the_same_station_is_a_no_op(self) -> None:
         directory, providers, _relay, core, station_id = self._relay_core()
         with directory:
@@ -336,8 +373,8 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertEqual(before, providers.draft_state()["providers"][0])
             self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
 
-    def test_station_binding_keeps_a_different_site_substantive(self) -> None:
-        """A host-level site mismatch (www vs bare) rewrites the URL and stays dirty."""
+    def test_station_binding_canonicalizes_the_www_alias_and_stays_substantive(self) -> None:
+        """A relay provider keeps its API surface while adopting the bare station URL."""
 
         directory, providers, _relay, core, station_id = self._relay_core()
         with directory:
@@ -362,7 +399,7 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 expected_revision=core.revision,
             )
             provider = providers.draft_state()["providers"][0]
-            self.assertEqual("https://atlas.example", provider["api_base"])
+            self.assertEqual("https://atlas.example/v1", provider["api_base"])
             self.assertEqual("atlas", provider["name"])
             self.assertTrue(core.snapshot()["drafts"]["providers_models"]["dirty"])
 

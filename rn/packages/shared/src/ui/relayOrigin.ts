@@ -8,6 +8,10 @@ export function normalizeRelayOrigin(value: string): string {
   while (/\/(?:login|signin|sign-in|dashboard|v1)$/iu.test(normalized)) {
     normalized = normalized.replace(/\/(?:login|signin|sign-in|dashboard|v1)$/iu, "");
   }
+  // A relay's www and bare hosts are two spellings of one deployment. Keep
+  // the bare host so station, account, login, and provider matching share one
+  // durable URL.
+  normalized = normalized.replace(/^(https?:\/\/)www\./iu, "$1");
   return normalized;
 }
 
@@ -66,9 +70,9 @@ export function suggestedProviderName(value: string): string {
  * The one origin key a relay browser session proved.
  *
  * Two spellings of the same deployment share a station: the host is
- * lower-cased, default ports are dropped, and a trailing slash disappears.
- * The path stays part of the identity, because a deployment base path is a
- * different site from the origin beside it.
+ * lower-cased, the www alias and default ports are dropped, and a trailing
+ * slash disappears. The path stays part of the identity, because a deployment
+ * base path is a different site from the origin beside it.
  */
 export function stationOriginKey(value: string): string {
   const normalized = normalizeRelayOrigin(value);

@@ -1498,6 +1498,7 @@ class BrowserRelaySignInTests(unittest.TestCase):
         self.assertEqual(STATION_SURFACES, surfaces)
         for origin, expected in (
             ("https://relay.example.test", "https://relay.example.test/login"),
+            ("https://www.relay.example.test", "https://relay.example.test/login"),
             ("https://relay.example.test/", "https://relay.example.test/login"),
             ("https://example.test/relay", "https://example.test/relay/login"),
             ("https://example.test/relay/", "https://example.test/relay/login"),

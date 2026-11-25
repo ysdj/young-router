@@ -4489,7 +4489,7 @@ class CoreStore:
         """
 
         from . import relay_browser
-        from .domains.relay_accounts import station_surface_address
+        from .domains.relay_accounts import normalize_relay_origin, station_surface_address
 
         # A published page is open in somebody else's browser -- a gateway, a
         # server, a machine on the LAN.  A window this Core opened would appear
@@ -4502,13 +4502,14 @@ class CoreStore:
             return {"status": "unsupported", "reason": reason}
         if not isinstance(origin, str) or not origin.strip():
             raise CoreError("relay_login_failed", "Relay origin is invalid")
+        normalized_origin = normalize_relay_origin(origin)
         prefill: Mapping[str, Any] = {}
         with self._domain_scope("relay_accounts"):
             relay = self._domains.get("relay_accounts")
             if relay is None or not callable(getattr(relay, "verify_browser_session", None)):
                 raise CoreError("relay_login_failed", "Relay account is unavailable")
             if pending_account is not True:
-                prefill = relay.login_prefill(str(account_id), account_type=account_type, origin=origin)
+                prefill = relay.login_prefill(str(account_id), account_type=account_type, origin=normalized_origin)
             # A window somebody opened and walked away from holds a browser and
             # a profile; the next sign-in is the one moment this side can see it.
             # Taken out of the map here and closed *after* the lock: stopping a
@@ -4524,7 +4525,7 @@ class CoreStore:
                 pass
         try:
             browser = relay_browser.launch(
-                station_surface_address(origin.strip(), "sign_in", account_type),
+                station_surface_address(normalized_origin, "sign_in", account_type),
                 profile_root=profile_root,
                 account_id=str(account_id),
                 embedded=embedded,
@@ -4561,7 +4562,7 @@ class CoreStore:
                 "account_id": str(account_id),
                 "type": str(account_type),
                 "label": str(label),
-                "origin": origin.strip(),
+                "origin": normalized_origin,
                 "username": sign_in_username,
                 "pending_account": pending_account is True,
                 "station_id": station_id,
@@ -6599,7 +6600,10 @@ class CoreStore:
         """
 
         names = {name}
-        if name == "relay_accounts" and normalized_action in _RELAY_DEPENDENCY_ACTIONS:
+        if name == "relay_accounts" and (
+            normalized_action in _RELAY_DEPENDENCY_ACTIONS
+            or normalized_action == "station_update"
+        ):
             names.add("providers_models")
         elif name == "providers_models" and (
             normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS
@@ -6892,9 +6896,12 @@ class CoreStore:
                 relay_dependency_action = (
                     name == "relay_accounts" and normalized_action in _RELAY_DEPENDENCY_ACTIONS
                 )
-                providers = self._domains.get("providers_models") if relay_dependency_action else None
+                relay_station_update = (
+                    name == "relay_accounts" and normalized_action == "station_update"
+                )
+                providers = self._domains.get("providers_models") if (relay_dependency_action or relay_station_update) else None
                 provider_before = self._adapter_draft_state("providers_models") if providers is not None else None
-                relay_checkpoint = _checkpoint_adapter(adapter, error_code="domain_error") if relay_dependency_action else None
+                relay_checkpoint = _checkpoint_adapter(adapter, error_code="domain_error") if (relay_dependency_action or relay_station_update) else None
                 provider_checkpoint = _checkpoint_adapter(providers, error_code="domain_error") if providers is not None else None
                 # The reverse direction: a provider delete releases the relay
                 # stations only that provider still reached.  The set is read
@@ -6943,6 +6950,44 @@ class CoreStore:
                             "api_key_name": resolved.get("api_key_name"),
                         }
                     result = adapter.dispatch(action_type, payload)
+                    if relay_station_update and providers is not None:
+                        from .domains.relay_accounts import normalize_relay_origin
+
+                        station_update_data = _as_mapping(payload)
+                        station_id = str(station_update_data.get("id", station_update_data.get("station_id", ""))).strip()
+                        requested_origin = str(station_update_data.get("origin", station_update_data.get("base_url", ""))).strip().rstrip("/")
+                        if requested_origin:
+                            requested_origin = normalize_relay_origin(requested_origin)
+                        relay_snapshot = adapter.snapshot()
+                        public_stations = relay_snapshot.get("stations", []) if isinstance(relay_snapshot, Mapping) else []
+                        target_station = next(
+                            (
+                                station
+                                for station in public_stations
+                                if isinstance(station, Mapping) and str(station.get("id", "")) == station_id
+                            ),
+                            None,
+                        )
+                        if target_station is None and requested_origin:
+                            target_station = next(
+                                (
+                                    station
+                                    for station in public_stations
+                                    if isinstance(station, Mapping)
+                                    and str(station.get("origin", "")).rstrip("/") == requested_origin
+                                ),
+                                None,
+                            )
+                        sync_station = getattr(providers, "sync_relay_station_origin", None)
+                        if target_station is None:
+                            raise CoreError("domain_error", "Relay station is unavailable")
+                        if callable(sync_station):
+                            sync_station(
+                                station_id,
+                                target_station.get("origin"),
+                                target_station_id=target_station.get("id"),
+                                station_name=target_station.get("name", ""),
+                            )
                     if released_relay is not None:
                         # What the delete stopped reaching is what it owned: the
                         # station and its accounts go through the relay domain's

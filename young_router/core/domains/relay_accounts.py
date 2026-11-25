@@ -340,6 +340,15 @@ def _origin(value: object) -> str:
     if parsed.query or parsed.fragment:
         raise RelayAccountsError("Relay origin is invalid")
     hostname = parsed.hostname.rstrip(".").lower()
+    # Relay deployments commonly expose the same control plane at both
+    # www.example and example. Treat that alias as one station so a URL edit
+    # does not invalidate the account's session, password, or cached key
+    # catalog. The station origin is the bare host everywhere it is persisted
+    # and handed to a browser.
+    if hostname.startswith("www.") and len(hostname) > 4:
+        netloc = parsed.netloc[4:]
+    else:
+        netloc = parsed.netloc
     loopback = hostname == "localhost" or hostname.endswith(".localhost") or hostname in {
         "127.0.0.1",
         "::1",
@@ -354,7 +363,7 @@ def _origin(value: object) -> str:
     while path_parts and path_parts[-1].lower() in {"login", "signin", "sign-in", "dashboard", "v1"}:
         path_parts.pop()
     path = "/" + "/".join(path_parts) if path_parts else ""
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
 def _api_base(value: object) -> str:
@@ -364,6 +373,12 @@ def _api_base(value: object) -> str:
     had_v1 = urlsplit(raw if "://" in raw else f"https://{raw.lstrip('/')}").path.rstrip("/").lower().endswith("/v1")
     origin = _origin(raw)
     return f"{origin}/v1" if had_v1 else origin
+
+
+def normalize_relay_origin(value: object) -> str:
+    """Return the one persisted origin spelling used by relay surfaces."""
+
+    return _origin(value)
 
 
 def _origin_key(value: str) -> tuple[str, str, int | None] | None:
@@ -377,7 +392,10 @@ def _origin_key(value: str) -> tuple[str, str, int | None] | None:
         port = parsed.port
         if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
             port = None
-        return (scheme, parsed.hostname.rstrip(".").lower(), port)
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname.startswith("www.") and len(hostname) > 4:
+            hostname = hostname[4:]
+        return (scheme, hostname, port)
     except ValueError:
         return None
 
@@ -412,7 +430,10 @@ def station_surface_address(origin: str, surface: object, account_type: object) 
     that kept its base path) is not given it twice.
     """
 
-    base = str(origin).strip().rstrip("/")
+    raw_base = str(origin).strip()
+    if not raw_base:
+        return ""
+    base = _origin(raw_base).rstrip("/")
     path = station_surface_path(account_type, surface).strip("/")
     if not base or not path:
         return base
@@ -498,9 +519,8 @@ def _username_key(value: object) -> str:
 def _station_origin_key(value: str) -> str:
     """Canonical identity for one relay deployment base URL.
 
-    ``_origin`` keeps the first user's spelling for display.  Group identity
-    additionally lower-cases hosts, removes default ports, and trims a
-    trailing slash so equivalent base URLs share one station.
+    Group identity lower-cases hosts, removes the www alias and default ports,
+    and trims a trailing slash so equivalent base URLs share one station.
     """
 
     normalized = _origin(value)
@@ -717,6 +737,8 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
     resource_error = str(raw.get("resource_error", "none"))
     if resource_error not in RESOURCE_ERRORS:
         resource_error = "none"
+    raw_origin = raw.get("origin", raw.get("base_url", ""))
+    origin = _origin(raw_origin) if raw_origin else ""
     remember_password = raw.get("remember_password") is True
     # Keeping the *login* is a separate decision from keeping the password.
     # The two native hosts always write the session into their own credential
@@ -749,7 +771,10 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "station_id": _station_id(raw.get("station_id")) if raw.get("station_id") else "",
         "type": account_type,
         "label": _text(raw.get("label"), "Relay label", limit=160),
-        "origin": _origin(raw.get("origin")),
+        # The station owns the durable URL. An old document may still carry an
+        # account copy, so retain it only as an in-memory migration value until
+        # _decode_storage links the account to its station.
+        "origin": origin,
         "username": _text(raw.get("username", ""), "Relay username", limit=320, required=False),
         "login_status": status,
         "remember_password": remember_password,
@@ -878,6 +903,10 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
 
 def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     stored = _public_account(account)
+    # A station is the sole owner of its deployment URL. Account snapshots
+    # still expose the derived value for existing clients, while durable
+    # account rows carry only station_id so a URL cannot drift in two places.
+    stored.pop("origin", None)
     stored.pop("password_saved", None)
     stored.pop("login_observed_seconds_ago", None)
     # The login *observation* is durable, because it is the account's state and
@@ -1892,7 +1921,7 @@ class RelayAccountsDomain:
             "version": 3, "accounts": [], "stations": [],
         }
         saved = next((row for row in document["accounts"] if row["id"] == account["id"]), None)
-        if saved is not None and any(saved.get(key) != account[key] for key in ("origin", "type")):
+        if saved is not None and any(saved.get(key) != account[key] for key in ("station_id", "type")):
             return  # An edited site still belongs to its unapplied draft.
         if saved is None and not new_account:
             return  # A manually added draft is persisted by its own Apply.
@@ -1904,7 +1933,10 @@ class RelayAccountsDomain:
             saved_station = next((row for row in document["stations"] if row["id"] == station_id), None)
             if saved_station is None:
                 document["stations"].append(copy.deepcopy(self._stations[self._station_index(station_id)]))
-            elif any(saved_station.get(key) != account[key] for key in ("type", "origin")):
+            elif (
+                saved_station.get("type") != account["type"]
+                or saved_station.get("origin") != self._station_origin(account["station_id"])
+            ):
                 raise RelayAccountsError("Apply the edited relay station before saving its new account")
             document["accounts"].append(stored)
         else:
@@ -2016,7 +2048,7 @@ class RelayAccountsDomain:
         renewed = {
             account["id"]: account for account in self._accounts
             if (old := prior.get(account["id"])) is not None
-            and all(old[key] == account[key] for key in ("origin", "type"))
+            and all(old[key] == account[key] for key in ("station_id", "type"))
             and account["session"] and any(old[key] != account[key] for key in ("session", "auto_login_unconfirmed"))
         }
         self.restore_transaction(checkpoint)
@@ -2039,6 +2071,12 @@ class RelayAccountsDomain:
             if station["id"] == station_id:
                 return index
         raise RelayAccountsError("Relay station is unavailable")
+
+    def _station_origin(self, station_id: object) -> str:
+        return self._stations[self._station_index(station_id)]["origin"]
+
+    def _account_origin(self, account: Mapping[str, Any]) -> str:
+        return self._station_origin(account["station_id"])
 
     def _station_for_origin(self, origin: str) -> int | None:
         key = _station_origin_key(origin)
@@ -2340,6 +2378,7 @@ class RelayAccountsDomain:
                     str(account.get("type", ""))
                     for account in accounts
                     if isinstance(account, Mapping)
+                    and str(account.get("origin", "")).strip()
                     and _station_origin_key(str(account.get("origin", ""))) == raw_key
                 ),
                 "newapi",
@@ -2420,6 +2459,10 @@ class RelayAccountsDomain:
             or relinked_accounts
             or any(not isinstance(item.get("station_id"), str) or not item.get("station_id") for item in raw_accounts if isinstance(item, Mapping))
             or len(stations) != len(raw_stations)
+            or any(
+                isinstance(item, Mapping) and ("origin" in item or "base_url" in item)
+                for item in raw_accounts
+            )
             or _removals_changed(loaded.get("removed_stations"), removed_stations)
             or _removals_changed(loaded.get("removed_accounts"), removed_accounts)
         )
@@ -4589,20 +4632,34 @@ class RelayAccountsDomain:
             account_id, allow_password=True, observed_status=observed_status, retry_limit_at=retry_limit_at,
         )
 
-    @staticmethod
-    def _relay_login_identity(account: Mapping[str, Any]) -> tuple[str, str, str]:
-        return (_station_origin_key(account["origin"]), account["type"], _username_key(account["username"]))
+    def _relay_login_identity(
+        self, account: Mapping[str, Any], *, origin: str = ""
+    ) -> tuple[str, str, str]:
+        station_origin = origin or str(account.get("origin", ""))
+        if not station_origin:
+            station_origin = self._account_origin(account)
+        return (
+            _station_origin_key(station_origin),
+            str(account.get("type", "")),
+            _username_key(account.get("username", "")),
+        )
 
     def _peer_login(self, account: dict[str, Any], document: Mapping[str, Any]) -> dict[str, Any] | None:
         identity = self._relay_login_identity(account)
         peer = None
         latest = account["session_issued_at"]
+        station_origins = {
+            str(station.get("id", "")): str(station.get("origin", ""))
+            for station in document.get("stations", ())
+            if isinstance(station, Mapping)
+        }
         for row in document.get("accounts", ()):
             if not isinstance(row, dict) or row.get("type") != account["type"]:
                 continue
-            if not isinstance(row.get("origin"), str) or _username_key(row.get("username")) != identity[2]:
+            if _username_key(row.get("username")) != identity[2]:
                 continue
-            if self._relay_login_identity(row) != identity:
+            row_origin = str(row.get("origin", "")) or station_origins.get(str(row.get("station_id", "")), "")
+            if not row_origin or self._relay_login_identity(row, origin=row_origin) != identity:
                 continue
             if account["user_id"] and row.get("user_id") and account["user_id"] != _station_user_id(row["user_id"]):
                 continue
@@ -5249,7 +5306,7 @@ class RelayAccountsDomain:
         # check can finish while this account has other edits in a draft.
         document = json.loads(baseline) if baseline else {}
         saved = next((row for row in document.get("accounts", ()) if row["id"] == account_id), None)
-        if saved is None or any(saved.get(key) != current[key] for key in ("origin", "type", "username")):
+        if saved is None or any(saved.get(key) != current[key] for key in ("station_id", "type", "username")):
             return TaskResult("skipped"), False
         outcome = TaskResult("succeeded")
         if status != "signed_in":
@@ -6520,7 +6577,7 @@ class RelayAccountsDomain:
         changed = False
         for account, reading in updates:
             row = rows.get(account["id"])
-            if row is None or any(row.get(key) != account[key] for key in ("origin", "type", "username")):
+            if row is None or any(row.get(key) != account[key] for key in ("station_id", "type", "username")):
                 continue
             if reading is None:
                 reading = row.get("balance"), ""
