@@ -47,6 +47,7 @@ from .base import (
     _RESPONSES_STREAM_INCOMPLETE_TYPES,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _HEAD_HEDGE_METADATA_KEY,
+    _HEAD_HEDGE_TURN_NAMES_KEY,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
     _RouteOrder,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
@@ -4038,6 +4039,18 @@ async def _dispatch_stream_hedge(
         # which is a second paid prefill for this route and not a hedge.
         return None
     excluded.add(current_id)
+    # The marker above is where this dispatch started; the turn's own walk may
+    # have moved on since (a route that refuses in a second hands the turn to
+    # the next order while this timer runs).  Excluding only the starting route
+    # then asks the sibling for the bytes an attempt already has in flight --
+    # two prefills on one relay for one head, the same waste as the reverse
+    # direction the reservation closes.  ``_remember_attempt_route`` is written
+    # at every selection under this turn's names, so it names the route the
+    # walk is actually on now.
+    live_route = _routing_module._remembered_attempt_route(request_data) or {}
+    live_deployment_id = live_route.get("deployment_id")
+    if isinstance(live_deployment_id, str) and live_deployment_id.strip():
+        excluded.add(live_deployment_id.strip())
     # Once the provider's endpoint and credentials are removed, dispatch by
     # the public group again. Its wire model may exist in several groups.
     payload["model"] = (
@@ -4076,7 +4089,14 @@ async def _dispatch_stream_hedge(
         _routing_module._selected_deployment_marker_from_box()
     ) or _routing_module._trace_request_id(request_data)
     parent = {"request_id": primary_id, "deployment_id": current_id} if primary_id else {}
+    # The turn's names travel with the selection so the route this hedge picks
+    # is reserved while it is in flight; without that the turn's own walk can
+    # select the same deployment and pay a second prefill for one answer (live
+    # 2026-11-26, see ``_LIVE_HEAD_HEDGE_ROUTES``).
+    turn_names = _routing_module._lease_identifier_candidates(request_data)
     selected_box: dict = {}
+    if turn_names:
+        selected_box[_HEAD_HEDGE_TURN_NAMES_KEY] = turn_names
     box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(selected_box)
     marker_token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
     # Every layer this dispatch enters is inside the hedge: the router rebuilds
@@ -4122,6 +4142,10 @@ async def _dispatch_stream_hedge(
         )
         return None
     finally:
+        # Whatever this hedge's dispatch did, its route goes back to the turn:
+        # the reservation exists only while another attempt could still select
+        # it alongside this prefill.
+        _release_live_head_hedge_route(turn_names)
         _CURRENT_HEAD_HEDGE_ATTEMPT.reset(hedge_token)
         _CURRENT_SELECTED_DEPLOYMENT.reset(marker_token)
         _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(box_token)
@@ -4406,6 +4430,108 @@ _HEAD_HEDGED_REQUESTS: dict[str, float] = {}
 _HEAD_HEDGED_REQUESTS_LOCK = threading.Lock()
 _HEAD_HEDGED_REQUEST_TTL_SECONDS = 6 * 60 * 60.0
 _HEAD_HEDGED_REQUEST_LIMIT = 4096
+
+
+# The route a live head hedge is prefilling, keyed by the turn's own request
+# identifiers.  A hedge buys a second *route*; selecting the deployment the
+# hedge already has in flight is not a race but the same prefill bought twice
+# from one upstream account.  Live 2026-11-26 06:07: the head hedge of a
+# 50 KB chat turn went to the order-1 relay at 06:07:36, the walk's
+# own fallback asked that same order again at 06:07:46 because nothing in its
+# step knew about the race, and the station answered both copies with "all
+# available accounts exhausted" -- 42 s and 52 s of duplicate prefill, then two
+# more same-route replays before the order-2 route that could answer was tried.
+# A reservation lives from the hedge's selection until its dispatch settles
+# (win, loss, or failure), which is exactly when the losing attempt's row is
+# settled; the TTL only covers a task that died with the worker, and a stale
+# entry would hide a healthy route from its own turn, so it stays short.
+_LIVE_HEAD_HEDGE_ROUTES: dict[str, tuple[str, float]] = {}
+_LIVE_HEAD_HEDGE_ROUTES_LOCK = threading.Lock()
+_LIVE_HEAD_HEDGE_ROUTE_TTL_SECONDS = 15 * 60.0
+_LIVE_HEAD_HEDGE_ROUTE_LIMIT = 4096
+
+
+def _reserve_live_head_hedge_route(names: Any, deployment_id: Any) -> None:
+    """Reserve the route this hedge's dispatch selected for the rest of the turn.
+
+    Called from the selection hook, so it runs for the deployment the router
+    actually picked rather than for the route the hedge asked for.  A hedge
+    that walks on re-reserves under the same names and thereby frees the
+    deployment it just failed; one turn has at most one live hedge (the claim
+    above), so the names name one reservation.
+    """
+
+    if not isinstance(names, (list, tuple)) or not names:
+        return
+    if not isinstance(deployment_id, str) or not deployment_id.strip():
+        return
+    deployment_id = deployment_id.strip()
+    now = time.time()
+    with _LIVE_HEAD_HEDGE_ROUTES_LOCK:
+        for name, (_reserved, reserved_at) in list(_LIVE_HEAD_HEDGE_ROUTES.items()):
+            if now - reserved_at > _LIVE_HEAD_HEDGE_ROUTE_TTL_SECONDS:
+                _LIVE_HEAD_HEDGE_ROUTES.pop(name, None)
+        for name in names:
+            if isinstance(name, str) and name.strip():
+                _LIVE_HEAD_HEDGE_ROUTES[name] = (deployment_id, now)
+        if len(_LIVE_HEAD_HEDGE_ROUTES) > _LIVE_HEAD_HEDGE_ROUTE_LIMIT:
+            oldest = sorted(
+                _LIVE_HEAD_HEDGE_ROUTES.items(),
+                key=lambda item: item[1][1],
+            )
+            for name, _entry in oldest[
+                : len(_LIVE_HEAD_HEDGE_ROUTES) - _LIVE_HEAD_HEDGE_ROUTE_LIMIT
+            ]:
+                _LIVE_HEAD_HEDGE_ROUTES.pop(name, None)
+
+
+def _release_live_head_hedge_route(names: Any) -> None:
+    """Give the hedge's route back once its dispatch has settled.
+
+    Every ending goes through here -- the hedge wins or loses the race, its
+    dispatch raises, or the winner cancels it -- because an entry that outlived
+    its hedge would keep a healthy route out of its own turn's later rounds.
+    """
+
+    if not isinstance(names, (list, tuple)) or not names:
+        return
+    with _LIVE_HEAD_HEDGE_ROUTES_LOCK:
+        for name in names:
+            if isinstance(name, str):
+                _LIVE_HEAD_HEDGE_ROUTES.pop(name, None)
+
+
+def _live_head_hedge_deployment_ids(request_kwargs: Optional[dict]) -> set[str]:
+    """The routes this turn's live head hedge is already prefilling.
+
+    A deployment filter must drop these from the turn's other attempts: the
+    hedge is silent there for the same reason the attempt would be, and asking
+    twice buys one relay's refusal twice.  Empty for another turn and once the
+    hedge has settled.  The hedge's own dispatch reads the same set: on its
+    first selection nothing is reserved yet, and a later one names the route it
+    just left.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return set()
+    names = _routing_module._lease_identifier_candidates(request_kwargs)
+    if not names:
+        return set()
+    now = time.time()
+    reserved: set[str] = set()
+    with _LIVE_HEAD_HEDGE_ROUTES_LOCK:
+        # Only the names this turn can be known by, not the whole table: this
+        # runs for every deployment selection in the process, and a turn's own
+        # handful of names is the whole question it asks.
+        for name in names:
+            entry = _LIVE_HEAD_HEDGE_ROUTES.get(name)
+            if entry is None:
+                continue
+            deployment_id, reserved_at = entry
+            if now - reserved_at > _LIVE_HEAD_HEDGE_ROUTE_TTL_SECONDS:
+                continue
+            reserved.add(deployment_id)
+    return reserved
 
 
 def _claim_head_hedge_race(request_kwargs: Optional[dict]) -> bool:

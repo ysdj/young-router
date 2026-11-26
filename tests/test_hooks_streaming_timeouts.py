@@ -3314,6 +3314,113 @@ class HookHeadHedgeTests(HookTestCase):
 
         self.assertFalse(streaming._head_hedge_eligible(request))
 
+    async def test_the_hedge_skips_the_route_the_turn_is_already_prefilling(self) -> None:
+        """The walk can move on while the hedge timer runs.
+
+        A route that refuses at once hands the turn to the next order while the
+        head-hedge delay is still counting, so the deployment the dispatch
+        started on is no longer the one that is silent.  Excluding only that
+        starting route asked the relay for the bytes an attempt already had in
+        flight -- one head, two prefills on one account.  Reproduced on the
+        isolated proxy: a synthetic three-order group answered the first turn
+        with order 1 twice, and this is the exclusion that leaves it one copy.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        routing = sys.modules["young_router.proxy.routing"]
+        request = self._chat_request()
+        request.update(model="openai/wire-model", request_id="turn-walked-on")
+        request["model_info"]["route_key"] = "model=public-alias / order=0"
+        calls: list = []
+
+        class Router:
+            async def acompletion(self, **payload):
+                calls.append(sorted(payload["_excluded_deployment_ids"]))
+                return _HedgeStream([])
+
+        proxy_server.llm_router = Router()
+        names = routing._lease_identifier_candidates(request)
+        def forget_route() -> None:
+            for name in names:
+                routing._ATTEMPT_ROUTE_REQUESTS.pop(name, None)
+
+        self.addCleanup(forget_route)
+        routing._remember_attempt_route(
+            request,
+            {"model_info": {"id": "order1-b", "order": 1}},
+        )
+
+        await streaming._dispatch_stream_hedge(request)
+
+        self.assertEqual([["order1-a", "order1-b"]], calls)
+
+    async def test_a_live_head_hedge_reserves_the_route_it_is_prefilling(self) -> None:
+        """A sibling must be a different route, or it is the same prefill twice.
+
+        Live 2026-11-26 06:07: the chat head hedge went to the
+        order-1 relay at 06:07:36, the walk's own order fallback asked that same
+        order again at 06:07:46 because nothing in its step knew about the race,
+        and the station refused both copies of the same 50 KB body with "all
+        available accounts exhausted" -- 42 s and 52 s of duplicate prefill,
+        then two same-route replays before the order-2 route was tried.  The
+        reservation is what makes the next attempt a different route, and it
+        ends with the dispatch that made it.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        request = self._chat_request()
+        request.update(model="openai/wire-model", request_id="turn-live-hedge")
+        request["model_info"]["route_key"] = "model=public-alias / order=1"
+        reserved_while_dispatching: list = []
+        continue_dispatch = asyncio.Event()
+
+        class Router:
+            async def acompletion(self, **payload):
+                hooks._remember_selected_deployment(
+                    {
+                        "model_info": {"id": "order1-b", "order": 1},
+                        "litellm_params": {"model": "openai/wire-model"},
+                    }
+                )
+                reserved_while_dispatching.append(
+                    streaming._live_head_hedge_deployment_ids(request)
+                )
+                await continue_dispatch.wait()
+                return _HedgeStream([])
+
+        proxy_server.llm_router = Router()
+        dispatch = asyncio.ensure_future(streaming._dispatch_stream_hedge(request))
+        self.addAsyncCleanup(self._settle_dispatch, dispatch)
+        for _ in range(500):
+            if reserved_while_dispatching:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual([{"order1-b"}], reserved_while_dispatching)
+        candidates = await hooks.YoungRouterHook().async_filter_deployments(
+            "public-alias",
+            [
+                {"model_info": {"id": "order1-b", "order": 1}},
+                {"model_info": {"id": "order2-c", "order": 2}},
+            ],
+            messages=[],
+            request_kwargs={"request_id": "turn-live-hedge", "_target_order": 1},
+        )
+        # The walk asked for the reserved order by name and got nothing: that
+        # empty answer is what makes it take the next order.
+        self.assertEqual([], candidates)
+
+        continue_dispatch.set()
+        await asyncio.wait_for(dispatch, 2)
+        self.assertEqual(set(), streaming._live_head_hedge_deployment_ids(request))
+
+    async def _settle_dispatch(self, dispatch) -> None:
+        if not dispatch.done():
+            dispatch.cancel()
+        await asyncio.gather(dispatch, return_exceptions=True)
+
     def test_a_hedge_dispatch_row_is_marked_as_internal(self) -> None:
         """The request log can tell a sibling race from a hop of the turn."""
 

@@ -518,3 +518,95 @@ class RustDispatchTests(unittest.TestCase):
             with patch.object(trace, "_route_trace"):
                 asyncio.run(main())
             ''')
+
+    def test_an_order_emptied_by_the_filter_walks_to_the_next_one(self) -> None:
+        """A filter that empties the walk's target order must not end the call.
+
+        The head hedge reserves the deployment it is prefilling, and the
+        deployment filter is where the walk learns that route is unavailable:
+        the walk asks for its target order by name, so an empty answer has to
+        mean "next order", not "no route at all".  Live 2026-11-26: the
+        order-1 fallback landed on the deployment the hedge had
+        been prefilling for ten seconds, and the relay refused both copies of
+        the same 50 KB body; this pin is what makes the reservation actually
+        change the route instead of ending the turn.
+        """
+
+        self.run_router_probe('''
+            import asyncio
+            from unittest.mock import patch
+
+            import litellm
+            from litellm import Router
+            from litellm.integrations.custom_logger import CustomLogger
+            from litellm.proxy import proxy_server
+            from young_router.proxy import patches
+
+            patches.install_all()
+
+            class DropOrderOne(CustomLogger):
+                """What the young-router filter does with a live hedge's route."""
+
+                async def async_filter_deployments(
+                    self, model, healthy_deployments, messages=None,
+                    request_kwargs=None, parent_otel_span=None,
+                ):
+                    from young_router.proxy import responses_request
+
+                    target_order = (request_kwargs or {}).get("_target_order")
+                    if target_order is not None:
+                        healthy_deployments = [
+                            deployment for deployment in healthy_deployments
+                            if responses_request._deployment_order(deployment)
+                            == target_order
+                        ]
+                    return [
+                        deployment for deployment in healthy_deployments
+                        if responses_request._deployment_id(deployment) != "order1"
+                    ]
+
+            litellm.callbacks = [DropOrderOne()]
+            router = Router(model_list=[
+                {
+                    "model_name": "probe",
+                    "litellm_params": {"model": "openai/fixture", "api_key": "sk-fake", "order": order},
+                    "model_info": {"id": route},
+                }
+                for order, route in enumerate(["order0", "order1", "order2"])
+            ], num_retries=0, disable_cooldowns=True)
+            proxy_server.llm_router = router
+
+            class CapacityRefusal(Exception):
+                status_code = 503
+
+            async def main():
+                calls = []
+
+                async def provider(**kwargs):
+                    route = (kwargs.get("model_info") or {}).get("id")
+                    calls.append(route)
+                    if route != "order2":
+                        raise CapacityRefusal("all available accounts exhausted")
+                    return {
+                        "id": "answer",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }],
+                    }
+
+                with patch.object(litellm, "acompletion", provider):
+                    answer = await asyncio.wait_for(
+                        router.acompletion(
+                            model="probe",
+                            messages=[{"role": "user", "content": "hi"}],
+                        ),
+                        20,
+                    )
+                assert calls == ["order0", "order2"], calls
+                assert answer["_hidden_params"]["model_id"] == "order2", answer
+
+            with patch("young_router.proxy.trace._route_trace"):
+                asyncio.run(main())
+            ''')

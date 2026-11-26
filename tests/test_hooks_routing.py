@@ -567,6 +567,49 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
         self.assertFalse(hooks._is_route_recovery_poll_error(error))
 
+    async def test_filter_deployments_drops_the_route_a_live_head_hedge_owns(self) -> None:
+        """One turn never asks one deployment for the same prefill twice.
+
+        The hedge is the turn's second *route*; when the walk's next attempt
+        lands on its deployment the turn pays the same upstream account for the
+        same bytes twice (live 2026-11-26: a 42 s hedge and a
+        52 s fallback on one relay, both refused with "all available accounts
+        exhausted").  The reservation is keyed by the turn, so another turn
+        still sees every route.
+        """
+
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        hook = hooks.YoungRouterHook()
+        deployments = [
+            {"model_info": {"id": "order1-b", "order": 1}},
+            {"model_info": {"id": "order2-c", "order": 2}},
+        ]
+        reserved_names = ["turn-with-live-hedge"]
+        streaming._reserve_live_head_hedge_route(reserved_names, "order1-b")
+        self.addCleanup(streaming._release_live_head_hedge_route, reserved_names)
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=[],
+            request_kwargs={"request_id": "turn-with-live-hedge"},
+        )
+        other = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=[],
+            request_kwargs={"request_id": "another-turn"},
+        )
+
+        self.assertEqual(
+            ["order2-c"], [item["model_info"]["id"] for item in filtered]
+        )
+        self.assertEqual(
+            ["order1-b", "order2-c"],
+            [item["model_info"]["id"] for item in other],
+        )
+
     async def test_filter_deployments_keeps_image_tool_candidates_for_runtime_probe(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

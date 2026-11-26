@@ -1049,6 +1049,13 @@ _CURRENT_ATTEMPT_STARTED_AT = contextvars.ContextVar(
     "current_attempt_started_at",
     default=None,
 )
+# Key on the selected-deployment box that names the turn a head hedge is
+# dispatching for.  The hedge is the turn's second *route*, so the deployment
+# its dispatch selects must be reserved for the turn until that dispatch
+# settles; the box carries the identifiers because the selection hook sees the
+# deployment and nothing else of the turn.  See
+# ``streaming._LIVE_HEAD_HEDGE_ROUTES``.
+_HEAD_HEDGE_TURN_NAMES_KEY = "head_hedge_turn_names"
 _CURRENT_SELECTED_DEPLOYMENT_BOX = contextvars.ContextVar(
     "current_selected_deployment_box",
     default=None,

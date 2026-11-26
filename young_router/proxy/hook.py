@@ -538,6 +538,27 @@ class YoungRouterHook(CustomLogger):
                 model,
             )
 
+            # A live head hedge of this turn is already prefilling these bytes
+            # on its own route.  Handing that deployment to another attempt is
+            # not a second chance for the turn, it is the same prefill bought
+            # twice from one upstream account -- and silence on a route looks
+            # identical whoever asked, so both copies wait the same time and
+            # read the same refusal.  Dropping the last candidate of a target
+            # order is what tells the walk to take the next order instead (live
+            # 2026-11-26: the order-1 fallback duplicated the hedge's own
+            # 50 KB prefill and spent 52 s on it).  The reservation names this
+            # turn's routes only, so another turn still sees all of them.
+            hedge_reserved_deployments = (
+                _streaming_module._live_head_hedge_deployment_ids(request_kwargs)
+            )
+            if hedge_reserved_deployments:
+                candidate_deployments = [
+                    deployment
+                    for deployment in candidate_deployments
+                    if _responses_request_module._deployment_id(deployment)
+                    not in hedge_reserved_deployments
+                ]
+
             _trace_module._route_trace(
                 "filter_deployments",
                 request_id=_routing_module._trace_request_id(request_kwargs),
@@ -545,6 +566,7 @@ class YoungRouterHook(CustomLogger):
                 model_group=model,
                 target_order=_responses_request_module._request_target_order(request_kwargs),
                 excluded_deployment_ids=sorted(_responses_request_module._request_excluded_deployment_ids(request_kwargs)),
+                hedge_reserved_deployments=sorted(hedge_reserved_deployments),
                 has_image_generation_tool=has_image_generation_tool,
                 has_web_search_tool=_tools_module._request_has_web_search_tool(request_kwargs),
                 has_image_input=_image_inputs_module._request_has_image_input(request_kwargs),

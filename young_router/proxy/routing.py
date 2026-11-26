@@ -48,6 +48,7 @@ from .base import (
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _HEAD_HEDGE_METADATA_KEY,
+    _HEAD_HEDGE_TURN_NAMES_KEY,
     _DEPLOYMENT_COOLDOWNS,
     _REPLAY_REASONING_ELISION_ENABLED_ENV,
     _REPLAY_REASONING_ELISION_KEEP_ENV,
@@ -6801,6 +6802,16 @@ def _remember_selected_deployment(
     selected_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
     if isinstance(selected_box, dict):
         selected_box["marker"] = marker
+        hedge_turn_names = selected_box.get(_HEAD_HEDGE_TURN_NAMES_KEY)
+        if hedge_turn_names:
+            # This selection is the head hedge's own route.  Reserve it for the
+            # turn until that dispatch settles: the turn's next attempt must be
+            # a different route, or the race pays one upstream account for the
+            # same prefill twice.
+            _streaming_module._reserve_live_head_hedge_route(
+                hedge_turn_names,
+                _responses_request_module._deployment_id(deployment),
+            )
 
 
 def _selected_deployment_marker_from_box(selected_box: Any = None) -> Optional[dict]:

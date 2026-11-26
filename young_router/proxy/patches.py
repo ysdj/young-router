@@ -1128,6 +1128,26 @@ def _install_relay_balance_selection_patch() -> None:
     RustCore._answer_callback_filters = filter_async
 
 
+def _excluded_deployment_ids_for_selection(
+    request_kwargs: Optional[dict],
+) -> set[str]:
+    """The routes this attempt may not select.
+
+    The request's own exclusions plus the deployment this turn's live head
+    hedge is already prefilling.  The hedge runs under its own request id, so
+    the walk that asks next cannot see it in ``_excluded_deployment_ids``; a
+    turn-keyed reservation is the only thing that keeps one relay account from
+    being asked for the same 50 KB prefill twice (live 2026-11-26, see
+    ``streaming._LIVE_HEAD_HEDGE_ROUTES``).
+    """
+
+    excluded_ids = _responses_request_module._request_excluded_deployment_ids(
+        request_kwargs
+    )
+    excluded_ids |= _streaming_module._live_head_hedge_deployment_ids(request_kwargs)
+    return excluded_ids
+
+
 def _install_routing_constraint_patch() -> None:
     try:
         from litellm.router import Router
@@ -1198,7 +1218,7 @@ def _install_routing_constraint_patch() -> None:
                 kwargs,
                 positional_index=4,
             )
-            excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_kwargs)
+            excluded_ids = _excluded_deployment_ids_for_selection(request_kwargs)
             verified_ids = _responses_request_module._request_verified_fallback_deployment_ids(
                 request_kwargs
             )
@@ -1275,7 +1295,7 @@ def _install_routing_constraint_patch() -> None:
             kwargs,
             positional_index=1,
         )
-        excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_kwargs)
+        excluded_ids = _excluded_deployment_ids_for_selection(request_kwargs)
         verified_ids = _responses_request_module._request_verified_fallback_deployment_ids(
             request_kwargs
         )
