@@ -344,6 +344,72 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         self.assertNotEqual(response["first_id"], response["last_id"])
 
 
+class ClaudeCodeSelectorTests(unittest.TestCase):
+    def test_selector_carries_the_published_window_and_behavior_model(self) -> None:
+        payload = claude_desktop_listing.claude_code_model_selector_payload(
+            "cc",
+            _response("gpt-6.2-astra", "gpt-image-2"),
+            public_window=lambda name: 500_000 if name == "gpt-6.2-astra" else None,
+            behavior_for=lambda name, window: "claude-opus-4-8",
+        )
+        self.assertEqual(
+            {
+                "model_selector_config": [
+                    {
+                        "id": "cc",
+                        "models": [
+                            {
+                                "id": "gpt-6.2-astra",
+                                "name": "gpt-6.2-astra",
+                                "section": "main",
+                                "runtime": {"max_input_tokens": 500_000},
+                                "behaves_as": "claude-opus-4-8",
+                            }
+                        ],
+                    }
+                ]
+            },
+            payload,
+        )
+
+    def test_selector_keeps_real_claude_ids_without_a_substitute(self) -> None:
+        payload = claude_desktop_listing.claude_code_model_selector_payload(
+            "ccd",
+            _response("claude-opus-5-5"),
+            public_window=lambda name: 1_000_000,
+            behavior_for=lambda name, window: None,
+        )
+        row = payload["model_selector_config"][0]["models"][0]
+        self.assertEqual("claude-opus-5-5", row["id"])
+        self.assertEqual("main", row["section"])
+        self.assertEqual({"max_input_tokens": 1_000_000}, row["runtime"])
+        self.assertNotIn("behaves_as", row)
+
+    def test_selector_rejects_an_unknown_surface(self) -> None:
+        with self.assertRaises(ValueError):
+            claude_desktop_listing.claude_code_model_selector_payload("bad", {"data": []})
+
+    def test_selector_route_registration_is_idempotent(self) -> None:
+        class App:
+            def __init__(self) -> None:
+                self.middlewares = []
+                self.routes = []
+
+            def add_middleware(self, middleware) -> None:
+                self.middlewares.append(middleware)
+
+            def add_api_route(self, path, endpoint, **kwargs) -> None:
+                self.routes.append((path, endpoint, kwargs))
+
+        app = App()
+        claude_desktop_listing.register(app)
+        claude_desktop_listing.register(app)
+        self.assertEqual(1, len(app.middlewares))
+        self.assertEqual(1, len(app.routes))
+        self.assertEqual("/api/model_selector/{surface}", app.routes[0][0])
+        self.assertEqual({"GET"}, set(app.routes[0][2]["methods"]))
+
+
 class ClaudeDesktopListingPatchTests(unittest.TestCase):
     def setUp(self) -> None:
         from litellm.llms.anthropic import common_utils

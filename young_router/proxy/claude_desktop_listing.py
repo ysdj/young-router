@@ -61,6 +61,10 @@ CLAUDE_CODE_CLIENT: Final = "claude-code"
 #: second spelling of the same ceiling (1,048,576) would only move the number the
 #: picker reports.
 _ONE_MILLION: Final = 1_000_000
+#: Claude Code's selector endpoint has one config per client surface. The
+#: standalone/remote CLI uses ``cc``/``ccr``; Claude Desktop's bundled CLI uses
+#: ``ccd``.
+_CLAUDE_CODE_SELECTOR_SURFACES: Final = frozenset({"cc", "ccd", "ccr"})
 
 #: The paths whose Anthropic-shaped answer this view rewrites.  The single-model
 #: lookup is not part of discovery and keeps the canonical id.
@@ -74,6 +78,7 @@ _GENERATION_FILTER_ACTIVE: ContextVar[bool] = ContextVar(
 )
 _PATCH_ATTR: Final = "_young_router_claude_desktop_listing"
 _REGISTERED_ATTR: Final = "_young_router_claude_desktop_listing_registered"
+_SELECTOR_REGISTERED_ATTR: Final = "_young_router_claude_code_selector_registered"
 
 
 def _normalized_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -397,6 +402,64 @@ def desktop_model_rows(
     }
 
 
+def claude_code_model_selector_payload(
+    surface: str,
+    listing: Mapping[str, object],
+    *,
+    public_window: Callable[[str], int | None] | None = None,
+    behavior_for: Callable[[str, object], str | None] | None = None,
+) -> dict[str, object]:
+    """Build Claude Code's selector config from an authenticated model list.
+
+    Claude Code reads ``runtime.max_input_tokens`` and ``behaves_as`` from
+    ``model_selector_config``; the Anthropic ``/v1/models`` window alone is not
+    consulted for its session context calculation. Keep the public id it will
+    send to the router, but give custom ids the same known Claude behavior tier
+    the settings projection uses. The per-model ``autoCompactWindow`` in client
+    settings then states the exact published context.
+
+    ``public_window`` and ``behavior_for`` are injectable for focused tests.
+    The production behavior mapping is owned by ClaudeSettingsDomain so the
+    picker file and this served catalog cannot choose different tiers.
+    """
+
+    if surface not in _CLAUDE_CODE_SELECTOR_SURFACES:
+        raise ValueError("unsupported Claude Code model-selector surface")
+    window_for = public_window or _public_context_window
+    if behavior_for is None:
+        from ..core.domains.claude import _code_behaves_as
+
+        behavior_for = _code_behaves_as
+
+    models: list[dict[str, object]] = []
+    raw_rows = listing.get("data")
+    if isinstance(raw_rows, list):
+        for row in raw_rows:
+            if not isinstance(row, Mapping) or _listing_row_serves_generation(row):
+                continue
+            model_id = row.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            model_id = model_id.strip()
+            model: dict[str, object] = {"id": model_id, "section": "main"}
+            name = row.get("display_name") or row.get("name")
+            if isinstance(name, str) and name.strip():
+                model["name"] = name.strip()
+            description = row.get("description")
+            if isinstance(description, str) and description.strip():
+                model["description"] = description.strip()
+
+            window = _published_context(model_id, window_for)
+            if isinstance(window, int) and not isinstance(window, bool):
+                model["runtime"] = {"max_input_tokens": window}
+                behaves_as = behavior_for(model_id, window)
+                if isinstance(behaves_as, str) and behaves_as.strip():
+                    model["behaves_as"] = behaves_as.strip()
+            models.append(model)
+
+    return {"model_selector_config": [{"id": surface, "models": models}]}
+
+
 def install_patch() -> None:
     """Publish the Claude views through LiteLLM's Anthropic listing builder.
 
@@ -472,12 +535,54 @@ class _DesktopListingMiddleware:
 
 
 def register(app: Any) -> None:
-    """Install the request marker on the proxy app (one app, one marker)."""
+    """Install discovery middleware and Claude Code's authenticated selector."""
 
-    if getattr(app, _REGISTERED_ATTR, False):
+    if not getattr(app, _REGISTERED_ATTR, False):
+        app.add_middleware(_DesktopListingMiddleware)
+        setattr(app, _REGISTERED_ATTR, True)
+
+    if getattr(app, _SELECTOR_REGISTERED_ATTR, False):
         return
-    app.add_middleware(_DesktopListingMiddleware)
-    setattr(app, _REGISTERED_ATTR, True)
+
+    from fastapi import Depends, Request
+    from fastapi.responses import JSONResponse
+    from litellm.proxy import proxy_server
+
+    async def selector_handler(
+        surface: str,
+        request: Request,
+        user_api_key_dict: Any = Depends(proxy_server.user_api_key_auth),
+    ) -> JSONResponse:
+        if surface not in _CLAUDE_CODE_SELECTOR_SURFACES:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        # Use LiteLLM's own caller-scoped listing so access groups and hot
+        # reloads have exactly the same visibility as /v1/models. Passing no
+        # HTTP request keeps this JSON-only endpoint from switching to the
+        # Anthropic or Desktop alias view.
+        listing = await proxy_server.model_list(
+            request=None,
+            user_api_key_dict=user_api_key_dict,
+        )
+        if not isinstance(listing, Mapping):
+            return JSONResponse({"error": "model listing unavailable"}, status_code=503)
+        return JSONResponse(claude_code_model_selector_payload(surface, listing))
+
+    # The module uses postponed annotations, but FastAPI resolves these classes
+    # at route registration time. Bind the real runtime types just like the
+    # other optional-FastAPI handlers in this package.
+    selector_handler.__annotations__ = {
+        "surface": str,
+        "request": Request,
+        "user_api_key_dict": proxy_server.UserAPIKeyAuth,
+        "return": JSONResponse,
+    }
+    app.add_api_route(
+        "/api/model_selector/{surface}",
+        selector_handler,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    setattr(app, _SELECTOR_REGISTERED_ATTR, True)
 
 
 __all__ = [
@@ -485,6 +590,7 @@ __all__ = [
     "CLAUDE_CODE_CLIENT_HEADER",
     "CLAUDE_DESKTOP_CLIENT",
     "CLAUDE_DESKTOP_CLIENT_HEADER",
+    "claude_code_model_selector_payload",
     "desktop_model_rows",
     "install_patch",
     "is_claude_code_client",
