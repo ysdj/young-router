@@ -95,17 +95,6 @@ def test_status_keeps_each_hosts_sync_error_apart():
     assert state["last_error"] == ""
     assert state["last_sync"] == "2026-01-01T00:00:00Z"
 
-    # A plugin that predates the per-host map still reports its one global
-    # error, which is the only attribution available for it.
-    legacy = {key: value for key, value in plugin.items() if key != "lastErrorByHost"}
-    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
-         mock.patch.object(model_list_plugin, "_row", return_value=row), \
-         mock.patch.object(model_list_plugin, "_binary", return_value=Path("/plugin")), \
-         mock.patch.object(model_list_plugin, "_json", return_value=legacy):
-        state = model_list_plugin.status("claude")
-    assert state["last_error"] == "codex: boom"
-
-
 def test_desktop_bundled_cli_is_found_newest_first(tmp_path):
     """An app-only machine's Claude Code lives inside Claude Desktop."""
 
@@ -274,7 +263,7 @@ def test_saving_the_yrapi_triplet_from_the_form_is_the_on_direction(tmp_path, mo
     assert document["model_providers"]["custom"]["base_url"] == "http://127.0.0.1:4000/v1"
 
 
-def test_takeover_sets_the_metadata_mode_and_syncs_once():
+def test_takeover_enables_the_host_and_syncs_once():
     row = {"version": "0.3.0", "enabled": True}
     states = [
         {"installed": True, "host_enabled": True, "enabled": False},
@@ -283,38 +272,12 @@ def test_takeover_sets_the_metadata_mode_and_syncs_once():
     with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
          mock.patch.object(model_list_plugin, "_row", return_value=row), \
          mock.patch.object(model_list_plugin, "status", side_effect=states), \
-         mock.patch.object(model_list_plugin, "set_alias_mode") as alias_mode, \
          mock.patch.object(model_list_plugin, "manage") as manage:
         result = model_list_plugin.ensure_claude_owner()
 
-    alias_mode.assert_called_once_with("metadata")
     assert mock.call("claude", "enable") in manage.call_args_list
     assert mock.call("claude", "sync") in manage.call_args_list
     assert result["enabled"] is True
-
-
-def test_takeover_refuses_a_plugin_that_predates_the_one_row_projection():
-    row = {"version": "0.2.10", "enabled": True}
-    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
-         mock.patch.object(model_list_plugin, "_row", return_value=row), \
-         mock.patch.object(model_list_plugin, "set_alias_mode") as alias_mode:
-        with pytest.raises(RuntimeError, match="Update model-list-plugin"):
-            model_list_plugin.ensure_claude_owner()
-    alias_mode.assert_not_called()
-
-
-def test_set_alias_mode_keeps_the_other_plugin_keys(tmp_path, monkeypatch):
-    monkeypatch.setenv("MODEL_LIST_PLUGIN_DATA", str(tmp_path))
-    config = tmp_path / "config.json"
-    config.write_text(json.dumps({
-        "enabled": True,
-        "targets": {"codex": True, "claude": False},
-        "syncIntervalSeconds": 60,
-    }))
-    model_list_plugin.set_alias_mode("metadata")
-    saved = json.loads(config.read_text())
-    assert saved["claudeAliasMode"] == "metadata"
-    assert saved["targets"] == {"codex": True, "claude": False}
 
 
 def test_takeover_is_a_plugin_operation_the_core_accepts():

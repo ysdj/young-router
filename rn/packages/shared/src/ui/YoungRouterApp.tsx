@@ -11514,7 +11514,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   </View>;
 }
 
-type ModelListPluginOperation = "install" | "uninstall" | "enable" | "disable" | "sync" | "takeover";
+type ModelListPluginOperation = "install" | "uninstall" | "disable" | "takeover";
 type ModelListPluginInfo = { state?: UnknownRecord; error?: string };
 
 async function requestClaudePlugin(ipc: IpcClient, operation: ModelListPluginOperation | "status"): Promise<UnknownRecord> {
@@ -11553,23 +11553,8 @@ function ModelListPluginFields({ info, busy, pending, translate, onAction, locke
     />
     {installed && <>
       {locked
-        ? <View style={styles.pluginControls}>
-          <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginManagedByApi")}</Text>
-          <NativeButton title={translate("settings.pluginSync")} disabled={busy} busy={pending === "takeover"} onPress={() => { void onAction("takeover"); }} />
-        </View>
-        : <View style={styles.pluginControls}>
-          <View style={SETTINGS_FIELD_ROW}>
-            <Text style={SETTINGS_FIELD_LABEL}>{translate("settings.pluginEnabled")}</Text>
-            <NativeToggle
-              accessibilityLabel={translate("settings.pluginEnabled")}
-              value={enabled}
-              disabled={busy}
-              onValueChange={(next) => onAction(next ? "enable" : "disable")}
-              style={SETTINGS_FIELD_SWITCH_SLOT}
-            />
-          </View>
-          <NativeButton title={translate("settings.pluginSync")} disabled={busy || !enabled} busy={pending === "sync"} onPress={() => { void onAction("sync"); }} />
-        </View>}
+        ? <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginManagedByApi")}</Text>
+        : null}
       <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginSourceHint")}</Text>
     </>}
     {error ? <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote, styles.pluginError]} accessibilityLiveRegion="polite">{error}</Text> : null}

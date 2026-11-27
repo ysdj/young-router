@@ -37,6 +37,15 @@ CODE_BEHAVES_AS_DEFAULT = "claude-sonnet-4-6"
 #: The width of the client's own small tier.
 CODE_DEFAULT_TIER_WINDOW = 200_000
 
+#: The window each substitute answers for.  A stored ``behavesAs`` whose
+#: window is narrower than the route's own cannot express that route; the
+#: picker repair uses this to decide when to replace it.
+CODE_BEHAVES_AS_WINDOWS = {
+    CODE_BEHAVES_AS_1M: 1_000_000,
+    CODE_BEHAVES_AS_LARGE: 1_000_000,
+    CODE_BEHAVES_AS_DEFAULT: CODE_DEFAULT_TIER_WINDOW,
+}
+
 
 def published_id(public_name: str, max_input_tokens: object = None) -> str:
     """The id both Claude apps address one public route by.

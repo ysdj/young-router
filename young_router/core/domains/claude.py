@@ -640,26 +640,6 @@ def default_settings_path() -> pathlib.Path:
     return pathlib.Path.home() / DEFAULT_SETTINGS_DIR / SETTINGS_FILENAME
 
 
-#: The picker constants and the two derived values live in ``claude_picker``
-#: so the proxy can publish exactly what this writer names.  These names stay
-#: here for the picker-repair code below and for callers that imported them.
-_CODE_BEHAVES_AS_1M = claude_picker.CODE_BEHAVES_AS_1M
-_CODE_BEHAVES_AS_LARGE = claude_picker.CODE_BEHAVES_AS_LARGE
-_CODE_BEHAVES_AS_DEFAULT = claude_picker.CODE_BEHAVES_AS_DEFAULT
-_CODE_DEFAULT_TIER_WINDOW = claude_picker.CODE_DEFAULT_TIER_WINDOW
-
-#: The window each substitute answers for.  A stored ``behavesAs`` whose window
-#: is narrower than the route's own cannot express that route -- the tier would
-#: be the ceiling and the session would read back the tier's number instead of
-#: the route's -- so it is corrected.  A substitute at least as wide as the route
-#: is left alone, even when this app happens to write the same name: it still
-#: states the route correctly, and a person who picked it meant it.
-_CODE_BEHAVES_AS_WINDOWS = {
-    _CODE_BEHAVES_AS_1M: 1_000_000,
-    _CODE_BEHAVES_AS_LARGE: 1_000_000,
-    _CODE_BEHAVES_AS_DEFAULT: _CODE_DEFAULT_TIER_WINDOW,
-}
-
 #: Claude Code's per-model ``modelSettings.<model>.autoCompactWindow`` range.
 #: The setting is the effective context window; the client caps it at the
 #: behavior model's own maximum, so a 500k route needs a 1M ``behavesAs``.
@@ -671,17 +651,6 @@ _CODE_AUTO_COMPACT_MAX = 1_000_000
 #: one value that survives the app's ``trim() || undefined`` fallback and draws
 #: no text, which is what keeps a row reading as just its model name.
 _CLAUDE_CODE_BLANK_DESCRIPTION = "\u200b"
-
-
-def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
-    """The known Claude Code model an unknown public id should behave as.
-
-    Kept as a thin import point for the domain and the selector payload; the
-    rule itself is ``claude_picker.published_behaves_as`` so the proxy's
-    canonical metadata and this picker cannot choose different tiers.
-    """
-
-    return claude_picker.published_behaves_as(name, max_input_tokens)
 
 
 def _code_auto_compact_window(max_input_tokens: object) -> int | str:
@@ -1951,7 +1920,7 @@ class ClaudeSettingsDomain:
                     # replace the friendly name the client draws.
                     if row.get("label") in (None, "", f"{name} (Desktop)"):
                         row["label"] = name
-                behaves_as = _code_behaves_as(name, window)
+                behaves_as = claude_picker.published_behaves_as(name, window)
                 if behaves_as is not None:
                     current = row.get("behavesAs")
                     # The substitute is this app's own choice of tier, and the
@@ -1961,7 +1930,7 @@ class ClaudeSettingsDomain:
                     # A target none of these three names is a person's and stays.
                     # The published number is capped at 1M, and the tier
                     # comparison reads that same ceiling.
-                    current_window = _CODE_BEHAVES_AS_WINDOWS.get(current)
+                    current_window = claude_picker.CODE_BEHAVES_AS_WINDOWS.get(current)
                     if current in (None, "") or (
                         isinstance(window, int)
                         and not isinstance(window, bool)

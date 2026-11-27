@@ -472,9 +472,7 @@ def claude_code_model_selector_payload(
         raise ValueError("unsupported Claude Code model-selector surface")
     window_for = public_window or _public_context_window
     if behavior_for is None:
-        from ..core.domains.claude import _code_behaves_as
-
-        behavior_for = _code_behaves_as
+        behavior_for = claude_picker.published_behaves_as
 
     models: list[dict[str, object]] = []
     raw_rows = listing.get("data")
