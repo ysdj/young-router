@@ -345,6 +345,8 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 self.assertEqual("public-a", form["model"])
                 self.assertTrue(form["key_configured"])
                 self.assertEqual("bearer", form["auth_mode"])
+                self.assertNotIn("sk-local", form["key_fingerprint"])
+                self.assertTrue(form["key_fingerprint"])
                 self.assertEqual("sk-local", domain.trusted_secret_value("direct_api_key", "edit-api"))
 
                 saved = domain.dispatch("use_direct_api", {
@@ -357,6 +359,10 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             code = json.loads(domain.raw_text(include_sensitive=True))
             self.assertEqual("https://direct.example.test", code["env"]["ANTHROPIC_BASE_URL"])
             self.assertEqual("next-direct-key", code["env"]["ANTHROPIC_AUTH_TOKEN"])
+            self.assertNotEqual(
+                form["key_fingerprint"],
+                saved["direct_api"]["key_fingerprint"],
+            )
 
             # URL and key alone are Claude's whole yrapi pair; the model is
             # not part of it.

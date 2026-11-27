@@ -11640,6 +11640,7 @@ function directApiConnectionFingerprint(connection: UnknownRecord | undefined): 
     connection.model_catalog_url,
     connection.auth_mode,
     connection.key_configured,
+    connection.key_fingerprint,
   ]);
 }
 
@@ -11721,6 +11722,53 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
   const keyEdited = useRef(false);
   const optional = translate("settings.directApiOptional");
   const auth = apiKeyAuth ? "x-api-key" : "bearer";
+  // The dialog is one side of the same connection the pane's switch reads.
+  // A manual edit to either client document has to reach it even while it is
+  // open; otherwise an unchanged form still shows the old pair and a save
+  // would put that pair back.  Only a clean form follows the disk.
+  const baseline = useRef({
+    url: stringValue(connection.base_url),
+    model: stringValue(connection.model),
+    catalog: stringValue(connection.model_catalog_url),
+    auth: connection.auth_mode === "x-api-key",
+    fingerprint: directApiConnectionFingerprint(connection),
+  });
+  const values = useRef({ url, model, catalog, auth: apiKeyAuth });
+  values.current = { url, model, catalog, auth: apiKeyAuth };
+  useEffect(() => {
+    let active = true;
+    const refresh = async (): Promise<void> => {
+      if (saving || keyEdited.current) return;
+      try {
+        const current = await ipc.snapshot();
+        if (!active) return;
+        const next = asRecord(domainState(current, client).direct_api);
+        const fingerprint = directApiConnectionFingerprint(next);
+        const base = baseline.current;
+        if (fingerprint === base.fingerprint) return;
+        const value = values.current;
+        if (value.url !== base.url || value.model !== base.model || value.catalog !== base.catalog || value.auth !== base.auth) return;
+        const nextURL = stringValue(next.base_url);
+        const nextModel = stringValue(next.model);
+        const nextCatalog = stringValue(next.model_catalog_url);
+        const nextAuth = next.auth_mode === "x-api-key";
+        baseline.current = { url: nextURL, model: nextModel, catalog: nextCatalog, auth: nextAuth, fingerprint };
+        values.current = { url: nextURL, model: nextModel, catalog: nextCatalog, auth: nextAuth };
+        setURL(nextURL);
+        setModel(nextModel);
+        setCatalog(nextCatalog);
+        setApiKeyAuth(nextAuth);
+        keyEdited.current = false;
+        setKeyReady(false);
+        setKeyReset((value) => value + 1);
+        setError(undefined);
+      } catch {
+        // A transient Core failure leaves the form exactly as it was.
+      }
+    };
+    const timer = setInterval(() => { void refresh(); }, 2_000);
+    return () => { active = false; clearInterval(timer); };
+  }, [client, ipc, saving]);
 
   const resetPrefilledKey = (): void => {
     // Only an explicit edit may carry a key to a different connection.

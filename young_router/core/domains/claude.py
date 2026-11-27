@@ -2877,10 +2877,17 @@ class ClaudeSettingsDomain:
         merely an address that happens to be local.
         """
 
+        key = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY") or ""
+        key = key.strip() if isinstance(key, str) else ""
         return {
             "base_url": settings["gateway_url"],
             "model": settings.get("model"),
             "key_configured": settings["token_configured"],
+            # The form observes a key it did not write (a manual edit to the
+            # settings file) without ever receiving the key itself.  The
+            # fingerprint changes with the credential, so a clean form can
+            # reload the new pair; an unchanged connection keeps its focus.
+            "key_fingerprint": hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] if key else "",
             "auth_mode": "x-api-key" if not env.get("ANTHROPIC_AUTH_TOKEN") and env.get("ANTHROPIC_API_KEY") else "bearer",
         }
 
