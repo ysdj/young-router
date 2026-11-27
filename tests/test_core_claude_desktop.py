@@ -14,6 +14,7 @@ from young_router.core.claude_desktop import (
     ClaudeDesktopConfigError,
     ClaudeDeveloperSettings,
 )
+from young_router.core.domains import claude as claude_domain
 from young_router.core.domains.claude import ClaudeSettingsDomain
 
 
@@ -1829,17 +1830,18 @@ general_settings:
                 self.assertIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
                 self.assertTrue(left["clients"]["claudeCode"]["model_list_enabled"])
 
-                # The plugin's rows name the provider's own ids; a session
-                # started from this form keeps the public name instead of
-                # adopting the historical alias row the plugin keeps for
-                # sessions created before the name changed.
+                # The plugin's handoff projection uses the same published id
+                # as the app's picker: the derived alias (and its ``[1m]``
+                # spelling).  A session launched from this form must name that
+                # id, because the plugin's row describes the alias, not the
+                # public route.
                 with mock.patch(
                     "young_router.core.domains.claude._shared_api.endpoint",
                     return_value=("http://127.0.0.1:4000", "fixture-router-key"),
                 ):
                     domain.dispatch("use_local_api", {"client": "claudeCode", "model": "deepseek-v4.1-flash"})
                 adopted = json.loads(domain.raw_text(include_sensitive=True))
-                self.assertEqual("deepseek-v4.1-flash", adopted["env"]["ANTHROPIC_MODEL"])
+                self.assertEqual("claude-mythos-eb1394", adopted["env"]["ANTHROPIC_MODEL"])
 
                 target["on"] = False
                 left = domain.dispatch("use_direct_api", direct)
@@ -1847,5 +1849,114 @@ general_settings:
                 self.assertFalse(left["clients"]["claudeCode"]["model_list_enabled"])
 
 
+def test_apply_preserves_the_plugins_model_list(tmp_path, monkeypatch) -> None:
+    """A settings edit after takeover must not write this app's old picker back.
+
+    The plugin writes ``modelPicker``/``modelSettings`` behind the domain.  The
+    next ordinary Apply owns the other keys, so it has to adopt the plugin's
+    fields from disk and treat that known external change as the baseline, not
+    as a conflict and not as a reason to restore the stale draft.
+    """
+
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (plugin_root / "config.json").write_text(json.dumps({
+        "enabled": True,
+        "targets": {"claude": True},
+    }))
+    monkeypatch.setenv("MODEL_LIST_PLUGIN_DATA", str(plugin_root))
+    runtime = tmp_path / "config.yaml"
+    runtime.write_text("model_list: []\n")
+    settings_path = tmp_path / "settings.json"
+    original = {
+        "env": {},
+        "enabledPlugins": {"model-list-plugin@model-list-plugin": True},
+        "modelPicker": {"replaceBuiltInOptions": True, "options": [{"model": "stale"}]},
+        "modelSettings": {"stale": {"autoCompactWindow": 100000}},
+    }
+    settings_path.write_text(json.dumps(original))
+    domain = ClaudeSettingsDomain(
+        settings_path,
+        runtime_config_path=runtime,
+        runtime_root=tmp_path,
+    )
+    plugin_picker = {
+        "replaceBuiltInOptions": True,
+        "options": [{"model": "claude-mythos-eb1394[1m]", "label": "deepseek-v4.1-flash"}],
+    }
+    plugin_settings = {
+        **original,
+        "modelPicker": plugin_picker,
+        "modelSettings": {"claude-mythos-eb1394[1m]": {"autoCompactWindow": 1000000}},
+    }
+    settings_path.write_text(json.dumps(plugin_settings))
+
+    domain.apply({"settings": {**original, "autoMemoryEnabled": False}})
+
+    saved = json.loads(settings_path.read_text())
+    assert saved["modelPicker"] == plugin_picker
+    assert saved["modelSettings"] == plugin_settings["modelSettings"]
+    assert saved["autoMemoryEnabled"] is False
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_leaving_the_proxy_retires_a_picker_the_plugin_restored(tmp_path, monkeypatch) -> None:
+    """The plugin restores the picker it found; that picker dies with the API.
+
+    The plugin takes a snapshot before it starts writing.  When it is disabled
+    on the way out, that snapshot is this app's own generated list.  Leaving
+    the gateway means this app no longer owns the list either, so the restored
+    rows must not outlive the connection they named.
+    """
+
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (plugin_root / "config.json").write_text(json.dumps({
+        "enabled": True,
+        "targets": {"claude": False},
+    }))
+    monkeypatch.setenv("MODEL_LIST_PLUGIN_DATA", str(plugin_root))
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({
+        "env": {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+            "ANTHROPIC_AUTH_TOKEN": "sk-local",
+        },
+        "enabledPlugins": {"model-list-plugin@model-list-plugin": True},
+        "modelPicker": {
+            "replaceBuiltInOptions": True,
+            "options": [{"model": "claude-mythos-eb1394[1m]"}],
+        },
+        "modelSettings": {"claude-mythos-eb1394[1m]": {"autoCompactWindow": 1000000}},
+    }))
+    from young_router.core.domains._shared_api import (
+        store_direct_connection,
+        store_generated_models,
+    )
+    store_direct_connection(tmp_path, "claudeCode", {
+        "provider": "gateway",
+        "base_url": "https://before.example.test",
+        "auth_mode": "bearer",
+        "event": "keep",
+    })
+    store_generated_models(tmp_path, "claudeCode", ["deepseek-v4.1-flash"])
+    runtime = tmp_path / "config.yaml"
+    runtime.write_text("model_list: []\n")
+    domain = ClaudeSettingsDomain(
+        settings_path,
+        runtime_config_path=runtime,
+        runtime_root=tmp_path,
+    )
+    with mock.patch.object(
+        claude_domain._shared_api,
+        "endpoint",
+        return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+    ):
+        domain.dispatch("leave_local_api", {"client": "claudeCode"})
+    domain.apply()
+    saved = json.loads(settings_path.read_text())
+    assert "modelPicker" not in saved
+    assert saved["env"]["ANTHROPIC_BASE_URL"] == "https://before.example.test"

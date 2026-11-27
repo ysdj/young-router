@@ -38,7 +38,8 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any, Final
 
-from ..claude_aliases import CONTEXT_SUFFIX, claude_desktop_alias, context_suffix_free, desktop_keeps_model_id
+from .. import claude_picker
+from ..claude_aliases import CONTEXT_SUFFIX, context_suffix_free, desktop_keeps_model_id
 
 #: A profile may name its client explicitly.  The desktop app sends
 #: ``inferenceCustomHeaders`` on the discovery request as well as on turns, so
@@ -325,6 +326,52 @@ def with_published_windows(response: Mapping[str, object]) -> dict[str, object]:
     return {**dict(response), "data": filled}
 
 
+def with_claude_picker_metadata(response: Mapping[str, object]) -> dict[str, object]:
+    """Publish the id and behavior the Claude Code picker will use.
+
+    The canonical ``/v1/models`` answer is read by the model-list plugin, which
+    writes Claude Code's settings.  Without these fields the plugin has to
+    re-derive the Desktop alias, the ``[1m]`` spelling and the behavior tier;
+    every one of those is a client-compatibility decision this app already
+    makes in ``claude_picker``.  Stating them here is what lets the plugin's
+    output and this app's own picker name one id space.
+
+    A generator is marked as such rather than advertised as a conversation
+    model.  The plugin drops non-chat rows, and the Claude views already do;
+    the canonical row was the one place still calling an image route a model.
+    """
+
+    rows = response.get("data")
+    if not isinstance(rows, list):
+        return dict(response)
+    filled: list[object] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            filled.append(row)
+            continue
+        current = dict(row)
+        if _listing_row_serves_generation(current):
+            current["type"] = "image"
+            current.pop("claude_alias", None)
+            current.pop("behaves_as", None)
+            filled.append(current)
+            continue
+        model_id = current.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            filled.append(current)
+            continue
+        window = current.get("max_input_tokens")
+        published = window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+        current["claude_alias"] = claude_picker.published_id(model_id, published)
+        behavior = claude_picker.published_behaves_as(model_id, published)
+        if behavior:
+            current["behaves_as"] = behavior
+        else:
+            current.pop("behaves_as", None)
+        filled.append(current)
+    return {**dict(response), "data": filled}
+
+
 def desktop_model_rows(
     response: Mapping[str, object],
     display_names: Mapping[str, str] | None = None,
@@ -373,9 +420,7 @@ def desktop_model_rows(
         # (``modelPrefer1mContext``) belongs to the client, not the gateway.
         # ``claude_aliases.context_suffix_free`` resolves the id back, so a turn
         # naming it reaches the same route.
-        alias = claude_desktop_alias(public_id)
-        if isinstance(published, int) and not isinstance(published, bool) and published >= 1_000_000:
-            alias = f"{alias}{CONTEXT_SUFFIX}"
+        alias = claude_picker.published_id(public_id, published)
         rows.append(
             {
                 "type": "model",
@@ -494,9 +539,9 @@ def install_patch() -> None:
         if not isinstance(response, Mapping):
             return response
         response = with_published_windows(response)
-        if not _VIEW_ACTIVE.get():
-            return response
-        return desktop_model_rows(response, display_names)
+        if _VIEW_ACTIVE.get():
+            return desktop_model_rows(response, display_names)
+        return with_claude_picker_metadata(response)
 
     setattr(patched, _PATCH_ATTR, True)
     setattr(patched, "_original_create_anthropic_model_list_response", original)
@@ -597,5 +642,6 @@ __all__ = [
     "is_claude_desktop_client",
     "is_claude_listing_client",
     "register",
+    "with_claude_picker_metadata",
     "with_published_windows",
 ]

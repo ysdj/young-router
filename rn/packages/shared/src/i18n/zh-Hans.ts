@@ -1004,6 +1004,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "settings.pluginEnabled": "同步模型列表",
   "settings.pluginInstallTitle": "安装模型列表插件",
   "settings.pluginInstallPrompt": "安装 model-list-plugin，同步此客户端的模型及其元数据？",
+  "settings.pluginManagedByApi": "由「使用漾路由 API」管理",
   "settings.pluginSourceHint": "模型来源跟随此客户端配置的网关；插件会自动更新，关闭同步会恢复安装前的模型设置。",
   "settings.pluginSync": "立即同步",
   "settings.pluginLastSync": "上次同步 {time}",

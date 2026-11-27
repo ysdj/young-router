@@ -991,6 +991,7 @@ export const en: Record<TranslationKey, string> = {
   "settings.pluginEnabled": "Synchronize models",
   "settings.pluginInstallTitle": "Install model list plugin",
   "settings.pluginInstallPrompt": "Install model-list-plugin to synchronize models and their metadata with this client?",
+  "settings.pluginManagedByApi": "Managed by the Use Young Router API switch",
   "settings.pluginSourceHint": "Model source follows this client's configured gateway; the plugin updates itself, and turning synchronization off restores the model settings it found.",
   "settings.pluginSync": "Sync now",
   "settings.pluginLastSync": "Last sync {time}",

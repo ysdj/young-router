@@ -954,6 +954,7 @@ export type TranslationKey =
   | "settings.pluginInstallTitle"
   | "settings.pluginInstallPrompt"
   | "settings.pluginSourceHint"
+  | "settings.pluginManagedByApi"
   | "settings.pluginSync"
   | "settings.pluginLastSync"
   | "settings.useLocalApiRequired"

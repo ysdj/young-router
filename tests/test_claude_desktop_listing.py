@@ -546,3 +546,17 @@ class PublishedWindowTests(unittest.TestCase):
             _response("gpt-image-2.6-flare", "nobody-knows")
         )["data"]
         self.assertEqual([None, None], [row["max_input_tokens"] for row in rows])
+
+    def test_the_picker_metadata_names_the_same_ids_the_app_writes(self) -> None:
+        response = {"data": [
+            {"type": "model", "id": "deepseek-v4.1-flash", "max_input_tokens": 1_000_000},
+            {"type": "model", "id": "claude-fable-5-2", "max_input_tokens": 1_000_000},
+            {"type": "model", "id": "gpt-image-2.6-sunburst", "mode": "image", "max_input_tokens": None},
+        ]}
+        rows = claude_desktop_listing.with_claude_picker_metadata(response)["data"]
+        self.assertEqual("claude-mythos-eb1394[1m]", rows[0]["claude_alias"])
+        self.assertEqual("claude-opus-5-5", rows[0]["behaves_as"])
+        self.assertEqual("claude-fable-5-2[1m]", rows[1]["claude_alias"])
+        self.assertNotIn("behaves_as", rows[1])
+        self.assertEqual("image", rows[2]["type"])
+        self.assertNotIn("claude_alias", rows[2])

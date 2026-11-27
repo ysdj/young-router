@@ -11514,7 +11514,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   </View>;
 }
 
-type ModelListPluginOperation = "install" | "uninstall" | "enable" | "disable" | "sync";
+type ModelListPluginOperation = "install" | "uninstall" | "enable" | "disable" | "sync" | "takeover";
 type ModelListPluginInfo = { state?: UnknownRecord; error?: string };
 
 async function requestClaudePlugin(ipc: IpcClient, operation: ModelListPluginOperation | "status"): Promise<UnknownRecord> {
@@ -11522,12 +11522,13 @@ async function requestClaudePlugin(ipc: IpcClient, operation: ModelListPluginOpe
   return asRecord(result.action_summary);
 }
 
-function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
+function ModelListPluginFields({ info, busy, pending, translate, onAction, locked }: {
   info?: ModelListPluginInfo;
   busy: boolean;
   pending?: ModelListPluginOperation;
   translate: Translate;
   onAction: (operation: ModelListPluginOperation) => Promise<boolean>;
+  locked?: boolean;
 }): React.JSX.Element {
   const state = info?.state;
   const installed = state?.installed === true;
@@ -11551,19 +11552,24 @@ function ModelListPluginFields({ info, busy, pending, translate, onAction }: {
       />}
     />
     {installed && <>
-      <View style={styles.pluginControls}>
-        <View style={SETTINGS_FIELD_ROW}>
-          <Text style={SETTINGS_FIELD_LABEL}>{translate("settings.pluginEnabled")}</Text>
-          <NativeToggle
-            accessibilityLabel={translate("settings.pluginEnabled")}
-            value={enabled}
-            disabled={busy}
-            onValueChange={(next) => onAction(next ? "enable" : "disable")}
-            style={SETTINGS_FIELD_SWITCH_SLOT}
-          />
+      {locked
+        ? <View style={styles.pluginControls}>
+          <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginManagedByApi")}</Text>
+          <NativeButton title={translate("settings.pluginSync")} disabled={busy} busy={pending === "takeover"} onPress={() => { void onAction("takeover"); }} />
         </View>
-        <NativeButton title={translate("settings.pluginSync")} disabled={busy || !enabled} busy={pending === "sync"} onPress={() => { void onAction("sync"); }} />
-      </View>
+        : <View style={styles.pluginControls}>
+          <View style={SETTINGS_FIELD_ROW}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("settings.pluginEnabled")}</Text>
+            <NativeToggle
+              accessibilityLabel={translate("settings.pluginEnabled")}
+              value={enabled}
+              disabled={busy}
+              onValueChange={(next) => onAction(next ? "enable" : "disable")}
+              style={SETTINGS_FIELD_SWITCH_SLOT}
+            />
+          </View>
+          <NativeButton title={translate("settings.pluginSync")} disabled={busy || !enabled} busy={pending === "sync"} onPress={() => { void onAction("sync"); }} />
+        </View>}
       <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote]}>{translate("settings.pluginSourceHint")}</Text>
     </>}
     {error ? <Text style={[SETTINGS_FIELD_HELP_TEXT, styles.pluginNote, styles.pluginError]} accessibilityLiveRegion="polite">{error}</Text> : null}
@@ -11989,7 +11995,14 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, standaloneSea
     pluginActionVersion.current += 1;
     setPluginPending(operation);
     try {
-      const state = await requestClaudePlugin(ipc, operation);
+      let state = await requestClaudePlugin(ipc, operation);
+      // Installing while "Use Young Router API" is on is a handoff, not a
+      // plain install: the plugin has to adopt the provider-published ids in
+      // the same gesture, or its raw projection would replace the list with a
+      // second id space.
+      if (operation === "install" && claudeYrapiActive && state.installed === true) {
+        state = await requestClaudePlugin(ipc, "takeover");
+      }
       setPluginInfo({ state });
       onStatus(translate("common.saved"));
       return true;
@@ -12066,31 +12079,53 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, standaloneSea
     return true;
   };
   const leaveClaudeLocalApi = async (): Promise<boolean> => {
+    // The plugin is the Claude Code list's writer while the API is on.  Stop
+    // it before the gateway connection is removed, so it restores its own
+    // baseline rather than observing a half-left client.
+    if (pluginInfo?.state?.installed === true && pluginInfo.state.enabled === true) {
+      try {
+        const state = await requestClaudePlugin(ipc, "disable");
+        setPluginInfo({ state });
+      } catch (reason) {
+        onStatus(errorMessage(reason, translate));
+        return false;
+      }
+    }
     for (const { app } of claudeApps) if (await onClaudeLeaveLocalApi(app) === false) return false;
     return true;
   };
   const useClaudeApiAndOfferPlugin = async (): Promise<boolean> => {
     // The plugin reads the saved client file and may write to it on install.
+    // Saving first is also what lets the plugin resolve the gateway it will
+    // project from; the takeover then makes it the only writer.
     if (!await saveLocalApi(useClaudeLocalApi)) return false;
     const version = pluginActionVersion.current;
     try {
-      const state = await requestClaudePlugin(ipc, "status");
+      let state = await requestClaudePlugin(ipc, "status");
       if (version !== pluginActionVersion.current) return true;
       setPluginInfo({ state });
-      if (state.enabled === true) {
-        // The API switch is independent of the plugin's interactive controls.
-        void requestClaudePlugin(ipc, "sync").then(
-          (synced) => { if (version === pluginActionVersion.current) setPluginInfo({ state: synced }); },
-          (reason: unknown) => {
-            if (version === pluginActionVersion.current) setPluginInfo((info) => ({ ...info, error: errorMessage(reason, translate) }));
-          },
-        );
-      } else if (state.available === true && state.installed !== true && await native.showConfirmation({
-        title: translate("settings.pluginInstallTitle"),
-        message: translate("settings.pluginInstallPrompt"),
-        confirmLabel: translate("settings.pluginInstall"),
-      })) await managePlugin("install");
+      if (state.available === false) {
+        onStatus(translate("settings.pluginUnavailable"));
+        return true;
+      }
+      if (state.installed !== true) {
+        if (!await native.showConfirmation({
+          title: translate("settings.pluginInstallTitle"),
+          message: translate("settings.pluginInstallPrompt"),
+          confirmLabel: translate("settings.pluginInstall"),
+        })) return true;
+        if (!await managePlugin("install")) return true;
+      }
+      // Install bumps the action version; the takeover still belongs to this
+      // sequence.  It is idempotent, so a stale check here would only skip the
+      // one step that makes the plugin the writer.
+      state = await requestClaudePlugin(ipc, "takeover");
+      setPluginInfo({ state });
     } catch (reason) {
+      const state = await requestClaudePlugin(ipc, "status").catch(() => undefined);
+      if (version === pluginActionVersion.current) {
+        setPluginInfo({ state: state ?? pluginInfo?.state, error: errorMessage(reason, translate) });
+      }
       onStatus(errorMessage(reason, translate));
     }
     return true;
@@ -12211,6 +12246,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, standaloneSea
           pending={pluginPending}
           translate={translate}
           onAction={managePlugin}
+          locked={claudeYrapiActive}
         /> : null}
         {selectedClient === "claude" && files !== undefined ? <>
           <ClientToggleField

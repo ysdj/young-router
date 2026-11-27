@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from ... import claude_aliases
+from ... import claude_aliases, claude_picker
 from ...atomic_io import atomic_write_text
 from ..claude_desktop import (
     ClaudeDesktopConfig,
@@ -640,27 +640,13 @@ def default_settings_path() -> pathlib.Path:
     return pathlib.Path.home() / DEFAULT_SETTINGS_DIR / SETTINGS_FILENAME
 
 
-#: Claude Code's compiled catalog entries this app names through
-#: ``modelPicker[].behavesAs``.  A public gateway id is not in that catalog, so
-#: without a substitute Claude Code assumes 200k and offers no Effort ladder;
-#: ``behavesAs`` lends the row a known model's client-side handling without
-#: changing the id it sends.  The 1M entry also carries the full
-#: low..max ladder (``xhigh_effort`` and ``max_effort``).
-_CODE_BEHAVES_AS_1M = "claude-opus-5-5"
-#: The 1M entry with the smaller output claim (64k instead of 128k).  A route
-#: between the client's 200k default and a full 1M needs a behavior model at
-#: least as wide as its own window -- otherwise the tier, not the route, is the
-#: ceiling and the session reports 200k for a 262k route -- while its output
-#: claim should stay as small as the tier allows, because ``behavesAs`` is also
-#: where the client reads a model's maximum output and nothing in
-#: ``modelSettings`` can state that per route.
-_CODE_BEHAVES_AS_LARGE = "claude-opus-4-8"
-_CODE_BEHAVES_AS_DEFAULT = "claude-sonnet-4-6"
-
-
-#: The width of the client's own small tier.  A route wider than this cannot be
-#: described by ``_CODE_BEHAVES_AS_DEFAULT``.
-_CODE_DEFAULT_TIER_WINDOW = 200_000
+#: The picker constants and the two derived values live in ``claude_picker``
+#: so the proxy can publish exactly what this writer names.  These names stay
+#: here for the picker-repair code below and for callers that imported them.
+_CODE_BEHAVES_AS_1M = claude_picker.CODE_BEHAVES_AS_1M
+_CODE_BEHAVES_AS_LARGE = claude_picker.CODE_BEHAVES_AS_LARGE
+_CODE_BEHAVES_AS_DEFAULT = claude_picker.CODE_BEHAVES_AS_DEFAULT
+_CODE_DEFAULT_TIER_WINDOW = claude_picker.CODE_DEFAULT_TIER_WINDOW
 
 #: The window each substitute answers for.  A stored ``behavesAs`` whose window
 #: is narrower than the route's own cannot express that route -- the tier would
@@ -690,37 +676,12 @@ _CLAUDE_CODE_BLANK_DESCRIPTION = "\u200b"
 def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
     """The known Claude Code model an unknown public id should behave as.
 
-    A real Claude id is already in the client's catalog, so it needs no
-    substitute.
-
-    The substitute has to be at least as wide as the route, because the client
-    caps the session at the behavior model's own window: the tier, not the
-    route, would otherwise be the ceiling, and a 262k route read back as 200k.
-    ``modelSettings.<model>.autoCompactWindow`` then narrows the effective
-    window to the route's exact number, which is the number the client displays
-    and compacts against.  So a route wider than the 200k tier gets a 1M entry,
-    and which 1M entry is a question about output: ``behavesAs`` is also where
-    the client reads a model's maximum output, nothing in ``modelSettings`` can
-    state that per route, and the smaller claim is the safer one below a full
-    1M.
-
-    A resolved window counts here even when the user declared none, because the
-    two ways of being wrong do not cost the same.  Too small is a *client-side*
-    refusal -- measured: a 213k prompt on a route the client reads as 200k never
-    reaches the router, and there is no elision pass to recover it.  Too large
-    arrives, and ``proxy.context_window`` shortens the replay for Codex.  So the
-    window a session is given follows the published number.
+    Kept as a thin import point for the domain and the selector payload; the
+    rule itself is ``claude_picker.published_behaves_as`` so the proxy's
+    canonical metadata and this picker cannot choose different tiers.
     """
 
-    if claude_aliases.desktop_keeps_model_id(name):
-        return None
-    if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool):
-        return _CODE_BEHAVES_AS_DEFAULT
-    if max_input_tokens >= 1_000_000:
-        return _CODE_BEHAVES_AS_1M
-    if max_input_tokens > _CODE_DEFAULT_TIER_WINDOW:
-        return _CODE_BEHAVES_AS_LARGE
-    return _CODE_BEHAVES_AS_DEFAULT
+    return claude_picker.published_behaves_as(name, max_input_tokens)
 
 
 def _code_auto_compact_window(max_input_tokens: object) -> int | str:
@@ -1674,15 +1635,45 @@ class ClaudeSettingsDomain:
         """
 
         from ..model_list_plugin import target_enabled
-        if not target_enabled("claude"):
+
+        def names_plugin(value: object) -> bool:
+            return isinstance(value, Mapping) and any(
+                enabled is True and "model-list-plugin" in str(name)
+                for name, enabled in value.items()
+            )
+
+        host_enabled = names_plugin(self._draft.get("enabledPlugins"))
+        if not host_enabled:
+            # The plugin manager writes ``enabledPlugins`` on disk, not through
+            # this domain's draft.  A takeover that just enabled the host would
+            # otherwise be invisible here until the next reload, and the next
+            # Apply would write the old picker back over the plugin's.
+            try:
+                text, exists = self._loader(self.settings_path)
+                disk = json.loads(text) if exists and text.strip() else {}
+            except (OSError, ValueError, json.JSONDecodeError):
+                disk = {}
+            host_enabled = names_plugin(disk.get("enabledPlugins")) if isinstance(disk, Mapping) else False
+        if not host_enabled:
             return False
-        enabled = self._draft.get("enabledPlugins")
-        if not isinstance(enabled, Mapping):
-            return False
-        return any(
-            value is True and "model-list-plugin" in str(name)
-            for name, value in enabled.items()
-        )
+        # While this app's own API is in use, an installed and host-enabled
+        # plugin owns the list even if its target switch is paused.  The app
+        # must not become the second writer just because someone stopped the
+        # plugin; the plugin card reports the pause and the list stays as it
+        # was.
+        if self.code_uses_yrapi_api():
+            return True
+        return target_enabled("claude")
+
+    def _plugin_owns_document(self, document: Mapping[str, Any]) -> bool:
+        """Whether the plugin owns the list after ``document`` is written."""
+
+        previous = self._draft
+        self._draft = dict(document)
+        try:
+            return self.plugin_owns_model_list()
+        finally:
+            self._draft = previous
 
     def desktop_model_list_enabled(
         self, state: Mapping[str, Any] | None = None
@@ -1804,18 +1795,7 @@ class ClaudeSettingsDomain:
         every surface here clamps to the same ceiling.
         """
 
-        base = (
-            name
-            if claude_aliases.desktop_keeps_model_id(name)
-            else claude_aliases.claude_desktop_alias(name)
-        )
-        if (
-            isinstance(max_input_tokens, int)
-            and not isinstance(max_input_tokens, bool)
-            and max_input_tokens >= 1_000_000
-        ):
-            return f"{base}{claude_aliases.CONTEXT_SUFFIX}"
-        return base
+        return claude_picker.published_id(name, max_input_tokens)
 
     def _code_route_window(self, name: str) -> object:
         """The window this app states for one of its own routes.
@@ -2453,7 +2433,7 @@ class ClaudeSettingsDomain:
         else:
             candidate.pop("model", None)
         candidate["env"] = env
-        if read_generated_models(self.app_state_root, "claudeCode") and not self.plugin_owns_model_list():
+        if read_generated_models(self.app_state_root, "claudeCode") and not self._plugin_owns_document(candidate):
             candidate.pop("modelPicker", None)
         errors = validate_settings(candidate)
         if errors:
@@ -2527,6 +2507,12 @@ class ClaudeSettingsDomain:
         else:
             candidate.pop("model", None)
         candidate["env"] = env
+        # The plugin restored the picker it found when it took over: the one
+        # this app had generated.  Leaving the gateway means this app is no
+        # longer the list's writer, so that restored list must not outlive the
+        # connection it described.
+        if read_generated_models(self.app_state_root, "claudeCode") and not self._plugin_owns_document(candidate):
+            candidate.pop("modelPicker", None)
         errors = validate_settings(candidate)
         if errors:
             raise ClaudeSettingsError(errors[0])
@@ -2580,12 +2566,11 @@ class ClaudeSettingsDomain:
         # public name: a gateway id has no catalogue entry in the client, so
         # a session launched with the public name reports the client's 200k
         # default and drops the effort ladder (see ``_code_published_id``).
-        # Only while the picker is *this app's* list is there a row to name.
-        # The model list plugin publishes the provider's own ids and keeps the
-        # derived alias only as the historical row an older session may still
-        # send, so a name launched from the plugin's list stays the public one
-        # and its own row carries the label, the window and the effort ladder.
-        named = self.code_model_list_enabled() and not self.plugin_owns_model_list()
+        # The model-list plugin's handoff mode writes the same alias and
+        # ``[1m]`` spelling as metadata mode, so both writers name the route
+        # identically; a plugin list is not a reason to fall back to the
+        # public name.
+        named = self.code_model_list_enabled() or self._plugin_owns_document(candidate)
         model = str(data.get("model") or "").strip()
         if model:
             env["ANTHROPIC_MODEL"] = self._code_published_id(model) if named else model
@@ -3253,6 +3238,52 @@ class ClaudeSettingsDomain:
             raise ClaudeSettingsError("Claude Settings contains invalid values")
         self._revision += 1
 
+    def _adopt_plugin_model_list(self) -> bool:
+        """Take the plugin-written model fields as the current document.
+
+        Once the plugin owns Claude Code's picker, it rewrites ``modelPicker``
+        and ``modelSettings`` behind this domain.  A later settings edit must
+        keep those fields exactly as the plugin wrote them and must not read
+        the known external change as a conflict; every other field still has
+        to match what this domain last saw, or the ordinary disk-conflict
+        refusal applies.
+        """
+
+        if not self.plugin_owns_model_list():
+            return False
+        text, exists = self._loader(self.settings_path)
+        if not exists:
+            return False
+        try:
+            disk = json.loads(text) if text.strip() else {}
+        except json.JSONDecodeError:
+            raise ClaudeSettingsError(_SAFE_ERROR) from None
+        if not isinstance(disk, dict):
+            raise ClaudeSettingsError(_SAFE_ERROR)
+        if validate_settings(disk):
+            raise ClaudeSettingsError("Claude Settings contains invalid values")
+        # The plugin manager writes these beside the model fields: the host
+        # switch and the marketplace declaration are its record, not this
+        # domain's.  Adopt them so an Apply after takeover neither conflicts
+        # nor turns the plugin off.
+        plugin_keys = (
+            "modelPicker",
+            "modelSettings",
+            "enabledPlugins",
+            "extraKnownMarketplaces",
+        )
+        disk_rest = {key: value for key, value in disk.items() if key not in plugin_keys}
+        raw_rest = {key: value for key, value in self._raw.items() if key not in plugin_keys}
+        if disk_rest != raw_rest:
+            raise ClaudeSettingsError("Claude Settings changed on disk; reload and try again")
+        for key in plugin_keys:
+            if key in disk:
+                self._draft[key] = copy.deepcopy(disk[key])
+            elif key in {"modelPicker", "modelSettings"}:
+                self._draft.pop(key, None)
+        self._baseline_bytes = text.encode("utf-8")
+        return True
+
     def apply(self, payload: object | None = None) -> dict[str, Any]:
         data = _mapping(payload or {}, "payload")
         if "raw_json" in data or "rawJson" in data:
@@ -3261,6 +3292,7 @@ class ClaudeSettingsDomain:
             self.dispatch("select_deployment", {"deployment": data["deployment"]})
         if "settings" in data:
             self._draft = copy.deepcopy(_mapping(data["settings"], "settings"))
+        self._adopt_plugin_model_list()
         validation = self.validate()
         if not validation["valid"]:
             raise ClaudeSettingsError("Claude Settings contains invalid values")

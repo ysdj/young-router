@@ -13,7 +13,7 @@ import threading
 NAME = "model-list-plugin"
 PLUGIN_ID = f"{NAME}@{NAME}"
 HOSTS = {"codex", "claude"}
-OPERATIONS = {"status", "install", "uninstall", "enable", "disable", "sync"}
+OPERATIONS = {"status", "install", "uninstall", "enable", "disable", "sync", "takeover"}
 _LOCK = threading.RLock()
 
 
@@ -157,6 +157,87 @@ def target_enabled(host: str) -> bool:
     return bool(config.get("enabled") and config.get("targets", {}).get(host))
 
 
+#: The first plugin release whose Claude projection writes one row per model,
+#: uses the provider's ``claude_alias``/``behaves_as`` metadata, and drops
+#: generators.  A takeover on an older plugin would replace the app's picker
+#: with the four-rows-per-model list the handoff exists to avoid.
+MIN_CLAUDE_METADATA_VERSION = (0, 3, 0)
+
+
+def version_tuple(value: object) -> tuple[int, ...]:
+    """A plugin version as comparable numbers; a pre-release suffix is ignored."""
+
+    parts: list[int] = []
+    for part in str(value or "").strip().split("."):
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _supports_claude_metadata(version: object) -> bool:
+    return version_tuple(version) >= MIN_CLAUDE_METADATA_VERSION
+
+
+def set_alias_mode(mode: str) -> None:
+    """Set the Claude projection mode without dropping the other plugin keys."""
+
+    path = _config_path()
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        config = {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("The model-list-plugin configuration is unreadable") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError("The model-list-plugin configuration must be a JSON object")
+    config["claudeAliasMode"] = mode
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def ensure_claude_owner() -> dict:
+    """Install/enable the plugin and make its Claude projection the YR one.
+
+    The plugin must be the one writer of Claude Code's model list; this is the
+    operation the "Use Young Router API" switch calls after the gateway
+    connection is saved.  It is idempotent: an installed, enabled plugin only
+    gets the metadata mode and a fresh sync.
+    """
+
+    with _LOCK:
+        executable = _executable("claude")
+        if not executable:
+            raise RuntimeError("Claude Code is unavailable")
+        row = _row("claude", executable)
+        if row is None:
+            managed = manage("claude", "install")
+            if not managed.get("installed"):
+                raise RuntimeError("The model-list plugin did not install")
+        row = _row("claude", executable)
+        if row is None:
+            raise RuntimeError("The model-list plugin is not installed")
+        if not _supports_claude_metadata(row.get("version")):
+            raise RuntimeError(
+                "Update model-list-plugin before handing over Claude's model list"
+            )
+        # Installation's own sync used the default mode; set the provider-
+        # published mode before the write that matters, then sync once.
+        set_alias_mode("metadata")
+        current = status("claude")
+        if not current.get("host_enabled") or not current.get("enabled"):
+            manage("claude", "enable")
+        manage("claude", "sync")
+        return status("claude")
+
+
 def status(host: str) -> dict:
     executable = _executable(host)
     if not executable:
@@ -212,6 +293,10 @@ def manage(host: str, action: str) -> dict:
         if not executable:
             raise RuntimeError(f"{host} is unavailable")
         row = _row(host, executable)
+        if action == "takeover":
+            if host != "claude":
+                raise RuntimeError("Takeover is only available for Claude Code")
+            return ensure_claude_owner()
         if action == "install":
             if row is None:
                 source = os.environ.get("MODEL_LIST_PLUGIN_MARKETPLACE") or "ysdj/model-list-plugin"

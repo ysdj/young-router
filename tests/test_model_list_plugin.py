@@ -272,3 +272,54 @@ def test_saving_the_yrapi_triplet_from_the_form_is_the_on_direction(tmp_path, mo
     assert document["model_provider"] == "custom"
     assert "young-router-direct" not in document["model_providers"]
     assert document["model_providers"]["custom"]["base_url"] == "http://127.0.0.1:4000/v1"
+
+
+def test_takeover_sets_the_metadata_mode_and_syncs_once():
+    row = {"version": "0.3.0", "enabled": True}
+    states = [
+        {"installed": True, "host_enabled": True, "enabled": False},
+        {"installed": True, "host_enabled": True, "enabled": True, "version": "0.3.0"},
+    ]
+    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
+         mock.patch.object(model_list_plugin, "_row", return_value=row), \
+         mock.patch.object(model_list_plugin, "status", side_effect=states), \
+         mock.patch.object(model_list_plugin, "set_alias_mode") as alias_mode, \
+         mock.patch.object(model_list_plugin, "manage") as manage:
+        result = model_list_plugin.ensure_claude_owner()
+
+    alias_mode.assert_called_once_with("metadata")
+    assert mock.call("claude", "enable") in manage.call_args_list
+    assert mock.call("claude", "sync") in manage.call_args_list
+    assert result["enabled"] is True
+
+
+def test_takeover_refuses_a_plugin_that_predates_the_one_row_projection():
+    row = {"version": "0.2.10", "enabled": True}
+    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
+         mock.patch.object(model_list_plugin, "_row", return_value=row), \
+         mock.patch.object(model_list_plugin, "set_alias_mode") as alias_mode:
+        with pytest.raises(RuntimeError, match="Update model-list-plugin"):
+            model_list_plugin.ensure_claude_owner()
+    alias_mode.assert_not_called()
+
+
+def test_set_alias_mode_keeps_the_other_plugin_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_LIST_PLUGIN_DATA", str(tmp_path))
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "enabled": True,
+        "targets": {"codex": True, "claude": False},
+        "syncIntervalSeconds": 60,
+    }))
+    model_list_plugin.set_alias_mode("metadata")
+    saved = json.loads(config.read_text())
+    assert saved["claudeAliasMode"] == "metadata"
+    assert saved["targets"] == {"codex": True, "claude": False}
+
+
+def test_takeover_is_a_plugin_operation_the_core_accepts():
+    core = CoreStore()
+    with mock.patch.object(model_list_plugin, "manage", return_value={"installed": True, "enabled": True}) as manage:
+        result = core.dispatch({"type": "model_list_plugin", "payload": {"host": "claude", "operation": "takeover"}})
+    assert result["action_summary"]["enabled"] is True
+    manage.assert_called_once_with("claude", "takeover")
