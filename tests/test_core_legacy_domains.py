@@ -3079,12 +3079,6 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
-    def setUp(self) -> None:
-        # These fixtures do not have the model-list plugin installed.
-        plugin = mock.patch("young_router.core.model_list_plugin.target_initialized", return_value=False)
-        plugin.start()
-        self.addCleanup(plugin.stop)
-
     def test_image_context_switch_writes_and_removes_only_this_apps_mcp_entry(self) -> None:
         """The switch alone never edits Codex: only an explicit MCP choice does."""
 

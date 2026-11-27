@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import sys
 import tomllib
 from unittest import mock
 
@@ -47,26 +49,121 @@ def test_install_reenables_host_and_keeps_installation_after_sync_error():
     assert result == {"installed": True, "last_error": "provider unavailable"}
 
 
-def test_initialized_target_remains_owned_when_disabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("MODEL_LIST_PLUGIN_DATA", str(tmp_path))
-    (tmp_path / "config.json").write_text(json.dumps({"enabled": False, "initializedTargets": {"codex": True}}))
-    assert model_list_plugin.target_initialized("codex")
-    assert not model_list_plugin.target_enabled("codex")
-    assert not model_list_plugin.target_initialized("claude")
-
-
-def test_legacy_plugin_configuration_owns_both_targets(tmp_path, monkeypatch):
+def test_target_enabled_is_the_ownership_the_legacy_generator_yields_to(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_LIST_PLUGIN_DATA", str(tmp_path))
     config_path = tmp_path / "config.json"
-    assert not model_list_plugin.target_initialized("codex")
-    config_path.write_text(json.dumps({"enabled": False, "targets": {"codex": True, "claude": True}}))
-    assert model_list_plugin.target_initialized("codex")
-    assert model_list_plugin.target_initialized("claude")
     assert not model_list_plugin.target_enabled("codex")
-    config_path.write_text(json.dumps({"enabled": False, "initializedTargets": None}))
-    assert not model_list_plugin.target_initialized("codex")
-    config_path.write_text(json.dumps({"enabled": True, "targets": {"codex": True}, "initializedTargets": {}}))
-    assert model_list_plugin.target_initialized("codex")
+    # A host that was initialized and then disabled is not owned: the legacy
+    # generator may maintain the list it restored instead of leaving it stale.
+    config_path.write_text(json.dumps({
+        "enabled": False,
+        "targets": {"codex": True, "claude": True},
+        "initializedTargets": {"codex": True, "claude": True},
+    }))
+    assert not model_list_plugin.target_enabled("codex")
+    assert not model_list_plugin.target_enabled("claude")
+    # Only the plugin's own on state makes it the owner of one host.
+    config_path.write_text(json.dumps({
+        "enabled": True,
+        "targets": {"codex": True, "claude": False},
+        "initializedTargets": {"codex": True, "claude": True},
+    }))
+    assert model_list_plugin.target_enabled("codex")
+    assert not model_list_plugin.target_enabled("claude")
+    # Configurations from the previous plugin version name their targets the
+    # same way; they no longer own a host merely by having been initialized.
+    config_path.write_text(json.dumps({"enabled": False, "targets": {"codex": True, "claude": True}}))
+    assert not model_list_plugin.target_enabled("codex")
+    assert not model_list_plugin.target_enabled("claude")
+
+
+def test_status_keeps_each_hosts_sync_error_apart():
+    row = {"version": "0.2.10", "enabled": True}
+    plugin = {
+        "enabled": True,
+        "targets": {"codex": True, "claude": True},
+        "lastError": "codex: boom",
+        "lastErrorByHost": {"codex": "codex: boom"},
+        "lastSyncAtByTarget": {"claude": "2026-01-01T00:00:00Z"},
+        "lastUpdateErrorByHost": {},
+    }
+    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
+         mock.patch.object(model_list_plugin, "_row", return_value=row), \
+         mock.patch.object(model_list_plugin, "_binary", return_value=Path("/plugin")), \
+         mock.patch.object(model_list_plugin, "_json", return_value=plugin):
+        state = model_list_plugin.status("claude")
+    assert state["last_error"] == ""
+    assert state["last_sync"] == "2026-01-01T00:00:00Z"
+
+    # A plugin that predates the per-host map still reports its one global
+    # error, which is the only attribution available for it.
+    legacy = {key: value for key, value in plugin.items() if key != "lastErrorByHost"}
+    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
+         mock.patch.object(model_list_plugin, "_row", return_value=row), \
+         mock.patch.object(model_list_plugin, "_binary", return_value=Path("/plugin")), \
+         mock.patch.object(model_list_plugin, "_json", return_value=legacy):
+        state = model_list_plugin.status("claude")
+    assert state["last_error"] == "codex: boom"
+
+
+def test_desktop_bundled_cli_is_found_newest_first(tmp_path):
+    """An app-only machine's Claude Code lives inside Claude Desktop."""
+
+    if sys.platform != "darwin" and os.name != "nt":
+        pytest.skip("Claude Desktop keeps its bundled CLI on macOS and Windows only")
+
+    def bundle(version: str, digest: str) -> Path:
+        if sys.platform == "darwin":
+            path = tmp_path / version / digest / "claude.app" / "Contents" / "MacOS" / "claude"
+        else:
+            path = tmp_path / version / digest / "claude.exe"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    older = bundle("2.1.0", "older")
+    newer = bundle("2.2.0", "newer")
+    os.utime(tmp_path / "2.1.0", (1_000_000, 1_000_000))
+    os.utime(tmp_path / "2.2.0", (2_000_000, 2_000_000))
+    assert model_list_plugin._desktop_claude_cli([tmp_path]) == str(newer)
+
+    if sys.platform == "darwin":
+        # A newer version whose binary is not executable is not a command.
+        blocked = bundle("2.3.0", "blocked")
+        blocked.chmod(0o644)
+        os.utime(tmp_path / "2.3.0", (3_000_000, 3_000_000))
+        assert model_list_plugin._desktop_claude_cli([tmp_path]) == str(newer)
+
+    assert model_list_plugin._desktop_claude_cli([tmp_path / "missing"]) is None
+
+
+def test_uninstall_restores_every_host_before_the_plugin_is_removed():
+    """Removing the plugin must not leave the other host's catalog pointer behind.
+
+    Young Router is asked to remove the plugin for Claude, but the plugin is
+    one installation serving both hosts.  The host's own removal runs after the
+    plugin's uninstall, which restores both targets and deletes the local
+    config and state that would otherwise keep claiming ownership.
+    """
+
+    row = {"version": "0.2.9", "enabled": True}
+    commands = []
+
+    def run(executable, args):
+        commands.append((executable, args))
+        return ""
+
+    with mock.patch.object(model_list_plugin, "_executable", return_value="claude"), \
+         mock.patch.object(model_list_plugin, "_row", return_value=row), \
+         mock.patch.object(model_list_plugin, "_binary", return_value=Path("/plugin")), \
+         mock.patch.object(model_list_plugin, "_run", side_effect=run), \
+         mock.patch.object(model_list_plugin, "status", return_value={"installed": False}):
+        model_list_plugin.manage("claude", "uninstall")
+
+    assert ("claude", ["plugin", "uninstall", model_list_plugin.PLUGIN_ID]) in commands
+    assert ("/plugin", ["uninstall"]) in commands
+    assert ("/plugin", ["disable", "--host", "claude"]) not in commands
 
 
 @pytest.mark.parametrize("host", ["codex", "claude"])

@@ -11232,8 +11232,8 @@ function ProviderEditor({ provider, relayStations, ipc, native, busy, translate,
 const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey: string; hintKey: string }> = [
   { client: "codex", titleKey: "clients.codex", hintKey: "settings.codexFilesHint" },
   // Claude is one entry with two apps inside it: the CLI and the desktop app
-  // keep separate files, so the detail lists them by app instead of the rail
-  // offering the same product twice.
+  // keep separate files, so the detail lists both apps' files under one entry
+  // instead of the rail offering the same product twice.
   { client: "claude", titleKey: "clients.claude", hintKey: "clients.claudeFilesHint" },
   { client: "pi", titleKey: "clients.pi", hintKey: "clients.piFilesHint" },
   { client: "dsh", titleKey: "clients.dsh", hintKey: "clients.dshFilesHint" },
@@ -11244,9 +11244,10 @@ const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey
 type ClaudeClientApp = "claudeCode" | "claudeDesktop";
 
 /**
- * The Claude Code document Core writes a generated picker into.  Claude Code
- * keeps its model list in its own settings file rather than a separate one, so
- * this is the file whose manual edit can be overwritten while that switch is on.
+ * The Claude Code document whose model tables (`modelPicker`, `modelSettings`)
+ * one of two writers may rewrite: the model list plugin while it is enabled for
+ * this client, or this app's legacy generator while the file still carries a
+ * picker this app wrote.  A manual edit therefore needs one confirmation first.
  */
 const CLAUDE_CODE_SETTINGS_FILE_ID = "claude.settings";
 
@@ -11884,12 +11885,14 @@ function ClientToggleField({ label, hint, accessibilityLabel, value, busy, onVal
 }
 
 /**
- * One client's listed files, grouped by the app that owns them.
+ * One client's listed files, in the order Core registers them.
  *
  * A rail entry can cover more than one app — Claude is Claude Code and Claude
- * Desktop — and their documents belong to different programs, so a group's
- * own title sits above its rows.  A client whose rail entry is already one app
- * draws its rows directly, without repeating the entry's name.
+ * Desktop — and their documents belong to different programs.  Core registers
+ * the CLI's settings document first and the desktop app's profile and developer
+ * settings after it, so the two apps' files stay adjacent under one entry
+ * without a second rail entry; the file each row names is what tells the two
+ * programs apart.
  */
 function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, onOpenFile }: {
   files: ClientFile[];
@@ -12092,22 +12095,22 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, standaloneSea
     }
     return true;
   };
-  // A file this app generates only stays the user's while its own switch is
-  // off: with the switch on, Core rewrites that file whenever the list it came
-  // from changes, so an edit needs one explicit confirmation first.
-  const generatedFileOpen = (file: ClientFile, generated: boolean): void => {
-    if (!generated) { onOpenFile(file); return; }
-    void native.showConfirmation({
-      title: translate("codex.modelCatalogEditTitle"),
-      message: translate("codex.modelCatalogEditBody"),
-      confirmLabel: translate("codex.modelCatalogEditConfirm"),
-    }).then((confirmed) => { if (confirmed) onOpenFile(file); });
-  };
+  // Claude Code keeps its picker in its own settings document, and one of two
+  // writers may rewrite that document: the model list plugin (only while the
+  // client enables the plugin and the plugin has this host's target on, which
+  // is the same pair the status line's switch answers) or this app's legacy
+  // generator (while the file still carries a picker this app wrote).  The
+  // wording names the writer, because the two do not rewrite it on the same
+  // schedule.
   const openClientFile = (file: ClientFile): void => {
-    // Claude Code keeps its picker in its own settings document, so that
-    // generated file needs the overwrite warning before it opens.
-    if (file.id === CLAUDE_CODE_SETTINGS_FILE_ID) { generatedFileOpen(file, booleanValue(claudeCode.model_list_enabled)); return; }
-    onOpenFile(file);
+    if (file.id !== CLAUDE_CODE_SETTINGS_FILE_ID) { onOpenFile(file); return; }
+    const pluginOwns = pluginInfo?.state?.enabled === true;
+    if (!pluginOwns && !booleanValue(claudeCode.model_list_enabled)) { onOpenFile(file); return; }
+    void native.showConfirmation({
+      title: translate("claude.settingsEditTitle"),
+      message: translate(pluginOwns ? "claude.settingsEditPluginBody" : "claude.settingsEditYrapiBody"),
+      confirmLabel: translate("claude.settingsEditConfirm"),
+    }).then((confirmed) => { if (confirmed) onOpenFile(file); });
   };
   const featureKeys = Object.keys(codexFeatures ?? {}).filter((feature) => feature.endsWith("_use"));
   // Browser and Computer Use are Codex's own capabilities and are on by default

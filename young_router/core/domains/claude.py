@@ -1659,6 +1659,31 @@ class ClaudeSettingsDomain:
         value = self._draft.get("modelPicker")
         return isinstance(value, Mapping) and value.get("replaceBuiltInOptions") is True
 
+    def plugin_owns_model_list(self) -> bool:
+        """Whether the model list plugin, not this app, writes this picker.
+
+        Both halves are needed.  Claude Code runs a plugin's hooks only while
+        the client's own document enables that plugin (``enabledPlugins``), so
+        a plugin the host switched off maintains nothing.  The plugin writes
+        this host's list only while its own configuration has the target on, so
+        a plugin that is on but has Claude's target off leaves the picker this
+        app restored alone.  This is the Claude counterpart of the Codex
+        domain's ``_plugin_enabled_in_host`` check on the plugin's catalog
+        pointer, and it is why ``target_initialized`` is not used: a target that
+        was enabled once and later disabled does not keep the file retired.
+        """
+
+        from ..model_list_plugin import target_enabled
+        if not target_enabled("claude"):
+            return False
+        enabled = self._draft.get("enabledPlugins")
+        if not isinstance(enabled, Mapping):
+            return False
+        return any(
+            value is True and "model-list-plugin" in str(name)
+            for name, value in enabled.items()
+        )
+
     def desktop_model_list_enabled(
         self, state: Mapping[str, Any] | None = None
     ) -> bool:
@@ -1994,7 +2019,11 @@ class ClaudeSettingsDomain:
 
         An entry under a superseded spelling is retired when it holds nothing
         but the window this app writes and that value agrees; an entry with any
-        other field or a different number is the user's and is kept.
+        other field or a different number is the user's and is kept.  An entry
+        under a derived alias that names no current route is retired when it
+        holds only that window too: the alias index is derived from the current
+        names, so the client cannot route that id any more and the number is
+        neither a live fallback nor a choice a person made.
         """
 
         settings: dict[str, Any] = {}
@@ -2059,6 +2088,33 @@ class ClaudeSettingsDomain:
                 if stale_window != current.get("autoCompactWindow") and stale_window != "auto":
                     continue
                 settings.pop(stale_key, None)
+        # A derived alias that resolves to no current route names a model this
+        # app served before it was removed or renamed.  The client cannot route
+        # it any more -- both alias indexes are derived from the current names
+        # -- so its window is neither a fallback for a live route nor a choice
+        # a person made.  Retire only an entry holding the one field this app
+        # writes; a field of the user's own keeps the entry, and the model the
+        # client is launched with is always kept.
+        current_ids: set[str] = set()
+        for name in names:
+            window = (known.get(name) or {}).get("max_input_tokens")
+            model_id = self._code_picker_id(name, window)
+            current_ids.update((model_id, claude_aliases.context_suffix_free(model_id)))
+        launch = {
+            str(self._code_env().get("ANTHROPIC_MODEL") or ""),
+            str(self._draft.get("model") or ""),
+        }
+        for stale_key in list(settings):
+            if stale_key in current_ids or stale_key in launch:
+                continue
+            if not claude_aliases.is_derived_alias(stale_key):
+                continue
+            if claude_aliases.resolve_alias(stale_key, names) is not None:
+                continue
+            stale = settings.get(stale_key)
+            if not isinstance(stale, Mapping) or set(stale) - {"autoCompactWindow"}:
+                continue
+            settings.pop(stale_key, None)
         return settings
 
     def _code_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> dict[str, Any]:
@@ -2130,23 +2186,25 @@ class ClaudeSettingsDomain:
         was added, removed, or renamed has to reach that picker without the
         user reopening the pane.
 
-        Only Claude Code still takes a generated list.  Claude Desktop's picker
-        now discovers the alias view ``/v1/models`` publishes for its own
-        request, so no background pass writes ``inferenceModels``; the list is
-        retired at reload instead.  Three gates keep the remaining list from
-        fighting the user: it is touched only while its switch is on; an
-        observation that is merely empty (the proxy still loading, a worker
-        reload between groups) is not a change; and a document holding an edit
-        the user has not applied is left alone, because writing the list would
-        commit that edit too.  The write is its own step --
-        ``_persist_generated_lists`` -- rather than the ordinary Apply: Apply
-        asks for confirmation of the *document's* risk settings, and a user who
-        has already applied ``bypassPermissions`` must not have every refresh
-        refused by a prompt nobody sees.
+        Only Claude Code still takes a generated list, and only while the model
+        list plugin has not taken this host: the plugin reads the same picker
+        from the client's configured gateway and rewrites it on its own hooks,
+        so a background pass here that also wrote it would be a second producer.
+        Claude Desktop's picker now discovers the alias view ``/v1/models``
+        publishes for its own request, so no background pass writes
+        ``inferenceModels``; the list is retired at reload instead.  While this
+        app does own the list, two gates keep it from fighting the user: it is
+        touched only while its switch is on; and an observation that is merely
+        empty (the proxy still loading, a worker reload between groups) is not a
+        change.  A document holding an edit the user has not applied is left
+        alone, because writing the list would commit that edit too.  The write
+        is its own step -- ``_persist_generated_lists`` -- rather than the
+        ordinary Apply: Apply asks for confirmation of the *document's* risk
+        settings, and a user who has already applied ``bypassPermissions`` must
+        not have every refresh refused by a prompt nobody sees.
         """
 
-        from ..model_list_plugin import target_initialized
-        if target_initialized("claude"):
+        if self.plugin_owns_model_list():
             return False
         names = self._public_models()
         if not names:
@@ -2368,8 +2426,6 @@ class ClaudeSettingsDomain:
     def _apply_direct_connection(self, data: Mapping[str, Any]) -> None:
         """Point both Claude apps at one direct connection and keep its key."""
 
-        from ..model_list_plugin import target_initialized
-
         connection = self._form_direct_connection(data)
         base_url = str(connection.get("base_url") or "")
         key = str(connection.get("api_key") or "")
@@ -2397,7 +2453,7 @@ class ClaudeSettingsDomain:
         else:
             candidate.pop("model", None)
         candidate["env"] = env
-        if read_generated_models(self.app_state_root, "claudeCode") and not target_initialized("claude"):
+        if read_generated_models(self.app_state_root, "claudeCode") and not self.plugin_owns_model_list():
             candidate.pop("modelPicker", None)
         errors = validate_settings(candidate)
         if errors:
@@ -2524,9 +2580,12 @@ class ClaudeSettingsDomain:
         # public name: a gateway id has no catalogue entry in the client, so
         # a session launched with the public name reports the client's 200k
         # default and drops the effort ladder (see ``_code_published_id``).
-        # Only while the picker is this app's list is there a row to name,
-        # so a client on the proxy with its own catalogue is left as it is.
-        named = self.code_model_list_enabled()
+        # Only while the picker is *this app's* list is there a row to name.
+        # The model list plugin publishes the provider's own ids and keeps the
+        # derived alias only as the historical row an older session may still
+        # send, so a name launched from the plugin's list stays the public one
+        # and its own row carries the label, the window and the effort ladder.
+        named = self.code_model_list_enabled() and not self.plugin_owns_model_list()
         model = str(data.get("model") or "").strip()
         if model:
             env["ANTHROPIC_MODEL"] = self._code_published_id(model) if named else model
@@ -2981,10 +3040,13 @@ class ClaudeSettingsDomain:
             self._revision += 1
             return self.snapshot()
         if name in {"claude_models_set", "claudemodelsset", "claude_models", "claudemodels"}:
-            # One switch per client, because the two apps keep different model
+            # The pre-plugin switch, still dispatched by hosts built before the
+            # model list plugin card replaced it.  The two apps keep different
             # lists: Claude Code reads ``modelPicker`` from its own settings,
             # Claude Desktop reads ``inferenceModels`` from its third-party
-            # profile.  Both are generated from this router's public list.
+            # profile.  While the plugin owns Claude Code's list this switch has
+            # nothing to change: writing here would be the second producer the
+            # plugin's ownership exists to prevent.
             client = _claude_client(data)
             enabled = data.get("enabled", data.get("model_list_enabled"))
             if not isinstance(enabled, bool):
@@ -2998,6 +3060,10 @@ class ClaudeSettingsDomain:
                 )
                 self._revision += 1
                 return self.snapshot()
+            if self.plugin_owns_model_list():
+                raise DomainError(
+                    "The model list plugin manages Claude Code's model list; use it to enable or disable synchronization"
+                )
             candidate = self._code_model_list_apply(enabled)
             errors = validate_settings(candidate)
             if errors:

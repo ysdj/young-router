@@ -17,6 +17,60 @@ OPERATIONS = {"status", "install", "uninstall", "enable", "disable", "sync"}
 _LOCK = threading.RLock()
 
 
+def _desktop_claude_roots() -> list[Path]:
+    """Where Claude Desktop installs the copy of Claude Code its Code tab runs."""
+
+    if sys.platform == "darwin":
+        return [Path.home() / "Library/Application Support" / "Claude-3p" / "claude-code"]
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return [Path(local) / "Claude-3p" / "claude-code"]
+    return []
+
+
+def _desktop_claude_cli(roots: list[Path] | None = None) -> str | None:
+    """The Claude Code CLI bundled with Claude Desktop, newest install first.
+
+    Claude Desktop's Code tab runs its own copy of Claude Code and puts no
+    ``claude`` command on PATH, so an app-only machine has no command for the
+    plugin manager even though the client is installed.  The copy sits under a
+    versioned directory whose names change with every app update, hence the
+    newest-first walk rather than a pinned build.  A CLI on PATH still wins:
+    that is the installation the user chose to put there.
+    """
+
+    suffix = (
+        Path("claude.app/Contents/MacOS/claude")
+        if sys.platform == "darwin"
+        else Path("claude.exe")
+    )
+    for root in _desktop_claude_roots() if roots is None else roots:
+        versions: list[tuple[float, Path]] = []
+        try:
+            for entry in root.iterdir():
+                if not entry.is_dir():
+                    continue
+                try:
+                    versions.append((entry.stat().st_mtime, entry))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+        for _, version in sorted(versions, reverse=True):
+            try:
+                bundles = [entry for entry in version.iterdir() if entry.is_dir()]
+            except OSError:
+                continue
+            for bundle in bundles:
+                candidate = bundle / suffix
+                try:
+                    if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+                        return str(candidate)
+                except OSError:
+                    continue
+    return None
+
+
 def _executable(host: str) -> str | None:
     executable = shutil.which(host)
     if executable:
@@ -35,6 +89,12 @@ def _executable(host: str) -> str | None:
         candidate = _installed_codex_cli(Path(os.environ.get("CODEX_HOME") or home / ".codex"))
         if candidate:
             return str(candidate)
+    if host == "claude":
+        # An app-only machine reaches its plugin manager through the copy of
+        # Claude Code that Claude Desktop installed, not a command on PATH.
+        bundled = _desktop_claude_cli()
+        if bundled:
+            return bundled
     return None
 
 
@@ -83,26 +143,18 @@ def _config_path() -> Path:
 
 
 def target_enabled(host: str) -> bool:
+    """Whether the plugin's configuration has this host's model list turned on.
+
+    Half of the ownership answer: the plugin writes this host's list only while
+    its configuration says so.  The other half is the client's own document
+    (``enabledPlugins``), because the client runs the plugin's hooks only while
+    it enables that plugin; the Claude domain joins the two.
+    """
     try:
         config = json.loads(_config_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     return bool(config.get("enabled") and config.get("targets", {}).get(host))
-
-
-def target_initialized(host: str) -> bool:
-    """Keep the legacy generator retired after the plugin takes ownership."""
-    try:
-        config = json.loads(_config_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if "initializedTargets" not in config:
-        # Configurations from the previous plugin version owned both targets.
-        return True
-    initialized = config.get("initializedTargets") or {}
-    return bool(initialized.get(host) or (
-        config.get("enabled") and config.get("targets", {}).get(host)
-    ))
 
 
 def status(host: str) -> dict:
@@ -113,13 +165,22 @@ def status(host: str) -> dict:
     if not row:
         return {"installed": False, "available": True, "enabled": False}
     plugin = _json(str(_binary(host, row)), ["status", "--host", host])
+    # A plugin that reports per-host errors must never hand one host's failure
+    # to the other's card.  Older plugin versions only carry the global field;
+    # for them the fallback is the best available attribution.
+    by_host = plugin.get("lastErrorByHost")
+    last_error = (
+        str(by_host.get(host) or "")
+        if isinstance(by_host, dict)
+        else str(plugin.get("lastError") or "")
+    )
     return {
         "installed": True, "available": True,
         "enabled": bool(row.get("enabled", True) and plugin.get("enabled") and plugin.get("targets", {}).get(host)),
         "host_enabled": bool(row.get("enabled", True)),
         "version": row.get("version", ""),
         "last_sync": (plugin.get("lastSyncAtByTarget") or {}).get(host, ""),
-        "last_error": plugin.get("lastError", ""),
+        "last_error": last_error,
         "last_update_error": (plugin.get("lastUpdateErrorByHost") or {}).get(host, ""),
     }
 
@@ -177,7 +238,12 @@ def manage(host: str, action: str) -> dict:
                 pass
         elif action == "uninstall":
             if row:
-                _run(str(_binary(host, row)), ["disable", "--host", host])
+                # The plugin is being removed for every host it serves, so its
+                # own uninstall (both targets restored, local config and state
+                # deleted) has to run before the host forgets it.  Disabling
+                # only this host would leave the other host's catalog pointer
+                # aimed at a file nothing updates any more.
+                _run(str(_binary(host, row)), ["uninstall"])
                 _run(executable, ["plugin", "remove" if host == "codex" else "uninstall", PLUGIN_ID])
         else:
             if row is None:

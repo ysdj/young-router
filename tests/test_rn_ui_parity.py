@@ -4645,12 +4645,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "SETTINGS_FIELD_SWITCH_SLOT",
             "const openClientFile = (file: ClientFile): void => {",
             # Claude Code keeps its picker in its own settings document, so
-            # that file is generated too and needs the same warning first.
+            # that file needs the overwrite warning while either writer owns
+            # it, and the copy has to name that writer.
             'const CLAUDE_CODE_SETTINGS_FILE_ID = "claude.settings";',
-            'if (file.id === CLAUDE_CODE_SETTINGS_FILE_ID) { generatedFileOpen(file, booleanValue(claudeCode.model_list_enabled)); return; }',
-            'title: translate("codex.modelCatalogEditTitle")',
-            'message: translate("codex.modelCatalogEditBody")',
-            'confirmLabel: translate("codex.modelCatalogEditConfirm")',
+            'if (file.id !== CLAUDE_CODE_SETTINGS_FILE_ID) { onOpenFile(file); return; }',
+            'const pluginOwns = pluginInfo?.state?.enabled === true;',
+            'if (!pluginOwns && !booleanValue(claudeCode.model_list_enabled)) { onOpenFile(file); return; }',
+            'title: translate("claude.settingsEditTitle")',
+            'message: translate(pluginOwns ? "claude.settingsEditPluginBody" : "claude.settingsEditYrapiBody")',
+            'confirmLabel: translate("claude.settingsEditConfirm")',
             ".then((confirmed) => { if (confirmed) onOpenFile(file); });",
             "onPress={() => onOpenFile(file)}",
         ):

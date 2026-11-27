@@ -56,7 +56,7 @@ def _write_desktop_config(root: pathlib.Path, config: dict[str, object]) -> path
 class ClaudeDesktopConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         # These fixtures do not have the model-list plugin installed.
-        plugin = mock.patch("young_router.core.model_list_plugin.target_initialized", return_value=False)
+        plugin = mock.patch("young_router.core.model_list_plugin.target_enabled", return_value=False)
         plugin.start()
         self.addCleanup(plugin.stop)
 
@@ -1048,6 +1048,59 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 settings,
             )
 
+    def test_a_removed_routes_derived_alias_window_is_retired(self) -> None:
+        """A window for a route this app no longer serves describes nothing.
+
+        The alias index is derived from the current public names, so an old
+        derived id cannot be routed any more; keeping only its window would
+        leave a growing history of dead ids.  A person's own field keeps the
+        entry, and an id outside this app's alias family is never touched.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            dead = alias_claude_desktop("retired-model")
+            dead_legacy = "claude-fable-" + dead.removeprefix(FABLE_ALIAS_PREFIX)
+            live = alias_claude_desktop("public-a")
+            launch = alias_claude_desktop("active-but-retired")
+            settings = {
+                "model": launch,
+                "modelSettings": {
+                    dead: {"autoCompactWindow": 500_000},
+                    f"{dead}[1m]": {"autoCompactWindow": 1_000_000},
+                    dead_legacy: {"autoCompactWindow": 200_000},
+                    launch: {"autoCompactWindow": 400_000},
+                    live: {"autoCompactWindow": 200_000, "effort": "a person's choice"},
+                    "typed-by-a-person": {"autoCompactWindow": 300_000},
+                },
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["public-a"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "public-a", "max_input_tokens": 200_000}],
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+
+            written = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            self.assertNotIn(dead, written)
+            self.assertNotIn(f"{dead}[1m]", written)
+            self.assertNotIn(dead_legacy, written)
+            # The id the client is launched with is always kept, even when it
+            # no longer names a current route.
+            self.assertIn(launch, written)
+            self.assertEqual("a person's choice", written[live]["effort"])
+            self.assertIn("typed-by-a-person", written)
+
     def test_a_one_million_window_is_named_1m_whatever_wrote_the_number(self) -> None:
         # One window per route, and this app publishes it: the pane, the picker
         # row and the discovery row state the same number.  At or above 1M that
@@ -1682,6 +1735,116 @@ general_settings:
             self.assertEqual([], domain.snapshot()["desktop"]["model_names"])
             stored = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertNotIn("inferenceModels", stored)
+
+    def test_the_model_list_plugin_owns_the_picker_only_while_client_and_target_agree(self) -> None:
+        """One picker, one writer: the plugin's target and the client's own plugin switch.
+
+        Claude Code runs a plugin's hooks only while ``enabledPlugins`` names it,
+        so a target the plugin's configuration switched on is not enough on its
+        own.  While both agree the background pass leaves the file alone; when
+        either stops naming the plugin, the list this app restored is its own
+        again instead of staying stale forever.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_runtime_config(root / "config.yaml", {"deepseek-v4.1-flash": 200_000})
+            settings_path = root / "settings.json"
+            settings_path.write_text(
+                json.dumps({
+                    "modelPicker": {"replaceBuiltInOptions": True, "options": [{"model": "stale-route"}]},
+                }),
+                encoding="utf-8",
+            )
+            domain = ClaudeSettingsDomain(
+                settings_path,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            target = {"on": True}
+            with mock.patch(
+                "young_router.core.model_list_plugin.target_enabled",
+                side_effect=lambda host: target["on"],
+            ):
+                self.assertFalse(domain.plugin_owns_model_list())
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                settings["enabledPlugins"] = {"model-list-plugin@model-list-plugin": True}
+                settings_path.write_text(json.dumps(settings), encoding="utf-8")
+                domain.reload()
+                self.assertTrue(domain.plugin_owns_model_list())
+
+                with mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]):
+                    self.assertFalse(domain.refresh_model_lists())
+                kept = json.loads(settings_path.read_text(encoding="utf-8"))["modelPicker"]
+                self.assertEqual("stale-route", kept["options"][0]["model"])
+
+                # The plugin's own configuration turned this host off: the file
+                # it restored is this app's to maintain again.
+                target["on"] = False
+                self.assertFalse(domain.plugin_owns_model_list())
+                with mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]):
+                    self.assertTrue(domain.refresh_model_lists())
+                rewritten = json.loads(settings_path.read_text(encoding="utf-8"))["modelPicker"]
+                self.assertNotEqual("stale-route", rewritten["options"][0]["model"])
+
+    def test_leaving_the_proxy_keeps_a_picker_the_plugin_maintains(self) -> None:
+        """The pop belongs to the switch that created the list, not to the plugin's.
+
+        A client leaving this proxy drops the picker this app generated, because
+        those ids name routes only this proxy serves.  While the model list
+        plugin owns the file, that list follows the client's new gateway instead:
+        the plugin rewrites it on its next hook, so removing it here would fight
+        the writer the user installed.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_runtime_config(root / "config.yaml", {"deepseek-v4.1-flash": 200_000})
+            settings_path = root / "settings.json"
+            settings_path.write_text(json.dumps({"env": {}}), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                settings_path,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            target = {"on": True}
+            with mock.patch(
+                "young_router.core.model_list_plugin.target_enabled",
+                side_effect=lambda host: target["on"],
+            ), mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                settings["enabledPlugins"] = {"model-list-plugin@model-list-plugin": True}
+                settings_path.write_text(json.dumps(settings), encoding="utf-8")
+                domain.reload()
+
+                direct = {
+                    "base_url": "https://relay.example.test/v1",
+                    "api_key": "fixture-direct",
+                    "auth_mode": "bearer",
+                    "model": "claude-direct",
+                }
+                left = domain.dispatch("use_direct_api", direct)
+                self.assertIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
+                self.assertTrue(left["clients"]["claudeCode"]["model_list_enabled"])
+
+                # The plugin's rows name the provider's own ids; a session
+                # started from this form keeps the public name instead of
+                # adopting the historical alias row the plugin keeps for
+                # sessions created before the name changed.
+                with mock.patch(
+                    "young_router.core.domains.claude._shared_api.endpoint",
+                    return_value=("http://127.0.0.1:4000", "fixture-router-key"),
+                ):
+                    domain.dispatch("use_local_api", {"client": "claudeCode", "model": "deepseek-v4.1-flash"})
+                adopted = json.loads(domain.raw_text(include_sensitive=True))
+                self.assertEqual("deepseek-v4.1-flash", adopted["env"]["ANTHROPIC_MODEL"])
+
+                target["on"] = False
+                left = domain.dispatch("use_direct_api", direct)
+                self.assertNotIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
+                self.assertFalse(left["clients"]["claudeCode"]["model_list_enabled"])
 
 
 if __name__ == "__main__":

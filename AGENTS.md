@@ -14,6 +14,7 @@
 ## 单一来源
 
 - 每个派生值只有一个产者；显示名、标签、分组、协议、状态和格式化文本都通过共享函数或域输出，消费者不得从原始字段再算一遍。
+- Claude Code 的模型表（`~/.claude/settings.json` 的 `modelPicker` 与 `modelSettings`）只有一个写者：客户端 `enabledPlugins` 启用 model-list-plugin 且插件配置打开 `claude` 目标时由插件写，后台刷新让出；否则 `refresh_model_lists` 继续维护已有列表。插件的 `initializedTargets` 不是所有权，停用后不得继续让出。编辑该文件的确认文案按当前写者区分。
 - 具有耦合语义的字段只能经一个 setter 一起更新，例如 provider 与 relay station、key 名与 key id。不要在别处只改其中一半。
 - 新增派生值时同步更新 `tests/test_single_source_rules.py` 的注册表；这项测试用于禁止规则拷贝，不用于替代实现测试。
 

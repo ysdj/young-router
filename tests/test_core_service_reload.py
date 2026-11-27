@@ -335,9 +335,6 @@ class CoreServiceReloadTests(unittest.TestCase):
             ), mock.patch(
                 "young_router.core.model_catalog.load_native_catalog",
                 return_value=[],
-            ), mock.patch(
-                "young_router.core.model_list_plugin.target_initialized",
-                return_value=False,
             ):
                 providers = ProvidersModelsDomain(config_path)
                 codex = CodexSettingsDomain(config_path, codex_home=codex_home)
