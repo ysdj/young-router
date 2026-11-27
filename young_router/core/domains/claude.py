@@ -2984,11 +2984,18 @@ class ClaudeSettingsDomain:
             key = data.get("api_key")
             key = key.strip() if isinstance(key, str) else ""
             if self._names_local_api(base_url) and bool(self._local_api_key) and key == self._local_api_key:
-                # The form is the off editor, but saving this app's full
-                # endpoint-and-key pair is how its other direction is reached:
-                # the local route owns the picker and the gateway profile as one
-                # connection instead of a look-alike hand-managed gateway.
-                self._adopt_local_api(data)
+                # The form names one connection for both Claude apps, just as
+                # the switch does.  Saving this app's own pair must adopt both:
+                # applying only Code left Desktop on its old route, so the
+                # pane's aggregate switch stayed off after a save that looked
+                # like it had turned the API on.  The local route also owns the
+                # picker and the gateway profile as one connection instead of a
+                # look-alike hand-managed gateway.
+                clients = ["claudeCode"]
+                if self._desktop is not None:
+                    clients.append("claudeDesktop")
+                for client in clients:
+                    self._adopt_local_api({**data, "client": client})
                 return self.snapshot()
             self._apply_direct_connection(data)
             return self.snapshot()

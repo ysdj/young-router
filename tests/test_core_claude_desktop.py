@@ -371,6 +371,13 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                     "auth_mode": "bearer",
                 })
             self.assertTrue(domain.snapshot()["clients"]["claudeCode"]["uses_yrapi_api"])
+            # The form is one connection for both apps; the same save must
+            # point Desktop at the proxy too, or the pane's aggregate switch
+            # remains off while the form shows the proxy pair.
+            self.assertTrue(domain.snapshot()["clients"]["claudeDesktop"]["uses_yrapi_api"])
+            desktop = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertEqual("http://127.0.0.1:4100", desktop["inferenceGatewayBaseUrl"])
+            self.assertEqual("sk-local", desktop["inferenceGatewayApiKey"])
             # The form follows the live connection onto the proxy.
             self.assertEqual("http://127.0.0.1:4100", domain.snapshot()["direct_api"]["base_url"])
             self.assertEqual("sk-local", domain.trusted_secret_value("direct_api_key", "edit-api"))
