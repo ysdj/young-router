@@ -90,3 +90,35 @@ class KeptRowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeCodeViewTests(unittest.TestCase):
+    def test_the_code_view_keeps_litellm_aliases_without_a_second_projection(self) -> None:
+        # LiteLLM publishes Claude Code's compatibility ids through
+        # ``listed_ids``.  This app's picker metadata belongs to the canonical
+        # listing the plugin reads; adding it to an already-aliased row made
+        # ``... [1m][1m]`` and named the compatibility id instead of the route.
+        from litellm.llms.anthropic import common_utils
+
+        claude_desktop_listing.install_patch()
+        build = common_utils.create_anthropic_model_list_response
+        models = [{
+            "id": "deepseek-v4.1-flash",
+            "max_input_tokens": 1_000_000,
+            "max_output_tokens": 393_216,
+        }]
+        listed = {"deepseek-v4.1-flash": "claude-router-test[1m]"}
+        with mock.patch.object(claude_desktop_listing, "_public_context_window", return_value=1_000_000):
+            token = claude_desktop_listing._CODE_VIEW_ACTIVE.set(True)
+            try:
+                rows = build(models, {"deepseek-v4.1-flash": "DeepSeek"}, listed)["data"]
+            finally:
+                claude_desktop_listing._CODE_VIEW_ACTIVE.reset(token)
+            self.assertEqual("claude-router-test[1m]", rows[0]["id"])
+            self.assertEqual("deepseek-v4.1-flash", rows[0]["source_model"])
+            self.assertNotIn("claude_alias", rows[0])
+            self.assertNotIn("behaves_as", rows[0])
+
+            generic = build(models, {"deepseek-v4.1-flash": "DeepSeek"}, {})["data"][0]
+            self.assertEqual("claude-mythos-eb1394[1m]", generic["claude_alias"])
+            self.assertEqual("claude-opus-5-5", generic["behaves_as"])

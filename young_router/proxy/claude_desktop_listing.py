@@ -77,6 +77,9 @@ _VIEW_ACTIVE: ContextVar[bool] = ContextVar(
 _GENERATION_FILTER_ACTIVE: ContextVar[bool] = ContextVar(
     "young_router_claude_generation_filter", default=False
 )
+_CODE_VIEW_ACTIVE: ContextVar[bool] = ContextVar(
+    "young_router_claude_code_listing_view", default=False
+)
 _PATCH_ATTR: Final = "_young_router_claude_desktop_listing"
 _REGISTERED_ATTR: Final = "_young_router_claude_desktop_listing_registered"
 _SELECTOR_REGISTERED_ATTR: Final = "_young_router_claude_code_selector_registered"
@@ -539,6 +542,13 @@ def install_patch() -> None:
         response = with_published_windows(response)
         if _VIEW_ACTIVE.get():
             return desktop_model_rows(response, display_names)
+        if _CODE_VIEW_ACTIVE.get():
+            # LiteLLM has already published Claude Code's compatibility ids
+            # (``claude-router-…``) for this view.  Adding this app's picker
+            # alias on top of those ids made ``[1m][1m]``: the canonical alias
+            # metadata belongs to the generic listing the plugin reads, not to
+            # the Claude Code view.
+            return response
         return with_claude_picker_metadata(response)
 
     setattr(patched, _PATCH_ATTR, True)
@@ -566,14 +576,15 @@ class _DesktopListingMiddleware:
             if isinstance(key, bytes) and isinstance(value, bytes)
         }
         desktop = is_claude_desktop_client(headers)
+        code = is_claude_code_client(headers)
         view_token = _VIEW_ACTIVE.set(desktop)
-        filter_token = _GENERATION_FILTER_ACTIVE.set(
-            desktop or is_claude_code_client(headers)
-        )
+        code_token = _CODE_VIEW_ACTIVE.set(code and not desktop)
+        filter_token = _GENERATION_FILTER_ACTIVE.set(desktop or code)
         try:
             await self.app(scope, receive, send)
         finally:
             _GENERATION_FILTER_ACTIVE.reset(filter_token)
+            _CODE_VIEW_ACTIVE.reset(code_token)
             _VIEW_ACTIVE.reset(view_token)
 
 
