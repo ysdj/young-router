@@ -2266,14 +2266,34 @@ class ClaudeSettingsDomain:
             and self._code_api_key() == self._local_api_key
         )
 
-    def desktop_uses_yrapi_api(self) -> bool:
-        if self._desktop is None or not self.desktop_uses_local_api() or not self._local_api_key:
+    def _desktop_carries_local_key(self) -> bool:
+        """Whether Claude Desktop's profile holds a credential for this API.
+
+        Desktop replaces a plaintext gateway key with a sealed envelope that
+        only Desktop can open.  Once it has restarted, ``secret_value`` is that
+        envelope, not the token this app wrote, so equality with the plaintext
+        key can never succeed.  A sealed envelope at this app's endpoint is the
+        credential the profile carries; a different plaintext key is still a
+        different connection and stays off.
+        """
+
+        if self._desktop is None or not self._local_api_key:
             return False
         try:
             key = self._desktop.secret_value("desktop_gateway_api_key")
         except ClaudeDesktopConfigError:
             return False
-        return key.strip() == self._local_api_key
+        key = key.strip()
+        if not key:
+            return False
+        return key == self._local_api_key or key.startswith("__sealed__:")
+
+    def desktop_uses_yrapi_api(self) -> bool:
+        return (
+            self._desktop is not None
+            and self.desktop_uses_local_api()
+            and self._desktop_carries_local_key()
+        )
 
     def _names_local_api(self, configured: object) -> bool:
         """Whether a client names the endpoint this domain already resolved.
@@ -2868,11 +2888,11 @@ class ClaudeSettingsDomain:
         settings = self._safe_projection(self._draft)
         uses_local_api = self.code_uses_local_api()
         env = self._code_env()
-        # The Edit API form edits the off position of the pane's switch.  While
-        # this app's API is on, the client's env names the proxy, and offering
-        # that back would turn a save of the form into a look-alike gateway.
-        # The connection the client left is remembered under the app's state
-        # root; without one the form is empty rather than a copy of the proxy.
+        # The Edit API form and the pane's switch edit the same connection.
+        # Opening the form while the API is on shows the live Code pair; saving
+        # it writes both Claude apps and the switch reads the resulting identity
+        # back.  Opening it while the API is off shows the remembered pair the
+        # switch returns to.
         direct_api = self._direct_api_settings(settings, env)
         return {
             "domain": self.name,

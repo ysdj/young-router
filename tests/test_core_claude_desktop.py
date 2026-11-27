@@ -375,6 +375,75 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             self.assertEqual("http://127.0.0.1:4100", domain.snapshot()["direct_api"]["base_url"])
             self.assertEqual("sk-local", domain.trusted_secret_value("direct_api_key", "edit-api"))
 
+    def test_a_sealed_desktop_credential_still_names_this_apps_api(self) -> None:
+        # Claude Desktop seals the gateway key with its own Safe Storage after
+        # it restarts.  The envelope is the credential the profile carries;
+        # comparing it to the plaintext token would turn the pane's switch off
+        # while both apps still name this proxy.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                "inferenceGatewayAuthScheme": "bearer",
+                "inferenceGatewayApiKey": "__sealed__:v1:synthetic-envelope",
+            })
+            (root / "settings.json").write_text(json.dumps({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-local",
+                },
+            }), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                desktop_loader=None,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain.refresh_local_api_endpoint()
+                clients = domain.snapshot()["clients"]
+                self.assertTrue(clients["claudeCode"]["uses_yrapi_api"])
+                self.assertTrue(clients["claudeDesktop"]["uses_yrapi_api"])
+                self.assertTrue(domain.desktop_uses_yrapi_api())
+
+    def test_a_plaintext_desktop_credential_for_another_key_stays_off(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                "inferenceGatewayAuthScheme": "bearer",
+                "inferenceGatewayApiKey": "another-key",
+            })
+            (root / "settings.json").write_text(json.dumps({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-local",
+                },
+            }), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                desktop_loader=None,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain.refresh_local_api_endpoint()
+                clients = domain.snapshot()["clients"]
+                self.assertTrue(clients["claudeCode"]["uses_yrapi_api"])
+                self.assertFalse(clients["claudeDesktop"]["uses_yrapi_api"])
+
     def test_leaving_the_local_api_restores_both_claude_apps(self) -> None:
         # Claude Code and Claude Desktop keep one connection each; off returns
         # both to what they used before the proxy was adopted.
