@@ -29,6 +29,7 @@ have called both builds correct.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,14 +102,8 @@ def _browser() -> str | None:
     return next((candidate for candidate in candidates if candidate and Path(candidate).exists()), None)
 
 
-@unittest.skipUnless(shutil.which("node"), "node is required to drive the browser")
-@unittest.skipUnless(_browser(), "a Chrome or Chromium binary is required (set CHROME_PATH)")
-class BrowserEditCostTests(unittest.TestCase):
-    """One settled edit costs a plan read, a dispatch and an apply."""
-
-    def setUp(self) -> None:
-        if not (BUILT_PAGE / "index.html").exists():
-            self.skipTest(f"no built page at {BUILT_PAGE}; run `pnpm run build:web` first")
+class _CorePageFixture(unittest.TestCase):
+    """One isolated Core serving the built page, with its own runtime root."""
 
     def _start_core(self, document: str) -> None:
         self._directory = tempfile.TemporaryDirectory()
@@ -159,6 +154,16 @@ class BrowserEditCostTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required to drive the browser")
+@unittest.skipUnless(_browser(), "a Chrome or Chromium binary is required (set CHROME_PATH)")
+class BrowserEditCostTests(_CorePageFixture):
+    """One settled edit costs a plan read, a dispatch and an apply."""
+
+    def setUp(self) -> None:
+        if not (BUILT_PAGE / "index.html").exists():
+            self.skipTest(f"no built page at {BUILT_PAGE}; run `pnpm run build:web` first")
 
     def test_table_columns_resize_at_their_edges_and_survive_log_updates(self) -> None:
         self._start_core(_provider_document())
@@ -610,6 +615,152 @@ class BrowserEditCostTests(unittest.TestCase):
         self.assertEqual(
             ["sk-synthetic-second"],
             [row["litellm_params"]["api_key"] for row in saved if row["model_name"] == "added-model"],
+        )
+
+
+class _CutDispatchProxy(BaseHTTPRequestHandler):
+    """The published port, answering exactly as a proxy replacement does.
+
+    A settings Apply replaces the proxy, and the page's port is the proxy's.
+    The first dispatch below gets the 502 a port with no worker listening
+    answers, so it never reaches Core; the second is forwarded -- Core commits
+    it -- and its answer is then thrown away, which is the 500 a retiring
+    worker produces.  A retry of the same envelope is what gets the answer
+    back, and Core's journal is what keeps the second arrival from being a
+    second write.
+    """
+
+    protocol_version = "HTTP/1.1"
+    upstream: tuple[str, int]
+    cuts = 0
+    cut = 0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        pass
+
+    def _forward(self, body: bytes) -> tuple[int, list[tuple[str, str]], bytes]:
+        headers = {
+            name: value
+            for name, value in self.headers.items()
+            if name.lower() not in {"host", "connection", "content-length", "transfer-encoding"}
+        }
+        headers["Host"] = f"{self.upstream[0]}:{self.upstream[1]}"
+        connection = http.client.HTTPConnection(*self.upstream, timeout=60)
+        try:
+            connection.request(self.command, self.path, body=body or None, headers=headers)
+            response = connection.getresponse()
+            data = response.read()
+            return (
+                response.status,
+                [
+                    (name, value)
+                    for name, value in response.getheaders()
+                    if name.lower() not in {"connection", "content-length", "server", "date", "transfer-encoding"}
+                ],
+                data,
+            )
+        finally:
+            connection.close()
+
+    def _answer(self, status: int, headers: list[tuple[str, str]], body: bytes) -> None:
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _handle(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        action_type = ""
+        if self.path == "/ipc":
+            try:
+                envelope = json.loads(body or b"{}")
+            except ValueError:
+                envelope = {}
+            if isinstance(envelope, dict):
+                action = (envelope.get("params") or {}).get("action") or {}
+                if isinstance(action, dict):
+                    action_type = str(action.get("type", ""))
+        # Only the edit's own write: the page also dispatches background reads
+        # (a status poll, a catalog fetch), and cutting those would not test
+        # the press.
+        if action_type in {"provider.patch", "model.patch"} and type(self).cut < type(self).cuts:
+            type(self).cut += 1
+            if type(self).cut == 1:
+                # No worker listening on the published port: the request never
+                # reaches Core, so nothing was staged and the press has no
+                # answer of its own to read.  This is the 502 the page showed.
+                self._answer(502, [], b"")
+                return
+            # A retiring worker: Core did receive it and may have committed
+            # it, but its answer never reaches the page.
+            self._forward(body)
+            self._answer(500, [], b"")
+            return
+        status, headers, data = self._forward(body)
+        self._answer(status, headers, data)
+
+    do_GET = _handle
+    do_POST = _handle
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required to drive the browser")
+@unittest.skipUnless(_browser(), "a Chrome or Chromium binary is required (set CHROME_PATH)")
+class BrowserCutAnswerTests(_CorePageFixture):
+    """A press whose answer the proxy replacement cut still lands.
+
+    The reported symptom was a control that snapped back to its old value and
+    a strip reading "The local core is unavailable." while Core was alive and
+    serving.  A source assertion cannot see it: the page and the proxy are two
+    processes, and the defect is what the page received between the press and
+    the paint.
+    """
+
+    def setUp(self) -> None:
+        if not (BUILT_PAGE / "index.html").exists():
+            self.skipTest(f"no built page at {BUILT_PAGE}; run `pnpm run build:web` first")
+        self._start_core(_provider_document())
+
+    def test_a_dispatch_cut_by_the_proxy_replacement_still_lands(self) -> None:
+        endpoint = self.server.endpoint
+        proxy_class = type(
+            "CutDispatchFixtureProxy",
+            (_CutDispatchProxy,),
+            {"upstream": (endpoint.address, endpoint.port), "cuts": 2, "cut": 0},
+        )
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), proxy_class)
+        proxy.daemon_threads = True
+        self.addCleanup(proxy.server_close)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+
+        url = f"http://127.0.0.1:{proxy.server_address[1]}/ui/"
+        completed = subprocess.run(
+            ["node", str(DRIVER), url, "--json", "--cut-dispatch"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        payload = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "{}"
+        try:
+            measured = json.loads(payload)
+        except ValueError:
+            self.fail(f"the page driver answered no measurement:\n{completed.stdout}\n{completed.stderr}")
+        self.assertTrue(
+            measured.get("ok"),
+            "a press survived by the retry did not settle:\n" + json.dumps(measured, indent=2),
+        )
+        self.assertEqual(2, proxy_class.cut, "the retry did not reach the cut answers")
+        saved = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(saved["providers"]["provider0"].get("enabled", True))
+        # The disabled provider's routes leave the runtime document, and the
+        # cut write is the only one this press asked for.
+        self.assertEqual(
+            {"provider1", "provider2"},
+            {entry["model_info"]["provider"] for entry in saved["model_list"]},
         )
 
 

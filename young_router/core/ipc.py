@@ -29,6 +29,7 @@ import secrets
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -120,6 +121,21 @@ MAX_PERSISTED_WEB_SESSIONS = 32
 #: record. Every authenticated call renews the in-memory lease, including
 #: event polls that run much more often.
 WEB_SESSION_PERSIST_INTERVAL_SECONDS = 60 * 60.0
+#: How long one answered write is kept so a repeat of its request id is
+#: answered instead of executed again.  Well past the minute the page spends
+#: asking a replaced port, and short enough that an id presented minutes later
+#: is read as a new request.
+REQUEST_JOURNAL_TTL_SECONDS = 5 * 60.0
+#: How many answered writes the journal holds.  One edit's answer is a
+#: revision, a summary and the domains that moved, so the whole journal is a
+#: rounding error beside the snapshot bytes cached beside it.
+REQUEST_JOURNAL_CAPACITY = 128
+#: How long a duplicate waits for the request already executing.  A client
+#: that retried did so because the transport lost the answer, and the first
+#: attempt is usually still running (the edit that reads an account catalog
+#: takes seconds); answering an error there would report a write as failed
+#: while the thread that owns it is about to commit it.
+REQUEST_REPLAY_WAIT_SECONDS = 60.0
 # The browser host's session travels in this cookie rather than a readable
 # header: page script can neither read ``X-LiteLLM-Core-Session`` nor be given
 # a session it could exfiltrate.  ``SameSite=Strict`` also keeps it out of every
@@ -1379,8 +1395,111 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         self._send(200, {"protocol_version": PROTOCOL_VERSION, "event": event})
 
 
+@dataclass
+class _JournalEntry:
+    """One write the journal is executing, or has answered."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    answer: ResponseEnvelope | None = None
+    expires_at: float = 0.0
+
+
+class _RequestJournal:
+    """Answer every repeat of a request id with its first answer.
+
+    The page's published port is the proxy's, and replacing the proxy retires
+    the worker that is carrying a forwarded request (its own log states it:
+    "retiring this worker with 1 turn(s) still open").  A settings write whose
+    answer was cut that way did land -- Core committed it -- but the page could
+    not tell that from a Core that was gone: it reported "the local core is
+    unavailable" and put the switch back where it started.
+
+    The page therefore re-sends the *same* envelope, request id included, and
+    this is what makes that safe: one thread executes an id, a duplicate waits
+    for its answer, and a finished answer is replayed for
+    ``ttl_seconds``.  Without it a retried ``model.add`` would add the row
+    twice (the retry carries the revision the first attempt consumed, so it
+    lands as a second write after the client rebases).
+
+    Reads are not journaled: asking one again has no effect, and a replayed
+    snapshot would answer an older state than the caller asked for.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = REQUEST_JOURNAL_TTL_SECONDS,
+        capacity: int = REQUEST_JOURNAL_CAPACITY,
+    ) -> None:
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self.capacity = max(1, int(capacity))
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, _JournalEntry] = OrderedDict()
+
+    def claim(self, request_id: str) -> tuple[_JournalEntry, bool]:
+        """This id's entry and whether this caller is the one executing it."""
+
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(request_id)
+            if entry is not None and entry.done.is_set() and entry.expires_at <= now:
+                # An answer older than the retry budget: the id is being used
+                # for a new request, not for the attempt that was cut.
+                self._entries.pop(request_id, None)
+                entry = None
+            if entry is not None:
+                self._entries.move_to_end(request_id)
+                return entry, False
+            entry = _JournalEntry()
+            self._entries[request_id] = entry
+            self._trim_locked(now)
+            return entry, True
+
+    def complete(self, request_id: str, entry: _JournalEntry, answer: ResponseEnvelope) -> None:
+        entry.answer = answer
+        entry.expires_at = time.monotonic() + self.ttl_seconds
+        entry.done.set()
+
+    def abandon(self, request_id: str, entry: _JournalEntry) -> None:
+        """Forget an attempt that never produced an answer.
+
+        A request that raised out of ``handle_request`` did not commit
+        anything the caller can see, so the next arrival must execute rather
+        than wait on an answer that is never coming.
+        """
+
+        with self._lock:
+            if self._entries.get(request_id) is entry:
+                self._entries.pop(request_id, None)
+        entry.done.set()
+
+    def wait(self, entry: _JournalEntry, timeout: float) -> ResponseEnvelope | None:
+        return entry.answer if entry.done.wait(max(0.0, timeout)) else None
+
+    def _trim_locked(self, now: float) -> None:
+        for request_id, entry in list(self._entries.items()):
+            if entry.done.is_set() and entry.expires_at <= now:
+                self._entries.pop(request_id, None)
+        # Only answered entries leave.  Evicting one that is still executing
+        # would let the duplicate that is waiting on it become a second
+        # execution of the same write.
+        while len(self._entries) > self.capacity:
+            oldest = next((key for key, item in self._entries.items() if item.done.is_set()), None)
+            if oldest is None:
+                return
+            self._entries.pop(oldest, None)
+
+
 class CoreIPCServer:
     """Serve one ``CoreStore`` on a random authenticated loopback port."""
+
+    #: The methods a repeat of which must be answered, never executed twice.
+    #: Every one of them writes and answers with a small envelope: a dispatch
+    #: stages, an apply commits, an editor stages text, a reload discards.  The
+    #: import/export pair is left out -- it answers with a package preview that
+    #: may be megabytes, and no host retries it -- as are the reads, which can
+    #: be asked again harmlessly (the snapshot has its own byte cache).
+    REPLAYED_METHODS = frozenset({"dispatch", "apply", "editor", "reload"})
 
     def __init__(
         self,
@@ -1417,6 +1536,9 @@ class CoreIPCServer:
         #: projection under the current head, and serving it after the lane
         #: freed would hand a window state Core had already left.
         self._snapshot_body: tuple[int, int, bytes] | None = None
+        #: The answers to write requests already executed, so the retry a
+        #: replaced proxy forces on the page is a read of the first answer.
+        self._request_journal = _RequestJournal()
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
@@ -2806,6 +2928,39 @@ class CoreIPCServer:
     ) -> "ResponseEnvelope | _PreparedResponse":
         if not self._valid_session(session_token):
             return ResponseEnvelope.failure(request.request_id, "unauthorized", "Core IPC authentication failed")
+        if request.method not in self.REPLAYED_METHODS:
+            return self._answer_request(request, session_token)
+        entry, owner = self._request_journal.claim(request.request_id)
+        if not owner:
+            answer = self._request_journal.wait(entry, REQUEST_REPLAY_WAIT_SECONDS)
+            if answer is None:
+                # The first attempt is still executing.  The caller may ask
+                # again, and this time it will read that attempt's answer.
+                return ResponseEnvelope.failure(
+                    request.request_id,
+                    "state_unavailable",
+                    "Core is still finishing this request",
+                    retryable=True,
+                )
+            return answer
+        try:
+            answer = self._answer_request(request, session_token)
+        except BaseException:
+            self._request_journal.abandon(request.request_id, entry)
+            raise
+        if isinstance(answer, ResponseEnvelope):
+            self._request_journal.complete(request.request_id, entry, answer)
+        else:
+            # No write method answers with prepared bytes; the branch exists so
+            # a future one cannot be journaled as a wait nobody fills.
+            self._request_journal.abandon(request.request_id, entry)
+        return answer
+
+    def _answer_request(
+        self,
+        request: RequestEnvelope,
+        session_token: str,
+    ) -> "ResponseEnvelope | _PreparedResponse":
         snapshot_result: dict[str, Any] | None = None
         try:
             params = request.params

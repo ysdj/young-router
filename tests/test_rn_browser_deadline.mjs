@@ -91,20 +91,56 @@ const response = (status, payload) => ({
 });
 globalThis.window = { location: { reload() { reloads += 1; } } };
 const startupRequest = JSON.stringify({ protocol_version: 1, request_id: "startup", method: "snapshot", params: {} });
-let greetingStatus = 503;
-let snapshotStatus = 503;
-globalThis.fetch = async (url) => String(url).endsWith("/ipc/hello")
-  ? response(greetingStatus, {})
-  : response(snapshotStatus, { protocol_version: 1, request_id: "startup", ok: true, result: { snapshot: liveSnapshot } });
+// A proxy replacement retires the worker carrying this page's own /ipc call:
+// the answer is a 500 while it shuts down, or a 502 while no worker listens on
+// the published port.  Both used to end the press and report the local core as
+// unavailable.  The same envelope is sent again -- request id included, so
+// Core's journal answers the first attempt instead of running it twice -- and
+// the press lands once a worker is back.
+let helloAttempts = 0;
+let snapshotAttempts = 0;
+const retriedBodies = [];
+globalThis.fetch = async (url, init = {}) => {
+  if (String(url).endsWith("/ipc/hello")) {
+    helloAttempts += 1;
+    return helloAttempts === 1 ? response(503, {}) : response(200, { ok: true });
+  }
+  snapshotAttempts += 1;
+  retriedBodies.push(init.body);
+  if (snapshotAttempts === 1) return response(502, {});
+  if (snapshotAttempts === 2) return response(500, {});
+  return response(200, { protocol_version: 1, request_id: "startup", ok: true, result: { snapshot: liveSnapshot } });
+};
 const startup = createBrowserIpcBridge({ baseURL: "" });
-await assert.rejects(startup.send(startupRequest));
-greetingStatus = 200;
-await assert.rejects(startup.send(startupRequest));
-assert.equal(reloads, 0, "Core can recover from a temporary failure on the same page");
-snapshotStatus = 200;
 assert.deepEqual(JSON.parse(await startup.send(startupRequest)).result.snapshot, liveSnapshot);
+assert.equal(helloAttempts, 2, "a greeting cut by the restart is asked again");
+assert.equal(snapshotAttempts, 3, "a 5xx from the retiring worker is retried");
+assert.ok(retriedBodies.every((body) => body === startupRequest), "a retry re-sends the same envelope, request id included");
+assert.equal(reloads, 0, "Core can recover from a temporary failure on the same page");
 
-greetingStatus = 401;
+// A refusal Core stated is an answer, not a lost connection: retrying it would
+// report the same refusal again and hold the strip in "working" for the whole
+// budget.  The page renders the envelope's own code.
+let refusalAttempts = 0;
+globalThis.fetch = async (url, init = {}) => {
+  if (String(url).endsWith("/ipc/hello")) return response(200, { ok: true });
+  refusalAttempts += 1;
+  const request = JSON.parse(init.body);
+  return response(400, {
+    protocol_version: 1,
+    request_id: request.request_id,
+    ok: false,
+    error: { code: "follow_rate_unavailable", message: "The account states no rate for this route" },
+  });
+};
+const refused = createBrowserIpcBridge({ baseURL: "" });
+const refusal = JSON.parse(await refused.send(JSON.stringify({ protocol_version: 1, request_id: "refused-1", method: "dispatch", params: { action: { type: "model.patch" } } })));
+assert.equal(refusal.error.code, "follow_rate_unavailable");
+assert.equal(refusalAttempts, 1, "a protocol refusal is not retried");
+
+globalThis.fetch = async (url) => String(url).endsWith("/ipc/hello")
+  ? response(401, {})
+  : response(200, { protocol_version: 1, request_id: "startup", ok: true, result: { snapshot: liveSnapshot } });
 const expired = createBrowserIpcBridge({ baseURL: "" });
 await Promise.all([assert.rejects(expired.send(startupRequest)), assert.rejects(expired.send(startupRequest))]);
 await assert.rejects(expired.send(startupRequest));

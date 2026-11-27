@@ -3010,5 +3010,144 @@ class CoreIPCTests(unittest.TestCase):
         client.close()
 
 
+class _SlowDispatchDomain(MemoryDomain):
+    """A domain whose write blocks, so a duplicate can arrive mid-write."""
+
+    def __init__(self, name: str, initial: dict[str, object] | None = None) -> None:
+        super().__init__(name, initial)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.executions = 0
+
+    def dispatch(self, action: str, payload: object | None = None) -> object:
+        self.executions += 1
+        self.entered.set()
+        self.release.wait(5.0)
+        return super().dispatch(action, payload)
+
+
+class CoreIPCReplayTests(unittest.TestCase):
+    """A re-sent write is answered; it is never executed twice.
+
+    The published port belongs to the proxy, so replacing the proxy retires the
+    worker carrying a forwarded `/ipc` request.  Core may have committed the
+    write before its answer was cut, and the page -- which cannot tell that from
+    a Core that is gone -- used to roll the edit back.  The page now re-sends the
+    same envelope; these two tests are the facts that make that safe.
+    """
+
+    def _session(self, server: CoreIPCServer) -> tuple[http.client.HTTPConnection, str]:
+        connection = http.client.HTTPConnection(server.address, server.port, timeout=10)
+        connection.request(
+            "POST",
+            "/ipc/hello",
+            body=b"{}",
+            headers={"Authorization": f"Bearer {server.bootstrap_token}", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        token = response.headers.get("X-LiteLLM-Core-Session") or ""
+        response.read()
+        self.assertEqual(200, response.status)
+        self.assertTrue(token)
+        return connection, token
+
+    def _post(
+        self,
+        server: CoreIPCServer,
+        token: str,
+        payload: dict[str, object],
+        connection: http.client.HTTPConnection | None = None,
+    ) -> tuple[int, dict]:
+        owned = connection is None
+        connection = connection or http.client.HTTPConnection(server.address, server.port, timeout=10)
+        try:
+            connection.request(
+                "POST",
+                "/ipc",
+                body=json.dumps(payload).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read() or b"{}")
+        finally:
+            if owned:
+                connection.close()
+
+    def _dispatch(self, request_id: str, choice: str, revision: int) -> dict[str, object]:
+        return {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "method": "dispatch",
+            "params": {"action": {"domain": "language", "type": "set", "payload": {"choice": choice}}, "revision": revision},
+        }
+
+    def test_a_retry_reads_the_first_answer_instead_of_staging_again(self) -> None:
+        language = MemoryDomain("language", {"choice": "system"})
+        core = CoreStore(domains=[language])
+        server = CoreIPCServer(core)
+        server.start()
+        self.addCleanup(server.stop)
+        connection, token = self._session(server)
+        self.addCleanup(connection.close)
+
+        first_id = uuid.uuid4().hex
+        status, first = self._post(server, token, self._dispatch(first_id, "en", core.revision), connection)
+        self.assertEqual(200, status, first)
+        self.assertTrue(first["ok"])
+        committed = core.revision
+
+        # The retry is the envelope the page built before the answer was cut:
+        # same request id, the payload that was sent, the revision it read.
+        status, replay = self._post(server, token, self._dispatch(first_id, "zh-Hans", core.revision), connection)
+        self.assertEqual(200, status, replay)
+        self.assertTrue(replay["ok"])
+        self.assertEqual(first["result"], replay["result"])
+        self.assertEqual(committed, core.revision)
+        self.assertEqual("en", language.snapshot()["state"]["choice"])
+
+        # A new request id is a new request, even with the same payload.
+        status, applied = self._post(
+            server, token, self._dispatch(uuid.uuid4().hex, "zh-Hans", core.revision), connection
+        )
+        self.assertEqual(200, status, applied)
+        self.assertTrue(applied["ok"])
+        self.assertEqual("zh-Hans", language.snapshot()["state"]["choice"])
+
+    def test_a_duplicate_that_arrives_mid_write_waits_for_it(self) -> None:
+        language = _SlowDispatchDomain("language", {"choice": "system"})
+        core = CoreStore(domains=[language])
+        server = CoreIPCServer(core)
+        server.start()
+        self.addCleanup(server.stop)
+        connection, token = self._session(server)
+        self.addCleanup(connection.close)
+        self.addCleanup(language.release.set)
+
+        first_id = uuid.uuid4().hex
+        revision = core.revision
+        answers: dict[str, tuple[int, dict]] = {}
+
+        def send(key: str, choice: str) -> None:
+            answers[key] = self._post(server, token, self._dispatch(first_id, choice, revision))
+
+        first = threading.Thread(target=send, args=("first", "en"))
+        first.start()
+        self.assertTrue(language.entered.wait(5.0), "the first attempt never reached the domain")
+        duplicate = threading.Thread(target=send, args=("duplicate", "zh-Hans"))
+        duplicate.start()
+        # The duplicate arrived while the first write is still blocked: it must
+        # be waiting for that answer, not running its own different write.
+        time.sleep(0.3)
+        self.assertNotIn("duplicate", answers)
+        language.release.set()
+        first.join(5.0)
+        duplicate.join(5.0)
+        self.assertFalse(first.is_alive() or duplicate.is_alive())
+
+        self.assertEqual(1, language.executions)
+        self.assertEqual(answers["first"][1]["result"], answers["duplicate"][1]["result"])
+        self.assertEqual("en", language.snapshot()["state"]["choice"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,7 @@ const modelSelectionEventFirst = modelSelection?.startsWith("event-first") ?? fa
 const modelSelectionUserChanges = modelSelection?.endsWith("user-change") ?? false;
 const rowChangeIndex = process.argv.indexOf("--row-change");
 const rowChange = rowChangeIndex >= 0 ? process.argv[rowChangeIndex + 1] : undefined;
+const cutDispatch = process.argv.includes("--cut-dispatch");
 const routeNavigationIndex = process.argv.indexOf("--route-navigation");
 const routeNavigation = routeNavigationIndex >= 0 ? process.argv[routeNavigationIndex + 1] : undefined;
 const groupSelection = process.argv.includes("--group-selection");
@@ -816,6 +817,24 @@ async function main() {
       cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
       result.measured = await checkModelSelection(cdp);
       result.ok = true;
+      return;
+    }
+
+    if (cutDispatch) {
+      // The published port answers 502 while no proxy worker listens, and 500
+      // when the retiring worker cancels the request it was carrying.  Both
+      // arrive after Core may have committed the write.  One press must still
+      // settle: the box keeps the chosen value and the strip states the save.
+      cdp = await openTarget(port, new URL("#/providers-models", pageUrl).href);
+      await waitForEnableBox(cdp);
+      const edit = await editOnce(cdp, "cut dispatch", 30000);
+      result.measured = edit;
+      if (edit.paintedMs === null) result.reasons.push("the press never showed the chosen value");
+      if (edit.returned) result.reasons.push("the press went back to its old value after a cut answer");
+      if (!/已保存/.test(edit.strip)) {
+        result.reasons.push(`the status strip never stated the save (last: ${edit.strip}, calls: ${edit.methods.join(", ")})`);
+      }
+      result.ok = result.reasons.length === 0;
       return;
     }
 

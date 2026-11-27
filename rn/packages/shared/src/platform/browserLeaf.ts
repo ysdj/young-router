@@ -186,6 +186,32 @@ export function deadlineFor(request: string): number {
   return CORE_CALL_TIMEOUT_MS;
 }
 
+/**
+ * How long the page waits between re-sending a call a proxy replacement cut.
+ *
+ * The published port is the proxy's, so replacing the proxy retires the worker
+ * that is carrying this page's `/ipc` request.  The worker logs that fact
+ * ("retiring this worker with 1 turn(s) still open") and the answer is lost --
+ * either as a 500 from the retiring worker or as a 502 while no worker listens
+ * on the port.  The request may still have executed on Core, so the retry
+ * repeats the *same* envelope: Core answers a request id it already executed
+ * from its own journal instead of running the write twice.
+ *
+ * The pause grows, because the gap is one worker's lifetime (seconds).  The
+ * run is bounded in two different ways on purpose: one attempt still has the
+ * request's own deadline (an edit gets twenty seconds, a lifecycle call fifteen
+ * minutes), while the run may keep asking a port that keeps refusing for
+ * {@link PROXY_REPLACEMENT_RETRY_MS}.  A gateway replaces five workers one
+ * after another, and the window in which no worker listens at all was measured
+ * at twenty-one seconds on that host; a request that was accepted and then hung
+ * is still ended by its own attempt deadline, so the write queue that must not
+ * stall is released exactly as before.
+ */
+const CORE_RETRY_STEP_MS = 250;
+const CORE_RETRY_MAX_DELAY_MS = 2000;
+/** How long a refused connection is asked again before the press is reported. */
+const PROXY_REPLACEMENT_RETRY_MS = 30_000;
+
 /** A failure with the code the shared UI maps to its own sentence. */
 function codedFailure(code: string, message: string = code): Error & { code: string } {
   const failure = new Error(message) as Error & { code?: string };
@@ -316,17 +342,44 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     return response;
   };
 
-  const exchange = async (request: string): Promise<string> => withDeadline(async (signal) => {
-    const response = await call("/ipc", request, signal);
-    if (response.status >= 500) throw new Error("The local core is unavailable.");
-    // A 400 carries a protocol envelope the shared client renders itself; only
-    // a refused credential or an empty body is an error here.
-    const text = await response.text();
-    if (!text) throw new Error("The local core returned no response.");
-    return text;
-  }, deadlineFor(request)).catch((reason: unknown) => {
-    throw isAbort(reason) ? coreTimeout(deadlineFor(request)) : reason;
-  });
+  const exchange = async (request: string): Promise<string> => {
+    const attemptBudget = deadlineFor(request);
+    const retryUntil = Date.now() + Math.max(attemptBudget, PROXY_REPLACEMENT_RETRY_MS);
+    let attempt = 0;
+    let lastFailure: unknown;
+    for (;;) {
+      let text: string | undefined;
+      try {
+        text = await withDeadline(async (signal) => {
+          const response = await call("/ipc", request, signal);
+          // A 5xx is the proxy hop, not Core's protocol: the request may have
+          // reached Core and committed before the worker carrying it was
+          // retired.  Throwing here is what the loop below retries; the same
+          // envelope is re-sent, so Core's journal answers it.
+          if (response.status >= 500) throw coreUnreachable();
+          // A 400 carries a protocol envelope the shared client renders
+          // itself; only a refused credential or an empty body is an error
+          // here.
+          const body = await response.text();
+          if (!body) throw new Error("The local core returned no response.");
+          return body;
+        }, attemptBudget);
+      } catch (reason: unknown) {
+        // One attempt that never answered is a lost connection: the page's own
+        // budget says so, and asking again would hold the write queue on a
+        // request that is no longer being watched.
+        if (isAbort(reason)) throw coreTimeout(attemptBudget);
+        // A refused credential is a decision, not a lost answer: this page has
+        // already left for the sign-in gate and must not loop on it.
+        if (leavingForSignIn) throw reason;
+        lastFailure = reason;
+      }
+      if (text !== undefined) return text;
+      attempt += 1;
+      if (Date.now() >= retryUntil) throw lastFailure ?? coreUnreachable();
+      await sleep(Math.min(CORE_RETRY_STEP_MS * attempt, CORE_RETRY_MAX_DELAY_MS));
+    }
+  };
 
   const request = (method: string, params: Record<string, unknown> = {}): string => JSON.stringify({
     protocol_version: 1,
