@@ -2535,10 +2535,9 @@ class ClaudeSettingsDomain:
         # public name: a gateway id has no catalogue entry in the client, so
         # a session launched with the public name reports the client's 200k
         # default and drops the effort ladder (see ``_code_published_id``).
-        # The model-list plugin's handoff mode writes the same alias and
-        # ``[1m]`` spelling as metadata mode, so both writers name the route
-        # identically; a plugin list is not a reason to fall back to the
-        # public name.
+        # The model-list plugin projects the provider's ``claude_alias`` and
+        # ``[1m]`` spelling, so both writers name the route identically; a
+        # plugin list is not a reason to fall back to the public name.
         named = self.code_model_list_enabled() or self._plugin_owns_document(candidate)
         model = str(data.get("model") or "").strip()
         if model:
