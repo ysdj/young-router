@@ -83,6 +83,15 @@ _SECRET_KEY_MARKERS = (
     "authorization",
 )
 _SAFE_ERROR = "Claude Settings could not be loaded"
+
+# Fields the model-list plugin owns beside the client document it maintains.
+# The domain adopts them on Apply; until then they are not a conflicting edit.
+_PLUGIN_OWNED_FIELDS = (
+    "modelPicker",
+    "modelSettings",
+    "enabledPlugins",
+    "extraKnownMarketplaces",
+)
 _REDACTED = "configured"
 
 # These are the public controls this application writes through structured
@@ -1353,11 +1362,30 @@ class ClaudeSettingsDomain:
 
         current = _current_bytes(self.settings_path)
         changed = current != self._baseline_bytes
+        # The plugin rewrites its picker and window table on every sync.  Those
+        # fields belong to it, not to an edit this window has to reconcile, so
+        # a plugin-only rewrite must not raise the disk-changed prompt.  Apply
+        # adopts them from disk; any other field still conflicts normally.
+        if changed and self._plugin_only_external_change(current):
+            changed = False
         if self._desktop is not None:
             changed = changed or self._desktop.external_disk_state()["changed"]
         if self._developer is not None:
             changed = changed or self._developer.external_disk_state()["changed"]
         return {"changed": changed, "exists": current is not None}
+
+    def _plugin_only_external_change(self, current: bytes | None) -> bool:
+        if current is None or not self.plugin_owns_model_list():
+            return False
+        try:
+            disk = json.loads(current.decode("utf-8")) if current.strip() else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(disk, dict):
+            return False
+        disk_rest = {key: value for key, value in disk.items() if key not in _PLUGIN_OWNED_FIELDS}
+        raw_rest = {key: value for key, value in self._raw.items() if key not in _PLUGIN_OWNED_FIELDS}
+        return disk_rest == raw_rest
 
     def external_disk_identity(self) -> str:
         """Return an opaque content identity used only by the Core conflict tracker."""
@@ -3268,17 +3296,11 @@ class ClaudeSettingsDomain:
         # switch and the marketplace declaration are its record, not this
         # domain's.  Adopt them so an Apply after takeover neither conflicts
         # nor turns the plugin off.
-        plugin_keys = (
-            "modelPicker",
-            "modelSettings",
-            "enabledPlugins",
-            "extraKnownMarketplaces",
-        )
-        disk_rest = {key: value for key, value in disk.items() if key not in plugin_keys}
-        raw_rest = {key: value for key, value in self._raw.items() if key not in plugin_keys}
+        disk_rest = {key: value for key, value in disk.items() if key not in _PLUGIN_OWNED_FIELDS}
+        raw_rest = {key: value for key, value in self._raw.items() if key not in _PLUGIN_OWNED_FIELDS}
         if disk_rest != raw_rest:
             raise ClaudeSettingsError("Claude Settings changed on disk; reload and try again")
-        for key in plugin_keys:
+        for key in _PLUGIN_OWNED_FIELDS:
             if key in disk:
                 self._draft[key] = copy.deepcopy(disk[key])
             elif key in {"modelPicker", "modelSettings"}:

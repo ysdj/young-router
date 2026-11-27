@@ -1870,6 +1870,42 @@ general_settings:
                 rewritten = json.loads(settings_path.read_text(encoding="utf-8"))["modelPicker"]
                 self.assertNotEqual("stale-route", rewritten["options"][0]["model"])
 
+    def test_plugin_rewrites_are_not_external_settings_changes(self) -> None:
+        # The plugin rewrites its picker on every sync.  Those fields belong
+        # to the plugin; a sync must not raise the disk-changed prompt while
+        # the person is editing some other field.  A change outside them is
+        # still a real conflict.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_runtime_config(root / "config.yaml", {"deepseek-v4.1-flash": 200_000})
+            settings_path = root / "settings.json"
+            settings_path.write_text(
+                json.dumps({
+                    "enabledPlugins": {"model-list-plugin@model-list-plugin": True},
+                    "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:4100"},
+                    "modelPicker": {"replaceBuiltInOptions": True, "options": [{"model": "old-route"}]},
+                }),
+                encoding="utf-8",
+            )
+            domain = ClaudeSettingsDomain(
+                settings_path,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch(
+                "young_router.core.model_list_plugin.target_enabled",
+                return_value=True,
+            ):
+                disk = json.loads(settings_path.read_text(encoding="utf-8"))
+                disk["modelPicker"] = {"replaceBuiltInOptions": True, "options": [{"model": "new-route"}]}
+                disk["modelSettings"] = {"new-route": {"autoCompactWindow": 200_000}}
+                settings_path.write_text(json.dumps(disk), encoding="utf-8")
+                self.assertFalse(domain.external_disk_state()["changed"])
+
+                disk["env"]["ANTHROPIC_BASE_URL"] = "https://direct.example.test"
+                settings_path.write_text(json.dumps(disk), encoding="utf-8")
+                self.assertTrue(domain.external_disk_state()["changed"])
+
     def test_leaving_the_proxy_keeps_a_picker_the_plugin_maintains(self) -> None:
         """The pop belongs to the switch that created the list, not to the plugin's.
 
