@@ -4536,7 +4536,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # without writing, and writing on the way out.
             'style={styles.childSurfaceFooter}',
             '<NativeButton title={translate("status.close")} disabled={saving} onPress={onClose} />',
-            '<NativeButton title={translate("status.saveAndClose")} primary disabled={saving || !keyReady || !url.trim()} busy={saving} onPress={submit} />',
+            '<NativeButton title={translate("status.saveAndClose")} primary disabled={saving || !dirty || !keyReady || !url.trim()} busy={saving} onPress={submit} />',
+            'const dirty = keyChanged',
+            'if (saving || !dirty || !keyReady || !url.trim()) return;',
+            'setKeyChanged(true);',
         ):
             self.assert_ui_has(marker)
         # A command that opens a dialog is a button, and the ellipsis is the

@@ -11703,6 +11703,7 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [keyReady, setKeyReady] = useState(false);
+  const [keyChanged, setKeyChanged] = useState(false);
   const [keyReset, setKeyReset] = useState(0);
   const [commitRequest, setCommitRequest] = useState(0);
   const [keyToken] = useState(() => `direct-api-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -11735,6 +11736,14 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
   });
   const values = useRef({ url, model, catalog, auth: apiKeyAuth });
   values.current = { url, model, catalog, auth: apiKeyAuth };
+  // An unchanged form has nothing to commit.  The button follows the fields
+  // and the key, never merely the fact that a key is present: opening the
+  // dialog and pressing Save must not rewrite the connection.
+  const dirty = keyChanged
+    || url !== baseline.current.url
+    || model !== baseline.current.model
+    || catalog !== baseline.current.catalog
+    || apiKeyAuth !== baseline.current.auth;
   useEffect(() => {
     let active = true;
     const refresh = async (): Promise<void> => {
@@ -11759,6 +11768,7 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
         setCatalog(nextCatalog);
         setApiKeyAuth(nextAuth);
         keyEdited.current = false;
+        setKeyChanged(false);
         setKeyReady(false);
         setKeyReset((value) => value + 1);
         setError(undefined);
@@ -11795,7 +11805,7 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
     }
   };
   const submit = (): void => {
-    if (saving || !keyReady || !url.trim()) return;
+    if (saving || !dirty || !keyReady || !url.trim()) return;
     setError(undefined);
     setSaving(true);
     pendingSecret.current = commitRequest + 1;
@@ -11804,6 +11814,7 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
   const secretChanged = ({ status, present, commitRequest: request }: SecretState): void => {
     if (status === "dirty") {
       keyEdited.current = true;
+      setKeyChanged(true);
       setKeyReady(true);
     }
     if (!pendingSecret.current) {
@@ -11850,7 +11861,7 @@ function DirectApiForm({ client, connection, native, ipc, translate, onClose }: 
       {error === undefined ? <View style={styles.childSurfaceFooterSpacer} /> : <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{error}</Text>}
       <View style={styles.childSurfaceFooterActions}>
         <NativeButton title={translate("status.close")} disabled={saving} onPress={onClose} />
-        <NativeButton title={translate("status.saveAndClose")} primary disabled={saving || !keyReady || !url.trim()} busy={saving} onPress={submit} />
+        <NativeButton title={translate("status.saveAndClose")} primary disabled={saving || !dirty || !keyReady || !url.trim()} busy={saving} onPress={submit} />
       </View>
     </View>
   </>;
