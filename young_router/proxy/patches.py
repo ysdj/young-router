@@ -2586,15 +2586,33 @@ def _install_rust_dispatch_patch() -> None:
             if outcome.get("ok") is False:
                 marker = selected_box.get("marker")
                 request_id = _routing_module._pending_request_log_id_from_marker(marker)
-                if marker is not previous_marker and request_id:
+                if marker is not previous_marker:
+                    failed_request = dict(self._request)
+                    if op == "acompletion" and isinstance(self.last_error, Exception):
+                        # The chat wire reaches this driver without the
+                        # per-deployment failover wrapper the generic helpers
+                        # install, so nothing below the driver charged a
+                        # refusal to its route.  A relay answering 429/403
+                        # for its exhausted accounts was therefore retried on
+                        # the same route for the whole recovery window (live
+                        # 2026-11-28 02:54-03:01: nine 429s, 6.5 min to the
+                        # first frame).  The marker is this attempt's own
+                        # row, so the charge names the route that refused and
+                        # no other.
+                        _routing_module._mark_exception_for_deployment_failover(
+                            self.last_error, failed_request,
+                        )
                     # The driver's next attempt can overwrite this progress
                     # entry. LiteLLM only logs the first failure on a shared
                     # logging object, so settle later refused attempts here.
-                    _routing_module._settle_failed_attempt(
-                        dict(self._request), self.last_error,
-                        event="request_log_closed_for_dispatch_failure",
-                        request_id=request_id,
-                    )
+                    # Without a published row there is nothing to settle, and
+                    # the route charge above still stands.
+                    if request_id:
+                        _routing_module._settle_failed_attempt(
+                            failed_request, self.last_error,
+                            event="request_log_closed_for_dispatch_failure",
+                            request_id=request_id,
+                        )
             return outcome
         except asyncio.CancelledError:
             # LiteLLM releases its own reservation in `_routed_attempt`.

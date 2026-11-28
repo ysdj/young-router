@@ -424,6 +424,96 @@ class RustDispatchTests(unittest.TestCase):
                 asyncio.run(main())
             ''')
 
+    def test_a_chat_dispatch_refusal_is_charged_to_its_route(self) -> None:
+        """A chat 429 must reach the shared cooldown, not only the request row.
+
+        ``acompletion`` reaches ``_Driver._routed_attempt`` without the
+        per-deployment failover wrapper the generic helpers install
+        (``bounded_endpoint`` wraps only responses/messages).  Before
+        2026-11-28 the failed dispatch only settled the request row, so a
+        relay answering ``all available accounts exhausted`` was re-selected
+        until the driver's own walk left the order: live 02:54-03:01, nine
+        429s and 6.5 minutes to the first frame.
+        """
+
+        self.run_router_probe('''
+            import asyncio
+            import os
+            from unittest.mock import patch
+
+            import litellm
+            from litellm import Router
+            from litellm.proxy import proxy_server
+            from young_router import runtime_store
+            from young_router.callbacks import image_generation_routing_hook
+            from young_router.proxy import patches, state as proxy_state
+
+            litellm.callbacks = [image_generation_routing_hook]
+            patches.install_all()
+            router = Router(model_list=[
+                {
+                    "model_name": "probe",
+                    "litellm_params": {
+                        "model": "openai/gpt-4o",
+                        "order": order,
+                        "api_key": f"sk-fake-{route}",
+                    },
+                    "model_info": {"id": route},
+                }
+                for order, route in enumerate(("refusing", "answering"))
+            ], num_retries=0, disable_cooldowns=True)
+            proxy_server.llm_router = router
+
+            class Stream:
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    return {"choices": [{"delta": {"content": "ok"}}]}
+
+                async def aclose(self):
+                    pass
+
+            async def main():
+                attempts = []
+
+                async def provider(**kwargs):
+                    route = kwargs["model_info"]["id"]
+                    attempts.append(route)
+                    if route == "refusing":
+                        raise litellm.RateLimitError(
+                            message="all available accounts exhausted",
+                            model="probe",
+                            llm_provider="openai",
+                        )
+                    return Stream()
+
+                with patch.object(litellm, "acompletion", provider), patch.dict(os.environ, {
+                    "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES": "1",
+                    "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_SECONDS": "300",
+                    "YOUNG_ROUTER_STREAM_HEDGE_ENABLED": "0",
+                }):
+                    response = await asyncio.wait_for(router.acompletion(
+                        model="probe",
+                        messages=[{"role": "user", "content": "hi"}],
+                        stream=True,
+                    ), 20)
+                    await response.aclose()
+
+                assert attempts == ["refusing", "answering"], attempts
+
+                path = proxy_state._deployment_cooldown_file_path()
+                assert path, "the cooldown document has no path"
+                cooldowns = runtime_store.read_document(path).get("cooldowns") or {}
+                assert any(
+                    entry.get("deployment_id") == "refusing"
+                    and entry.get("failures", 0) >= 1
+                    for entry in cooldowns.values()
+                ), cooldowns
+
+            asyncio.run(main())
+            ''')
+
     def test_native_responses_retry_retains_usage_and_closes_unread_stream(self) -> None:
         self.run_router_probe('''
             import asyncio
