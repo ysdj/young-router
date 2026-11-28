@@ -236,7 +236,12 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         rows = claude_desktop_listing.desktop_model_rows(_response("gpt-6.1-sol"))["data"]
         self.assertEqual(500_000, rows[0]["max_input_tokens"])
 
-    def test_a_small_window_is_stated_as_it_is(self) -> None:
+    def test_a_missing_registry_keeps_an_arbitrary_submillion_listing_window(self) -> None:
+        response = _response("gpt-6.1-sol")
+        response["data"][0]["max_input_tokens"] = 262_144
+        rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+        self.assertEqual(262_144, rows[0]["max_input_tokens"])
+
         # Below 1M the number is what the picker reports, and the app offers no
         # 1M variant from it.
         self.windows["gpt-5.4"] = 272_000

@@ -203,44 +203,37 @@ def _public_context_window(name: str) -> int | None:
 def _published_context(
     public_id: str,
     public_window: Callable[[str], int | None],
+    listed_window: object = None,
 ) -> object:
-    """The ``max_input_tokens`` one discovery row states.
+    """Normalize one route's published context window.
 
-    The number is the route's *published* window -- the one this app shows in
-    its own pane and writes into the managed Codex catalog (``record_for``),
-    resolved once.  Never the number its upstream advertises in the listing: an
-    advertised 1,048,576 turned routes into 1M rows whose only picker entry
-    answered ``Invalid model name``, because the row named an id that did not
-    resolve.
-
-    There is one window per route in this app, and a client surface states it
-    rather than judging it.  At or above 1M the statement is exactly 1M: the
-    client's own 1M spelling means "this route has the large window", every
-    surface here clamps to the same ceiling (the per-model setting accepts
-    100k..1M), and a number like 1,048,576 would only be a second way to say it.
-    Below 1M the number is stated as it is, which is what the picker reports for
-    a 500k or 272k route.  A window this app cannot resolve, or a generator's
-    ``0``, states nothing.
-
-    Both row kinds state this window: ``_kept_row`` states it for an id the
-    client keeps as written, and keeps the number the canonical row gave only
-    when this resolution has no answer.
+    The registry is authoritative when it has a positive observation.  A
+    positive listing value is the only local observation available when the
+    registry has no record, so keep it instead of replacing a real window with
+    ``None``.  Both paths use the same 1M ceiling.
     """
 
     try:
         window = public_window(public_id)
-        if not isinstance(window, int) or isinstance(window, bool):
-            return None
-        # A generator resolves ``0``: its catalog states no window because it
-        # holds no conversation.  Stating ``0`` here would be a limit Claude
-        # Desktop reads as "this model cannot be given a prompt"; the row
-        # states nothing instead, exactly as for an unresolved route.
-        if window <= 0:
-            return None
+        if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+            if (
+                isinstance(listed_window, int)
+                and not isinstance(listed_window, bool)
+                and 0 < listed_window < _ONE_MILLION
+            ):
+                window = listed_window
+            else:
+                return None
         if window >= _ONE_MILLION:
             return _ONE_MILLION
         return window
     except Exception:
+        if (
+            isinstance(listed_window, int)
+            and not isinstance(listed_window, bool)
+            and 0 < listed_window < _ONE_MILLION
+        ):
+            return listed_window
         return None
 
 
@@ -321,7 +314,11 @@ def with_published_windows(response: Mapping[str, object]) -> dict[str, object]:
             continue
         model_id = row.get("id")
         published = (
-            _published_context(model_id, _public_context_window)
+            _published_context(
+                model_id,
+                _public_context_window,
+                current,
+            )
             if isinstance(model_id, str) and model_id.strip()
             else None
         )
@@ -408,11 +405,19 @@ def desktop_model_rows(
             continue
         if desktop_keeps_model_id(public_id):
             rows.append(
-                _kept_row(public_id, row, _published_context(public_id, window_for))
+                _kept_row(
+                    public_id,
+                    row,
+                    _published_context(public_id, window_for, row.get("max_input_tokens")),
+                )
             )
             continue
         display_name = row.get("display_name") or names.get(public_id) or public_id
-        published = _published_context(public_id, window_for)
+        published = _published_context(
+            public_id,
+            window_for,
+            row.get("max_input_tokens"),
+        )
         # Claude Desktop's 1M row is a name before it is a number: an id
         # carrying its own ``[1m]`` suffix is read at 1M by the session, and a
         # suffixed id is not a row that "offers 1M" to the picker, so no second
@@ -495,7 +500,11 @@ def claude_code_model_selector_payload(
             if isinstance(description, str) and description.strip():
                 model["description"] = description.strip()
 
-            window = _published_context(model_id, window_for)
+            window = _published_context(
+                model_id,
+                window_for,
+                row.get("max_input_tokens"),
+            )
             if isinstance(window, int) and not isinstance(window, bool):
                 model["runtime"] = {"max_input_tokens": window}
                 behaves_as = behavior_for(model_id, window)
