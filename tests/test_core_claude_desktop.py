@@ -555,7 +555,7 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
-            _write_desktop_config(desktop_root, {})
+            _write_desktop_config(desktop_root, {"inferenceModels": [{"name": "stale-model"}]})
             domain = ClaudeSettingsDomain(
                 root / "settings.json",
                 desktop_config_library_path=desktop_root,
@@ -564,7 +564,6 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             )
             with mock.patch("young_router.core.domains._shared_api.endpoint", return_value=("http://127.0.0.1:4100/v1", "sk-local")):
                 snapshot = domain.dispatch("use_local_api", {"client": "claudeDesktop"})
-
             self.assertTrue(snapshot["clients"]["claudeDesktop"]["uses_local_api"])
             self.assertFalse(snapshot["clients"]["claudeCode"]["uses_local_api"])
             config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
@@ -572,6 +571,8 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             # /v1/messages itself.
             self.assertEqual("http://127.0.0.1:4100", config["inferenceGatewayBaseUrl"])
             self.assertEqual("gateway", config["inferenceProvider"])
+            self.assertEqual("bearer", config["inferenceGatewayAuthScheme"])
+            self.assertEqual([], config["inferenceModels"])
             self.assertEqual("sk-local", config["inferenceGatewayApiKey"])
 
     def test_generated_model_lists_follow_the_public_list_and_its_own_switch(self) -> None:

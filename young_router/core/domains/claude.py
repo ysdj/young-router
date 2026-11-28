@@ -2564,7 +2564,12 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
             try:
                 self._desktop.patch(
-                    {"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": base_url}
+                    {
+                        "inferenceProvider": "gateway",
+                        "inferenceGatewayBaseUrl": base_url,
+                        "inferenceGatewayAuthScheme": "bearer",
+                        "inferenceModels": [],
+                    }
                 )
                 self._desktop.stage_secret("desktop_gateway_api_key", key)
             except ClaudeDesktopConfigError as exc:
