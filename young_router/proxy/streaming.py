@@ -5590,6 +5590,7 @@ def _build_streaming_error_fallback_payload(
         "model_info",
         "extra_body",
         "extra_headers",
+        "generationConfig",
     )
     responses_keys = (
         "input",
@@ -7133,6 +7134,14 @@ async def _yield_native_stream_with_output_limit_continuation(
     # They are withheld with it and re-emitted only when no continuation runs,
     # so the client always receives a complete terminal sequence.
     withheld_ceiling_closers: List[Any] = []
+    # The terminal frame of a normal Chat stop is held briefly when usage is
+    # requested. Some relays report their own 8192 ceiling as ``stop``; the
+    # trailing usage frame lets us distinguish that from a natural completion.
+    pending_normal_terminal: Optional[Any] = None
+    # A route may close with a normal ``stop`` after spending the whole answer
+    # on reasoning.  Kelivo stores that as a successful empty answer unless the
+    # terminal is held back and the turn gets one bounded continuation attempt.
+    continuation_requires_visible_text = False
     chat_usage_frame: Optional[Any] = None
     # Everything this answer has delivered, so a continuation resumes from the
     # end of it instead of restarting the answer.
@@ -7352,6 +7361,8 @@ async def _yield_native_stream_with_output_limit_continuation(
 
     async def deliver_route() -> AsyncIterator[Any]:
         nonlocal withheld_ceiling_terminal
+        nonlocal pending_normal_terminal
+        nonlocal continuation_requires_visible_text
         nonlocal native_chunk_count
         nonlocal chat_usage_frame
         can_continue = _stream_continuation_module._request_is_continuable_native_stream(request_data)
@@ -7382,7 +7393,66 @@ async def _yield_native_stream_with_output_limit_continuation(
                         withheld_ceiling_terminal = frame
                         native_chunk_count += 1
                         remember_route_accounting(frame)
+                        if (
+                            not visible_output_delivered
+                            and not _stream_chunk_has_visible_output(frame)
+                        ):
+                            continuation_requires_visible_text = True
                         continue
+                    # A native route can spend an entire answer on private
+                    # reasoning and then emit a normal ``stop``.  That frame
+                    # is not a usable answer for Kelivo: hold it back and let
+                    # the continuation turn the reasoning-only attempt into
+                    # actual response text instead of persisting an empty
+                    # success.
+                    if (
+                        withheld_ceiling_terminal is None
+                        and can_continue
+                        and _native_stream_chunk_is_terminal(
+                            frame, request_data, finished_choice_indices
+                        )
+                        and not visible_output_delivered
+                        and not _stream_chunk_has_visible_output(frame)
+                    ):
+                        withheld_ceiling_terminal = frame
+                        continuation_requires_visible_text = True
+                        native_chunk_count += 1
+                        remember_route_accounting(frame)
+                        continue
+                    # A normal Chat terminal can be accompanied by a trailing
+                    # usage frame. Hold it until that frame tells us whether
+                    # this is the relay's implicit 8192-token ceiling.
+                    stream_options = request_data.get("stream_options") or {}
+                    if (
+                        pending_normal_terminal is None
+                        and not is_anthropic_stream
+                        and can_continue
+                        and stream_options.get("include_usage") is True
+                        and (
+                            visible_output_delivered
+                            or _stream_chunk_has_visible_output(frame)
+                        )
+                        and _native_stream_chunk_is_terminal(
+                            frame, request_data, finished_choice_indices
+                        )
+                        and _stream_continuation_module._native_stream_output_limit_reason(
+                            frame
+                        ) is None
+                    ):
+                        visible, terminal = _stream_continuation_module._split_chat_finish_chunk(frame)
+                        if visible is not None:
+                            inspect_native_chunk(visible)
+                            yield remember_delivered_text(visible)
+                        pending_normal_terminal = terminal
+                        remember_route_accounting(terminal)
+                        continue
+                    if pending_normal_terminal is not None and dumped is not None:
+                        if dumped.get("usage") and not _stream_chunk_has_delivered_output(
+                            frame, request_data
+                        ):
+                            chat_usage_frame = frame
+                            remember_route_accounting(frame)
+                            continue
                     if withheld_ceiling_terminal is not None and dumped is not None:
                         # A Chat client expects final usage after the finish
                         # reason. Hold the accounting chunk until we know
@@ -7422,6 +7492,22 @@ async def _yield_native_stream_with_output_limit_continuation(
             )
         for event in dsml_tool_use_events():
             yield event
+        if pending_normal_terminal is not None:
+            implicit_limit = _stream_continuation_module._native_stream_usage_is_implicit_output_limit(
+                request_data,
+                answered_output_tokens,
+            )
+            if implicit_limit:
+                withheld_ceiling_terminal = pending_normal_terminal
+                pending_normal_terminal = None
+                native_chunk_count += 1
+                remember_route_accounting(withheld_ceiling_terminal)
+            else:
+                inspect_native_chunk(pending_normal_terminal)
+                yield pending_normal_terminal
+                pending_normal_terminal = None
+                if chat_usage_frame is not None:
+                    yield chat_usage_frame
         if is_anthropic_stream:
             _dsml_trace(
                 request_data,
@@ -7501,6 +7587,7 @@ async def _yield_native_stream_with_output_limit_continuation(
             anthropic_index_offset=highest_anthropic_index + 1,
             chat_usage=extra_chat_usage,
             continuation_error=continuation_error,
+            require_visible_text=continuation_requires_visible_text,
         ):
             # The same test the continuation applies before it hands over a
             # route's closing frame: that frame is the only terminal it yields.
@@ -7508,6 +7595,19 @@ async def _yield_native_stream_with_output_limit_continuation(
                 continuation_closed = True
             yield chunk
         exception = continuation_error.get("exception")
+        if (
+            continuation_requires_visible_text
+            and not continuation_closed
+            and exception is None
+        ):
+            # A zero-round limit or an ineligible resume must never restore the
+            # reasoning-only ``stop`` as a successful empty answer.
+            exception = _native_stream_incomplete_exception(
+                request_data,
+                buffered_chunks=native_chunk_count,
+            )
+            exception.stream_incomplete = True  # type: ignore[attr-defined]
+            continuation_error["exception"] = exception
         # Restore the limit frame only if the continuation was ineligible or disabled.
         if not continuation_closed and exception is None:
             if extra_chat_usage and _stream_chunk_dump(withheld_ceiling_terminal).get("usage"):

@@ -32,6 +32,8 @@ the text that exists rather than discarding it.
 from __future__ import annotations
 
 
+from copy import deepcopy
+
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
 from . import anthropic_sse as _anthropic_sse_module
@@ -56,29 +58,14 @@ from .base import (
 _MAX_CONTINUATION_ROUNDS_ENV = "YOUNG_ROUTER_STREAM_CONTINUATION_MAX_ROUNDS"
 _MAX_CONTINUATION_ROUNDS_DEFAULT = 8
 
-# The assistant text carried into the next request is the continuation's own
-# instruction.  Sending the whole answer back would grow the prompt by the
-# output ceiling on every round, so the tail is enough to resume from: the
-# model only has to know where it stopped and what it had already said.
-_CONTINUATION_TAIL_CHARS = 6000
-
+# The assistant message is the continuation's complete resume point.  It is
+# intentionally not bounded: the model must see everything the client already
+# received, not only a quote from the end of it.
 _CONTINUATION_INSTRUCTION = (
     "Your previous answer was cut off because it reached the output limit. "
     "Continue it from exactly where it stopped. Do not repeat any text that "
     "was already written, do not restate the question, and do not add a "
     "preamble. Resume in the middle of the sentence if that is where it stopped."
-)
-
-# The source the continuation no longer needs.  Re-sending the client's whole
-# document every round re-asks the original question -- a document-length
-# "translate all of this" -- so the model starts the answer again instead of
-# resuming it, and it pays the full prompt cost on every round.  The quote is
-# what the resume actually needs: enough of the source to name its place.
-_CONTINUATION_SOURCE_QUOTE_CHARS = 1500
-
-_CONTINUATION_PREAMBLE = (
-    "Use the source below as context for continuing the answer you already "
-    "started; it is not a new request."
 )
 
 _STREAM_CONTINUATION_ENV = "YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED"
@@ -183,12 +170,19 @@ def _sum_chat_token_usage(total: dict, usage: dict) -> None:
 _CONTINUATION_REQUEST_KEYS = (
     "temperature",
     "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "reasoning",
     "reasoning_effort",
     "user",
     "service_tier",
     "seed",
     "stop",
     "response_format",
+    "modalities",
+    "parallel_tool_calls",
+    "prediction",
     "stream",
     "stream_timeout",
     "api_base",
@@ -198,6 +192,9 @@ _CONTINUATION_REQUEST_KEYS = (
     "extra_body",
     "extra_headers",
     "prompt_cache_key",
+    # Kelivo sends provider generation controls in this top-level camel-case
+    # field rather than in ``extra_body``.
+    "generationConfig",
 )
 
 
@@ -209,7 +206,7 @@ _ROUTE_CEILING_SHORTFALL_TOKENS = 256
 
 
 def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
-    """Whether this request can be rebuilt as a single text continuation."""
+    """Whether this request can be rebuilt as a safe text continuation."""
 
     from . import streaming as _streaming_module
 
@@ -229,7 +226,7 @@ def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
         return False
     # Chat clients may attach optional function declarations to every request.
     # The stream checks whether the model actually started a call. A request
-    # that requires one can't be resumed with the declarations removed.
+    # that requires one cannot be resumed with the declarations removed.
     if is_chat and (
         request_data.get("tool_choice") not in (None, "auto", "none")
         or request_data.get("n") not in (None, 1)
@@ -237,37 +234,57 @@ def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
         or request_data.get("modalities") not in (None, ["text"])
     ):
         return False
+
     messages = request_data.get("messages")
-    if not isinstance(messages, list):
+    if not isinstance(messages, list) or not messages:
         return False
 
+    allowed_roles = {"system", "user", "assistant"}
+    if is_chat:
+        allowed_roles.add("developer")
     user_message_count = 0
     for message in messages:
         if not isinstance(message, dict):
             return False
         role = message.get("role")
+        if role not in allowed_roles:
+            # In particular, do not replay historical tool/function messages.
+            return False
+        if any(
+            key in message for key in ("tool_calls", "function_call", "audio", "refusal")
+        ):
+            # These fields either describe an executable call or a structured
+            # assistant result that the text-only continuation cannot reproduce.
+            return False
         if role == "user":
             user_message_count += 1
-        elif role != "system":
-            # The resume prompt intentionally rebuilds a single plain-text
-            # request. Earlier assistant turns, tool results, and other roles
-            # carry context it would otherwise discard.
-            return False
 
         content = message.get("content")
         if isinstance(content, str):
             continue
-        if not isinstance(content, list) or any(
-            not isinstance(part, dict)
-            or not (
-                (part.get("type") == "text" and isinstance(part.get("text"), str))
-                or (is_chat and role == "user" and part.get("type") == "image_url")
-            )
-            for part in content
-        ):
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if not isinstance(part, dict):
+                return False
+            if part.get("type") == "text":
+                if not isinstance(part.get("text"), str):
+                    return False
+                continue
+            if (
+                is_chat
+                and role == "user"
+                and part.get("type") == "image_url"
+                and isinstance(part.get("image_url"), dict)
+            ):
+                continue
+            # Preserve only text and the native Chat image input. Other blocks
+            # may carry executable or surface-specific semantics.
             return False
 
-    return user_message_count == 1
+    # The stream is the answer to the final user turn. Historical plain-text
+    # assistant turns are safe because they remain in the original order.
+    return user_message_count > 0 and messages[-1].get("role") == "user"
 
 
 def _stopped_at_the_routes_own_ceiling(
@@ -294,6 +311,26 @@ def _stopped_at_the_routes_own_ceiling(
     if budget is None:
         return True
     return type(output_tokens) is int and 0 < output_tokens < budget - _ROUTE_CEILING_SHORTFALL_TOKENS
+
+
+def _native_stream_usage_is_implicit_output_limit(
+    request_data: Optional[dict],
+    output_tokens: Optional[int],
+) -> bool:
+    """Whether a normal Chat stop matches a relay's known hard ceiling.
+
+    Some OpenAI-compatible relays map their own ``max_output_tokens: 8192``
+    stop to ``finish_reason: stop``.  The trailing usage frame is the only
+    reliable signal left at this layer. Keep the range narrow enough that a
+    normal long answer is not silently continued, and still honor a smaller
+    budget the client explicitly chose.
+    """
+
+    if not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
+        return False
+    if not 8180 <= output_tokens <= 8192:
+        return False
+    return _stopped_at_the_routes_own_ceiling(request_data, output_tokens)
 
 
 def _continuation_is_decided_by_the_engine(
@@ -334,6 +371,8 @@ def _continuation_is_decided_by_the_engine(
 def _continuation_request_payload(
     request_data: dict,
     delivered_text: str,
+    *,
+    require_visible_text: bool = False,
 ) -> Optional[dict]:
     """The request that asks the same route for the rest of the answer.
 
@@ -349,8 +388,8 @@ def _continuation_request_payload(
     messages = request_data.get("messages")
     if not isinstance(messages, list):
         return None
-    tail = delivered_text[-_CONTINUATION_TAIL_CHARS:]
-    if not tail.strip():
+    tail = delivered_text
+    if not tail.strip() and not require_visible_text:
         return None
     payload = {key: request_data[key] for key in _CONTINUATION_REQUEST_KEYS if key in request_data}
     payload["model"] = _routing_module._request_public_model(request_data)
@@ -389,59 +428,28 @@ def _continuation_request_payload(
     return payload
 
 
-def _continuation_messages(messages: List[Any], tail: str) -> List[Any]:
-    """Give the continuation the source and the text already delivered."""
+def _continuation_messages(messages: List[Any], delivered_text: str) -> List[Any]:
+    """Preserve the original prompt, then append the complete answer so far.
 
-    system_messages: List[Any] = []
-    resume_turn: Any = _CONTINUATION_PREAMBLE
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if role == "system":
-            system_messages.append(_message_copy(message))
-        elif role == "user":
-            content = message.get("content")
-            if isinstance(content, list) and any(part.get("type") == "image_url" for part in content):
-                # For an image summary the unsummarized facts are in the
-                # images. A text tail can't stand in for them. Keep the entire
-                # source in order, with the partial answer as the next turn.
-                resume_turn = [{"type": "text", "text": _CONTINUATION_PREAMBLE}, *content]
-            else:
-                source_quote = _message_text(message)[-_CONTINUATION_SOURCE_QUOTE_CHARS:]
-                if source_quote.strip():
-                    resume_turn = f"{resume_turn}\n\n--- document (tail) ---\n{source_quote}"
-    return [
-        *system_messages,
-        {"role": "user", "content": resume_turn},
-        {"role": "assistant", "content": tail},
-        {"role": "user", "content": _CONTINUATION_INSTRUCTION},
+    The source request is rebuilt from the original ``messages`` every round,
+    rather than from the previous continuation payload. That keeps one resume
+    instruction at the end and prevents prior resume instructions from
+    accumulating across rounds. An empty initial answer has no assistant
+    message to replay; it still gets the original prompt and one instruction.
+    """
+
+    original_messages = [
+        _message_copy(message) if isinstance(message, dict) else message
+        for message in messages
     ]
-
-
-def _message_text(message: dict) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                parts.append(part["text"])
-        return "\n".join(parts)
-    return ""
+    if delivered_text:
+        original_messages.append({"role": "assistant", "content": delivered_text})
+    original_messages.append({"role": "user", "content": _CONTINUATION_INSTRUCTION})
+    return original_messages
 
 
 def _message_copy(message: dict) -> dict:
-    rebuilt: dict[str, Any] = {}
-    for key, value in message.items():
-        if key == "content" and isinstance(value, list):
-            rebuilt[key] = [
-                dict(part) if isinstance(part, dict) else part for part in value
-            ]
-        else:
-            rebuilt[key] = value
-    return rebuilt
+    return deepcopy(message)
 
 
 async def _stream_native_continuation_rounds(
@@ -454,6 +462,7 @@ async def _stream_native_continuation_rounds(
     anthropic_index_offset: int = 0,
     chat_usage: Optional[dict] = None,
     continuation_error: Optional[dict[str, Exception]] = None,
+    require_visible_text: bool = False,
 ) -> AsyncIterator[Any]:
     """Ask the same route for the rest of an answer it cut off at its ceiling.
 
@@ -463,7 +472,10 @@ async def _stream_native_continuation_rounds(
     actually complete.
 
     ``answered_output_tokens`` tells a route ceiling from a ceiling the client
-    asked for when the request included a budget.
+    asked for when the request included a budget. ``require_visible_text`` is
+    used for an initial reasoning-only answer: a continuation may emit private
+    reasoning, but it cannot accept a terminal stop until it has emitted answer
+    text.
     """
 
     from . import streaming as _streaming_module
@@ -483,6 +495,7 @@ async def _stream_native_continuation_rounds(
         return
 
     seen_text = delivered_text
+    visible_text_seen = bool(delivered_text.strip())
     chat_identity = {} if is_anthropic else {
         k: v for k, v in _streaming_module._stream_chunk_dump(ceiling_chunk).items()
         if k in ("id", "created", "model") and v is not None
@@ -563,7 +576,10 @@ async def _stream_native_continuation_rounds(
                             open_anthropic_indices.discard(event["index"])
                         delta = event.get("delta")
                         if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                            round_text_parts.append(str(delta.get("text") or ""))
+                            text = str(delta.get("text") or "")
+                            round_text_parts.append(text)
+                            if text.strip():
+                                state["visible_text"] = True
                         state["released"] = True
                         yield _anthropic_sse_module._sse_block(event)
                     continue
@@ -593,9 +609,10 @@ async def _stream_native_continuation_rounds(
                 ):
                     visible, terminal = _split_chat_finish_chunk(chunk)
                     if visible is not None:
-                        round_text_parts.append(
-                            _responses_output_module._response_text(visible)
-                        )
+                        visible_text = _responses_output_module._response_text(visible)
+                        round_text_parts.append(visible_text)
+                        if visible_text.strip():
+                            state["visible_text"] = True
                         state["released"] = True
                         yield visible
                     if not state["round_ceiling_hit"]:
@@ -604,6 +621,8 @@ async def _stream_native_continuation_rounds(
                 chunk_text = _responses_output_module._response_text(chunk)
                 if chunk_text:
                     round_text_parts.append(chunk_text)
+                    if chunk_text.strip():
+                        state["visible_text"] = True
                 state["released"] = True
                 yield chunk
         except Exception as exception:
@@ -692,7 +711,11 @@ async def _stream_native_continuation_rounds(
     routing_request = request_data
     max_rounds = _max_continuation_rounds()
     for round_number in range(1, max_rounds + 1):
-        payload = _continuation_request_payload(request_data, seen_text)
+        payload = _continuation_request_payload(
+            request_data,
+            seen_text,
+            require_visible_text=require_visible_text,
+        )
         if payload is None:
             return
         active_deployment_id = _routing_module._deployment_id_from_request(
@@ -766,6 +789,7 @@ async def _stream_native_continuation_rounds(
                 "round_text": "",
                 "round_ceiling_hit": False,
                 "released": False,
+                "visible_text": False,
                 "final_terminal": None,
                 "final_message_delta": None,
                 "anthropic_output_tokens": None,
@@ -778,11 +802,19 @@ async def _stream_native_continuation_rounds(
                 yield chunk
             round_text += attempt_state["round_text"]
             released = released or attempt_state["released"]
+            visible_text_seen = visible_text_seen or attempt_state["visible_text"]
             round_ceiling_hit = attempt_state["round_ceiling_hit"]
             final_terminal = attempt_state["final_terminal"]
             final_message_delta = attempt_state["final_message_delta"]
             if attempt_state["unsupported_tool_activity"]:
                 remember_error(RuntimeError("The continuation emitted an unexpected tool call."))
+                return
+            if final_terminal is not None and require_visible_text and not visible_text_seen:
+                remember_error(
+                    RuntimeError(
+                        "The continuation reached a terminal stop without visible text."
+                    )
+                )
                 return
             if final_terminal is not None or round_ceiling_hit:
                 _routing_module._apply_current_selected_deployment_to_request(payload)
@@ -809,6 +841,7 @@ async def _stream_native_continuation_rounds(
             resume_payload = _continuation_request_payload(
                 request_data,
                 f"{seen_text}{round_text}",
+                require_visible_text=require_visible_text,
             )
             if resume_payload is None:
                 remember_error(exception)
